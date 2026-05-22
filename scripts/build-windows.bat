@@ -94,13 +94,35 @@ if "%TARGET%"=="installer" if exist "%REPO%build\build.ninja" goto :do_installer
 :: ============================================================
 :: CMake Generate
 :: ============================================================
+:: The plug-in's CMake add_subdirectory(runtime) triggers the runtime's
+:: own CMake — which needs vcpkg (for Eigen3 etc.), Vulkan SDK, and the
+:: OpenXR loader. We inherit those from the runtime sibling's already-
+:: built dev tree (the user's `scripts\build_windows.bat all` has set
+:: them up). Required env: VULKAN_SDK pointing at the installed SDK.
 echo === CMake Generate ===
 set CMAKE_ARGS=-S "%REPO%." -B "%REPO%build" -G "Ninja Multi-Config" ^
   -DCMAKE_PREFIX_PATH="%LEIASR_SDKROOT%" ^
   -DCMAKE_INSTALL_PREFIX="%REPO%_package"
+
 if not "%DXR_RUNTIME_SOURCE_DIR%"=="" (
     set CMAKE_ARGS=!CMAKE_ARGS! -DDXR_RUNTIME_SOURCE_DIR="%DXR_RUNTIME_SOURCE_DIR%"
+
+    REM Inherit the runtime sibling's vcpkg toolchain + OpenXR loader
+    REM so add_subdirectory of the runtime resolves Eigen3, cjson,
+    REM OpenXR, etc. matching the runtime's own build script settings.
+    if exist "%DXR_RUNTIME_SOURCE_DIR%\vcpkg\scripts\buildsystems\vcpkg.cmake" (
+        set CMAKE_ARGS=!CMAKE_ARGS! -DCMAKE_TOOLCHAIN_FILE="%DXR_RUNTIME_SOURCE_DIR%\vcpkg\scripts\buildsystems\vcpkg.cmake" -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON -DVCPKG_MANIFEST_DIR="%DXR_RUNTIME_SOURCE_DIR%"
+        echo Using runtime sibling's vcpkg toolchain + vcpkg.json.
+    ) else (
+        echo WARN: runtime vcpkg not found at %DXR_RUNTIME_SOURCE_DIR%\vcpkg
+        echo       Run scripts\build_windows.bat all in the runtime first.
+    )
+
+    if exist "%DXR_RUNTIME_SOURCE_DIR%\openxr_sdk\x64\lib\openxr_loader.lib" (
+        set CMAKE_ARGS=!CMAKE_ARGS! -DOpenXR_ROOT="%DXR_RUNTIME_SOURCE_DIR%\openxr_sdk"
+    )
 )
+
 cmake !CMAKE_ARGS!
 if %ERRORLEVEL% NEQ 0 (
     echo CMake generate FAILED

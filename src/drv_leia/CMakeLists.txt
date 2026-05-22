@@ -77,6 +77,11 @@ endif()
 
 add_library(DisplayXR-LeiaSR SHARED ${LEIA_SOURCES})
 
+# leia_display_processor.cpp uses C++20 designated initializers for the
+# VkPipelineCreateInfo + chroma-key pipeline-state structs; match the
+# original runtime build's per-target bump.
+set_target_properties(DisplayXR-LeiaSR PROPERTIES CXX_STANDARD 20)
+
 target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_USING_RUNTIME_DLL)
 
 target_include_directories(DisplayXR-LeiaSR PRIVATE

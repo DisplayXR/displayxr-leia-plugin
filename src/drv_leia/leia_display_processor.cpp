@@ -28,14 +28,14 @@
 #include <cstring>
 
 // SPIR-V chroma-key shaders (generated at build time by spirv_shaders()).
-#include "leia/shaders/fullscreen_tri.vert.h"
-#include "leia/shaders/ck_fill.frag.h"
-#include "leia/shaders/ck_strip.frag.h"
+#include "shaders/fullscreen_tri.vert.h"
+#include "shaders/ck_fill.frag.h"
+#include "shaders/ck_strip.frag.h"
 
 #ifdef _WIN32
 #include "leia_bg_capture_win.h"
-#include "leia/shaders/compose_under_bg.frag.h"
-#include "leia/shaders/alpha_gate.frag.h"
+#include "shaders/compose_under_bg.frag.h"
+#include "shaders/alpha_gate.frag.h"
 #endif
 
 
@@ -398,21 +398,21 @@ ck_init_pipeline(struct leia_display_processor *ldp, VkFormat target_format)
 	VkShaderModule vs = VK_NULL_HANDLE;
 	VkShaderModule fs_fill = VK_NULL_HANDLE;
 	VkShaderModule fs_strip = VK_NULL_HANDLE;
-	res = ck_create_shader_module(vk, leia_shaders_fullscreen_tri_vert,
-	                              sizeof(leia_shaders_fullscreen_tri_vert), &vs);
+	res = ck_create_shader_module(vk, shaders_fullscreen_tri_vert,
+	                              sizeof(shaders_fullscreen_tri_vert), &vs);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: ck vs create failed: %d", res);
 		return false;
 	}
-	res = ck_create_shader_module(vk, leia_shaders_ck_fill_frag,
-	                              sizeof(leia_shaders_ck_fill_frag), &fs_fill);
+	res = ck_create_shader_module(vk, shaders_ck_fill_frag,
+	                              sizeof(shaders_ck_fill_frag), &fs_fill);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: ck fill fs create failed: %d", res);
 		vk->vkDestroyShaderModule(vk->device, vs, NULL);
 		return false;
 	}
-	res = ck_create_shader_module(vk, leia_shaders_ck_strip_frag,
-	                              sizeof(leia_shaders_ck_strip_frag), &fs_strip);
+	res = ck_create_shader_module(vk, shaders_ck_strip_frag,
+	                              sizeof(shaders_ck_strip_frag), &fs_strip);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: ck strip fs create failed: %d", res);
 		vk->vkDestroyShaderModule(vk->device, fs_fill, NULL);
@@ -1294,14 +1294,14 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 
 	// Build pipeline.
 	VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
-	res = ck_create_shader_module(vk, leia_shaders_fullscreen_tri_vert,
-	                              sizeof(leia_shaders_fullscreen_tri_vert), &vs);
+	res = ck_create_shader_module(vk, shaders_fullscreen_tri_vert,
+	                              sizeof(shaders_fullscreen_tri_vert), &vs);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: compose vs create failed: %d", res);
 		return false;
 	}
-	res = ck_create_shader_module(vk, leia_shaders_compose_under_bg_frag,
-	                              sizeof(leia_shaders_compose_under_bg_frag), &fs);
+	res = ck_create_shader_module(vk, shaders_compose_under_bg_frag,
+	                              sizeof(shaders_compose_under_bg_frag), &fs);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: compose fs create failed: %d", res);
 		vk->vkDestroyShaderModule(vk->device, vs, NULL);
@@ -1440,14 +1440,14 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		}
 		// Build pipeline against ck_strip_rp (writes swap-chain image).
 		VkShaderModule ag_vs = VK_NULL_HANDLE, ag_fs = VK_NULL_HANDLE;
-		res = ck_create_shader_module(vk, leia_shaders_fullscreen_tri_vert,
-		                              sizeof(leia_shaders_fullscreen_tri_vert), &ag_vs);
+		res = ck_create_shader_module(vk, shaders_fullscreen_tri_vert,
+		                              sizeof(shaders_fullscreen_tri_vert), &ag_vs);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Leia VK DP: alpha-gate vs create failed: %d", res);
 			return false;
 		}
-		res = ck_create_shader_module(vk, leia_shaders_alpha_gate_frag,
-		                              sizeof(leia_shaders_alpha_gate_frag), &ag_fs);
+		res = ck_create_shader_module(vk, shaders_alpha_gate_frag,
+		                              sizeof(shaders_alpha_gate_frag), &ag_fs);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Leia VK DP: alpha-gate fs create failed: %d", res);
 			vk->vkDestroyShaderModule(vk->device, ag_vs, NULL);
