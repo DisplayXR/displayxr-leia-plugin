@@ -52,6 +52,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout displayxr-runtime (pinned)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        # The plug-in's CMakeLists.txt FetchContent pin tracks the runtime
+        # SHA. Cloning here instead lets us point the build at it as a
+        # local source dir (skips a redundant clone inside CMake) and use
+        # its vcpkg.json for vcpkg manifest-mode (Eigen3, glslang, etc.).
+        # KEEP IN SYNC with DXR_RUNTIME_GIT_TAG in CMakeLists.txt.
+        uses: actions/checkout@v4
+        with:
+          repository: DisplayXR/displayxr-runtime
+          ref: '2fbd7e21c85bd6546b2a1a5a9147ef9a9fd28d7c'
+          path: displayxr-runtime
+          fetch-depth: 1
+
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "docs_only=true; build steps will skip and report success."
@@ -75,6 +89,9 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
+          # Point vcpkg manifest mode at the runtime's vcpkg.json so
+          # Eigen3 + glslang + vulkan + cjson get installed.
+          vcpkgJsonGlob: 'displayxr-runtime/vcpkg.json'
 
       - name: Install Vulkan SDK
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -100,8 +117,10 @@ jobs:
           LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
+            -DDXR_RUNTIME_SOURCE_DIR="${{ github.workspace }}/displayxr-runtime" `
             -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/displayxr-runtime" `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
