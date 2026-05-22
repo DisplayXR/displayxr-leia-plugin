@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: CC0-1.0
+
+# Build artifacts
+build/
+_package/
+out/
+*.user
+*.user.*
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.sdf
+
+# OS
+.DS_Store
+Thumbs.db
+__MACOSX/
+
+# Fetched SR SDK (not committed; downloaded by CI / scripts/build-windows.bat)
+LeiaSR-SDK-*/
+
+# Installer artifacts (built into _package/)
+DisplayXRLeiaSRSetup-*.exe
