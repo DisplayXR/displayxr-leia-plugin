@@ -32,26 +32,25 @@ endif()
 #     and the user's joint-test path (issue #263 plan A6).
 #   - Otherwise, FetchContent fetches DXR_RUNTIME_GIT_TAG from GitHub.
 #
-# The runtime's own drv_leia_plugin target is gated on
-# XRT_BUILD_DRV_LEIA_IN_TREE (default ON in the runtime today; goes away
-# entirely after the #263 cleanup lands). We force it OFF here so the
-# runtime build never tries to also produce DisplayXR-LeiaSR.dll.
-
-set(XRT_BUILD_DRV_LEIA_IN_TREE OFF CACHE BOOL "Disable in-tree drv_leia inside the fetched runtime" FORCE)
+# Post-#263 the runtime tree no longer carries any drv_leia source, so
+# there's no conflict to gate against here — the runtime always builds
+# vendor-source-clean.
 
 if(DXR_RUNTIME_SOURCE_DIR)
     message(STATUS "Using local runtime checkout: ${DXR_RUNTIME_SOURCE_DIR}")
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    set(DXR_RUNTIME_GIT_TAG "feat/extract-leia-plugin" CACHE STRING
-        "Runtime git ref to fetch. Bootstrap: branch ref. Post-#263 merge: replace with a v* tag.")
+    # Pinned to the displayxr-runtime#263 merge commit on main. Bump
+    # to the next v* runtime release tag when one ships (the /release
+    # skill cuts tags from the runtime repo; no tag includes #263 yet).
+    set(DXR_RUNTIME_GIT_TAG "2fbd7e21c85bd6546b2a1a5a9147ef9a9fd28d7c" CACHE STRING
+        "Runtime git ref to fetch. Use a v* tag once one is published post-#263.")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
         displayxr_runtime
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-runtime.git
         GIT_TAG "${DXR_RUNTIME_GIT_TAG}"
-        GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(displayxr_runtime)
 endif()
