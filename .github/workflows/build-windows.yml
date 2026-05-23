@@ -55,14 +55,14 @@ jobs:
       - name: Checkout displayxr-runtime (pinned)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         # The plug-in's CMakeLists.txt FetchContent pin tracks the runtime
-        # SHA. Cloning here instead lets us point the build at it as a
-        # local source dir (skips a redundant clone inside CMake) and use
-        # its vcpkg.json for vcpkg manifest-mode (Eigen3, glslang, etc.).
+        # release tag. Cloning here instead lets us point the build at it
+        # as a local source dir (skips a redundant clone inside CMake) and
+        # use its vcpkg.json for vcpkg manifest-mode (Eigen3, glslang, etc.).
         # KEEP IN SYNC with DXR_RUNTIME_GIT_TAG in CMakeLists.txt.
         uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
-          ref: '2fbd7e21c85bd6546b2a1a5a9147ef9a9fd28d7c'
+          ref: 'v1.4.0'
           path: displayxr-runtime
           fetch-depth: 1
 

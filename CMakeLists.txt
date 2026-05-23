@@ -41,11 +41,11 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to the displayxr-runtime#263 merge commit on main. Bump
-    # to the next v* runtime release tag when one ships (the /release
-    # skill cuts tags from the runtime repo; no tag includes #263 yet).
-    set(DXR_RUNTIME_GIT_TAG "2fbd7e21c85bd6546b2a1a5a9147ef9a9fd28d7c" CACHE STRING
-        "Runtime git ref to fetch. Use a v* tag once one is published post-#263.")
+    # Pinned to the displayxr-runtime v1.4.0 release tag — the first
+    # runtime release that includes #263 (driver extraction) + #264
+    # (vendor-plugin-onboarding docs).
+    set(DXR_RUNTIME_GIT_TAG "v1.4.0" CACHE STRING
+        "Runtime git ref to fetch. Bump to a newer v* tag as the runtime ABI evolves.")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
         displayxr_runtime
