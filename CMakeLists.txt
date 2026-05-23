@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(
     DisplayXR-LeiaSR
-    VERSION 1.0.1
+    VERSION 1.0.2
     LANGUAGES C CXX
     DESCRIPTION "DisplayXR Leia SR display-processor plug-in"
 )
@@ -41,10 +41,10 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to the displayxr-runtime v1.4.0 release tag — the first
-    # runtime release that includes #263 (driver extraction) + #264
-    # (vendor-plugin-onboarding docs).
-    set(DXR_RUNTIME_GIT_TAG "v1.4.0" CACHE STRING
+    # Pinned to displayxr-runtime v1.4.1 — patch release fixing #286
+    # cascade-uninstall (PR #292). ABI is identical to v1.4.0; bump
+    # tracks the latest runtime release for cleanliness.
+    set(DXR_RUNTIME_GIT_TAG "v1.4.1" CACHE STRING
         "Runtime git ref to fetch. Bump to a newer v* tag as the runtime ABI evolves.")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
