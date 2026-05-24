@@ -33,6 +33,8 @@
 #include "shaders/ck_strip.frag.h"
 
 #ifdef _WIN32
+#include <windows.h>
+#include <cwchar>
 #include "leia_bg_capture_win.h"
 #include "shaders/compose_under_bg.frag.h"
 #include "shaders/alpha_gate.frag.h"
@@ -2183,6 +2185,74 @@ leia_dp_destroy(struct xrt_display_processor *xdp)
 }
 
 
+#ifdef _WIN32
+/*!
+ * Ensure the SR Vulkan weaver DLL (SimulatedRealityVulkanBeta.dll) is loaded
+ * from this plug-in's own directory before the first weaver call.
+ *
+ * The SR SDK import lib pulls SimulatedRealityVulkanBeta.dll in as a
+ * *delay-loaded* dependency. The Windows loader resolves delay-loaded deps
+ * against the host *process's* search path (exe dir, System32, PATH) — NOT
+ * the directory of the DLL that triggers the load. We ship the weaver DLL
+ * next to this plug-in, but that directory is on none of those search paths,
+ * so any host that doesn't carry the DLL next to its own exe (e.g. a Unity
+ * Player) hits ERROR_MOD_NOT_FOUND (raised as 0xC06D007E by the VC++
+ * delay-load helper) at the first weaver call and crashes inside
+ * xrCreateSession. (The D3D weaver, SimulatedRealityDirectX.dll, escapes this
+ * because the SR Platform installer puts it on PATH.)
+ *
+ * Pre-loading by absolute path from our own directory makes the module
+ * resident before the delay-load thunk fires; the thunk then binds by base
+ * name. LOAD_WITH_ALTERED_SEARCH_PATH additionally lets the weaver DLL resolve
+ * its own co-located dependencies from our directory. Idempotent and cheap.
+ */
+static void
+ensure_sr_vulkan_dll_loaded(void)
+{
+	static bool tried = false;
+	if (tried) {
+		return;
+	}
+	tried = true;
+
+	HMODULE self = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                        reinterpret_cast<LPCWSTR>(&ensure_sr_vulkan_dll_loaded), &self)) {
+		U_LOG_W("SR VK weaver preload: GetModuleHandleExW failed (err=%lu)", GetLastError());
+		return;
+	}
+
+	wchar_t path[MAX_PATH];
+	DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) {
+		U_LOG_W("SR VK weaver preload: GetModuleFileNameW failed (err=%lu)", GetLastError());
+		return;
+	}
+
+	// Replace this plug-in's filename with the SR weaver DLL name.
+	wchar_t *slash = wcsrchr(path, L'\\');
+	if (slash == NULL) {
+		return;
+	}
+	slash[1] = L'\0';
+	static const wchar_t kSrVkDll[] = L"SimulatedRealityVulkanBeta.dll";
+	if (wcslen(path) + wcslen(kSrVkDll) >= MAX_PATH) {
+		return;
+	}
+	wcscat_s(path, MAX_PATH, kSrVkDll);
+
+	HMODULE sr = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+	if (sr == NULL) {
+		U_LOG_W("SR VK weaver preload: LoadLibraryExW('%ls') failed (err=%lu) — "
+		        "weaver delay-load will likely fail",
+		        path, GetLastError());
+	} else {
+		U_LOG_W("SR VK weaver preload: loaded SimulatedRealityVulkanBeta.dll from plug-in dir");
+	}
+}
+#endif // _WIN32
+
 /*
  *
  * Factory function — matches xrt_dp_factory_vk_fn_t signature.
@@ -2196,6 +2266,13 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
                    int32_t target_format,
                    struct xrt_display_processor **out_xdp)
 {
+#ifdef _WIN32
+	// SimulatedRealityVulkanBeta.dll is delay-loaded and ships next to this
+	// plug-in, which is on no default DLL search path — preload it from our
+	// own directory so the first weaver call doesn't AV on a missing module.
+	ensure_sr_vulkan_dll_loaded();
+#endif
+
 	// Extract Vulkan handles from vk_bundle.
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle_ptr;
 
