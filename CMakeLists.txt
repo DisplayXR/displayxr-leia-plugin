@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(
     DisplayXR-LeiaSR
-    VERSION 1.0.2
+    VERSION 1.0.3
     LANGUAGES C CXX
     DESCRIPTION "DisplayXR Leia SR display-processor plug-in"
 )
