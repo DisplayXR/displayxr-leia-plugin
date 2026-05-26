@@ -13,7 +13,7 @@ first. Audit references in brackets.
 
 ## 1. Face position axis convention [B15]
 
-**What's assumed:** in `src/drv_leia/leia_cnsdk.cpp::leia_cnsdk_get_primary_face`,
+**What's assumed:** in `src/drv_leia_android/leia_cnsdk.cpp::leia_cnsdk_get_primary_face`,
 CNSDK's `leia_core_get_primary_face` returns a 3-float position in
 millimeters with axes x=right / y=up / z=toward viewer, origin at the
 camera. The wrapper converts mm→m and subtracts the cached
@@ -104,9 +104,9 @@ mapping). If 4 is off, it's #3 (UV flip).
 
 | Assumption | File | Function | Audit ref |
 |---|---|---|---|
-| Face position axes / units | `src/drv_leia/leia_cnsdk.cpp` | `leia_cnsdk_get_primary_face` | B15 |
-| Tile-to-eye mapping | `src/drv_leia/leia_cnsdk.cpp` | `leia_cnsdk_weave` (`set_view_for_texture_array`) | B17 |
-| UV vertical flip | `src/drv_leia/leia_cnsdk.cpp` | `leia_cnsdk_weave` (`set_flip_input_uv_vertical`) | B18 |
+| Face position axes / units | `src/drv_leia_android/leia_cnsdk.cpp` | `leia_cnsdk_get_primary_face` | B15 |
+| Tile-to-eye mapping | `src/drv_leia_android/leia_cnsdk.cpp` | `leia_cnsdk_weave` (`set_view_for_texture_array`) | B17 |
+| UV vertical flip | `src/drv_leia_android/leia_cnsdk.cpp` | `leia_cnsdk_weave` (`set_flip_input_uv_vertical`) | B18 |
 
 All three are 1–3 line changes once you know the correct values.
 
