@@ -51,6 +51,35 @@ list(APPEND CMAKE_PREFIX_PATH "${CNSDK_ROOT}")
 find_package(CNSDK CONFIG REQUIRED)
 message(STATUS "Leia CNSDK at ${CNSDK_ROOT}")
 
+# CNSDK 0.7.28's CMake config only exports targets for the
+# faceTrackingInService variant (out-of-process face tracking via
+# a separate Leia system service). For in-process operation on a
+# stock device + emulator testing we want the faceTrackingInApp
+# variant, which CNSDK ships as a sibling .so but doesn't expose a
+# target for. Define our own IMPORTED target around it.
+if(NOT TARGET CNSDK::leiaSDK-faceTrackingInApp)
+    set(_inapp_lib "${CNSDK_ROOT}/lib/${CMAKE_ANDROID_ARCH_ABI}/libleiaSDK-faceTrackingInApp.so")
+    if(NOT EXISTS "${_inapp_lib}")
+        message(FATAL_ERROR "CNSDK in-app face-tracking lib not found: ${_inapp_lib}")
+    endif()
+    # Reuse CNSDK::leiaSDK-faceTrackingInService-shared's include dirs
+    # (they're identical between variants — same headers, different
+    # backing impl) so the plug-in's #include <leia/sdk/core.h> etc.
+    # resolve.
+    get_target_property(_cnsdk_includes
+        CNSDK::leiaSDK-faceTrackingInService-shared
+        INTERFACE_INCLUDE_DIRECTORIES)
+    add_library(CNSDK::leiaSDK-faceTrackingInApp-shared SHARED IMPORTED)
+    set_target_properties(CNSDK::leiaSDK-faceTrackingInApp-shared PROPERTIES
+        IMPORTED_LOCATION "${_inapp_lib}"
+        INTERFACE_INCLUDE_DIRECTORIES "${_cnsdk_includes}"
+    )
+    add_library(CNSDK::leiaSDK-faceTrackingInApp INTERFACE IMPORTED)
+    set_target_properties(CNSDK::leiaSDK-faceTrackingInApp PROPERTIES
+        INTERFACE_LINK_LIBRARIES "CNSDK::leiaSDK-faceTrackingInApp-shared"
+    )
+endif()
+
 # --- Plug-in target -------------------------------------------------------
 
 set(DRV_LEIA_ANDROID_SOURCES
@@ -76,8 +105,10 @@ target_link_libraries(dxrp050_leia_cnsdk
         aux_os
         aux_math
         aux_vk
-        # CNSDK Vulkan interlacer + face-tracker.
-        CNSDK::leiaSDK
+        # CNSDK Vulkan interlacer + in-process face-tracker.
+        # (The InApp variant is what we ship; see the IMPORTED-target
+        # definition above for why we don't just use CNSDK::leiaSDK.)
+        CNSDK::leiaSDK-faceTrackingInApp
         # Android system libs.
         log
         android
