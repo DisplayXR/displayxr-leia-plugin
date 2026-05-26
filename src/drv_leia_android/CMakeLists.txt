@@ -41,6 +41,12 @@ if(NOT DEFINED CNSDK_ROOT)
             "Source: https://github.com/LeiaInc/leiainc.github.io/tree/master/CNSDK/cnsdk-android-0.7.28.zip")
     endif()
 endif()
+# Android NDK toolchain defaults CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY,
+# which restricts find_package to NDK sysroot dirs and ignores
+# CMAKE_PREFIX_PATH outside that. Flip it to BOTH so the CNSDK install
+# at ${CNSDK_ROOT} is searchable (matches the runtime APK's gradle
+# cmake.arguments setup).
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 list(APPEND CMAKE_PREFIX_PATH "${CNSDK_ROOT}")
 find_package(CNSDK CONFIG REQUIRED)
 message(STATUS "Leia CNSDK at ${CNSDK_ROOT}")
