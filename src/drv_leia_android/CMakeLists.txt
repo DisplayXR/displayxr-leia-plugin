@@ -97,3 +97,15 @@ set_target_properties(dxrp050_leia_cnsdk PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
+
+# Single-symbol export discipline (plug-in discovery contract §4):
+# only xrtPluginNegotiate should be in the dynamic symbol table.
+# C_/CXX_VISIBILITY_PRESET=hidden only affects this target's own
+# sources, not symbols pulled in from linked static libs (aux_util,
+# aux_vk, jni glue, etc.). --exclude-libs,ALL applies a "hidden"
+# visibility filter to ALL static libs, so their symbols stay
+# private to this .so even if compiled with default visibility.
+# XRT_PLUGIN_EXPORT on xrtPluginNegotiate keeps it explicitly visible.
+if(ANDROID OR UNIX)
+    target_link_options(dxrp050_leia_cnsdk PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
