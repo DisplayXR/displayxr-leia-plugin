@@ -17,6 +17,12 @@
 # Usage: scripts/build-android.sh [target]
 #   target = dxrp050_leia_cnsdk (default) — only the plug-in .so
 #          = clean                       — wipe build-android/
+#          = install-runtime-jnilibs     — build .so + copy plug-in
+#                                            .so + CNSDK transitive
+#                                            .so files into the
+#                                            runtime APK's jniLibs/
+#                                            (the runtime APK then
+#                                             needs `assembleInProcessDebug --rerun-tasks`)
 #
 # Required:
 #   ANDROID_SDK_ROOT or ANDROID_HOME — Android SDK install dir
@@ -112,6 +118,16 @@ if [ "${TARGET}" = "clean" ]; then
     exit 0
 fi
 
+# install-runtime-jnilibs: build the plug-in .so AND copy it (plus
+# the CNSDK transitive .so deps) into the runtime APK's jniLibs/.
+# Internally just delegates the build step to the default target,
+# then does the copies.
+INSTALL_JNILIBS=false
+if [ "${TARGET}" = "install-runtime-jnilibs" ]; then
+    INSTALL_JNILIBS=true
+    TARGET=dxrp050_leia_cnsdk
+fi
+
 # Configure
 cd "${REPO}"
 if [ ! -f build-android/CMakeCache.txt ]; then
@@ -135,10 +151,75 @@ cmake --build build-android --target "${TARGET}"
 # Report
 echo
 SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
-if [ -f "${SO}" ]; then
-    echo "=== Built: $(pwd)/${SO} ==="
-    ls -l "${SO}"
+if [ ! -f "${SO}" ]; then
+    exit 0
+fi
+echo "=== Built: $(pwd)/${SO} ==="
+ls -l "${SO}"
+
+# Install into runtime APK's jniLibs/ when requested.
+if [ "${INSTALL_JNILIBS}" = "true" ]; then
+    JNI_DIR="${DXR_RUNTIME_SOURCE_DIR}/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a"
+    mkdir -p "${JNI_DIR}"
     echo
-    echo "Drop into the runtime APK's jniLibs/<ABI>/:"
+    echo "=== Installing into ${JNI_DIR} ==="
+
+    # Plug-in .so itself.
+    cp -f "${SO}" "${JNI_DIR}/"
+    echo "  + $(basename "${SO}")"
+
+    # CNSDK transitive .so deps. The plug-in's leia_cnsdk_get_*
+    # entry points need libleiaSDK-faceTrackingInApp.so (loaded
+    # via DT_NEEDED), which in turn needs libblink.so and
+    # liblicense_utils.so. These ship in the sdk-faceTrackingInApp
+    # AAR — extract and copy.
+    AAR_NAME="sdk-faceTrackingInApp"
+    AAR_VERSION_FILE="${CNSDK_ROOT}/VERSION.txt"
+    if [ -f "${AAR_VERSION_FILE}" ]; then
+        CNSDK_VERSION="$(cat "${AAR_VERSION_FILE}" | tr -d ' \r\n')"
+    else
+        CNSDK_VERSION="0.7.28"
+    fi
+    AAR="${CNSDK_ROOT}/android/${AAR_NAME}-${CNSDK_VERSION}.aar"
+    if [ ! -f "${AAR}" ]; then
+        echo "WARNING: ${AAR} not found — runtime APK won't have CNSDK transitive .so deps and the plug-in will fail to dlopen on device."
+    else
+        # AAR is a zip; extract just the arm64-v8a .so files.
+        TMP_AAR=$(mktemp -d)
+        unzip -q -j "${AAR}" 'jni/arm64-v8a/*.so' -d "${TMP_AAR}"
+        for so in "${TMP_AAR}"/*.so; do
+            cp -f "${so}" "${JNI_DIR}/"
+            echo "  + $(basename "${so}")"
+        done
+        rm -rf "${TMP_AAR}"
+    fi
+
+    # SNPE — Qualcomm's Snapdragon Neural Processing Engine, used by
+    # CNSDK's libblink.so (face-tracking inference). Ships as a separate
+    # AAR under CNSDK's third_party tree. Bundle these unless they're
+    # known to come from the platform (e.g. system /vendor/ on Lume Pad).
+    SNPE_AAR="${CNSDK_ROOT}/android/third_party/snpe-release.aar"
+    if [ -f "${SNPE_AAR}" ]; then
+        TMP_SNPE=$(mktemp -d)
+        unzip -q -j "${SNPE_AAR}" 'jni/arm64-v8a/*.so' -d "${TMP_SNPE}"
+        for so in "${TMP_SNPE}"/*.so; do
+            # libc++_shared.so already shipped by the runtime build —
+            # double-include can cause version-skew dlopen failures.
+            if [ "$(basename "${so}")" = "libc++_shared.so" ]; then
+                continue
+            fi
+            cp -f "${so}" "${JNI_DIR}/"
+            echo "  + $(basename "${so}")"
+        done
+        rm -rf "${TMP_SNPE}"
+    fi
+
+    echo
+    echo "Now build the runtime APK with the jniLibs picked up:"
+    echo "  cd ${DXR_RUNTIME_SOURCE_DIR} && ./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug --rerun-tasks"
+else
+    echo
+    echo "Drop into the runtime APK's jniLibs/<ABI>/ (or re-run this script with"
+    echo "the 'install-runtime-jnilibs' target to do this + CNSDK transitive .so deps in one step):"
     echo "  cp ${SO} ${DXR_RUNTIME_SOURCE_DIR}/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a/"
 fi
