@@ -19,6 +19,7 @@
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
+#include <sys/system_properties.h>
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 #include <android/trace.h>
 #endif
@@ -108,6 +109,86 @@ struct leia_cnsdk
 	// render thread (no concurrent access; no atomic needed).
 	bool interlacer_init_failed{false};
 };
+
+
+/*
+ *
+ * Calibration knobs (runtime-tunable via `setprop`).
+ *
+ * Three CNSDK conventions are ambiguous from the SDK headers and can
+ * only be validated on real Lume Pad hardware. Each lives behind a
+ * `debug.dxr.leia.*` system property so we can flip the right knob
+ * without rebuilding the plug-in. Cached once at first read (CNSDK
+ * init time) because `__system_property_get` is not free, and
+ * because changing these mid-session would race against in-flight
+ * frames. To re-read after a flip, force-stop the app.
+ *
+ * See `displayxr-leia-plugin/docs/cnsdk-android-calibration.md` for
+ * the symptom→knob table.
+ */
+struct calibration_knobs {
+	bool flip_uv;        // debug.dxr.leia.flip_uv         default 1 (current behavior)
+	bool face_flip_x;    // debug.dxr.leia.face_flip_x     default 0
+	bool face_flip_y;    // debug.dxr.leia.face_flip_y     default 0
+	bool face_flip_z;    // debug.dxr.leia.face_flip_z     default 0
+	bool face_swap_xy;   // debug.dxr.leia.face_swap_xy    default 0
+};
+
+static struct calibration_knobs g_calib = {};
+static std::atomic<bool> g_calib_loaded{false};
+
+#ifdef XRT_OS_ANDROID
+static bool
+get_prop_bool(const char *name, bool default_val)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	int n = __system_property_get(name, buf);
+	if (n <= 0) {
+		return default_val;
+	}
+	/* Accept "1", "true", "yes", "on" (case-insensitive) as true.
+	 * Anything else, including empty string, is false. */
+	if (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y') {
+		return true;
+	}
+	return false;
+}
+#else
+static bool
+get_prop_bool(const char *name, bool default_val)
+{
+	(void)name;
+	return default_val;
+}
+#endif
+
+static void
+ensure_calibration_loaded(void)
+{
+	if (g_calib_loaded.load(std::memory_order_acquire)) {
+		return;
+	}
+	g_calib.flip_uv       = get_prop_bool("debug.dxr.leia.flip_uv",       true);
+	g_calib.face_flip_x   = get_prop_bool("debug.dxr.leia.face_flip_x",   false);
+	g_calib.face_flip_y   = get_prop_bool("debug.dxr.leia.face_flip_y",   false);
+	g_calib.face_flip_z   = get_prop_bool("debug.dxr.leia.face_flip_z",   false);
+	g_calib.face_swap_xy  = get_prop_bool("debug.dxr.leia.face_swap_xy",  false);
+	g_calib_loaded.store(true, std::memory_order_release);
+	U_LOG_W("HW_DBG_CNSDK calibration: flip_uv=%d face_flip_xyz=%d%d%d face_swap_xy=%d",
+	        (int)g_calib.flip_uv,
+	        (int)g_calib.face_flip_x, (int)g_calib.face_flip_y, (int)g_calib.face_flip_z,
+	        (int)g_calib.face_swap_xy);
+}
+
+extern "C" void
+leia_cnsdk_log_calibration_knobs(void)
+{
+	/* Exposed via leia_cnsdk.h so the plug-in's probe() can force the
+	 * knob log line to land in logcat at xrCreateInstance time, even
+	 * when CNSDK init never runs (e.g. emulator hits
+	 * VK_ERROR_EXTENSION_NOT_PRESENT before reaching the DP). */
+	ensure_calibration_loaded();
+}
 
 
 /*
@@ -442,9 +523,20 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	// CNSDK returns millimeters relative to the camera. xrt_eye_position
 	// wants meters relative to the display center, so divide by 1000 then
 	// subtract the cached camera center (also already in meters).
-	const float pos_x_m = position[0] / 1000.0f - cnsdk->camera_center_x_m;
-	const float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
-	const float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
+	float pos_x_m = position[0] / 1000.0f - cnsdk->camera_center_x_m;
+	float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
+	float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
+
+	// Calibration knobs (B15). Defaults match the pre-calibration
+	// assumption; flip via `adb shell setprop debug.dxr.leia.face_flip_x 1`
+	// etc. if Lume Pad reveals a different convention.
+	ensure_calibration_loaded();
+	if (g_calib.face_swap_xy) {
+		float tmp = pos_x_m; pos_x_m = pos_y_m; pos_y_m = tmp;
+	}
+	if (g_calib.face_flip_x) { pos_x_m = -pos_x_m; }
+	if (g_calib.face_flip_y) { pos_y_m = -pos_y_m; }
+	if (g_calib.face_flip_z) { pos_z_m = -pos_z_m; }
 
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 	// Throttle to once per ~second at 60 Hz so logcat stays readable.
@@ -482,7 +574,12 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	}
 
 	DXR_ATRACE("dxr_cnsdk:weave");
-	leia_interlacer_set_flip_input_uv_vertical(cnsdk->interlacer, true);
+	// Calibration knob (B18): flip_input_uv_vertical defaults to true
+	// because we assume CNSDK uses GL convention (Y-up) and Vulkan NDC
+	// is Y-down. If Lume Pad shows text upside-down, flip via
+	// `adb shell setprop debug.dxr.leia.flip_uv 0`.
+	ensure_calibration_loaded();
+	leia_interlacer_set_flip_input_uv_vertical(cnsdk->interlacer, g_calib.flip_uv);
 
 	// Atlas mode: hand CNSDK the SBS atlas VkImage+View each frame; it
 	// splits internally per the 2x1 layout set in ensure_interlacer.

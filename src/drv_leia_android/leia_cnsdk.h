@@ -32,6 +32,18 @@ xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk);
 
 /*!
+ * Read all `debug.dxr.leia.*` calibration setprops and log them.
+ *
+ * Idempotent (cached after first call). Safe to call from the plug-in
+ * `probe()` so the values land in logcat at `xrCreateInstance` time
+ * even when the emulator never reaches CNSDK init due to a missing
+ * Vulkan extension. See
+ * `docs/cnsdk-android-calibration.md` for the knob table.
+ */
+void
+leia_cnsdk_log_calibration_knobs(void);
+
+/*!
  * Destroy a CNSDK handle and release all resources.
  *
  * @param cnsdk_ptr  Pointer to handle; set to NULL on return.
