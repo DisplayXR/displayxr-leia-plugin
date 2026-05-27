@@ -166,6 +166,59 @@ leia_display_processor(struct xrt_display_processor *xdp)
 
 /*
  *
+ * Isolated allocation for the display-processor struct.
+ *
+ * The NVIDIA Vulkan driver's host-side shader compiler (nvwgf2umx) churns the
+ * process heap heavily while compiling pipelines during BOTH the SR weaver
+ * creation (CreateVulkanWeaver) AND the compositor's target/DComp-bridge /
+ * VkSwapchain creation that runs right after the factory returns. On the exact
+ * shipping CI codegen, this small leia_display_processor block — when it lives
+ * in the shared CRT heap — lands on memory the driver's allocator reuses or
+ * overflows into, stomping the DP's C vtable. Observed standalone on the Leia
+ * box as a garbage get_display_pixel_info pointer (vtable offset 0x38) pointing
+ * into nvwgf2umx: it crashed xrCreateSession (leia <= v1.0.3), and after the
+ * runtime added its dp_vtable_looks_sane guard (v1.5.2) it instead trips the
+ * guard, which NULLs the DP and silently disables weaving (transparent output).
+ *
+ * The v1.0.4 "allocate before the weaver" reorder only isolated the block from
+ * the *weaver's* churn, not the *target-creation* churn that happens later — so
+ * the corruption persisted. The robust fix is to take the block out of the
+ * shared heap entirely: a dedicated VirtualAlloc reservation is never handed
+ * out by the CRT / process default heap, so the driver's allocations cannot
+ * alias, reuse, or be adjacent to it. (This is the shippable form of what
+ * full-process PageHeap does — and PageHeap is known to mask this bug, which
+ * confirms allocation isolation is the cure, not just a perturbation.)
+ *
+ * VirtualAlloc-committed pages are zero-initialized, matching the calloc the
+ * callers previously relied on. Non-Windows keeps calloc/free (the failure is
+ * specific to the Windows NVIDIA Vulkan driver).
+ */
+static void *
+ldp_isolated_alloc(size_t size)
+{
+#ifdef _WIN32
+	return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+	return calloc(1, size);
+#endif
+}
+
+static void
+ldp_isolated_free(void *p)
+{
+	if (p == NULL) {
+		return;
+	}
+#ifdef _WIN32
+	VirtualFree(p, 0, MEM_RELEASE);
+#else
+	free(p);
+#endif
+}
+
+
+/*
+ *
  * Chroma-key fill/strip helpers (transparency support).
  *
  * Lazy-allocated on first frame the pass runs. ck_should_run() gates the
@@ -2181,7 +2234,7 @@ leia_dp_destroy(struct xrt_display_processor *xdp)
 	}
 
 	leiasr_destroy(ldp->leiasr);
-	free(ldp);
+	ldp_isolated_free(ldp);
 }
 
 
@@ -2276,16 +2329,14 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	// Extract Vulkan handles from vk_bundle.
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle_ptr;
 
-	// Allocate and fully initialize the display-processor struct BEFORE
-	// creating the SR Vulkan weaver. CreateVulkanWeaver triggers heavy
-	// NVIDIA Vulkan shader-compiler heap churn (host-side LLVM pipeline
-	// compilation). If this small struct is allocated *after* that churn it
-	// can land on a heap block the driver's compiler later reuses, stomping
-	// the vtable — observed standalone on the Leia box as a garbage
-	// get_display_pixel_info pointer (vtable offset 0x38) crashing
-	// xrCreateSession. Allocating + initializing first keeps the block out
-	// of the weaver/driver's freed-and-reused region.
-	struct leia_display_processor *ldp = (struct leia_display_processor *)calloc(1, sizeof(*ldp));
+	// Allocate the display-processor struct in its OWN VirtualAlloc reservation
+	// (see ldp_isolated_alloc) so the NVIDIA Vulkan driver's shader-compiler
+	// heap churn — from BOTH the weaver creation below and the compositor's
+	// target/swapchain creation that runs after this factory returns — cannot
+	// reuse, alias, or overflow into the DP vtable. The block is fully
+	// initialized below before the weaver runs.
+	struct leia_display_processor *ldp =
+	    (struct leia_display_processor *)ldp_isolated_alloc(sizeof(*ldp));
 	if (ldp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
@@ -2311,7 +2362,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	                                 (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, &leiasr);
 	if (ret != XRT_SUCCESS || leiasr == NULL) {
 		U_LOG_W("Failed to create SR Vulkan weaver, continuing without interlacing");
-		free(ldp);
+		ldp_isolated_free(ldp);
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	ldp->leiasr = leiasr;
@@ -2351,7 +2402,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Leia VK DP: failed to create render pass: %d", vk_ret);
 		leiasr_destroy(leiasr);
-		free(ldp);
+		ldp_isolated_free(ldp);
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -2382,7 +2433,10 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	struct leia_display_processor *ldp = (struct leia_display_processor *)calloc(1, sizeof(*ldp));
+	// Same isolated allocation as the factory — this legacy path assigns the
+	// shared leia_dp_destroy, which now VirtualFrees, so the alloc must match.
+	struct leia_display_processor *ldp =
+	    (struct leia_display_processor *)ldp_isolated_alloc(sizeof(*ldp));
 	if (ldp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
