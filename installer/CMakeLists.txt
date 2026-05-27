@@ -29,16 +29,25 @@ set(DXR_LEIA_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJEC
 
 set(DXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
-# Path to the SR Vulkan Beta runtime DLL — fetched into ${SR_PATH}/bin by
-# scripts/build-windows.bat from the sr-sdk-v* release. Optional; if it
-# isn't present the installer just omits the Vulkan-weaver fallback DLL.
+# SR Vulkan Beta runtime DLL — fetched into ${SR_PATH}/bin by
+# scripts/build-windows.bat from the sr-sdk-v* release. REQUIRED, not
+# optional: the plug-in delay-loads SimulatedRealityVulkanBeta.dll and must
+# ship it next to the plug-in DLL, else VK apps fail to weave / crash at
+# xrCreateSession on boxes that don't already have it on PATH (issue #314).
+# The NSI `File "${SR_VK_BETA_DLL}"` line is NOT conditional — an empty value
+# would make NSIS error out anyway — so fail loudly and legibly here rather
+# than silently producing a #314-prone installer.
 if(EXISTS "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
     set(SR_VK_BETA_DLL "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
     file(TO_NATIVE_PATH "${SR_VK_BETA_DLL}" SR_VK_BETA_DLL)
     message(STATUS "Bundling SR VK Beta DLL: ${SR_VK_BETA_DLL}")
 else()
-    # NSI script tolerates missing SR_VK_BETA_DLL — File line is conditional.
-    set(SR_VK_BETA_DLL "")
+    message(FATAL_ERROR
+        "SimulatedRealityVulkanBeta.dll not found at ${SR_PATH}/bin. The "
+        "plug-in delay-loads it and the installer must bundle it (issue "
+        "#314); a missing DLL ships an installer whose VK apps crash at "
+        "xrCreateSession. Run scripts/build-windows.bat first — it fetches "
+        "the DLL from the sr-sdk-v* release into the SR SDK's bin/ dir.")
 endif()
 
 add_custom_target(installer
