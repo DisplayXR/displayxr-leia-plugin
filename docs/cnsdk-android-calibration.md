@@ -11,6 +11,43 @@ CNSDK conventions that the SDK docs leave ambiguous. Once a Lume Pad is
 attached, validate each in this order — they're listed cheapest-to-test
 first. Audit references in brackets.
 
+## Runtime-tunable calibration (no rebuild)
+
+Two of the three knobs (face axes + UV flip) are tunable via `setprop`,
+so you can iterate without rebuilding/reinstalling the plug-in:
+
+| Property | Default | Effect |
+|---|---|---|
+| `debug.dxr.leia.flip_uv` | 1 | Pass `false` to `leia_interlacer_set_flip_input_uv_vertical` |
+| `debug.dxr.leia.face_flip_x` | 0 | Negate `out_x` in `leia_cnsdk_get_primary_face` |
+| `debug.dxr.leia.face_flip_y` | 0 | Negate `out_y` in `leia_cnsdk_get_primary_face` |
+| `debug.dxr.leia.face_flip_z` | 0 | Negate `out_z` in `leia_cnsdk_get_primary_face` |
+| `debug.dxr.leia.face_swap_xy` | 0 | Swap `out_x` and `out_y` (applied BEFORE the flips) |
+
+Values: `1`/`true`/`t`/`yes`/`y` → enabled; anything else → disabled.
+
+Properties are cached at plug-in init (one read per process), so to
+re-test a different combination:
+
+```bash
+adb shell setprop debug.dxr.leia.face_flip_x 1
+adb shell am force-stop com.displayxr.cube_handle_vk_android
+adb shell am start -n com.displayxr.cube_handle_vk_android/android.app.NativeActivity
+adb logcat | grep 'HW_DBG_CNSDK calibration'
+# → flip_uv=1 face_flip_xyz=100 face_swap_xy=0
+```
+
+The active values are logged once at `xrCreateInstance` time (in the
+plug-in's `probe()`) so they're visible even when the test reaches
+hardware-blocked failure modes later (`VK_ERROR_EXTENSION_NOT_PRESENT`,
+session creation, etc.).
+
+The tile-to-eye swap (#2 below) is **not** runtime-tunable — the atlas
+mode the DP currently uses doesn't expose a swap parameter. If Lume
+Pad shows that mapping wrong, the fix is a code change in the runtime's
+atlas blit or a switch back to per-view-blit mode. The other two
+knobs cover the vast majority of "looks wrong" symptoms.
+
 ## 1. Face position axis convention [B15]
 
 **What's assumed:** in `src/drv_leia_android/leia_cnsdk.cpp::leia_cnsdk_get_primary_face`,

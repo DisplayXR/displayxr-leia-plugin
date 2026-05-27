@@ -29,6 +29,7 @@
 #include "util/u_device.h"
 #include "util/u_logging.h"
 
+#include "leia_cnsdk.h"
 #include "leia_display_processor_cnsdk.h"
 
 #include <math.h>
@@ -119,6 +120,14 @@ leia_plugin_android_probe(struct xrt_plugin_instance **out_inst)
 	// time. POC pattern: always claim the slot on Android. The
 	// downstream leia_dp_factory_cnsdk path bails cleanly if CNSDK
 	// fails to initialize later.
+
+	// Log the debug.dxr.leia.* calibration knobs at xrCreateInstance
+	// time. Idempotent — the function caches after first call. We log
+	// here (not from CNSDK init) so the values show up in logcat even
+	// on emulators that never reach DP creation due to missing Vulkan
+	// extensions. See docs/cnsdk-android-calibration.md.
+	leia_cnsdk_log_calibration_knobs();
+
 	*out_inst = NULL;
 	return XRT_SUCCESS;
 }
