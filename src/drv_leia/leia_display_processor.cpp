@@ -2276,19 +2276,45 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	// Extract Vulkan handles from vk_bundle.
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle_ptr;
 
+	// Allocate and fully initialize the display-processor struct BEFORE
+	// creating the SR Vulkan weaver. CreateVulkanWeaver triggers heavy
+	// NVIDIA Vulkan shader-compiler heap churn (host-side LLVM pipeline
+	// compilation). If this small struct is allocated *after* that churn it
+	// can land on a heap block the driver's compiler later reuses, stomping
+	// the vtable — observed standalone on the Leia box as a garbage
+	// get_display_pixel_info pointer (vtable offset 0x38) crashing
+	// xrCreateSession. Allocating + initializing first keeps the block out
+	// of the weaver/driver's freed-and-reused region.
+	struct leia_display_processor *ldp = (struct leia_display_processor *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	ldp->base.process_atlas = leia_dp_process_atlas;
+	ldp->base.get_render_pass = leia_dp_get_render_pass;
+	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
+	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
+	ldp->base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
+	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
+	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
+	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
+	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
+	ldp->base.destroy = leia_dp_destroy;
+	ldp->vk = vk;
+	ldp->view_count = 2;
+	ldp->hwnd_opaque = window_handle;
+
+	// Now create the SR Vulkan weaver (spins up SR senses + NV VK pipelines).
 	struct leiasr *leiasr = NULL;
 	xrt_result_t ret = leiasr_create(5.0, vk->device, vk->physical_device, vk->main_queue->queue,
 	                                 (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, &leiasr);
 	if (ret != XRT_SUCCESS || leiasr == NULL) {
 		U_LOG_W("Failed to create SR Vulkan weaver, continuing without interlacing");
+		free(ldp);
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
-
-	struct leia_display_processor *ldp = (struct leia_display_processor *)calloc(1, sizeof(*ldp));
-	if (ldp == NULL) {
-		leiasr_destroy(leiasr);
-		return XRT_ERROR_ALLOCATION;
-	}
+	ldp->leiasr = leiasr;
 
 	// Create a render pass compatible with the SR weaver's output.
 	// The weaver renders to a single color attachment (no depth).
@@ -2329,23 +2355,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 		return XRT_ERROR_VULKAN;
 	}
 
-	ldp->base.process_atlas = leia_dp_process_atlas;
-	ldp->base.get_render_pass = leia_dp_get_render_pass;
-	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
-	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
-	ldp->base.request_display_mode = leia_dp_request_display_mode;
-	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
-	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
-	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
-	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
-	ldp->base.destroy = leia_dp_destroy;
-
-	ldp->leiasr = leiasr;
-	ldp->vk = vk;
+	// vtable + leiasr/vk/view_count/hwnd_opaque were set above (before the
+	// weaver) for heap-isolation; only the render pass remains.
 	ldp->render_pass = render_pass;
-	ldp->view_count = 2;
-	ldp->hwnd_opaque = window_handle;
 
 	*out_xdp = &ldp->base;
 
