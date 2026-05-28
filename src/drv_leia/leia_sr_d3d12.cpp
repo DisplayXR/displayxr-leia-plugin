@@ -388,9 +388,15 @@ leiasr_d3d12_get_predicted_eye_positions(struct leiasr_d3d12 *leiasr,
 		return false;
 	}
 
-	// Get positions in millimeters from weaver
+	// SR SDK throws std::runtime_error ~per frame from inside this call
+	// as routine internal control flow. Catch at the DP boundary so it
+	// never crosses the C ABI. See [[feedback_leia_eye_pos_throws_intrinsic]].
 	float left_mm[3], right_mm[3];
-	leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
+	try {
+		leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
+	} catch (...) {
+		return false;
+	}
 
 	// Convert to meters
 	out_left_eye[0] = left_mm[0] / 1000.0f;
