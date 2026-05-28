@@ -237,3 +237,21 @@ jobs:
             _package/bin/plugins/DisplayXR-LeiaSR.dll
             _package/DisplayXRLeiaSRSetup-*.exe
           if-no-files-found: error
+
+      # Attach the Windows installer to the v* GitHub release on tag push —
+      # mirrors the runtime's pattern (DisplayXR/displayxr-runtime#290). Before
+      # this step, cutting a leia release required a manual `gh run download`
+      # + `gh release create` dance after every tag (as we did for v1.0.6).
+      # Now: tag → CI builds → installer attached automatically. The first
+      # workflow to complete on the tag creates the release; subsequent ones
+      # (none here, but the pattern matches the runtime) would append.
+      # Only the installer .exe is attached; the raw DLL stays in the CI
+      # artifact bundle for debugging access via `gh run download`.
+      - name: Attach Windows installer to GitHub release on tag
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: _package/DisplayXRLeiaSRSetup-*.exe
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
