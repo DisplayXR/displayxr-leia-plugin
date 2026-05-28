@@ -1356,6 +1356,10 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 static void
 leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 {
+	// ADR-020 rule 1: advertise the vtable size (caller calloc'd the struct
+	// so reserved_0 is already zero). Tells the runtime which slots this
+	// plug-in actually built.
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d11));
 	ldp->base.process_atlas = leia_dp_d3d11_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d11_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_d3d11_get_window_metrics;

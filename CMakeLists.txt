@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(
     DisplayXR-LeiaSR
-    VERSION 1.0.5
+    VERSION 1.0.6
     LANGUAGES C CXX
     DESCRIPTION "DisplayXR Leia SR display-processor plug-in"
 )
@@ -41,18 +41,16 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v1.5.2 — MUST match the deployed runtime's
-    # xrt_display_processor ABI. The struct is an inline C vtable; runtime
-    # d665014ab (post-v1.4.1) appended is_self_submitting + on_pause +
-    # on_resume, which shifts set_chroma_key (0x48->0x50) and destroy
-    # (0x50->0x68). Building against v1.4.1 against a v1.5.x runtime made the
-    # runtime's set_chroma_key call land on leia_dp_destroy(0x50) — the DP
-    # self-destructed right after creation (weaver torn down + ldp freed),
-    # which is why standalone VK didn't weave. KEEP THIS == the released
-    # runtime tag (and the workflow checkout ref) whenever the runtime ABI
-    # changes.
-    set(DXR_RUNTIME_GIT_TAG "v1.5.2" CACHE STRING
-        "Runtime git ref to fetch. Bump to match the deployed runtime whenever its ABI evolves.")
+    # Pinned to displayxr-runtime v1.6.0 (ABI major v2 per ADR-020). The DP
+    # vtables now carry a struct_size header; the runtime's loader rejects any
+    # plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own. This
+    # plug-in MUST be built against headers that ship the matching major, or
+    # the runtime will log "ABI major mismatch — plugin_api=N, runtime expects
+    # M ... skipping (ADR-020 rule 3)" and fall back to sim_display. The
+    # rule-5 CI self-check below asserts this value equals the workflow's
+    # runtime checkout ref so the two can't drift.
+    set(DXR_RUNTIME_GIT_TAG "v1.6.0" CACHE STRING
+        "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
         displayxr_runtime

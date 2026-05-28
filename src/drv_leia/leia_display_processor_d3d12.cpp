@@ -1780,6 +1780,8 @@ leia_dp_factory_d3d12(void *d3d12_device,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d12));
 	ldp->base.process_atlas = leia_dp_d3d12_process_atlas;
 	ldp->base.set_output_format = leia_dp_d3d12_set_output_format;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d12_get_predicted_eye_positions;
