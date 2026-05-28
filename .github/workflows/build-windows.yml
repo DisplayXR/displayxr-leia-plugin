@@ -48,9 +48,35 @@ jobs:
     env:
       SR_TAG: 1.35.0.2011
       GH_TOKEN: ${{ github.token }}
+      # ADR-020 rule 5: single source of truth for the runtime ref. The
+      # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
+      # equals this value so the FetchContent pin and the workflow checkout
+      # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
+      # regression originally).
+      RUNTIME_REF: v1.6.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Rule-5 ABI pin self-check (ADR-020)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        # Hard-fail the build if CMakeLists.txt's DXR_RUNTIME_GIT_TAG drifts
+        # from the workflow's RUNTIME_REF. Turns the "KEEP IN SYNC" comment
+        # below into an enforced check — bumping one without the other now
+        # surfaces here, not in a silent ABI-skew bug on a user's box.
+        shell: pwsh
+        run: |
+          $line = Select-String -Path 'CMakeLists.txt' -Pattern 'DXR_RUNTIME_GIT_TAG\s+"([^"]+)"' | Select-Object -First 1
+          if (-not $line) {
+            Write-Error "Rule-5 self-check: could not find DXR_RUNTIME_GIT_TAG in CMakeLists.txt"
+            exit 1
+          }
+          $cmakeTag = $line.Matches[0].Groups[1].Value
+          if ($cmakeTag -ne $env:RUNTIME_REF) {
+            Write-Error "Rule-5 ABI pin drift (ADR-020): CMakeLists.txt has DXR_RUNTIME_GIT_TAG='$cmakeTag' but workflow RUNTIME_REF='$env:RUNTIME_REF'. Bump both together or the deployed runtime and plug-in ABIs will diverge."
+            exit 1
+          }
+          Write-Host "Rule-5 ABI pin OK: DXR_RUNTIME_GIT_TAG == RUNTIME_REF == $env:RUNTIME_REF"
 
       - name: Checkout displayxr-runtime (pinned)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -58,11 +84,12 @@ jobs:
         # release tag. Cloning here instead lets us point the build at it
         # as a local source dir (skips a redundant clone inside CMake) and
         # use its vcpkg.json for vcpkg manifest-mode (Eigen3, glslang, etc.).
-        # KEEP IN SYNC with DXR_RUNTIME_GIT_TAG in CMakeLists.txt.
+        # KEEP IN SYNC with DXR_RUNTIME_GIT_TAG in CMakeLists.txt — enforced
+        # by the Rule-5 self-check step above (ADR-020).
         uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
-          ref: 'v1.5.2'
+          ref: ${{ env.RUNTIME_REF }}
           path: displayxr-runtime
           fetch-depth: 1
 

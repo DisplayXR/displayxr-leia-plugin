@@ -695,6 +695,9 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 static void
 leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 {
+	// ADR-020 rule 1: advertise the vtable size (caller calloc'd the struct
+	// so reserved_0 is already zero).
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_gl));
 	ldp->base.process_atlas = leia_dp_gl_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_gl_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_gl_get_window_metrics;

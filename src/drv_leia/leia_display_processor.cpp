@@ -2290,6 +2290,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
+	// Tells the runtime which slots this plug-in actually built.
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor));
 	ldp->base.process_atlas = leia_dp_process_atlas;
 	ldp->base.get_render_pass = leia_dp_get_render_pass;
 	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
@@ -2387,6 +2390,8 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor));
 	ldp->base.process_atlas = leia_dp_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
