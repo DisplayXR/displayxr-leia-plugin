@@ -408,10 +408,18 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 		return false;
 	}
 
-	// Get predicted eye positions from weaver's LookaroundFilter
-	// The weaver returns positions in millimeters
+	// Get predicted eye positions from weaver's LookaroundFilter.
+	// The weaver returns positions in millimeters. SR SDK throws
+	// std::runtime_error ~per frame from inside this call as routine
+	// internal control flow. Catch at the DP boundary so it never
+	// crosses the C ABI. See [[feedback_leia_eye_pos_throws_intrinsic]].
 	float leftEye[3], rightEye[3];
-	leiasr->weaver->getPredictedEyePositions(leftEye, rightEye);
+	try {
+		leiasr->weaver->getPredictedEyePositions(leftEye, rightEye);
+	} catch (...) {
+		out_eye_pos->valid = false;
+		return false;
+	}
 
 	// Convert from millimeters to meters
 	out_eye_pos->eyes[0].x = leftEye[0] / 1000.0f;

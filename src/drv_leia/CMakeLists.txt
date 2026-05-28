@@ -107,7 +107,6 @@ target_link_libraries(DisplayXR-LeiaSR
         # SR SDK core (always-on).
         ${SR_PATH}/lib/SimulatedRealityCore.lib
         ${SR_PATH}/lib/SimulatedRealityDisplays.lib
-        ${SR_PATH}/lib/SimulatedRealityFaceTrackers.lib
         ${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 )
 add_dependencies(DisplayXR-LeiaSR ${RUNTIME_TARGET})
