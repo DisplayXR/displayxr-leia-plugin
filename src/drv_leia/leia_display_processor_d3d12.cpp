@@ -1006,7 +1006,10 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
                       uint32_t atlas_w, uint32_t atlas_h,
                       DXGI_FORMAT atlas_format,
                       uint32_t tile_columns, uint32_t tile_rows,
-                      D3D12_CPU_DESCRIPTOR_HANDLE prev_rtv)
+                      D3D12_CPU_DESCRIPTOR_HANDLE prev_rtv,
+                      uint32_t target_width, uint32_t target_height,
+                      int32_t canvas_offset_x, int32_t canvas_offset_y,
+                      uint32_t canvas_width, uint32_t canvas_height)
 {
 	if (!compose_init_pipeline(ldp) || !ck_ensure_fill_target(ldp, atlas_w, atlas_h)) {
 		return atlas_resource;
@@ -1018,6 +1021,27 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	bool have_bg = leia_bg_capture_poll(ldp->bg_capture, bg_origin, bg_extent, &fence_value);
 	if (!have_bg) {
 		return atlas_resource;
+	}
+
+	// (#131) Canvas sub-rect: the atlas is full-size, but the weaver downscales
+	// it into the sub-rect viewport at weave time — so the desktop we composite
+	// under it here gets downscaled along with the foreground. Remap the
+	// background window UVs to the sub-rect's fraction of the window, so the
+	// captured desktop lands 1:1 behind the sub-rect after the weave downscale
+	// (instead of the whole-window desktop shrunk into the sub-rect). No sub-rect
+	// (canvas_w/h == 0) leaves the full-window mapping unchanged.
+	// NOTE: offsets assume bg UVs are top-left origin (bg_origin = window TL);
+	// if the desktop appears vertically misplaced on device, negate the fy term.
+	if (canvas_width > 0 && canvas_height > 0 &&
+	    target_width > 0 && target_height > 0) {
+		float fx = (float)canvas_offset_x / (float)target_width;
+		float fy = (float)canvas_offset_y / (float)target_height;
+		float fw = (float)canvas_width  / (float)target_width;
+		float fh = (float)canvas_height / (float)target_height;
+		bg_origin[0] += fx * bg_extent[0];
+		bg_origin[1] += fy * bg_extent[1];
+		bg_extent[0] *= fw;
+		bg_extent[1] *= fh;
 	}
 
 	// Order the consumer's GPU work after the producer's signal. Queue Wait
@@ -1271,7 +1295,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 			bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
 			ID3D12Resource *composed = compose_run_pre_weave(
 			    ldp, cmd, atlas_res, atlas_w, atlas_h,
-			    static_cast<DXGI_FORMAT>(format), tile_columns, tile_rows, bb_rtv);
+			    static_cast<DXGI_FORMAT>(format), tile_columns, tile_rows, bb_rtv,
+			    target_width, target_height,
+			    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height);
 			if (composed != nullptr) {
 				atlas_res = composed;
 			}
@@ -1392,7 +1418,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	if (compose_should_run(ldp) && weaver_input != NULL) {
 		weaver_input = compose_run_pre_weave(
 		    ldp, cmd_3d, weaver_input, atlas_w, atlas_h,
-		    static_cast<DXGI_FORMAT>(format), tile_columns, tile_rows, bb_rtv);
+		    static_cast<DXGI_FORMAT>(format), tile_columns, tile_rows, bb_rtv,
+		    target_width, target_height,
+		    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height);
 	} else if (ck_should_run(ldp) && weaver_input != NULL) {
 		weaver_input = ck_run_pre_weave_fill(
 		    ldp, cmd_3d, weaver_input, atlas_w, atlas_h,

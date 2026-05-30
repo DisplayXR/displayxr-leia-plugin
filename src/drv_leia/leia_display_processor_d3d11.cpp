@@ -778,7 +778,13 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
                       uint32_t atlas_w,
                       uint32_t atlas_h,
                       uint32_t tile_columns,
-                      uint32_t tile_rows)
+                      uint32_t tile_rows,
+                      uint32_t target_width,
+                      uint32_t target_height,
+                      int32_t canvas_offset_x,
+                      int32_t canvas_offset_y,
+                      uint32_t canvas_width,
+                      uint32_t canvas_height)
 {
 	if (!compose_init_pipeline(ldp) || !ck_ensure_fill_target(ldp, atlas_w, atlas_h)) {
 		return atlas_srv;
@@ -793,6 +799,27 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 		// straight to the weaver; transparent regions stay alpha=0 RGB=0
 		// — visually black but won't crash. The DP will recover next frame.
 		return atlas_srv;
+	}
+
+	// (#131) Canvas sub-rect: the atlas is full-size, but the weaver downscales
+	// it into the sub-rect viewport at weave time — so the desktop we composite
+	// under it here gets downscaled along with the foreground. Remap the
+	// background window UVs to the sub-rect's fraction of the window, so the
+	// captured desktop lands 1:1 behind the sub-rect after the weave downscale
+	// (instead of the whole-window desktop shrunk into the sub-rect). No sub-rect
+	// (canvas_w/h == 0) leaves the full-window mapping unchanged.
+	// NOTE: offsets assume bg UVs are top-left origin (bg_origin = window TL);
+	// if the desktop appears vertically misplaced on device, negate the fy term.
+	if (canvas_width > 0 && canvas_height > 0 &&
+	    target_width > 0 && target_height > 0) {
+		float fx = (float)canvas_offset_x / (float)target_width;
+		float fy = (float)canvas_offset_y / (float)target_height;
+		float fw = (float)canvas_width  / (float)target_width;
+		float fh = (float)canvas_height / (float)target_height;
+		bg_origin[0] += fx * bg_extent[0];
+		bg_origin[1] += fy * bg_extent[1];
+		bg_extent[0] *= fw;
+		bg_extent[1] *= fh;
 	}
 
 	// Update constants.
@@ -1031,7 +1058,10 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		// path for 2D mode when WGC capture is active.
 		if (compose_should_run(ldp)) {
 			ID3D11ShaderResourceView *composed =
-			    compose_run_pre_weave(ldp, ctx, srv, atlas_w, atlas_h, tile_columns, tile_rows);
+			    compose_run_pre_weave(ldp, ctx, srv, atlas_w, atlas_h, tile_columns, tile_rows,
+			                          target_width, target_height,
+			                          canvas_offset_x, canvas_offset_y,
+			                          canvas_width, canvas_height);
 			if (composed != nullptr) {
 				srv = composed;
 			}
@@ -1112,7 +1142,10 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		weaver_srv = compose_run_pre_weave(
 		    ldp, ctx,
 		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
-		    atlas_w, atlas_h, tile_columns, tile_rows);
+		    atlas_w, atlas_h, tile_columns, tile_rows,
+		    target_width, target_height,
+		    canvas_offset_x, canvas_offset_y,
+		    canvas_width, canvas_height);
 	} else if (ck_should_run(ldp)) {
 		weaver_srv = ck_run_pre_weave_fill(
 		    ldp, ctx,
