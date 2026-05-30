@@ -151,8 +151,14 @@ SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
     uint2 tile_count;
     uint2 pad;
+    float2 canvas_uv_origin;  // canvas sub-rect origin on the window, normalized
+    float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
 };
 float4 main(VSOut i) : SV_Target {
+    // (#131) The gate runs only over the canvas sub-rect viewport, so i.uv (0..1)
+    // maps directly to the woven tiger's tile-local atlas UV. The back buffer is
+    // full-window → map i.uv into the window via the canvas rect. Default (no
+    // sub-rect) origin=(0,0) extent=(1,1) → identity (original behavior).
     bool all_transparent = true;
     for (uint ty = 0; ty < tile_count.y; ty++) {
         for (uint tx = 0; tx < tile_count.x; tx++) {
@@ -162,7 +168,8 @@ float4 main(VSOut i) : SV_Target {
             }
         }
     }
-    float3 rgb = backbuffer.Sample(samp, i.uv).rgb;
+    float2 bb_uv = canvas_uv_origin + i.uv * canvas_uv_extent;
+    float3 rgb = backbuffer.Sample(samp, bb_uv).rgb;
     float m = all_transparent ? 0.0 : 1.0;
     return float4(rgb * m, m);
 }
@@ -1135,7 +1142,10 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
                           ID3D12Resource *atlas_resource,
                           DXGI_FORMAT atlas_format,
                           uint32_t bb_w, uint32_t bb_h,
-                          uint32_t tile_columns, uint32_t tile_rows)
+                          uint32_t tile_columns, uint32_t tile_rows,
+                          uint32_t target_width, uint32_t target_height,
+                          int32_t canvas_offset_x, int32_t canvas_offset_y,
+                          uint32_t canvas_width, uint32_t canvas_height)
 {
 	if (atlas_resource == nullptr || ldp->alpha_gate_pso == nullptr) {
 		return;
@@ -1197,16 +1207,38 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 	cmd->SetGraphicsRootSignature(ldp->compose_root_sig);
 	ID3D12DescriptorHeap *heaps[] = {ldp->alpha_gate_srv_heap};
 	cmd->SetDescriptorHeaps(1, heaps);
-	// Pack tile_count into the first 2 root-constant slots. Remaining 10
-	// slots in compose_root_sig (bg_uv_*, chroma_rgb, etc.) are unused by
-	// the alpha-gate shader — fine.
-	uint32_t consts[12] = {tile_columns, tile_rows};
+	// (#131) Restrict the gate to the canvas sub-rect (where the woven 3D lives)
+	// so i.uv maps directly to the atlas tile-local UV — otherwise it samples the
+	// atlas at full-window scale and carves the shrunk tiger (cheek/arm wedges).
+	// The surround region outside the canvas is filled by the surround blit.
+	int32_t  vp_x = 0, vp_y = 0;
+	uint32_t vp_w = bb_w, vp_h = bb_h;
+	float cu_ox = 0.0f, cu_oy = 0.0f, cu_ex = 1.0f, cu_ey = 1.0f;
+	if (canvas_width > 0 && canvas_height > 0 &&
+	    target_width > 0 && target_height > 0) {
+		vp_x = canvas_offset_x;
+		vp_y = canvas_offset_y;
+		vp_w = canvas_width;
+		vp_h = canvas_height;
+		cu_ox = (float)canvas_offset_x / (float)target_width;
+		cu_oy = (float)canvas_offset_y / (float)target_height;
+		cu_ex = (float)canvas_width  / (float)target_width;
+		cu_ey = (float)canvas_height / (float)target_height;
+	}
+
+	// Root constants layout matches the cbuffer: tile_count.xy (0,1), pad (2,3),
+	// canvas_uv_origin.xy (4,5), canvas_uv_extent.xy (6,7). Remaining slots unused.
+	uint32_t consts[12] = {tile_columns, tile_rows, 0, 0};
+	memcpy(&consts[4], &cu_ox, sizeof(float));
+	memcpy(&consts[5], &cu_oy, sizeof(float));
+	memcpy(&consts[6], &cu_ex, sizeof(float));
+	memcpy(&consts[7], &cu_ey, sizeof(float));
 	cmd->SetGraphicsRoot32BitConstants(0, 12, consts, 0);
 	cmd->SetGraphicsRootDescriptorTable(
 	    1, ldp->alpha_gate_srv_heap->GetGPUDescriptorHandleForHeapStart());
 
-	D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)bb_w, (float)bb_h, 0.0f, 1.0f};
-	D3D12_RECT scissor = {0, 0, (LONG)bb_w, (LONG)bb_h};
+	D3D12_VIEWPORT vp = {(float)vp_x, (float)vp_y, (float)vp_w, (float)vp_h, 0.0f, 1.0f};
+	D3D12_RECT scissor = {vp_x, vp_y, vp_x + (LONG)vp_w, vp_y + (LONG)vp_h};
 	cmd->RSSetViewports(1, &vp);
 	cmd->RSSetScissorRects(1, &scissor);
 
@@ -1382,7 +1414,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 				    static_cast<ID3D12Resource *>(target_resource), bb_rtv,
 				    original_atlas_res, static_cast<DXGI_FORMAT>(format),
 				    target_width, target_height,
-				    tile_columns, tile_rows);
+				    tile_columns, tile_rows,
+				    target_width, target_height,
+				    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height);
 			} else if (ck_should_run(ldp)) {
 				ck_run_post_weave_strip(
 				    ldp, cmd,
@@ -1453,7 +1487,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 			    static_cast<ID3D12Resource *>(target_resource), bb_rtv_post,
 			    original_atlas_3d, static_cast<DXGI_FORMAT>(format),
 			    target_width, target_height,
-			    tile_columns, tile_rows);
+			    tile_columns, tile_rows,
+			    target_width, target_height,
+			    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height);
 		} else if (ck_should_run(ldp)) {
 			ck_run_post_weave_strip(
 			    ldp, cmd_3d,
