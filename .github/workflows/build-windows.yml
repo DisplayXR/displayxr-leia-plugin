@@ -255,3 +255,39 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+  # On v* tag push, after Build succeeds, tell displayxr-runtime to
+  # bump versions.json[leia_plugin] to this tag. The runtime side
+  # runs an ABI assertion before committing (scripts/check_plugin_abi.py)
+  # and, on mismatch, opens a tracking issue back on this repo asking
+  # for a rebuild against the current runtime headers.
+  #
+  # Contract: "released = tested." A tagged release here means this
+  # plug-in is intended to drop into the dev-orchestrator bundle.
+  # See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
+  DispatchVersionsBump:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-leia-plugin' }}
+    needs: [Build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "leia_plugin",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }
