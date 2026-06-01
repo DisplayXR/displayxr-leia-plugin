@@ -41,15 +41,19 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v1.6.0 (ABI major v2 per ADR-020). The DP
-    # vtables now carry a struct_size header; the runtime's loader rejects any
-    # plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own. This
-    # plug-in MUST be built against headers that ship the matching major, or
-    # the runtime will log "ABI major mismatch — plugin_api=N, runtime expects
-    # M ... skipping (ADR-020 rule 3)" and fall back to sim_display. The
-    # rule-5 CI self-check below asserts this value equals the workflow's
-    # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v1.6.0" CACHE STRING
+    # Pinned to displayxr-runtime v1.9.0 (ABI major v2 per ADR-020). v1.9.0 is
+    # the first runtime tag that ships the optional, append-only
+    # xrt_plugin_iface::probe_displays() (#69 / ADR-015) this plug-in
+    # implements — earlier tags (≤ v1.8.0) lack the field, so the vtable
+    # initializer would not compile against them. The DP vtables carry a
+    # struct_size header; the runtime's loader rejects any plug-in whose
+    # XRT_PLUGIN_API_VERSION_CURRENT differs from its own. This plug-in MUST be
+    # built against headers that ship the matching major, or the runtime will
+    # log "ABI major mismatch — plugin_api=N, runtime expects M ... skipping
+    # (ADR-020 rule 3)" and fall back to sim_display. The rule-5 CI self-check
+    # below asserts this value equals the workflow's runtime checkout ref so
+    # the two can't drift.
+    set(DXR_RUNTIME_GIT_TAG "v1.9.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
