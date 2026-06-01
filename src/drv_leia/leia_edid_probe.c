@@ -339,3 +339,14 @@ leia_edid_find_3d_display_rect(int32_t *out_left,
 	}
 	return true;
 }
+
+bool
+leia_edid_table_contains(uint16_t manufacturer_id, uint16_t product_id)
+{
+	for (size_t i = 0; i < LEIA_EDID_TABLE_LEN; i++) {
+		if (leia_edid_table[i][0] == manufacturer_id && leia_edid_table[i][1] == product_id) {
+			return true;
+		}
+	}
+	return false;
+}

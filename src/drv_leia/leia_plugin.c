@@ -163,6 +163,71 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	return any_populated;
 }
 
+static uint32_t
+leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
+                           const struct xrt_display_descriptor *displays,
+                           uint32_t display_count,
+                           struct xrt_display_claim *out_claims,
+                           uint32_t max_claims)
+{
+	(void)inst;
+
+	/*
+	 * Per-monitor claims (issue #69 / ADR-015). Thin wrapper over the same
+	 * detection the binary probe() uses — no new logic, just re-shaped:
+	 *   - Match EACH runtime-supplied descriptor's (mfr, product) against
+	 *     the known-panel EDID table (the runtime already enumerated the
+	 *     monitors, so we don't re-enumerate).
+	 *   - SR SDK + service presence are system-global; check once and apply
+	 *     to every matched monitor. EDID match alone → EDID confidence;
+	 *     EDID + SDK + running service → VERIFIED.
+	 */
+	struct leia_display_probe_result probe = {0};
+	(void)leia_edid_probe_display(&probe);
+	const bool verified = probe.sdk_installed && probe.service_running;
+
+	/* Which create_dp_<api> factories this build actually ships — mirror
+	 * the #ifdef gating of the vtable factory fields. The runtime masks
+	 * these against the non-NULL factory pointers as well. */
+	uint32_t apis = 0;
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	apis |= XRT_DP_API_BIT_VK;
+#endif
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	apis |= XRT_DP_API_BIT_D3D11;
+#endif
+#ifdef XRT_HAVE_LEIA_SR_D3D12
+	apis |= XRT_DP_API_BIT_D3D12;
+#endif
+#ifdef XRT_HAVE_LEIA_SR_GL
+	apis |= XRT_DP_API_BIT_GL;
+#endif
+	/* No Metal weaver in drv_leia — that's the macOS sim_display path. */
+
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
+		if (!leia_edid_table_contains(displays[i].edid_manufacturer, displays[i].edid_product)) {
+			continue;
+		}
+		struct xrt_display_claim *c = &out_claims[n++];
+		c->monitor_id = displays[i].monitor_id;
+		c->confidence = verified ? (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED : (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+		c->supported_apis = apis;
+		/*
+		 * TODO(#69 Phase 2 follow-up): read the FPC device serial from
+		 * `Global\sharedDeviceSerialMemory` so multi-Leia setups can pair
+		 * each monitor with its own camera/calibration unit. Empty for now
+		 * — single-display setups don't need it.
+		 */
+		c->serial[0] = '\0';
+
+		U_LOG_I("leia_plugin: claim monitor 0x%016llx (mfr=0x%04X prod=0x%04X) confidence=%s",
+		        (unsigned long long)displays[i].monitor_id, displays[i].edid_manufacturer,
+		        displays[i].edid_product, verified ? "VERIFIED" : "EDID");
+	}
+	return n;
+}
+
 
 /*
  *
@@ -223,6 +288,8 @@ static struct xrt_plugin_iface g_leia_iface = {
     .get_display_info = leia_plugin_get_display_info,
 
     .set_pose_source = leia_plugin_set_pose_source,
+
+    .probe_displays = leia_plugin_probe_displays,
 };
 
 

@@ -119,6 +119,21 @@ leia_edid_find_3d_display_rect(int32_t *out_left,
                                int32_t *out_height);
 
 /*!
+ * Does the known Leia/Dimenco EDID table contain this (manufacturer, product)
+ * pair? Lets `probe_displays()` (issue #69 / ADR-015) match each
+ * runtime-supplied display descriptor against the table without
+ * re-enumerating monitors.
+ *
+ * @param manufacturer_id EDID bytes 8-9 (raw).
+ * @param product_id      EDID bytes 10-11 (raw).
+ * @return true if the pair is a known Leia/Dimenco panel.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_edid_table_contains(uint16_t manufacturer_id, uint16_t product_id);
+
+/*!
  * Probe for SR display hardware.
  *
  * Creates a temporary SR context and checks for an active SR display.
