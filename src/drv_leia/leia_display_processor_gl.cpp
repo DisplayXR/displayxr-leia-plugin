@@ -713,6 +713,59 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 
 /*
  *
+ * GLAD function-pointer loading for the plug-in module.
+ *
+ * aux_ogl is a static lib, so DisplayXR-LeiaSR.dll has its OWN copy of the
+ * glad_gl* function-pointer table — the runtime's load (comp_gl_compositor)
+ * does NOT populate ours. Without this, the first GL call in process_atlas
+ * (e.g. glViewport) dereferences a null pointer and crashes. Mirrors the
+ * runtime's loader (comp_gl_compositor.cpp); runs once, on the GL context the
+ * compositor made current before invoking the factory.
+ *
+ */
+
+//! GLAD loader: wglGetProcAddress first, fall back to opengl32.dll exports.
+static GLADapiproc
+leia_gl_get_proc_addr(void *userptr, const char *name)
+{
+	GLADapiproc ret = (GLADapiproc)wglGetProcAddress(name);
+	if (ret == NULL) {
+		ret = (GLADapiproc)GetProcAddress((HMODULE)userptr, name);
+	}
+	return ret;
+}
+
+static bool
+leia_gl_ensure_glad_loaded(void)
+{
+	static bool loaded = false;
+	if (loaded) {
+		return true;
+	}
+
+	// Kept loaded for the process lifetime (no FreeLibrary) so the function
+	// pointers stay valid.
+	HMODULE opengl_dll = LoadLibraryW(L"opengl32.dll");
+	if (opengl_dll == NULL) {
+		U_LOG_E("Leia GL DP: failed to load opengl32.dll");
+		return false;
+	}
+
+	int gl_result = gladLoadGLUserPtr(leia_gl_get_proc_addr, opengl_dll);
+	if (gl_result == 0) {
+		U_LOG_E("Leia GL DP: gladLoadGLUserPtr failed (no current GL context?)");
+		return false;
+	}
+
+	loaded = true;
+	U_LOG_W("Leia GL DP: GLAD loaded for plug-in module (GL %d.%d)",
+	        GLAD_VERSION_MAJOR(gl_result), GLAD_VERSION_MINOR(gl_result));
+	return true;
+}
+
+
+/*
+ *
  * Factory function — matches xrt_dp_factory_gl_fn_t signature.
  *
  */
@@ -721,6 +774,11 @@ extern "C" xrt_result_t
 leia_dp_factory_gl(void *window_handle,
                     struct xrt_display_processor_gl **out_xdp)
 {
+	// Populate this module's GLAD table before any GL call (see above). The
+	// compositor has made the GL context current ahead of this call.
+	if (!leia_gl_ensure_glad_loaded()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
 	// so we pass 0,0 here.
 	struct leiasr_gl *weaver = NULL;
