@@ -200,6 +200,16 @@ static struct xrt_plugin_iface g_leia_android_iface = {
     .get_display_info = leia_plugin_android_get_display_info,
 
     .set_pose_source = NULL, // CNSDK pose comes from face tracking, not an external source
+
+    // probe_displays (v1.9.0 / ADR-015 / #69): deliberately omitted on Android.
+    // It exists for per-monitor claim discovery on desktop multi-display setups
+    // (the Windows arm in drv_leia/leia_plugin.c implements it over EDID
+    // enumeration). Android is a single fixed-panel device with no monitor
+    // enumeration, so we leave it NULL — struct_size still spans the full v2
+    // iface, so the runtime's struct_size gate sees the slot, finds it NULL, and
+    // falls back to query_source_claims()'s synthesized primary claim off a
+    // successful binary probe(). Validated end-to-end via android-smoketest.sh.
+    .probe_displays = NULL,
 };
 
 
