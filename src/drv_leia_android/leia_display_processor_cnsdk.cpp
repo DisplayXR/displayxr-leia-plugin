@@ -439,6 +439,13 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
 	impl->cmd_pool = (VkCommandPool)(uintptr_t)vk_cmd_pool;
 
+	/* ABI major v2 (ADR-020): the 8-byte struct_size header tells the
+	 * runtime how far this vtable extends. The runtime gates every optional
+	 * slot below on XRT_DP_HAS_SLOT(xdp, field), bounded against this value —
+	 * leave it 0 (calloc default) and is_self_submitting / on_pause / on_resume /
+	 * eye-positions / display-dims all read as absent, silently regressing the
+	 * self-submitting atlas path into a double-submit. */
+	impl->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor));
 	impl->base.process_atlas = process_atlas_weave;
 	impl->base.on_pause = on_pause_cnsdk;
 	impl->base.on_resume = on_resume_cnsdk;
