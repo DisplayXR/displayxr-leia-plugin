@@ -6,9 +6,9 @@
  *         Vulkan interlacer as an @ref xrt_display_processor.
  *
  * Advertises `is_self_submitting = true`. The compositor flushes its
- * pre-DP cmd buffer before calling process_atlas, which blits the SBS
- * atlas tiles into per-view VkImages and then calls leia_cnsdk_weave —
- * CNSDK records and submits its own command buffer internally.
+ * pre-DP cmd buffer before calling process_atlas, which hands the SBS
+ * atlas VkImage directly to leia_cnsdk_weave (atlas mode — no per-view
+ * blit) — CNSDK records and submits its own command buffer internally.
  *
  * Display metrics + face-tracked eye positions come from CNSDK once the
  * async core init completes (lazy on first query). Falls back to hardcoded

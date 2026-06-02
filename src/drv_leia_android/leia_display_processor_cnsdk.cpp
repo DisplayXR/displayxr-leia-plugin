@@ -99,6 +99,14 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
 {
 	DXR_ATRACE("dxr_dp:mono_passthrough_blit");
 	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr || vk->main_queue == nullptr) {
+		// Defensive: this mono 1x1 fallback submits on the main queue
+		// directly. The atlas-weave path guards vk==nullptr already;
+		// mirror it here so a partially-initialized bundle can't deref
+		// vk->main_queue->queue below.
+		U_LOG_W("mono_passthrough_blit: vk bundle/main_queue not ready, skipping");
+		return false;
+	}
 
 	VkCommandBufferAllocateInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
