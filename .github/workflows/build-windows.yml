@@ -53,7 +53,7 @@ jobs:
       # equals this value so the FetchContent pin and the workflow checkout
       # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
       # regression originally).
-      RUNTIME_REF: v1.9.0
+      RUNTIME_REF: 82b68ed19158d0d79fb391ac10807ab9cd667b7c
     steps:
       - name: Checkout
         uses: actions/checkout@v4
