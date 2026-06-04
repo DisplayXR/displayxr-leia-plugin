@@ -1291,6 +1291,11 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
+	// ADR-021: `format` is the real atlas DXGI format (unchanged). This D3D12
+	// variant declares no color capability and no set_atlas_encoding (Model-A
+	// passthrough only); wiring EITHER + the weaver sRGB control here is a
+	// tracked follow-up.
+
 	// Compute effective viewport: canvas sub-rect when set, else full target.
 	// The SR SDK weaver uses viewport offset in its phase calculation:
 	//   xOffset = window_WeavingX + vpX

@@ -254,6 +254,11 @@ struct leia_display_processor_d3d11_impl
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
 
+	//! ADR-021: atlas encoding the runtime declared for the next process_atlas
+	//! (set via set_atlas_encoding). Zero-init ⟹ XRT_ATLAS_ENCODING_ENCODED
+	//! (Model A) — so an old runtime that never calls the setter stays passthrough.
+	enum xrt_atlas_encoding atlas_encoding;
+
 	//! @name Chroma-key transparency support (lazy-allocated on first frame)
 	//!
 	//! Enabled via set_chroma_key() when the session asked for a transparent
@@ -1069,6 +1074,18 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
+	// ADR-021: drive the weaver's sRGB conversion from the atlas encoding the
+	// runtime declared out-of-band via set_atlas_encoding (stored in
+	// ldp->atlas_encoding). When the runtime composed in linear (Model B) it
+	// declares LINEAR, so the weaver must encode on output (write=true) — the
+	// matched encode lives here in the DP (this DP declares EITHER). When ENCODED
+	// (Model A) no conversion (passthrough). read stays false: the runtime's
+	// linear atlas is already linear, and ENCODED needs no input decode. The
+	// `format` arg remains the real atlas DXGI format (used below for the SRV).
+	// (Standard sRGB only — no vendor curve; see ADR-021 §2/§4.)
+	const bool atlas_is_linear = (ldp->atlas_encoding == XRT_ATLAS_ENCODING_LINEAR);
+	leiasr_d3d11_set_srgb_conversion(ldp->leiasr, /*read=*/false, /*write=*/atlas_is_linear);
+
 	// Compute effective viewport: canvas sub-rect when set, else full target.
 	// The SR SDK weaver reads the D3D11 viewport via RSGetViewports() and
 	// incorporates vpX/vpY into the phase calculation automatically:
@@ -1401,6 +1418,26 @@ leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
 	}
 }
 
+/*
+ * ADR-021 §3/§4: the SR weaver has an explicit input/output sRGB-conversion
+ * control (leiasr_d3d11_set_srgb_conversion → setShaderSRGBConversion), wired in
+ * process_atlas from the runtime's per-frame encoding declaration. So this DP
+ * accepts EITHER encoding and performs the output encode itself — the runtime
+ * never converts at the boundary.
+ */
+static enum xrt_dp_color_capability
+leia_dp_d3d11_get_handoff_color_capability(struct xrt_display_processor_d3d11 *xdp)
+{
+	(void)xdp;
+	return XRT_DP_COLOR_EITHER;
+}
+
+static void
+leia_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding atlas_encoding)
+{
+	leia_dp_d3d11(xdp)->atlas_encoding = atlas_encoding;
+}
+
 static void
 leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
@@ -1452,6 +1489,8 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_d3d11_set_chroma_key;
 	ldp->base.destroy = leia_dp_d3d11_destroy;
+	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
+	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
 }
 
 

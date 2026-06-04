@@ -504,6 +504,10 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
+	// ADR-021: `format` is the real atlas GL internal format (unchanged). This GL
+	// variant declares no color capability and no set_atlas_encoding (Model-A
+	// passthrough only); wiring EITHER + the weaver sRGB control is a follow-up.
+
 	// 2D mode: bypass weaver, blit atlas content directly via glBlitFramebuffer
 	if (ldp->view_count == 1) {
 		// Lazily create the read FBO
