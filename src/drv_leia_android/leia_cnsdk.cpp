@@ -14,9 +14,11 @@
 
 // CNSDK 0.10.x headers (relocated from leia/sdk/ → leia/core/ vs 0.7.28).
 #include <leia/core/core.h>
+#include <leia/core/faceTracking.h>
 #include <leia/core/interlacer.vulkan.h>
 #include <leia/core/library.h>
 #include <leia/core/deviceConfig.h>
+#include <leia/headTracking/common/types.h>
 #include <leia/common/version.h>
 
 #ifdef XRT_OS_ANDROID
@@ -97,6 +99,22 @@ struct leia_cnsdk
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
 
+	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
+	// detection runs in the system head-tracking service and steers the weave
+	// directly — leia_core_get_primary_face stays empty in our process
+	// (confirmed on the nubia NP02J: sdk_started=1 but pred/nonpred both 0).
+	// To drive the app's per-eye cameras (scene parallax) we register a frame
+	// listener and cache the latest head point (mm, camera-relative) from each
+	// frame the service delivers. Written on the listener's background thread,
+	// read on the render thread — atomics give cross-thread visibility. The
+	// listener is OWNED by leia_core once set, so we never release it ourselves.
+	struct leia_headtracking_frame_listener *frame_listener{nullptr};
+	std::atomic<bool> listener_face_valid{false};
+	std::atomic<int> listener_miss_count{0};
+	std::atomic<float> listener_face_x_mm{0.0f};
+	std::atomic<float> listener_face_y_mm{0.0f};
+	std::atomic<float> listener_face_z_mm{0.0f};
+
 	// Cached display metrics. Populated by the worker thread alongside
 	// the camera-center snapshot; the atomic flag gives the render
 	// thread happens-before visibility on the float/int writes. Once
@@ -168,6 +186,31 @@ get_prop_bool(const char *name, bool default_val)
 }
 #endif
 
+#ifdef XRT_OS_ANDROID
+// Tri-state property override: returns `derived` when the property is unset,
+// otherwise the property's boolean value. Lets orientation-derived axis
+// defaults be overridden per-axis via setprop for calibration, no rebuild.
+static bool
+prop_override(const char *name, bool derived)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(name, buf) <= 0) {
+		return derived;
+	}
+	const char c = buf[0];
+	if (c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y') { return true; }
+	if (c == '0' || c == 'f' || c == 'F' || c == 'n' || c == 'N') { return false; }
+	return derived;
+}
+#else
+static bool
+prop_override(const char *name, bool derived)
+{
+	(void)name;
+	return derived;
+}
+#endif
+
 static void
 ensure_calibration_loaded(void)
 {
@@ -204,6 +247,63 @@ leia_cnsdk_log_calibration_knobs(void)
  */
 
 namespace {
+
+// Frame listener callback — invoked on a CNSDK background thread for every
+// head-tracking frame the service delivers (the HTS-Binder onMessage(Frame)
+// stream). Cache the primary face's Kalman-filtered point so the render thread
+// can read it. Must release the frame (ownership transferred in).
+void
+on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
+{
+	struct leia_cnsdk *cnsdk = static_cast<struct leia_cnsdk *>(userData);
+
+	// Read the head position. On this device the Kalman tracking_result comes
+	// back empty, but the raw DETECTED faces (posePosition, mm, camera origin)
+	// are populated every frame — confirmed in the service log
+	// ([FaceTracker] detected face: ...posePosition={...}). Prefer detected
+	// faces; fall back to the tracking result for other devices/modes.
+	bool got = false;
+	float px = 0.0f, py = 0.0f, pz = 0.0f;
+	struct leia_headtracking_detected_faces detected = {};
+	if (cnsdk != nullptr &&
+	    leia_headtracking_frame_get_detected_faces(frame, &detected) ==
+	        kLeiaHeadTrackingStatusSuccess &&
+	    detected.numFaces > 0) {
+		px = detected.faces[0].posePosition.x;
+		py = detected.faces[0].posePosition.y;
+		pz = detected.faces[0].posePosition.z;
+		got = true;
+	} else if (cnsdk != nullptr) {
+		struct leia_headtracking_tracking_result tracked = {};
+		if (leia_headtracking_frame_get_tracking_result(frame, &tracked) ==
+		        kLeiaHeadTrackingStatusSuccess &&
+		    tracked.num_faces > 0) {
+			px = tracked.faces[0].point.pos.x;
+			py = tracked.faces[0].point.pos.y;
+			pz = tracked.faces[0].point.pos.z;
+			got = true;
+		}
+	}
+
+	if (cnsdk != nullptr && got) {
+		cnsdk->listener_face_x_mm.store(px, std::memory_order_relaxed);
+		cnsdk->listener_face_y_mm.store(py, std::memory_order_relaxed);
+		cnsdk->listener_face_z_mm.store(pz, std::memory_order_relaxed);
+		cnsdk->listener_face_valid.store(true, std::memory_order_release);
+		cnsdk->listener_miss_count.store(0, std::memory_order_relaxed);
+	} else if (cnsdk != nullptr) {
+		// The service's detector drops to num_faces==0 intermittently (steep
+		// camera angle / brief loss). Don't snap the view back to the default
+		// on a single miss — hold the last position and only invalidate after a
+		// sustained loss (~1 s at the service's frame rate), so head tracking
+		// stays smooth instead of flickering to the static fallback.
+		const int misses = cnsdk->listener_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (misses > 90) {
+			cnsdk->listener_face_valid.store(false, std::memory_order_release);
+		}
+	}
+	leia_headtracking_frame_release(frame);
+}
 
 void
 face_tracking_worker(struct leia_cnsdk *cnsdk)
@@ -287,6 +387,17 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		return;
 	}
 	leia_core_start_face_tracking(cnsdk->core, true);
+
+	// Register the frame listener for the in-service face readout. leia_core
+	// takes ownership of the listener, so we don't release it ourselves.
+	cnsdk->frame_listener = leia_headtracking_frame_listener_alloc(
+	    cnsdk->lib, on_headtracking_frame, cnsdk, nullptr);
+	if (cnsdk->frame_listener != nullptr) {
+		leia_core_set_face_tracking_frame_listener(cnsdk->core, cnsdk->frame_listener);
+		U_LOG_W("CNSDK frame listener registered (in-service face readout)");
+	} else {
+		U_LOG_W("leia_headtracking_frame_listener_alloc failed");
+	}
 
 	cnsdk->face_tracking_started.store(true, std::memory_order_release);
 	U_LOG_W("CNSDK face tracking started (worker)");
@@ -609,9 +720,46 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 		return false;
 	}
 
-	float position[3] = {0, 0, 0};
-	struct leia_float_slice slice = {position, 3};
-	if (!leia_core_get_primary_face(cnsdk->core, slice)) {
+	// The predicted face is latency-compensated and preferred, but on the
+	// nubia NP02J in portrait it can stay empty even while raw face frames
+	// stream in from the head-tracking service (HTS-Binder onMessage(Frame)).
+	// Query both and fall back to the latest non-predicted detection. The
+	// diagnostic is U_LOG_W (WARN) on purpose — aux INFO is dropped from the
+	// Android hot path, so a U_LOG_I here would be invisible.
+	// Primary source on this device: the frame listener (in-service detection).
+	// leia_core_get_primary_face / non_predicted stay empty in service mode, so
+	// they're only a fallback for in-app mode / other devices.
+	const bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
+	float lst_pos[3] = {
+	    cnsdk->listener_face_x_mm.load(std::memory_order_relaxed),
+	    cnsdk->listener_face_y_mm.load(std::memory_order_relaxed),
+	    cnsdk->listener_face_z_mm.load(std::memory_order_relaxed),
+	};
+
+	float pred_pos[3] = {0, 0, 0};
+	float np_pos[3] = {0, 0, 0};
+	struct leia_float_slice pred_slice = {pred_pos, 3};
+	struct leia_float_slice np_slice = {np_pos, 3};
+	const bool pred_ok = leia_core_get_primary_face(cnsdk->core, pred_slice);
+	const bool np_ok = leia_core_get_non_predicted_primary_face(cnsdk->core, np_slice);
+
+	static int dbg = 0;
+	if ((dbg++ % 60) == 0) {
+		U_LOG_W("HW_FACE: listener=%d(%.0f,%.0f,%.0f) pred=%d(%.0f,%.0f,%.0f) nonpred=%d",
+		        (int)lst_ok, lst_pos[0], lst_pos[1], lst_pos[2],
+		        (int)pred_ok, pred_pos[0], pred_pos[1], pred_pos[2], (int)np_ok);
+	}
+
+	float position[3];
+	bool used_nonpred = false;
+	if (lst_ok) {
+		position[0] = lst_pos[0]; position[1] = lst_pos[1]; position[2] = lst_pos[2];
+	} else if (pred_ok) {
+		position[0] = pred_pos[0]; position[1] = pred_pos[1]; position[2] = pred_pos[2];
+	} else if (np_ok) {
+		position[0] = np_pos[0]; position[1] = np_pos[1]; position[2] = np_pos[2];
+		used_nonpred = true;
+	} else {
 		return false;
 	}
 
@@ -622,25 +770,36 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
 	float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
 
-	// Calibration knobs (B15). Defaults match the pre-calibration
-	// assumption; flip via `adb shell setprop debug.dxr.leia.face_flip_x 1`
-	// etc. if Lume Pad reveals a different convention.
-	ensure_calibration_loaded();
-	if (g_calib.face_swap_xy) {
-		float tmp = pos_x_m; pos_x_m = pos_y_m; pos_y_m = tmp;
-	}
-	if (g_calib.face_flip_x) { pos_x_m = -pos_x_m; }
-	if (g_calib.face_flip_y) { pos_y_m = -pos_y_m; }
-	if (g_calib.face_flip_z) { pos_z_m = -pos_z_m; }
+	// Orientation-aware face-axis mapping — NOT hardwired. The camera is
+	// landscape-native, so its X/Y map onto the view differently per device
+	// orientation. Derive the mapping from CNSDK's LIVE orientation (updates on
+	// physical rotation), so it adapts the way the Leia viewer does instead of
+	// being pinned to one orientation. Per-axis setprop overrides
+	// (debug.dxr.leia.face_swap_xy / face_flip_x/y/z = 0|1) win when set, for
+	// calibrating the per-orientation defaults without a rebuild.
+	// The head-tracking service delivers detected-face coordinates already in
+	// the current display-orientation frame, so the face axes need NO
+	// per-orientation remap here — identity. (A swap double-rotated and sent
+	// head left/right to the cube's vertical axis in portrait.) Kept
+	// overridable via setprop for any residual per-device calibration.
+	enum leia_orientation ori = leia_core_get_orientation(cnsdk->core);
+	bool swap = false, flip_x = false, flip_y = false;
+	swap          = prop_override("debug.dxr.leia.face_swap_xy", swap);
+	flip_x        = prop_override("debug.dxr.leia.face_flip_x", flip_x);
+	flip_y        = prop_override("debug.dxr.leia.face_flip_y", flip_y);
+	const bool fz = prop_override("debug.dxr.leia.face_flip_z", false);
+	if (swap)   { float tmp = pos_x_m; pos_x_m = pos_y_m; pos_y_m = tmp; }
+	if (flip_x) { pos_x_m = -pos_x_m; }
+	if (flip_y) { pos_y_m = -pos_y_m; }
+	if (fz)     { pos_z_m = -pos_z_m; }
 
-#ifdef XRT_DEBUG_ANDROID_VERBOSE
-	// Throttle to once per ~second at 60 Hz so logcat stays readable.
-	static int dbg_face_counter = 0;
-	if ((dbg_face_counter++ % 60) == 0) {
-		DXR_HW_DBG("face: raw_mm=(%.1f, %.1f, %.1f) → out_m=(%.4f, %.4f, %.4f)",
-		           position[0], position[1], position[2], pos_x_m, pos_y_m, pos_z_m);
+	static int oridbg = 0;
+	if ((oridbg++ % 120) == 0) {
+		U_LOG_W("HW_ORI: orientation=%d swap=%d flip_x=%d flip_y=%d",
+		        (int)ori, (int)swap, (int)flip_x, (int)flip_y);
 	}
-#endif
+
+	(void)used_nonpred;
 
 	if (out_x != NULL) { *out_x = pos_x_m; }
 	if (out_y != NULL) { *out_y = pos_y_m; }
@@ -661,10 +820,36 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 	}
 	static int throttle = 0;
 	static int last = -1;
+	static int last_ori = -999;
 	if ((throttle++ % 30) != 0) {
 		return;
 	}
 	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
+
+	// On orientation change, re-apply the 3D mode so CNSDK re-evaluates the
+	// panel/lenticular geometry for the new orientation. The lenticular has to
+	// switch axis for landscape 3D, but enable_3d is otherwise only applied
+	// once at startup — so without this the panel stays in the startup
+	// orientation's 3D mode and landscape never separates. Re-sync the device
+	// config and toggle 3D off→on. (Experimental — landscape 3D on this panel
+	// may still need a Leia-side display-mode path.)
+	const int ori = (int)leia_core_get_orientation(cnsdk->core);
+	if (ori != last_ori) {
+		struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
+		if (cfg != NULL) {
+			leia_core_sync_device_config(cnsdk->core, cfg);
+			leia_device_config_release(cfg);
+		}
+		if (want != 0) {
+			leia_core_enable_3d(cnsdk->core, false);
+			leia_core_enable_3d(cnsdk->core, true);
+		}
+		U_LOG_W("HW_DBG_CNSDK: orientation -> %d, re-applied 3D + synced device config", ori);
+		last_ori = ori;
+		last = want;  // enable_3d already in the wanted state
+		return;
+	}
+
 	if (want != last) {
 		leia_core_enable_3d(cnsdk->core, want != 0);
 		last = want;
