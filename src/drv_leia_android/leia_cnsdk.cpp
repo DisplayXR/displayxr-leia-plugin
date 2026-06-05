@@ -285,6 +285,21 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 		}
 	}
 
+	// Plausibility gate: reject garbage detections (the service occasionally
+	// emits a bogus face — e.g. z=66 mm, ~6.6 cm — which puts the eye camera
+	// almost on the screen and wildly distorts/stretches the cube). A real face
+	// sits ~150–2000 mm deep and within ~800 mm laterally; anything outside that
+	// is dropped (treated as a miss, so the last good position holds).
+	if (got && (pz < 150.0f || pz > 2000.0f ||
+	            px < -800.0f || px > 800.0f ||
+	            py < -800.0f || py > 800.0f)) {
+		static int rej = 0;
+		if ((rej++ % 60) == 0) {
+			U_LOG_W("HW_FACE: rejected implausible face (%.0f,%.0f,%.0f) mm", px, py, pz);
+		}
+		got = false;
+	}
+
 	if (cnsdk != nullptr && got) {
 		cnsdk->listener_face_x_mm.store(px, std::memory_order_relaxed);
 		cnsdk->listener_face_y_mm.store(py, std::memory_order_relaxed);
@@ -820,35 +835,10 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 	}
 	static int throttle = 0;
 	static int last = -1;
-	static int last_ori = -999;
 	if ((throttle++ % 30) != 0) {
 		return;
 	}
 	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
-
-	// On orientation change, re-apply the 3D mode so CNSDK re-evaluates the
-	// panel/lenticular geometry for the new orientation. The lenticular has to
-	// switch axis for landscape 3D, but enable_3d is otherwise only applied
-	// once at startup — so without this the panel stays in the startup
-	// orientation's 3D mode and landscape never separates. Re-sync the device
-	// config and toggle 3D off→on. (Experimental — landscape 3D on this panel
-	// may still need a Leia-side display-mode path.)
-	const int ori = (int)leia_core_get_orientation(cnsdk->core);
-	if (ori != last_ori) {
-		struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
-		if (cfg != NULL) {
-			leia_core_sync_device_config(cnsdk->core, cfg);
-			leia_device_config_release(cfg);
-		}
-		if (want != 0) {
-			leia_core_enable_3d(cnsdk->core, false);
-			leia_core_enable_3d(cnsdk->core, true);
-		}
-		U_LOG_W("HW_DBG_CNSDK: orientation -> %d, re-applied 3D + synced device config", ori);
-		last_ori = ori;
-		last = want;  // enable_3d already in the wanted state
-		return;
-	}
 
 	if (want != last) {
 		leia_core_enable_3d(cnsdk->core, want != 0);
