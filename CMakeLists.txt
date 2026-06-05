@@ -13,8 +13,12 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT WIN32)
-    message(FATAL_ERROR "The Leia SR plug-in is Windows-only.")
+if(NOT WIN32 AND NOT ANDROID)
+    message(FATAL_ERROR
+        "The Leia plug-in supports two targets:\n"
+        "  - Windows / Leia SR (DisplayXR-LeiaSR.dll, drv_leia)\n"
+        "  - Android / Leia CNSDK (libdxrp050_leia_cnsdk.so, drv_leia_android)\n"
+        "Configured platform is neither WIN32 nor ANDROID.")
 endif()
 
 if(NOT DEFINED BUILD_NUM)
@@ -64,17 +68,26 @@ else()
     FetchContent_MakeAvailable(displayxr_runtime)
 endif()
 
-# --- SR SDK -------------------------------------------------------------
-if(NOT DEFINED ENV{LEIASR_SDKROOT})
-    message(FATAL_ERROR
-        "LEIASR_SDKROOT env var not set. Point at an extracted LeiaSR-SDK-*-win64 directory. "
-        "scripts/build-windows.bat fetches it from the sr-sdk-v* release on this repo.")
-endif()
-set(SR_PATH "$ENV{LEIASR_SDKROOT}")
-list(APPEND CMAKE_PREFIX_PATH "${SR_PATH}")
-find_package(simulatedreality CONFIG REQUIRED GLOBAL)
-find_package(srDirectX CONFIG REQUIRED GLOBAL)
-message(STATUS "Leia SR SDK at ${SR_PATH}")
+if(WIN32)
+    # --- SR SDK (Windows / Leia SR plug-in) ----------------------------
+    if(NOT DEFINED ENV{LEIASR_SDKROOT})
+        message(FATAL_ERROR
+            "LEIASR_SDKROOT env var not set. Point at an extracted LeiaSR-SDK-*-win64 directory. "
+            "scripts/build-windows.bat fetches it from the sr-sdk-v* release on this repo.")
+    endif()
+    set(SR_PATH "$ENV{LEIASR_SDKROOT}")
+    list(APPEND CMAKE_PREFIX_PATH "${SR_PATH}")
+    find_package(simulatedreality CONFIG REQUIRED GLOBAL)
+    find_package(srDirectX CONFIG REQUIRED GLOBAL)
+    message(STATUS "Leia SR SDK at ${SR_PATH}")
 
-add_subdirectory(src/drv_leia)
-add_subdirectory(installer)
+    add_subdirectory(src/drv_leia)
+    add_subdirectory(installer)
+elseif(ANDROID)
+    # --- CNSDK (Android / Leia CNSDK plug-in) --------------------------
+    # CNSDK setup (find_package(CNSDK CONFIG)) lives inside
+    # src/drv_leia_android/CMakeLists.txt — it consumes CNSDK_ROOT,
+    # which the build environment supplies. No NSIS installer on
+    # Android; the .so ships in the runtime APK's jniLibs/<ABI>/.
+    add_subdirectory(src/drv_leia_android)
+endif()
