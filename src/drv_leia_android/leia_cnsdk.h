@@ -32,6 +32,23 @@ xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk);
 
 /*!
+ * Provide the host-iface Android accessors (JavaVM + Activity getters)
+ * captured at `xrtPluginNegotiate` (`xrt_plugin_host_iface`).
+ *
+ * The plug-in statically links its own copy of the runtime's
+ * `android_globals`, which the runtime never populates (hidden-visibility
+ * symbols bind to the plug-in's private copy), so CNSDK init must obtain
+ * the `JavaVM`/Activity through these host callbacks rather than calling
+ * `android_globals_get_vm()` itself. NULL accessors (older runtime, or a
+ * non-Android host) leave the legacy `android_globals` fallback in place.
+ *
+ * @param get_vm        Host getter for the `JavaVM *` (as `void *`), or NULL.
+ * @param get_activity  Host getter for the Activity `jobject` (as `void *`), or NULL.
+ */
+void
+leia_cnsdk_set_host_android_accessors(void *(*get_vm)(void), void *(*get_activity)(void));
+
+/*!
  * Read all `debug.dxr.leia.*` calibration setprops and log them.
  *
  * Idempotent (cached after first call). Safe to call from the plug-in

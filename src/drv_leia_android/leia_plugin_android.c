@@ -234,7 +234,17 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
                    struct xrt_plugin_iface **out_iface,
                    uint32_t *out_plugin_api_version)
 {
-	(void)host;
+	// Capture the host's Android JavaVM/Activity accessors for CNSDK init.
+	// Our statically-linked aux_android copy of the VM globals is never
+	// populated by the runtime (hidden-visibility binds locally), so CNSDK
+	// must get the JavaVM/Activity through the host iface. These named
+	// fields were carved from the formerly zero-initialized reserved[]
+	// block (struct_size unchanged), so reading them is safe on any
+	// runtime; the values are NULL on non-Android / older runtimes, in
+	// which case leia_cnsdk falls back to its own android_globals.
+	if (host != NULL) {
+		leia_cnsdk_set_host_android_accessors(host->get_android_vm, host->get_android_activity);
+	}
 
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 
