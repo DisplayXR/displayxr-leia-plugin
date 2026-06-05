@@ -273,6 +273,20 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
  *
  */
 
+// Host-iface Android accessors captured at xrtPluginNegotiate. The plug-in's
+// own statically-linked android_globals copy is never populated by the
+// runtime, so we obtain the JavaVM/Activity through these host callbacks.
+// NULL until set (older runtime / non-Android) -> legacy fallback below.
+static void *(*g_host_get_android_vm)(void) = nullptr;
+static void *(*g_host_get_android_activity)(void) = nullptr;
+
+extern "C" void
+leia_cnsdk_set_host_android_accessors(void *(*get_vm)(void), void *(*get_activity)(void))
+{
+	g_host_get_android_vm = get_vm;
+	g_host_get_android_activity = get_activity;
+}
+
 extern "C" xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 {
@@ -282,9 +296,17 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	struct leia_core_init_configuration *config = leia_core_init_configuration_alloc(CNSDK_VERSION);
 
 #ifdef XRT_OS_ANDROID
-	leia_core_init_configuration_set_platform_android_java_vm(config, (JavaVM *)android_globals_get_vm());
-	leia_core_init_configuration_set_platform_android_handle(
-	    config, LEIA_CORE_ANDROID_HANDLE_ACTIVITY, (jobject)android_globals_get_activity());
+	// Prefer the host-iface accessors (the runtime's populated VM globals);
+	// fall back to our own android_globals only if the host didn't supply
+	// them (older runtime that predates the host-iface getters).
+	void *vm = g_host_get_android_vm != nullptr ? g_host_get_android_vm() : (void *)android_globals_get_vm();
+	void *activity = g_host_get_android_activity != nullptr ? g_host_get_android_activity()
+	                                                        : android_globals_get_activity();
+	DXR_HW_DBG("leia_cnsdk_create: android vm=%p activity=%p (host_accessors=%p/%p)", vm, activity,
+	           (void *)g_host_get_android_vm, (void *)g_host_get_android_activity);
+	leia_core_init_configuration_set_platform_android_java_vm(config, (JavaVM *)vm);
+	leia_core_init_configuration_set_platform_android_handle(config, LEIA_CORE_ANDROID_HANDLE_ACTIVITY,
+	                                                         (jobject)activity);
 #endif
 
 	leia_core_init_configuration_set_platform_log_level(config, kLeiaLogLevelTrace);
