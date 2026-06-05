@@ -161,6 +161,10 @@ ls -l "${SO}"
 if [ "${INSTALL_JNILIBS}" = "true" ]; then
     JNI_DIR="${DXR_RUNTIME_SOURCE_DIR}/src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a"
     mkdir -p "${JNI_DIR}"
+    # Clean stale .so so a variant switch (e.g. faceTrackingInApp →
+    # faceTrackingService) doesn't leave the old in-app engine + SNPE libs
+    # lingering in the runtime APK.
+    rm -f "${JNI_DIR}"/*.so
     echo
     echo "=== Installing into ${JNI_DIR} ==="
 
@@ -168,51 +172,28 @@ if [ "${INSTALL_JNILIBS}" = "true" ]; then
     cp -f "${SO}" "${JNI_DIR}/"
     echo "  + $(basename "${SO}")"
 
-    # CNSDK transitive .so deps. The plug-in's leia_cnsdk_get_*
-    # entry points need libleiaSDK-faceTrackingInApp.so (loaded
-    # via DT_NEEDED), which in turn needs libblink.so and
-    # liblicense_utils.so. These ship in the sdk-faceTrackingInApp
-    # AAR — extract and copy.
-    AAR_NAME="sdk-faceTrackingInApp"
-    AAR_VERSION_FILE="${CNSDK_ROOT}/VERSION.txt"
-    if [ -f "${AAR_VERSION_FILE}" ]; then
-        CNSDK_VERSION="$(cat "${AAR_VERSION_FILE}" | tr -d ' \r\n')"
-    else
-        CNSDK_VERSION="0.7.28"
-    fi
-    AAR="${CNSDK_ROOT}/android/${AAR_NAME}-${CNSDK_VERSION}.aar"
-    if [ ! -f "${AAR}" ]; then
-        echo "WARNING: ${AAR} not found — runtime APK won't have CNSDK transitive .so deps and the plug-in will fail to dlopen on device."
-    else
-        # AAR is a zip; extract just the arm64-v8a .so files.
-        TMP_AAR=$(mktemp -d)
-        unzip -q -j "${AAR}" 'jni/arm64-v8a/*.so' -d "${TMP_AAR}"
-        for so in "${TMP_AAR}"/*.so; do
-            cp -f "${so}" "${JNI_DIR}/"
-            echo "  + $(basename "${so}")"
-        done
-        rm -rf "${TMP_AAR}"
-    fi
+    # CNSDK 0.10.x transitive .so deps. The loader (libleiaCore-loader.so) is
+    # what the plug-in links/dlopens; libleiaSDK-jni.so is the Java<->native
+    # bridge the loader/Java side dlopens to reach the on-device Leia service.
+    # Both ship in the SDK's lib/<ABI>/. Face tracking runs IN the device's
+    # licensed service (selected via set_face_tracking_runtime(IN_SERVICE)),
+    # so none of the 0.7.28 in-app engine libs (blink/license_utils/SNPE) are
+    # needed. Matching the device's CNSDK 0.10.54 is what makes the service
+    # connection succeed.
+    CNSDK_LIB_DIR="${CNSDK_ROOT}/lib/arm64-v8a"
+    for libname in libleiaCore-loader.so libleiaSDK-jni.so; do
+        if [ -f "${CNSDK_LIB_DIR}/${libname}" ]; then
+            cp -f "${CNSDK_LIB_DIR}/${libname}" "${JNI_DIR}/"
+            echo "  + ${libname}"
+        else
+            echo "WARNING: ${CNSDK_LIB_DIR}/${libname} not found — plug-in will fail to dlopen on device. Is CNSDK_ROOT a 0.10.x SDK?"
+        fi
+    done
 
-    # SNPE — Qualcomm's Snapdragon Neural Processing Engine, used by
-    # CNSDK's libblink.so (face-tracking inference). Ships as a separate
-    # AAR under CNSDK's third_party tree. Bundle these unless they're
-    # known to come from the platform (e.g. system /vendor/ on Lume Pad).
-    SNPE_AAR="${CNSDK_ROOT}/android/third_party/snpe-release.aar"
-    if [ -f "${SNPE_AAR}" ]; then
-        TMP_SNPE=$(mktemp -d)
-        unzip -q -j "${SNPE_AAR}" 'jni/arm64-v8a/*.so' -d "${TMP_SNPE}"
-        for so in "${TMP_SNPE}"/*.so; do
-            # libc++_shared.so already shipped by the runtime build —
-            # double-include can cause version-skew dlopen failures.
-            if [ "$(basename "${so}")" = "libc++_shared.so" ]; then
-                continue
-            fi
-            cp -f "${so}" "${JNI_DIR}/"
-            echo "  + $(basename "${so}")"
-        done
-        rm -rf "${TMP_SNPE}"
-    fi
+    # NOTE: SNPE (Qualcomm's DSP inference engine) is intentionally NOT
+    # bundled — it was only needed by the in-app face-tracking engine
+    # (libblink). With the faceTrackingInService variant, inference runs in
+    # the device's Leia system service, so the app/runtime needs none of it.
 
     echo
     echo "Now build the runtime APK with the jniLibs picked up:"

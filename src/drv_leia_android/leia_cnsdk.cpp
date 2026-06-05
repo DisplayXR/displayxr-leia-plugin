@@ -12,10 +12,12 @@
 
 #include "util/u_logging.h"
 
-#include <leia/sdk/core.h>
-#include <leia/sdk/core.interlacer.vulkan.h>
+// CNSDK 0.10.x headers (relocated from leia/sdk/ → leia/core/ vs 0.7.28).
+#include <leia/core/core.h>
+#include <leia/core/interlacer.vulkan.h>
+#include <leia/core/library.h>
+#include <leia/core/deviceConfig.h>
 #include <leia/common/version.h>
-#include <leia/device/config.h>
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
@@ -63,6 +65,10 @@ struct AtraceScopeCnsdk {
 
 struct leia_cnsdk
 {
+	// CNSDK 0.10.x loader handle — loads the core impl (which talks to the
+	// on-device Leia service). Held for the lifetime of the core; released
+	// after the core in destroy.
+	struct leia_core_library *lib{nullptr};
 	struct leia_core *core{nullptr};
 	struct leia_interlacer *interlacer{nullptr};
 
@@ -225,6 +231,17 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	}
 	DXR_HW_DBG("worker: core initialized after %d polls", poll_count);
 
+	// Force the 3D light-field ON. Face tracking may fail to license on this
+	// build (no eye position), and CNSDK's no-face mode would then auto-drop
+	// the backlight to flat 2D — making the weave look wrong/flat on the
+	// panel. Disable no-face mode and force the backlight on so the
+	// light-field is driven regardless of face tracking. Do this BEFORE the
+	// (possibly-failing) face-tracking enable below so it always runs. A live
+	// 2D/3D A-B toggle is available via debug.dxr.leia.backlight (see weave).
+	leia_core_enable_no_face_mode(cnsdk->core, false);
+	leia_core_enable_3d(cnsdk->core, true);
+	DXR_HW_DBG("worker: forced backlight ON + no-face mode OFF (3D light-field)");
+
 	// Phase 2a: snapshot all device-config values we need on the render
 	// thread (camera center for face-position translation; display
 	// metrics for Kooima projection). CNSDK doesn't annotate device
@@ -232,24 +249,35 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// expose only cached values to the render thread via atomics. mm→m
 	// conversion happens at storage time so render-thread reads are
 	// branch-free.
+	// CNSDK 0.10.x: leia_device_config is opaque — read via typed property
+	// getters instead of struct fields. Camera-center (used only to translate
+	// our get_primary_face output, which feeds the app's per-eye cameras, NOT
+	// the in-service weave steering) moved into a leia_camera struct; defer it
+	// (left 0) — the weave is steered by CNSDK's own in-service face data.
 	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
 	if (cfg != NULL) {
-		cnsdk->camera_center_x_m = cfg->cameraCenterX / 1000.0f;
-		cnsdk->camera_center_y_m = cfg->cameraCenterY / 1000.0f;
-		cnsdk->camera_center_z_m = cfg->cameraCenterZ / 1000.0f;
-		cnsdk->display_width_m_cached = (float)cfg->displaySizeInMm[0] / 1000.0f;
-		cnsdk->display_height_m_cached = (float)cfg->displaySizeInMm[1] / 1000.0f;
-		cnsdk->display_pixel_w_cached = (uint32_t)cfg->panelResolution[0];
-		cnsdk->display_pixel_h_cached = (uint32_t)cfg->panelResolution[1];
-		leia_core_release_device_config(cnsdk->core, cfg);
+		float display_size_mm[2] = {0.0f, 0.0f};
+		int32_t panel_res_px[2] = {0, 0};
+		bool got_size = leia_device_config_get_f32(
+		    cfg, LEIA_DEVICE_CONFIG_PROPERTY_DISPLAY_SIZE_MM, 2, display_size_mm);
+		bool got_res = leia_device_config_get_i32(
+		    cfg, LEIA_DEVICE_CONFIG_PROPERTY_PANEL_RESOLUTION_PX, 2, panel_res_px);
+		if (got_size) {
+			cnsdk->display_width_m_cached = display_size_mm[0] / 1000.0f;
+			cnsdk->display_height_m_cached = display_size_mm[1] / 1000.0f;
+		}
+		if (got_res) {
+			cnsdk->display_pixel_w_cached = (uint32_t)panel_res_px[0];
+			cnsdk->display_pixel_h_cached = (uint32_t)panel_res_px[1];
+		}
+		leia_device_config_release(cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
-		DXR_HW_DBG("worker: cached metrics: %ux%u px, %.3fx%.3f m; cam=(%.3f, %.3f, %.3f) m",
+		DXR_HW_DBG("worker: cached metrics: %ux%u px, %.3fx%.3f m (size_ok=%d res_ok=%d)",
 		           cnsdk->display_pixel_w_cached, cnsdk->display_pixel_h_cached,
 		           cnsdk->display_width_m_cached, cnsdk->display_height_m_cached,
-		           cnsdk->camera_center_x_m, cnsdk->camera_center_y_m,
-		           cnsdk->camera_center_z_m);
+		           (int)got_size, (int)got_res);
 	} else {
-		U_LOG_W("leia_core_get_device_config failed in worker; camera center + metrics stay default");
+		U_LOG_W("leia_core_get_device_config failed in worker; metrics stay default");
 	}
 
 	// Phase 2b: heavy enable + start. Single call, can't be interrupted —
@@ -291,9 +319,6 @@ extern "C" xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 {
 	DXR_HW_DBG("leia_cnsdk_create: entering");
-	leia_platform_on_library_load();
-
-	struct leia_core_init_configuration *config = leia_core_init_configuration_alloc(CNSDK_VERSION);
 
 #ifdef XRT_OS_ANDROID
 	// Prefer the host-iface accessors (the runtime's populated VM globals);
@@ -304,7 +329,34 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	                                                        : android_globals_get_activity();
 	DXR_HW_DBG("leia_cnsdk_create: android vm=%p activity=%p (host_accessors=%p/%p)", vm, activity,
 	           (void *)g_host_get_android_vm, (void *)g_host_get_android_activity);
-	leia_core_init_configuration_set_platform_android_java_vm(config, (JavaVM *)vm);
+#endif
+
+	// CNSDK 0.10.x loader: load the core library first. The JavaVM + a
+	// Context go into the loader request now (not the init configuration),
+	// and the loader brings up the core impl that talks to the on-device
+	// Leia service. (0.7.28 had no loader — leia_core_init_configuration_alloc
+	// took just the version string.)
+	struct leia_core_library_load_request load_req = {};
+	load_req.apiVersion = CNSDK_VERSION_U64;
+	load_req.loaderVersion = LEIA_CORE_LOADER_API_VERSION;
+#ifdef XRT_OS_ANDROID
+	struct leia_core_library_load_android android_load = {};
+	android_load.vm = (JavaVM *)vm;
+	android_load.context = (jobject)activity;  // Activity is-a android.content.Context
+	load_req.android = &android_load;
+#endif
+	struct leia_core_library *lib = leia_core_library_load(&load_req);
+	if (lib == NULL) {
+		U_LOG_E("leia_core_library_load failed");
+		*out_cnsdk = NULL;
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct leia_core_init_configuration *config = leia_core_init_configuration_alloc(lib, CNSDK_VERSION);
+
+#ifdef XRT_OS_ANDROID
+	// Activity handle still goes through the init configuration (permission
+	// dialogs etc.); the JavaVM no longer does — it's in the loader request.
 	leia_core_init_configuration_set_platform_android_handle(config, LEIA_CORE_ANDROID_HANDLE_ACTIVITY,
 	                                                         (jobject)activity);
 #endif
@@ -312,18 +364,34 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	leia_core_init_configuration_set_platform_log_level(config, kLeiaLogLevelTrace);
 	leia_core_init_configuration_set_enable_validation(config, true);
 
+	// HW-2c: use the in-SERVICE face-tracking runtime — it delegates tracking
+	// to the device's licensed Leia system service. The in-app runtime failed
+	// to license on the Lume Pad ("Invalid Device"). IN_SERVICE is the enum
+	// default (0), set explicitly so it's unambiguous.
+	leia_core_init_configuration_set_face_tracking_runtime(
+	    config, LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE);
+
+	// NOTE: tried config-time auto enable/start + check_permission(false) to
+	// "start in 3D", but it regressed the device's 3D activation (lost the
+	// system Present3D / mode3D=true engagement that the worker-driven path
+	// triggers). Reverted — the worker enables face tracking + 3D after the
+	// async core init, which is what actually flips the panel into 3D. The
+	// brief 2D→3D warmup is inherent to the async service bring-up.
+
 	struct leia_core *core = leia_core_init_async(config);
 	leia_core_init_configuration_free(config);
 
 	if (core == NULL) {
 		U_LOG_E("leia_core_init_async failed");
+		leia_core_library_release(lib);
 		*out_cnsdk = NULL;
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	leia_core_set_backlight(core, true);
+	leia_core_enable_3d(core, true);
 
 	auto *cnsdk = new struct leia_cnsdk();
+	cnsdk->lib = lib;
 	cnsdk->core = core;
 	cnsdk->worker = std::thread(face_tracking_worker, cnsdk);
 
@@ -378,19 +446,22 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	}
 
 	if (cnsdk->interlacer != NULL) {
-		// CNSDK 0.7.28 renamed the per-interlacer release; the core owns the
-		// interlacer lifetime, so the shutdown call needs both handles.
-		leia_interlacer_shutdown(cnsdk->core, cnsdk->interlacer);
+		// CNSDK 0.10.x: single-arg interlacer release.
+		leia_interlacer_release(cnsdk->interlacer);
 		cnsdk->interlacer = NULL;
 	}
 
 	if (cnsdk->core != NULL) {
-		// CNSDK 0.7.28 renamed leia_core_release → leia_core_shutdown.
-		leia_core_shutdown(cnsdk->core);
+		leia_core_release(cnsdk->core);
 		cnsdk->core = NULL;
 	}
 
-	leia_platform_on_library_unload();
+	// CNSDK 0.10.x: release the loader library last (replaces 0.7.28's
+	// leia_platform_on_library_unload()).
+	if (cnsdk->lib != NULL) {
+		leia_core_library_release(cnsdk->lib);
+		cnsdk->lib = NULL;
+	}
 
 	delete cnsdk;
 	*cnsdk_ptr = NULL;
@@ -505,8 +576,10 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	leia_interlacer_init_configuration_set_use_atlas_for_views(ic, true);
 	// Views format = atlas format. Atlas is rendered to UNORM by
 	// comp_vk_native_renderer.c, so use UNORM here (audit B2).
+	// CNSDK 0.10.x dropped the separate textureFormat param (now just
+	// renderTargetFormat + depthStencilFormat).
 	cnsdk->interlacer = leia_interlacer_vulkan_initialize(
-	    cnsdk->core, ic, device, physDev, VK_FORMAT_B8G8R8A8_UNORM,
+	    cnsdk->core, ic, device, physDev,
 	    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
 	leia_interlacer_init_configuration_free(ic);
 
@@ -575,6 +648,31 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	return true;
 }
 
+// Live 2D/3D A-B toggle: `adb shell setprop debug.dxr.leia.backlight 0|1`.
+//   1 (default) → 3D light-field backlight ON.
+//   0           → flat 2D (backlight off; the SAME weaved image is shown, so
+//                 the user can compare 2D vs 3D and confirm the weave works).
+// Re-read every ~30 frames; only call CNSDK when the value actually changes.
+static void
+apply_backlight_toggle(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL) {
+		return;
+	}
+	static int throttle = 0;
+	static int last = -1;
+	if ((throttle++ % 30) != 0) {
+		return;
+	}
+	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
+	if (want != last) {
+		leia_core_enable_3d(cnsdk->core, want != 0);
+		last = want;
+		U_LOG_W("HW_DBG_CNSDK: backlight -> %s (debug.dxr.leia.backlight)",
+		        want ? "3D ON" : "2D OFF");
+	}
+}
+
 extern "C" void
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
@@ -595,6 +693,9 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		return;
 	}
 
+	// Live 2D/3D A-B toggle for verifying the weave on the panel.
+	apply_backlight_toggle(cnsdk);
+
 	DXR_ATRACE("dxr_cnsdk:weave");
 	// Calibration knob (B18): flip_input_uv_vertical defaults to true
 	// because we assume CNSDK uses GL convention (Y-up) and Vulkan NDC
@@ -605,15 +706,16 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 
 	// Atlas mode: hand CNSDK the SBS atlas VkImage+View each frame; it
 	// splits internally per the 2x1 layout set in ensure_interlacer.
-	// (Previously this function blitted tiles into per-view images and
-	// passed those — see git log for the per-tile-blit history.)
-	leia_interlacer_vulkan_set_interlace_view_texture_atlas(
-	    cnsdk->interlacer, atlas_image, atlas_view);
+	// CNSDK 0.10.x renamed set_interlace_view_texture_atlas →
+	// set_source_views(texture, view, viewIndex, layer); with atlas-for-views
+	// enabled, viewIndex 0 / layer 0 designates the whole atlas.
+	// (set_shader_debug_mode was removed in 0.10.x.)
+	leia_interlacer_vulkan_set_source_views(
+	    cnsdk->interlacer, atlas_image, atlas_view, /*viewIndex=*/0, /*layer=*/0);
 	leia_interlacer_set_source_views_size(
 	    cnsdk->interlacer, (int32_t)atlas_width, (int32_t)atlas_height,
 	    /*isHorizontalViews=*/true);
 
-	leia_interlacer_set_shader_debug_mode(cnsdk->interlacer, LEIA_SHADER_DEBUG_MODE_NONE);
 	DXR_HW_DBG_ONCE("weave: first do_post_process atlas=%ux%u target=%ux%u",
 	                atlas_width, atlas_height, w, h);
 	leia_interlacer_vulkan_do_post_process(

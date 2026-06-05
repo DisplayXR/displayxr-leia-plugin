@@ -76,6 +76,35 @@ struct leia_dp_cnsdk
 	struct leia_cnsdk *cnsdk;          //!< Owned.
 	struct vk_bundle *vk;              //!< Borrowed from compositor.
 	VkCommandPool cmd_pool;            //!< Borrowed from compositor; used by mono passthrough.
+
+	// CNSDK's self-submitting Vulkan weave (leia_interlacer_vulkan_do_post_process)
+	// needs a *caller-supplied* destination framebuffer (color + depth)
+	// compatible with its internal interlace render pass. The runtime
+	// compositor stays CNSDK-agnostic (ADR-019) and has no depth image, so
+	// we build + own these here. The render pass + depth target are created
+	// once per (w, h, color format); the per-swapchain-image color view +
+	// framebuffer are cached because the compositor rotates target_image
+	// through a small set of swapchain images.
+	VkRenderPass weave_rp;
+	VkImage weave_depth_img;
+	VkDeviceMemory weave_depth_mem;
+	VkImageView weave_depth_view;
+	uint32_t weave_w;
+	uint32_t weave_h;
+	VkFormat weave_color_fmt;
+	// The compositor's color view for the target image of the upcoming
+	// process_atlas, handed to us via set_target_color_view. We do NOT own
+	// it (the compositor created it and destroys it on swapchain resize) —
+	// we only build framebuffers from it. Reusing it avoids creating our own
+	// VkImageView on swapchain images, which Adreno faults on.
+	VkImageView pending_target_view;
+	// Framebuffer cache keyed by the compositor's color view. Each swapchain
+	// image has one stable view, so this is bounded by the swapchain size.
+	struct {
+		VkImageView view;   //!< Borrowed key (compositor-owned).
+		VkFramebuffer fb;   //!< Owned.
+	} weave_fb_cache[8];
+	uint32_t weave_fb_count;
 };
 
 inline leia_dp_cnsdk *
@@ -204,6 +233,244 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
 	return res == VK_SUCCESS;
 }
 
+// Tear down the cached CNSDK weave destination (render pass + depth target +
+// all per-image color views/framebuffers). Safe to call repeatedly.
+void
+destroy_weave_target(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < impl->weave_fb_count; i++) {
+		if (impl->weave_fb_cache[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, impl->weave_fb_cache[i].fb, nullptr);
+		}
+		// .view is borrowed (compositor-owned) — do NOT destroy it.
+		impl->weave_fb_cache[i] = {};
+	}
+	impl->weave_fb_count = 0;
+	if (impl->weave_depth_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, impl->weave_depth_view, nullptr);
+		impl->weave_depth_view = VK_NULL_HANDLE;
+	}
+	if (impl->weave_depth_img != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, impl->weave_depth_img, nullptr);
+		impl->weave_depth_img = VK_NULL_HANDLE;
+	}
+	if (impl->weave_depth_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, impl->weave_depth_mem, nullptr);
+		impl->weave_depth_mem = VK_NULL_HANDLE;
+	}
+	if (impl->weave_rp != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, impl->weave_rp, nullptr);
+		impl->weave_rp = VK_NULL_HANDLE;
+	}
+	impl->weave_w = 0;
+	impl->weave_h = 0;
+	impl->weave_color_fmt = VK_FORMAT_UNDEFINED;
+}
+
+// One-shot transition of the depth target into DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+// so CNSDK's interlace render pass (LOAD + that initialLayout, per CNSDK's own
+// Vulkan sample) is satisfied. Depth contents are unused (interlace is a
+// fullscreen pass) — only the layout must match.
+void
+transition_weave_depth_once(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk->main_queue == nullptr) {
+		return;
+	}
+	VkCommandBufferAllocateInfo ai = {};
+	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	ai.commandPool = impl->cmd_pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &ai, &cmd) != VK_SUCCESS) {
+		return;
+	}
+	VkCommandBufferBeginInfo bi = {};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vk->vkBeginCommandBuffer(cmd, &bi);
+	VkImageMemoryBarrier b = {};
+	b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	b.srcAccessMask = 0;
+	b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	b.image = impl->weave_depth_img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	vk->vkEndCommandBuffer(cmd);
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cmd;
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
+}
+
+// Build (once per w/h/format) the CNSDK-compatible destination render pass
+// (color + depth) and depth target. Render-pass compatibility is format-based,
+// so matching the attachment formats CNSDK's interlacer was initialized with
+// (color = target format, depth = D32_SFLOAT) lets its internal
+// vkCmdBeginRenderPass accept a framebuffer we built. Mirrors CNSDK's own
+// Vulkan sample (cnsdk/samples/leia/lwEngine/LWE_Core.cpp). Returns false on
+// failure → the caller skips the weave that frame (never crashes the loop).
+bool
+ensure_weave_rp_and_depth(leia_dp_cnsdk *impl, uint32_t w, uint32_t h, VkFormat color_fmt)
+{
+	struct vk_bundle *vk = impl->vk;
+
+	if (impl->weave_rp != VK_NULL_HANDLE && impl->weave_w == w &&
+	    impl->weave_h == h && impl->weave_color_fmt == color_fmt) {
+		return true;
+	}
+	// Params changed (e.g. orientation swap) — rebuild from scratch.
+	destroy_weave_target(impl);
+
+	VkAttachmentDescription color = {};
+	color.format = color_fmt;
+	color.samples = VK_SAMPLE_COUNT_1_BIT;
+	color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentDescription depth = {};
+	depth.format = VK_FORMAT_D32_SFLOAT;
+	depth.samples = VK_SAMPLE_COUNT_1_BIT;
+	depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	depth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentReference color_ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkAttachmentReference depth_ref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+	VkSubpassDescription subpass = {};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &color_ref;
+	subpass.pDepthStencilAttachment = &depth_ref;
+
+	VkSubpassDependency dep = {};
+	dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dep.dstSubpass = 0;
+	dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	VkAttachmentDescription atts[2] = {color, depth};
+	VkRenderPassCreateInfo rpci = {};
+	rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	rpci.attachmentCount = 2;
+	rpci.pAttachments = atts;
+	rpci.subpassCount = 1;
+	rpci.pSubpasses = &subpass;
+	rpci.dependencyCount = 1;
+	rpci.pDependencies = &dep;
+	if (vk->vkCreateRenderPass(vk->device, &rpci, nullptr, &impl->weave_rp) != VK_SUCCESS) {
+		impl->weave_rp = VK_NULL_HANDLE;
+		U_LOG_W("ensure_weave_rp_and_depth: vkCreateRenderPass failed");
+		return false;
+	}
+
+	VkExtent2D ext = {w, h};
+	if (vk_create_image_simple(vk, ext, VK_FORMAT_D32_SFLOAT,
+	        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+	        &impl->weave_depth_mem, &impl->weave_depth_img) != VK_SUCCESS) {
+		U_LOG_W("ensure_weave_rp_and_depth: depth image create failed");
+		destroy_weave_target(impl);
+		return false;
+	}
+	VkImageSubresourceRange depth_range = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+	if (vk_create_view(vk, impl->weave_depth_img, VK_IMAGE_VIEW_TYPE_2D,
+	        VK_FORMAT_D32_SFLOAT, depth_range, &impl->weave_depth_view) != VK_SUCCESS) {
+		U_LOG_W("ensure_weave_rp_and_depth: depth view create failed");
+		destroy_weave_target(impl);
+		return false;
+	}
+	transition_weave_depth_once(impl);
+
+	impl->weave_w = w;
+	impl->weave_h = h;
+	impl->weave_color_fmt = color_fmt;
+	DXR_HW_DBG("weave target built: rp=%p depth=%p %ux%u colorFmt=%d",
+	           (void *)impl->weave_rp, (void *)impl->weave_depth_img, w, h, (int)color_fmt);
+	return true;
+}
+
+// Look up (or lazily create + cache) the destination framebuffer wrapping the
+// compositor's color view (set via set_target_color_view) for the upcoming
+// target image, plus our shared depth view. We build NO image views on
+// swapchain images ourselves — the compositor owns those. Returns
+// VK_NULL_HANDLE on failure (caller skips the weave).
+VkFramebuffer
+get_or_create_weave_fb(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	VkImageView color_view = impl->pending_target_view;
+	if (color_view == VK_NULL_HANDLE) {
+		// Runtime didn't hand us a target view (older runtime without the
+		// set_target_color_view slot). We can't safely mint our own on this
+		// driver, so skip the weave this frame.
+		DXR_HW_DBG_ONCE("get_or_create_weave_fb: no target view from compositor; skipping weave");
+		return VK_NULL_HANDLE;
+	}
+	for (uint32_t i = 0; i < impl->weave_fb_count; i++) {
+		if (impl->weave_fb_cache[i].view == color_view) {
+			return impl->weave_fb_cache[i].fb;
+		}
+	}
+	if (impl->weave_fb_count >= 8) {
+		// Swapchains have only a handful of images; a full cache means the
+		// view set churned unexpectedly. Don't grow unbounded.
+		U_LOG_W("get_or_create_weave_fb: cache full, skipping weave");
+		return VK_NULL_HANDLE;
+	}
+	VkImageView atts[2] = {color_view, impl->weave_depth_view};
+	VkFramebufferCreateInfo fbci = {};
+	fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fbci.renderPass = impl->weave_rp;
+	fbci.attachmentCount = 2;
+	fbci.pAttachments = atts;
+	fbci.width = impl->weave_w;
+	fbci.height = impl->weave_h;
+	fbci.layers = 1;
+	DXR_HW_DBG("weave fb create: rp=%p color_view=%p depth_view=%p %ux%u",
+	           (void *)impl->weave_rp, (void *)color_view, (void *)impl->weave_depth_view,
+	           impl->weave_w, impl->weave_h);
+	VkFramebuffer fb = VK_NULL_HANDLE;
+	if (vk->vkCreateFramebuffer(vk->device, &fbci, nullptr, &fb) != VK_SUCCESS) {
+		U_LOG_W("get_or_create_weave_fb: vkCreateFramebuffer failed");
+		return VK_NULL_HANDLE;
+	}
+	impl->weave_fb_cache[impl->weave_fb_count].view = color_view;
+	impl->weave_fb_cache[impl->weave_fb_count].fb = fb;
+	impl->weave_fb_count++;
+	DXR_HW_DBG("weave fb cached[%u]: color_view=%p fb=%p", impl->weave_fb_count - 1,
+	           (void *)color_view, (void *)fb);
+	return fb;
+}
+
+// Compositor hands us the color view for the next process_atlas target.
+void
+set_target_color_view_cnsdk(struct xrt_display_processor *xdp, VkImageView color_view)
+{
+	as_impl(xdp)->pending_target_view = color_view;
+}
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -227,6 +494,7 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	DXR_ATRACE("dxr_dp:process_atlas_weave");
 	(void)cmd_buffer;     // self-submitting: compositor passes VK_NULL_HANDLE
 	(void)view_format;
+	(void)target_fb;      // self-submit: compositor has no CNSDK-compatible FB; we build our own
 	(void)canvas_offset_x; (void)canvas_offset_y;
 	(void)canvas_width; (void)canvas_height;
 
@@ -277,8 +545,36 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	}
 	DXR_HW_DBG_ONCE("process_atlas_weave: first frame with ready interlacer");
 
+	// Build the CNSDK destination framebuffer (color + depth). The
+	// compositor's target_fb is NULL for a self-submitting DP — CNSDK needs
+	// a framebuffer compatible with its internal interlace render pass, which
+	// only we can construct (it requires a depth attachment the compositor
+	// has no knowledge of). Skip the weave (don't crash) if it can't be built.
+	if (!ensure_weave_rp_and_depth(impl, target_width, target_height, (VkFormat)target_format)) {
+		return;
+	}
+	VkFramebuffer dest_fb = get_or_create_weave_fb(impl);
+	if (dest_fb == VK_NULL_HANDLE) {
+		return;
+	}
+
 	const uint32_t atlas_w = view_width * tile_columns;
 	const uint32_t atlas_h = view_height * tile_rows;
+
+	{
+		// HW-2c-geo diagnostic: dump the exact geometry handed to CNSDK once.
+		// Ghosting + wrong-aspect together would show up here as a per-view
+		// aspect that doesn't match a real eye image or a tile/atlas mismatch.
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("HW_GEO: view=%ux%u (aspect %.3f) tiles=%ux%u atlas=%ux%u target=%ux%u fmt=%d",
+			        view_width, view_height,
+			        view_height ? (float)view_width / (float)view_height : 0.0f,
+			        tile_columns, tile_rows, atlas_w, atlas_h, target_width, target_height,
+			        (int)target_format);
+		}
+	}
 
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 	static int dp_dbg_frame = 0;
@@ -298,7 +594,7 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                 (VkFormat)target_format,
 	                 target_width,
 	                 target_height,
-	                 target_fb,
+	                 dest_fb,
 	                 (VkImage)(uintptr_t)target_image);
 }
 
@@ -413,9 +709,13 @@ destroy_impl(struct xrt_display_processor *xdp)
 		impl->vk->vkDeviceWaitIdle(impl->vk->device);
 	}
 
+	// Destroy CNSDK first (it may still reference our framebuffers via its
+	// interlacer), then our weave destination (render pass + depth + cached
+	// per-image views/framebuffers). Both are after the device-idle above.
 	if (impl->cnsdk != nullptr) {
 		leia_cnsdk_destroy(&impl->cnsdk);
 	}
+	destroy_weave_target(impl);
 	free(impl);
 }
 
@@ -458,6 +758,7 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->base.on_pause = on_pause_cnsdk;
 	impl->base.on_resume = on_resume_cnsdk;
 	impl->base.is_self_submitting = is_self_submitting_true;
+	impl->base.set_target_color_view = set_target_color_view_cnsdk;
 	impl->base.get_predicted_eye_positions = get_predicted_eye_positions_ipd;
 	impl->base.get_display_dimensions = get_display_dimensions_default;
 	impl->base.get_display_pixel_info = get_display_pixel_info_default;
