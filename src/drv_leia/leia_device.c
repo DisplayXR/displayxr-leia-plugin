@@ -206,7 +206,8 @@ leia_hmd_create(void)
 	// Rendering modes: Leia exposes 2 modes (2D + LeiaSR).
 	hmd->base.rendering_mode_count = 2;
 
-	// Mode 0: 2D (mono, full resolution, 1×1 tile)
+	// Mode 0: 2D (mono, full resolution, 1×1 tile). Untracked — mode_flags
+	// stays 0 unless/until a "2D tracked" product mode is added (#29).
 	hmd->base.rendering_modes[0].mode_index = 0;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
@@ -215,8 +216,11 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[0].hardware_display_3d = false;
 	hmd->base.rendering_modes[0].tile_columns = 1;
 	hmd->base.rendering_modes[0].tile_rows = 1;
+	hmd->base.rendering_modes[0].mode_flags = 0;
 
-	// Mode 1: LeiaSR (stereo, 2×1 = SBS, scale from SR SDK — set later by target_instance)
+	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from SR SDK — set later by
+	// target_instance). Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
+	// reserved[] stays zeroed via the calloc'd U_DEVICE_ALLOCATE block.
 	hmd->base.rendering_modes[1].mode_index = 1;
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
 	hmd->base.rendering_modes[1].view_count = 2;
@@ -225,6 +229,7 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[1].hardware_display_3d = true;
 	hmd->base.rendering_modes[1].tile_columns = 2;
 	hmd->base.rendering_modes[1].tile_rows = 1;
+	hmd->base.rendering_modes[1].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
 
 	hmd->base.hmd->active_rendering_mode_index = 1; // Default to LeiaSR (3D)
 
