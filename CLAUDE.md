@@ -70,6 +70,7 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
 | `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `$RuntimeInstall\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Path, ProbeOrder}`. |
 | `scripts/build-windows.bat` | Local Windows build entry point. |
+| `docs/` | Leia implementation internals (weaver, transparency, chroma-key, phase snapping, mode switching) — migrated from the runtime's `docs/vendors/leia/`. Start at `docs/README.md`. |
 
 ## Build commands
 

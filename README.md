@@ -17,6 +17,19 @@ This repo was extracted from `DisplayXR/displayxr-runtime` per issue [#263](http
 
 CMake build glue + CI workflow + `scripts/build-windows.bat` follow in a separate commit (see issue #263 plan).
 
+## Documentation
+
+Implementation internals live in [`docs/`](docs/) (migrated from the runtime's `docs/vendors/leia/`):
+
+- [Integration overview](docs/README.md) — source layout, build flags, eye-tracking mode
+- [Weaver internals](docs/weaver.md) — DX11 / DX12 / GL / Vulkan weaver creation, weave() flow, DPI, phase math
+- [Transparency model](docs/transparency.md) — WGC compose-under-bg (primary) on D3D11 / D3D12 / Vulkan
+- [Chroma-key overlay](docs/chroma-key-overlay.md) — legacy fallback; still the only path on the GL DP
+- [Window phase snapping](docs/window-phase-snapping.md) — SR weaver WndProc subclassing for lenticular phase alignment
+- [Display mode switching](docs/display-mode-switching.md) — 2D/3D via `SwitchableLensHint` / backlight
+
+The vendor-neutral contract (what any plug-in must implement) stays in the runtime repo: `docs/specs/vendor/`, `docs/specs/runtime/plugin-discovery.md`, `docs/guides/vendor-plugin-onboarding.md`.
+
 ## License
 
 [BSL-1.0](LICENSE) — same as the DisplayXR runtime.
