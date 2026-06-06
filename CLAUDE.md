@@ -43,8 +43,10 @@ This plug-in's compatibility with a given runtime is governed by
 `XRT_PLUGIN_API_VERSION_CURRENT`. The plug-in reports its supported
 ABI from the runtime headers it was built against:
 
-- `CMakeLists.txt` pins `DXR_RUNTIME_GIT_TAG` (currently a `v*` runtime tag).
-- That tag's `xrt_plugin.h` defines `XRT_PLUGIN_API_VERSION_CURRENT`.
+- `CMakeLists.txt` pins `DXR_RUNTIME_GIT_TAG` (a `v*` runtime tag, or a runtime
+  `main` SHA pre-release when tracking an ABI bump that hasn't tagged yet —
+  re-pin to the tag at the coupled release).
+- That ref's `xrt_plugin.h` defines `XRT_PLUGIN_API_VERSION_CURRENT`.
 - `src/drv_leia/leia_plugin.c::xrtPluginNegotiate` reports that value.
 - The runtime's loader (`target_plugin_loader.c`) **rejects** plug-ins reporting an ABI major different from the runtime's current ABI (ADR-020 rule 3).
 

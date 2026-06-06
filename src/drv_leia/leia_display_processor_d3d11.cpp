@@ -1294,7 +1294,21 @@ leia_dp_d3d11_get_predicted_eye_positions(struct xrt_display_processor_d3d11 *xd
 	out_eye_pos->eyes[1].z = right[2];
 	out_eye_pos->count = 2;
 	out_eye_pos->valid = true;
-	out_eye_pos->is_tracking = true;
+	// Tracking-loss heuristic (#29 / runtime #441): in MANAGED mode the SR
+	// SDK keeps serving animated positions through its grace period and
+	// collapses the eye pair toward a single point as it falls back to 2D —
+	// so near-zero inter-eye distance ⇔ tracking lost, with the flip timing
+	// aligned to the actual 2D switch as the eye-tracking-modes spec
+	// recommends. Same heuristic as leiasr_get_predicted_eye_positions()
+	// (leia_sr.cpp); positions here are meters, so 1e-6 ⇔ 1 mm (real pair
+	// ~63 mm apart). MUST be computed on the raw pair, before any 2D-mode
+	// midpoint average.
+	{
+		const float dx = right[0] - left[0];
+		const float dy = right[1] - left[1];
+		const float dz = right[2] - left[2];
+		out_eye_pos->is_tracking = (dx * dx + dy * dy + dz * dz) > 1e-6f;
+	}
 	// In 2D mode, average L/R to a single midpoint eye.
 	if (ldp->view_count == 1 && out_eye_pos->count >= 2) {
 		out_eye_pos->eyes[0].x = (out_eye_pos->eyes[0].x + out_eye_pos->eyes[1].x) * 0.5f;
