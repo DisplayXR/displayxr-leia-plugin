@@ -1,0 +1,39 @@
+// Configured by CMake (runtime issue #461): embed VERSIONINFO so the
+// runtime's plug-in loader can compare the DLL on disk against the
+// registry-declared install version and warn on skew (an installer that
+// hits a locked DLL in a silent install skips it with exit 0, leaving an
+// old DLL under a new registry entry — the v0.14.0 bundle incident).
+// FILEVERSION major.minor.patch MUST track PROJECT_VERSION: the loader
+// compares it against HKLM\...\DisplayProcessors\leia-sr\Version, which
+// the NSI writes from the same PROJECT_VERSION.
+// Use the Windows SDK resource header (winres.h is Visual-Studio-only).
+#include <winresrc.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@BUILD_NUM@
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@BUILD_NUM@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x2L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Leia Inc."
+            VALUE "FileDescription", "DisplayXR Leia SR Display Processor Plug-in"
+            VALUE "FileVersion", "@PROJECT_VERSION@.@BUILD_NUM@"
+            VALUE "InternalName", "DisplayXR-LeiaSR"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Leia Inc."
+            VALUE "OriginalFilename", "DisplayXR-LeiaSR.dll"
+            VALUE "ProductName", "DisplayXR Leia SR Plug-in"
+            VALUE "ProductVersion", "@PROJECT_VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
