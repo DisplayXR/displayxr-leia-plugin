@@ -23,6 +23,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 - **[Chroma-key overlay (legacy / OpenGL fallback)](chroma-key-overlay.md)** — fallback path; still the only transparency path on the Leia OpenGL DP.
 - **[Window phase snapping](window-phase-snapping.md)** — the SR weaver's automatic `WndProc` subclassing for lenticular phase alignment during window drag (Windows), and the resolved `WndProcDispatcher` race.
 - **[Display mode switching (2D/3D)](display-mode-switching.md)** — how the plug-in maps the neutral mode-request API onto `SwitchableLensHint` (Windows) / `leia_core_set_backlight` (Android).
+- **[CNSDK Android calibration](cnsdk-android-calibration.md)** — symptom→fix procedure for the three CNSDK convention assumptions (face axes, tile-to-eye mapping, UV flip); pending Lume Pad hardware validation.
 
 ## Build flags
 

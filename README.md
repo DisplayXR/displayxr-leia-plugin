@@ -27,6 +27,7 @@ Implementation internals live in [`docs/`](docs/) (migrated from the runtime's `
 - [Chroma-key overlay](docs/chroma-key-overlay.md) — legacy fallback; still the only path on the GL DP
 - [Window phase snapping](docs/window-phase-snapping.md) — SR weaver WndProc subclassing for lenticular phase alignment
 - [Display mode switching](docs/display-mode-switching.md) — 2D/3D via `SwitchableLensHint` / backlight
+- [CNSDK Android calibration](docs/cnsdk-android-calibration.md) — face axes / tile-to-eye / UV-flip validation procedure for Lume Pad
 
 The vendor-neutral contract (what any plug-in must implement) stays in the runtime repo: `docs/specs/vendor/`, `docs/specs/runtime/plugin-discovery.md`, `docs/guides/vendor-plugin-onboarding.md`.
 
