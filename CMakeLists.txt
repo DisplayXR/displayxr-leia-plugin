@@ -41,18 +41,17 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to the runtime's merged #446 commit (plug-in ABI v3 per #441 —
+    # Pinned to displayxr-runtime v1.13.0 (plug-in ABI v3 per #441 —
     # xrt_rendering_mode gained mode_flags + reserved[3], an element-stride
-    # ABI break; runtime-repo issue #441 / this repo's #29). Pre-release SHA
-    # pin: re-pin to the first runtime tag ≥ this commit at the coupled
-    # release (ADR-020). The DP vtables carry a struct_size header; the
-    # runtime's loader rejects any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT
-    # differs from its own. This plug-in MUST be built against headers that
-    # ship the matching major, or the runtime will log "ABI major mismatch —
-    # plugin_api=N, runtime expects M ... skipping (ADR-020 rule 3)" and fall
-    # back to sim_display. The rule-5 CI self-check below asserts this value
-    # equals the workflow's runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "35f57c5f825e5f40c47a416753ae7b15f8e48a8e" CACHE STRING
+    # ABI break; runtime-repo issue #441 / this repo's #29). The DP vtables
+    # carry a struct_size header; the runtime's loader rejects any plug-in
+    # whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own. This plug-in
+    # MUST be built against headers that ship the matching major, or the
+    # runtime will log "ABI major mismatch — plugin_api=N, runtime expects M
+    # ... skipping (ADR-020 rule 3)" and fall back to sim_display. The rule-5
+    # CI self-check below asserts this value equals the workflow's runtime
+    # checkout ref so the two can't drift.
+    set(DXR_RUNTIME_GIT_TAG "v1.13.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
