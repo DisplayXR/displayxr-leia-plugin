@@ -75,6 +75,12 @@ endif()
 
 # --- Plug-in DLL target -------------------------------------------------
 
+# #461 (runtime repo): embed a VERSIONINFO resource tracking PROJECT_VERSION
+# so the runtime's plug-in loader can detect registry/disk version skew
+# (installer silently skipped a locked DLL).
+configure_file(version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/version.rc" @ONLY)
+list(APPEND LEIA_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/version.rc")
+
 add_library(DisplayXR-LeiaSR SHARED ${LEIA_SOURCES})
 
 # leia_display_processor.cpp uses C++20 designated initializers for the

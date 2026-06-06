@@ -48,6 +48,12 @@ InstallDirRegKey HKLM "Software\DisplayXR\Plugins\LeiaSR" "InstallPath"
 RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
+; #461 (runtime repo): a silent install must NEVER skip a locked file and
+; exit 0 — that's how the v0.14.0 bundle left an old DLL on disk under a
+; new registry Version (displayxr-service had the plug-in mapped). With
+; AllowSkipFiles off, a locked file aborts the install with a non-zero
+; exit code instead, and the registry below is never written.
+AllowSkipFiles off
 
 ; Modern UI
 !include "MUI2.nsh"
@@ -111,10 +117,16 @@ Section "Leia SR Plug-in" SecPlugin
 
 	SetOutPath "$INSTDIR"
 
-	; Kill any in-flight cube / app process that might have the plug-in
-	; loaded (mirrors the runtime installer's process-kill pattern).
-	; Once the registry is rewritten, the next xrCreateInstance picks
-	; the new DLL up.
+	; #461: stop displayxr-service BEFORE the File steps — it maps this
+	; plug-in DLL once any client has connected, and a locked DLL would
+	; abort the install (AllowSkipFiles off above). The runtime installer
+	; (or its logon Run key) started it; we restart it at the end of this
+	; section. In the bundle chain the bundle stops it up-front and
+	; restarts it once at the end — our kill/restart is then redundant
+	; but harmless (the service has a single-instance pipe guard).
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	Pop $0
+	Sleep 1500   ; let the killed process release its file handles
 
 	; Install the plug-in DLL.
 	File "${BIN_DIR}\plugins\DisplayXR-LeiaSR.dll"
@@ -192,6 +204,25 @@ Section "Leia SR Plug-in" SecPlugin
 	IntFmt $0 "0x%08X" $0
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR" \
 		"EstimatedSize" "$0"
+
+	; #461: restart the service we killed above so the box doesn't sit
+	; service-less until the next logon / shell launch. '/NOSTART' (passed
+	; by the bundle, which restarts the service ONCE after the whole
+	; chain) suppresses this; unknown switches are ignored by older
+	; installers so callers can always pass it.
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOSTART" $R1
+	${IfNot} ${Errors}
+		DetailPrint "Skipping service restart (/NOSTART)."
+	${Else}
+		ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+		${If} $0 != ""
+		${AndIf} ${FileExists} "$0\displayxr-service.exe"
+			DetailPrint "Restarting DisplayXR Service..."
+			Exec '"$0\displayxr-service.exe"'
+		${EndIf}
+	${EndIf}
 
 SectionEnd
 
