@@ -259,6 +259,27 @@ struct leia_display_processor_d3d11_impl
 	//! (Model A) — so an old runtime that never calls the setter stays passthrough.
 	enum xrt_atlas_encoding atlas_encoding;
 
+	//! @name #224 local 2D/3D zones — 1×1 leg
+	//! The runtime publishes the XR_EXT_local_3d_zone mask per frame; on this
+	//! single-zone panel the OR-collapse is "mask has any non-zero pixel ⟹
+	//! this client hints 3D", mapped onto the per-client SR lens hint
+	//! (leiasr_d3d11_request_display_mode — the SR service arbitrates hints
+	//! across clients and applies its own admin/lock-screen supersedes, which
+	//! is exactly the spec's union + override contract). Content is evaluated
+	//! once per mask GENERATION (the publish seq bumps only on submit), via a
+	//! lazily-allocated staging readback. The zone path deliberately does NOT
+	//! touch view_count — a partial-3D mask keeps the panel hint 3D while the
+	//! weave continues at the active rendering mode's view count.
+	//! @{
+	uint64_t zone_eval_seq;        //!< Generation last content-evaluated.
+	bool zone_eval_valid;          //!< zone_eval_seq/zone_want_3d are valid.
+	bool zone_want_3d;             //!< Verdict for zone_eval_seq (any non-zero).
+	bool zone_hint_3d;             //!< Lens-hint state the zone path last set.
+	bool zone_active;              //!< A publish is live (not cleared).
+	ID3D11Texture2D *zone_staging; //!< Readback scratch (mask-sized, R8).
+	uint32_t zone_staging_w, zone_staging_h;
+	//! @}
+
 	//! @name Chroma-key transparency support (lazy-allocated on first frame)
 	//!
 	//! Enabled via set_chroma_key() when the session asked for a transparent
@@ -1343,6 +1364,160 @@ leia_dp_d3d11_request_display_mode(struct xrt_display_processor_d3d11 *xdp, bool
 	return ok;
 }
 
+
+/*
+ *
+ * #224 local 2D/3D zones — 1×1 leg (see the impl-struct comment block).
+ *
+ * Both this path and leia_dp_d3d11_request_display_mode drive the same SR
+ * lens hint; last caller wins on the SR side. Mixing them in one app (an
+ * active zone mask + legacy mode requests) is contradictory by definition —
+ * the spec lets zone-capable DPs treat request_display_mode(true) as an
+ * all-1 publish, and the runtime stops issuing legacy requests for zone
+ * clients as the legs converge.
+ *
+ */
+
+static bool
+leia_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	if (out_caps == nullptr || out_caps->struct_size < sizeof(struct xrt_dp_local_zone_caps)) {
+		return false;
+	}
+	// Zones are driven through the per-client SR lens hint — needs the hint
+	// channel to exist (same gate as request_display_mode support).
+	if (!leiasr_d3d11_supports_display_mode_switch(ldp->leiasr)) {
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = 1; // single-zone panel: union collapses to global on/off
+	out_caps->zone_grid_height = 1;
+	out_caps->max_mask_width = 0; // no preference — content is reduced to one bit
+	out_caps->max_mask_height = 0;
+	out_caps->max_update_hz = 0; // edge-triggered internally (verdict changes only)
+	return true;
+}
+
+static bool
+leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
+                                      void *d3d11_context,
+                                      void *mask_srv,
+                                      uint32_t mask_width,
+                                      uint32_t mask_height,
+                                      int32_t screen_x,
+                                      int32_t screen_y,
+                                      uint32_t screen_w,
+                                      uint32_t screen_h,
+                                      uint64_t seq)
+{
+	// 1×1 grid: the screen anchor can't change the verdict — only content
+	// matters, and content only changes per generation (seq).
+	(void)screen_x;
+	(void)screen_y;
+	(void)screen_w;
+	(void)screen_h;
+
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(mask_srv);
+	if (ctx == nullptr || srv == nullptr || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+
+	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
+	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
+	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
+		if (ldp->zone_staging == nullptr || ldp->zone_staging_w != mask_width ||
+		    ldp->zone_staging_h != mask_height) {
+			if (ldp->zone_staging != nullptr) {
+				ldp->zone_staging->Release();
+				ldp->zone_staging = nullptr;
+			}
+			D3D11_TEXTURE2D_DESC td = {};
+			td.Width = mask_width;
+			td.Height = mask_height;
+			td.MipLevels = 1;
+			td.ArraySize = 1;
+			td.Format = DXGI_FORMAT_R8_UNORM; // the XR_EXT_local_3d_zone mask format
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_STAGING;
+			td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			if (ldp->device == nullptr || FAILED(ldp->device->CreateTexture2D(&td, nullptr, &ldp->zone_staging))) {
+				ldp->zone_staging = nullptr;
+				return false; // can't evaluate — don't flip the lens blindly
+			}
+			ldp->zone_staging_w = mask_width;
+			ldp->zone_staging_h = mask_height;
+		}
+
+		ID3D11Resource *res = nullptr;
+		srv->GetResource(&res);
+		if (res == nullptr) {
+			return false;
+		}
+		ctx->CopyResource(ldp->zone_staging, res);
+		res->Release();
+
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		if (FAILED(ctx->Map(ldp->zone_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+			return false;
+		}
+		bool any = false;
+		for (uint32_t y = 0; y < mask_height && !any; y++) {
+			const uint8_t *row = static_cast<const uint8_t *>(mapped.pData) + (size_t)y * mapped.RowPitch;
+			for (uint32_t x = 0; x < mask_width; x++) {
+				if (row[x] != 0) {
+					any = true;
+					break;
+				}
+			}
+		}
+		ctx->Unmap(ldp->zone_staging, 0);
+
+		ldp->zone_want_3d = any;
+		ldp->zone_eval_seq = seq;
+		ldp->zone_eval_valid = true;
+		U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
+		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+	}
+
+	// Edge-triggered lens hint: flip only when the verdict changes (or on the
+	// first publish), so per-frame republish costs nothing SR-side.
+	if (!ldp->zone_active || ldp->zone_hint_3d != ldp->zone_want_3d) {
+		if (!leiasr_d3d11_request_display_mode(ldp->leiasr, ldp->zone_want_3d)) {
+			return false;
+		}
+		ldp->zone_hint_3d = ldp->zone_want_3d;
+	}
+	ldp->zone_active = true;
+	return true;
+}
+
+static bool
+leia_dp_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	// End of zone authority for this client — hand the lens back to the MODE
+	// authority: restore the hint to what the active rendering mode implies
+	// (view_count ≥ 2 ⟹ a 3D mode is active and the compositor snaps back to
+	// the canvas weave, which needs a 3D panel; view_count 1 ⟹ 2D mode).
+	// Blindly disabling here would strand a 3D-mode canvas weave on a 2D
+	// panel after mask destroy.
+	if (ldp->zone_active) {
+		bool mode_wants_3d = ldp->view_count >= 2;
+		if (ldp->zone_hint_3d != mode_wants_3d) {
+			leiasr_d3d11_request_display_mode(ldp->leiasr, mode_wants_3d);
+		}
+		ldp->zone_hint_3d = false;
+		U_LOG_W("SR D3D11 zone: cleared — lens handed back to mode authority (%s)",
+		        mode_wants_3d ? "3D" : "2D");
+	}
+	ldp->zone_active = false;
+	ldp->zone_eval_valid = false;
+	return true;
+}
+
 static bool
 leia_dp_d3d11_get_hardware_3d_state(struct xrt_display_processor_d3d11 *xdp, bool *out_is_3d)
 {
@@ -1473,6 +1648,10 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	compose_release_resources(ldp);
 	ck_release_resources(ldp);
 
+	if (ldp->zone_staging != NULL) {
+		ldp->zone_staging->Release();
+	}
+
 	if (ldp->leiasr != NULL) {
 		leiasr_d3d11_destroy(&ldp->leiasr);
 	}
@@ -1505,6 +1684,10 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
+	// #224 local 2D/3D zones — 1×1 leg (slots 12–14, runtime gates on struct_size).
+	ldp->base.get_local_zone_caps = leia_dp_d3d11_get_local_zone_caps;
+	ldp->base.publish_local_zone_mask = leia_dp_d3d11_publish_local_zone_mask;
+	ldp->base.clear_local_zone_mask = leia_dp_d3d11_clear_local_zone_mask;
 }
 
 
