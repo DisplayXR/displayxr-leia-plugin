@@ -478,6 +478,28 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+#ifdef XRT_OS_ANDROID
+	// LOXR-730/733: register the host Activity for orientation tracking so the
+	// core's orientation auto-detect follows the real device orientation across
+	// rotations. The native (NativeActivity) path otherwise never does this;
+	// Leia's own Java sample calls LeiaSDK.limitOrientations(activity,
+	// legalOrientations) at startup (com.leia.sdk.test MainActivity.kt:102).
+	// This matters for the weave because leia_interlacer_vulkan_do_post_process
+	// takes NO orientation param — the interlacing shader reads orientation from
+	// the core. If the core's orientation is stale in landscape, the landscape
+	// weave ghosts (clean portrait, double-image landscape). All four
+	// orientations are legal for us.
+	if (activity != NULL) {
+		struct leia_legal_orientations legal = {};
+		legal.portrait = 1;
+		legal.landscape = 1;
+		legal.reversePortrait = 1;
+		legal.reverseLandscape = 1;
+		leia_core_limit_orientations(lib, (jobject)activity, &legal);
+		DXR_HW_DBG("leia_cnsdk_create: limit_orientations(all) registered activity=%p", activity);
+	}
+#endif
+
 	struct leia_core_init_configuration *config = leia_core_init_configuration_alloc(lib, CNSDK_VERSION);
 
 #ifdef XRT_OS_ANDROID
