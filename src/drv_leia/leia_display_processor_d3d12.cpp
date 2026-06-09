@@ -147,10 +147,16 @@ static const char *alpha_gate_ps_source = R"(
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 Texture2D<float4> backbuffer : register(t0);
 Texture2D<float4> atlas      : register(t1);
+// #491 part 3 — runtime's flattened 2D-under backdrop (premultiplied). A real
+// under-layer: where the atlas is transparent but the backdrop covers, emit the
+// backdrop premultiplied with its own alpha (DWM composites it over the LIVE
+// desktop) instead of punching to full transparency.
+Texture2D<float4> backdrop   : register(t2);
 SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
     uint2 tile_count;
-    uint2 pad;
+    uint  has_backdrop;       // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
+    uint  pad;
     float2 canvas_uv_origin;  // canvas sub-rect origin on the window, normalized
     float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
 };
@@ -169,9 +175,17 @@ float4 main(VSOut i) : SV_Target {
         }
     }
     float2 bb_uv = canvas_uv_origin + i.uv * canvas_uv_extent;
-    float3 rgb = backbuffer.Sample(samp, bb_uv).rgb;
-    float m = all_transparent ? 0.0 : 1.0;
-    return float4(rgb * m, m);
+    if (!all_transparent) {
+        // Woven 3D content (already over backdrop-over-desktop): opaque.
+        return float4(backbuffer.Sample(samp, bb_uv).rgb, 1.0);
+    }
+    // #491 part 3 — atlas transparent: emit the backdrop premultiplied with its
+    // own alpha (DWM adds the live desktop) instead of punching fully through.
+    if (has_backdrop != 0) {
+        float4 bd = backdrop.Sample(samp, bb_uv);
+        return float4(bd.rgb, bd.a);
+    }
+    return float4(0.0, 0.0, 0.0, 0.0); // live desktop
 }
 )";
 
@@ -179,12 +193,16 @@ static const char *compose_under_bg_ps_source = R"(
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 Texture2D<float4> atlas : register(t0);
 Texture2D<float4> bg    : register(t1);
+// #491 part 3 — runtime's flattened 2D-under backdrop (premultiplied,
+// window-client-area). Composited OVER the captured desktop when has_backdrop.
+Texture2D<float4> backdrop : register(t2);
 SamplerState samp       : register(s0);
 cbuffer Constants : register(b0) {
     float2 bg_uv_origin;
     float2 bg_uv_extent;
     uint2  tile_count;
-    uint2  pad0;
+    uint   has_backdrop;  // #491 part 3 — 1 ⟹ composite backdrop over desktop
+    uint   pad0;
     float3 chroma_rgb;    // sentinel for fully-transparent atlas pixels
     float  pad1;
 };
@@ -195,6 +213,12 @@ float4 main(VSOut i) : SV_Target {
     float2 tile_local = frac(i.uv * float2(tile_count));
     float2 bg_uv = bg_uv_origin + tile_local * bg_uv_extent;
     float3 b = bg.SampleLevel(samp, bg_uv, 0).rgb;
+    // #491 part 3 — flat z=0 backdrop sampled at window-local tile_local;
+    // premultiplied "over" the desktop before the atlas-over.
+    if (has_backdrop != 0) {
+        float4 bd = backdrop.Sample(samp, tile_local);
+        b = bd.rgb + (1.0 - bd.a) * b;
+    }
     return float4(lerp(b, a.rgb, a.a), 1.0);
 }
 )";
@@ -268,9 +292,18 @@ struct leia_display_processor_d3d12_impl
 	UINT cbv_srv_desc_size;              //!< Cached for offset arithmetic in compose heap.
 
 	// Post-weave alpha-gate (replaces ck_strip when compose is active).
-	// Reuses compose_root_sig (12 32-bit constants, 2-SRV table, linear sampler).
+	// Reuses compose_root_sig (12 32-bit constants, 3-SRV table, linear sampler).
 	ID3D12PipelineState *alpha_gate_pso;
-	ID3D12DescriptorHeap *alpha_gate_srv_heap; //!< Shader-visible, 2 entries (backbuffer, atlas).
+	ID3D12DescriptorHeap *alpha_gate_srv_heap; //!< Shader-visible, 3 entries (backbuffer, atlas, backdrop).
+
+	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
+	//! process_atlas (set via set_background_2d; same D3D12 device as the
+	//! compositor → the runtime's ID3D12Resource is sampled directly via an SRV
+	//! we create into heap slot 2). The compose pass composites
+	//! `backdrop over captured-desktop`; the alpha-gate preserves it over the
+	//! live desktop. NULL ⟹ no backdrop (desktop-only).
+	ID3D12Resource *backdrop_resource; //!< NOT owned (compositor-owned).
+	uint32_t backdrop_w, backdrop_h;
 	//! @}
 };
 
@@ -781,14 +814,15 @@ compose_should_run(struct leia_display_processor_d3d12_impl *ldp)
 }
 
 // Root signature: 12 32-bit constants (bg_uv_origin xy + bg_uv_extent xy +
-// tile_count xy + pad xy + chroma_rgb + pad = 48 bytes) at b0 + 2-SRV
-// descriptor table (t0,t1) + static linear sampler at s0.
+// tile_count xy + has_backdrop + pad + chroma_rgb + pad = 48 bytes) at b0 +
+// 3-SRV descriptor table (t0,t1,t2 — #491 part 3 added the backdrop at t2) +
+// static linear sampler at s0. Shared by the compose + alpha-gate PSOs.
 static bool
 compose_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
 {
 	D3D12_DESCRIPTOR_RANGE srv_range = {};
 	srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	srv_range.NumDescriptors = 2;
+	srv_range.NumDescriptors = 3;
 	srv_range.BaseShaderRegister = 0;
 	srv_range.OffsetInDescriptorsFromTableStart = 0;
 
@@ -919,7 +953,7 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 	if (ldp->compose_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = 2;
+		hd.NumDescriptors = 3; // #491 part 3 — slot 2 = backdrop (t2)
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		HRESULT hr = ldp->device->CreateDescriptorHeap(
 		    &hd, __uuidof(ID3D12DescriptorHeap),
@@ -983,7 +1017,7 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 	if (ldp->alpha_gate_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = 2;
+		hd.NumDescriptors = 3; // #491 part 3 — slot 2 = backdrop (t2)
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		HRESULT hr = ldp->device->CreateDescriptorHeap(
 		    &hd, __uuidof(ID3D12DescriptorHeap),
@@ -1067,6 +1101,25 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	    atlas_resource, &atlas_srv,
 	    ldp->compose_srv_heap->GetCPUDescriptorHandleForHeapStart());
 
+	// #491 part 3 — slot 2: the 2D-under backdrop (R8G8B8A8_UNORM, premultiplied).
+	// Same device as the compositor → the runtime's resource is sampled directly.
+	// When absent, a dummy SRV (bg) keeps the descriptor valid; has_backdrop gates
+	// the sample so the dummy is never read.
+	{
+		ID3D12Resource *bd_res =
+		    (ldp->backdrop_resource != nullptr) ? ldp->backdrop_resource : ldp->bg_shared_tex;
+		D3D12_SHADER_RESOURCE_VIEW_DESC bd_srv = {};
+		bd_srv.Format = (ldp->backdrop_resource != nullptr) ? DXGI_FORMAT_R8G8B8A8_UNORM
+		                                                    : DXGI_FORMAT_B8G8R8A8_UNORM;
+		bd_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		bd_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		bd_srv.Texture2D.MipLevels = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE bd_cpu =
+		    ldp->compose_srv_heap->GetCPUDescriptorHandleForHeapStart();
+		bd_cpu.ptr += 2 * ldp->cbv_srv_desc_size;
+		ldp->device->CreateShaderResourceView(bd_res, &bd_srv, bd_cpu);
+	}
+
 	// ck_fill_tex PIXEL_SHADER_RESOURCE → RENDER_TARGET
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1088,8 +1141,16 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	memcpy(&consts[3], &bg_extent[1], sizeof(float));
 	consts[4] = tile_columns;
 	consts[5] = tile_rows;
-	consts[6] = 0;
+	consts[6] = (ldp->backdrop_resource != nullptr) ? 1u : 0u; // #491 part 3 has_backdrop
 	consts[7] = 0;
+	if (ldp->backdrop_resource != nullptr) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("Leia D3D12 DP #491 part3: compositing 2D-under backdrop %ux%u over desktop",
+			        ldp->backdrop_w, ldp->backdrop_h);
+		}
+	}
 	// chroma_rgb (same key as the strip pass). ck_color stays set in compose
 	// mode — see set_chroma_key. Atlas α==0 pixels are emitted as this sentinel
 	// so the post-weave strip can rewrite them to α=0 → live desktop via DWM.
@@ -1178,6 +1239,22 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 		atlas_cpu.ptr += ldp->cbv_srv_desc_size;
 		ldp->device->CreateShaderResourceView(atlas_resource, &sd, atlas_cpu);
 	}
+	// #491 part 3 — slot 2: the 2D-under backdrop (premultiplied). In
+	// atlas-transparent regions the gate emits this over the live desktop instead
+	// of punching to full transparency. Dummy = ck_strip_tex keeps slot valid
+	// when absent; has_backdrop gates the sample.
+	{
+		ID3D12Resource *bd_res =
+		    (ldp->backdrop_resource != nullptr) ? ldp->backdrop_resource : ldp->ck_strip_tex;
+		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // backdrop_scratch + ck_strip_tex both UNORM
+		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sd.Texture2D.MipLevels = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE bd_cpu = cpu_base;
+		bd_cpu.ptr += 2 * ldp->cbv_srv_desc_size;
+		ldp->device->CreateShaderResourceView(bd_res, &sd, bd_cpu);
+	}
 
 	// back_buffer RENDER_TARGET → COPY_SOURCE; ck_strip_tex → COPY_DEST.
 	D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -1226,9 +1303,11 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 		cu_ey = (float)canvas_height / (float)target_height;
 	}
 
-	// Root constants layout matches the cbuffer: tile_count.xy (0,1), pad (2,3),
-	// canvas_uv_origin.xy (4,5), canvas_uv_extent.xy (6,7). Remaining slots unused.
-	uint32_t consts[12] = {tile_columns, tile_rows, 0, 0};
+	// Root constants layout matches the cbuffer: tile_count.xy (0,1),
+	// has_backdrop (2) + pad (3), canvas_uv_origin.xy (4,5),
+	// canvas_uv_extent.xy (6,7). Remaining slots unused.
+	uint32_t consts[12] = {tile_columns, tile_rows,
+	                       (ldp->backdrop_resource != nullptr) ? 1u : 0u, 0}; // #491 part 3
 	memcpy(&consts[4], &cu_ox, sizeof(float));
 	memcpy(&consts[5], &cu_oy, sizeof(float));
 	memcpy(&consts[6], &cu_ex, sizeof(float));
@@ -1723,6 +1802,22 @@ leia_dp_d3d12_set_chroma_key(struct xrt_display_processor_d3d12 *xdp,
 	}
 }
 
+// #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
+// process_atlas. Same D3D12 device as the compositor → the resource is sampled
+// directly via an SRV we create into heap slot 2 (no open/import, unlike the
+// WGC desktop). NULL ⟹ clear (desktop-only).
+static void
+leia_dp_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
+                                void *background_resource,
+                                uint32_t width,
+                                uint32_t height)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	ldp->backdrop_resource = static_cast<ID3D12Resource *>(background_resource);
+	ldp->backdrop_w = width;
+	ldp->backdrop_h = height;
+}
+
 static void
 leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
@@ -1875,6 +1970,7 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.get_display_pixel_info = leia_dp_d3d12_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_d3d12_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_d3d12_set_chroma_key;
+	ldp->base.set_background_2d = leia_dp_d3d12_set_background_2d; // #491 part 3
 	ldp->base.destroy = leia_dp_d3d12_destroy;
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
