@@ -1399,17 +1399,20 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 	// copy plumbing. Distinct descriptor set (2 image samplers — backbuffer
 	// copy + atlas) and push constants (tile_count).
 	if (ldp->alpha_gate_pipeline == VK_NULL_HANDLE) {
-		// 2-binding descriptor set.
+		// 3-binding descriptor set: backbuffer (0) + atlas (1) + 2D-under
+		// backdrop (2, #491 part 3).
 		{
-			VkDescriptorSetLayoutBinding bs[2] = {
+			VkDescriptorSetLayoutBinding bs[3] = {
 			    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 			    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+			    {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 			};
 			VkDescriptorSetLayoutCreateInfo ci = {
 			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-			    .bindingCount = 2, .pBindings = bs,
+			    .bindingCount = 3, .pBindings = bs,
 			};
 			res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->alpha_gate_desc_layout);
 			if (res != VK_SUCCESS) {
@@ -1417,7 +1420,7 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 				return false;
 			}
 		}
-		// Push constants: uvec2 tile_count + uvec2 pad = 16 bytes.
+		// Push constants: uvec2 tile_count + uint has_backdrop + uint pad = 16 bytes.
 		{
 			VkPushConstantRange pc = {
 			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1439,7 +1442,7 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		{
 			VkDescriptorPoolSize size = {
 			    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			    .descriptorCount = 2,
+			    .descriptorCount = 3, // backbuffer + atlas + backdrop (#491 part 3)
 			};
 			VkDescriptorPoolCreateInfo dpi = {
 			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1723,14 +1726,19 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	if (strip_fb == VK_NULL_HANDLE) return;
 
 	// Update alpha-gate descriptor set: slot 0 = strip_view (backbuffer copy),
-	// slot 1 = atlas_view.
-	VkDescriptorImageInfo infos[2] = {
+	// slot 1 = atlas_view, slot 2 = 2D-under backdrop (#491 part 3; dummy when
+	// absent — gated by has_backdrop below).
+	const bool have_backdrop = (ldp->backdrop_view != VK_NULL_HANDLE);
+	VkDescriptorImageInfo infos[3] = {
 	    {.sampler = ldp->compose_sampler, .imageView = ldp->ck_strip_view,
 	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
 	    {.sampler = ldp->compose_sampler, .imageView = atlas_view,
 	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+	    {.sampler = ldp->compose_sampler,
+	     .imageView = have_backdrop ? ldp->backdrop_view : ldp->ck_strip_view,
+	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
 	};
-	VkWriteDescriptorSet writes[2] = {
+	VkWriteDescriptorSet writes[3] = {
 	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 	     .dstSet = ldp->alpha_gate_set, .dstBinding = 0, .descriptorCount = 1,
 	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1739,8 +1747,12 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	     .dstSet = ldp->alpha_gate_set, .dstBinding = 1, .descriptorCount = 1,
 	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 	     .pImageInfo = &infos[1]},
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	     .dstSet = ldp->alpha_gate_set, .dstBinding = 2, .descriptorCount = 1,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	     .pImageInfo = &infos[2]},
 	};
-	vk->vkUpdateDescriptorSets(vk->device, 2, writes, 0, NULL);
+	vk->vkUpdateDescriptorSets(vk->device, 3, writes, 0, NULL);
 
 	// target PRESENT_SRC_KHR → TRANSFER_SRC; strip_image UNDEFINED/SR → TRANSFER_DST.
 	VkImageMemoryBarrier pre[2] = {
@@ -1809,9 +1821,10 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                             ldp->alpha_gate_pipeline_layout, 0, 1, &ldp->alpha_gate_set, 0, NULL);
 
-	struct { uint32_t tile_count[2]; uint32_t pad[2]; } push = {};
+	struct { uint32_t tile_count[2]; uint32_t has_backdrop; uint32_t pad; } push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
+	push.has_backdrop = have_backdrop ? 1u : 0u; // #491 part 3
 	vk->vkCmdPushConstants(cmd, ldp->alpha_gate_pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 

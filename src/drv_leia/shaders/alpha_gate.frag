@@ -18,10 +18,18 @@
 
 layout(binding = 0) uniform sampler2D backbuffer;
 layout(binding = 1) uniform sampler2D atlas;
+// #491 part 3 — the runtime's flattened 2D-under backdrop (premultiplied RGBA,
+// window-client-area pixels = screen/tile-local UV). A real under-layer the
+// runtime owns, so it must NOT be punched through to the live desktop: where
+// the atlas is transparent but the backdrop covers, the backdrop is emitted
+// premultiplied with its own alpha so DWM blends it OVER the live desktop
+// (opaque backdrop fully occludes; semi-transparent reveals the desktop).
+layout(binding = 2) uniform sampler2D backdrop;
 
 layout(push_constant) uniform PC {
 	uvec2 tile_count;
-	uvec2 pad;
+	uint  has_backdrop;   // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
+	uint  pad;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -38,7 +46,22 @@ void main()
 			}
 		}
 	}
-	vec3 rgb = texture(backbuffer, in_uv).rgb;
-	float m = all_transparent ? 0.0 : 1.0;
-	out_color = vec4(rgb * m, m);   // premultiplied for DWM
+
+	if (!all_transparent) {
+		// Woven 3D content (over the backdrop-over-desktop baked pre-weave):
+		// opaque so DWM shows it as-is.
+		out_color = vec4(texture(backbuffer, in_uv).rgb, 1.0);
+		return;
+	}
+
+	// Atlas transparent here. #491 part 3 — if a 2D-under backdrop covers this
+	// pixel, emit it premultiplied with its own alpha (DWM composites it over
+	// the live desktop). Sample at screen UV (= window-local) like the compose
+	// pass. Otherwise punch through to the live desktop (today's behavior).
+	if (pc.has_backdrop != 0u) {
+		vec4 bd = texture(backdrop, in_uv); // premultiplied
+		out_color = vec4(bd.rgb, bd.a);
+		return;
+	}
+	out_color = vec4(0.0, 0.0, 0.0, 0.0);   // live desktop
 }
