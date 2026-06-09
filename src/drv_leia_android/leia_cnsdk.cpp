@@ -151,7 +151,7 @@ struct leia_cnsdk
  * the symptom→knob table.
  */
 struct calibration_knobs {
-	bool flip_uv;        // debug.dxr.leia.flip_uv         default 1 (current behavior)
+	bool flip_uv;        // debug.dxr.leia.flip_uv         default 0 (VK Y-down apps)
 	bool face_flip_x;    // debug.dxr.leia.face_flip_x     default 0
 	bool face_flip_y;    // debug.dxr.leia.face_flip_y     default 0
 	bool face_flip_z;    // debug.dxr.leia.face_flip_z     default 0
@@ -217,7 +217,12 @@ ensure_calibration_loaded(void)
 	if (g_calib_loaded.load(std::memory_order_acquire)) {
 		return;
 	}
-	g_calib.flip_uv       = get_prop_bool("debug.dxr.leia.flip_uv",       true);
+	// Default FALSE: the Android DP is VK-only, and DisplayXR VK apps render
+	// their atlas in Vulkan's Y-down convention (the projection bakes the Y
+	// flip), so the interlacer must NOT flip the input again — flipping turned
+	// the cube upside-down on the nubia NP02J (#499). Set to 1 to re-flip for a
+	// GL-Y-up source.
+	g_calib.flip_uv       = get_prop_bool("debug.dxr.leia.flip_uv",       false);
 	g_calib.face_flip_x   = get_prop_bool("debug.dxr.leia.face_flip_x",   false);
 	g_calib.face_flip_y   = get_prop_bool("debug.dxr.leia.face_flip_y",   false);
 	g_calib.face_flip_z   = get_prop_bool("debug.dxr.leia.face_flip_z",   false);
