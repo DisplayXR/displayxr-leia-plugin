@@ -107,6 +107,14 @@ struct leia_display_processor_gl_impl
 	uint32_t ck_strip_w, ck_strip_h;
 
 	GLuint ck_vao;                //!< Empty VAO required by core profile draws.
+
+	//! #491 part 3 — the runtime's flattened 2D-under backdrop (set via
+	//! set_background_2d). STORED ONLY — the GL Leia DP is chroma-key-only (no WGC
+	//! compose-under-bg path), so there is nowhere to composite the backdrop yet;
+	//! this is a VISUAL NO-OP until a GL transparency/compose path lands (separate
+	//! deferred follow-up). The slot is wired so the runtime contract is complete.
+	GLuint backdrop_tex; //!< NOT owned (compositor-owned). 0 ⟹ no backdrop.
+	uint32_t backdrop_w, backdrop_h;
 };
 
 static inline struct leia_display_processor_gl_impl *
@@ -589,6 +597,32 @@ leia_dp_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
 	}
 }
 
+// #491 part 3 — store the runtime's flattened 2D-under backdrop. The GL Leia DP
+// is chroma-key-only (no WGC compose-under-bg path, see
+// project_leia_transparency_model), so there is nowhere to composite it yet:
+// this records the handle for parity but is a VISUAL NO-OP until a GL
+// transparency/compose path lands (separate deferred follow-up). NULL ⟹ clear.
+static void
+leia_dp_gl_set_background_2d(struct xrt_display_processor_gl *xdp,
+                             uint32_t background_tex,
+                             uint32_t width,
+                             uint32_t height)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	ldp->backdrop_tex = background_tex;
+	ldp->backdrop_w = width;
+	ldp->backdrop_h = height;
+	if (background_tex != 0) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("Leia GL DP #491 part3: 2D-under backdrop %ux%u received (stored; GL DP is "
+			        "chroma-key-only → visual no-op until GL compose lands)",
+			        width, height);
+		}
+	}
+}
+
 static bool
 leia_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
                                         struct xrt_eye_positions *out_eye_pos)
@@ -725,6 +759,7 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.get_display_pixel_info = leia_dp_gl_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_gl_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_gl_set_chroma_key;
+	ldp->base.set_background_2d = leia_dp_gl_set_background_2d; // #491 part 3 (no-op store)
 	ldp->base.destroy = leia_dp_gl_destroy;
 }
 
