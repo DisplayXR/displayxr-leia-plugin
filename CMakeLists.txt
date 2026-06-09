@@ -52,7 +52,7 @@ else()
     # plugin_api=N, runtime expects M ... skipping (ADR-020 rule 3)" and fall
     # back to sim_display. The rule-5 CI self-check below asserts this value
     # equals the workflow's runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v1.14.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "v1.15.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
