@@ -147,12 +147,16 @@ static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
 static const char *compose_under_bg_ps_source = R"(
 Texture2D<float4> atlas : register(t0);
 Texture2D<float4> bg    : register(t1);
+// #491 part 3 — runtime's flattened 2D-under backdrop (premultiplied,
+// window-client-area). Composited OVER the captured desktop when has_backdrop.
+Texture2D<float4> backdrop : register(t2);
 SamplerState samp       : register(s0);
 cbuffer Constants : register(b0) {
 	float2 bg_uv_origin;  // window TL on monitor, normalized
 	float2 bg_uv_extent;  // window size on monitor, normalized
 	uint2  tile_count;    // (tile_columns, tile_rows)
-	uint2  pad0;
+	uint   has_backdrop;  // #491 part 3 — 1 ⟹ composite backdrop over desktop
+	uint   pad0;
 	float3 chroma_rgb;    // sentinel for fully-transparent atlas pixels
 	float  pad1;
 };
@@ -166,6 +170,12 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 tile_local = frac(uv * float2(tile_count));
 	float2 bg_uv = bg_uv_origin + tile_local * bg_uv_extent;
 	float3 b = bg.SampleLevel(samp, bg_uv, 0).rgb;
+	// #491 part 3 — flat z=0 backdrop sampled at window-local tile_local;
+	// premultiplied "over" the desktop before the atlas-over.
+	if (has_backdrop != 0) {
+		float4 bd = backdrop.Sample(samp, tile_local);
+		b = bd.rgb + (1.0 - bd.a) * b;
+	}
 	return float4(lerp(b, a.rgb, a.a), 1.0);
 }
 )";
@@ -174,7 +184,8 @@ struct ComposeConstants {
 	float bg_uv_origin[2];
 	float bg_uv_extent[2];
 	uint32_t tile_count[2];
-	uint32_t pad0[2];
+	uint32_t has_backdrop;
+	uint32_t pad0;
 	float chroma_rgb[3];
 	float pad1;
 };
@@ -196,10 +207,16 @@ struct ComposeConstants {
 static const char *alpha_gate_ps_source = R"(
 Texture2D<float4> backbuffer : register(t0);
 Texture2D<float4> atlas      : register(t1);
+// #491 part 3 — runtime's flattened 2D-under backdrop (premultiplied). A real
+// under-layer: where the atlas is transparent but the backdrop covers, emit the
+// backdrop premultiplied with its own alpha (DWM composites it over the LIVE
+// desktop) instead of punching to full transparency.
+Texture2D<float4> backdrop   : register(t2);
 SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
 	uint2 tile_count;
-	uint2 pad0;
+	uint  has_backdrop;       // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
+	uint  pad0;
 	float2 canvas_uv_origin;  // canvas sub-rect origin on the window, normalized
 	float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
 };
@@ -219,15 +236,24 @@ float4 main(VSOut i) : SV_Target {
 		}
 	}
 	float2 bb_uv = canvas_uv_origin + i.uv * canvas_uv_extent;
-	float3 rgb = backbuffer.Sample(samp, bb_uv).rgb;
-	float m = all_transparent ? 0.0 : 1.0;
-	return float4(rgb * m, m);
+	if (!all_transparent) {
+		// Woven 3D content (already over backdrop-over-desktop): opaque.
+		return float4(backbuffer.Sample(samp, bb_uv).rgb, 1.0);
+	}
+	// #491 part 3 — atlas transparent: emit the backdrop premultiplied with its
+	// own alpha (DWM adds the live desktop) instead of punching fully through.
+	if (has_backdrop != 0) {
+		float4 bd = backdrop.Sample(samp, bb_uv);
+		return float4(bd.rgb, bd.a);
+	}
+	return float4(0.0, 0.0, 0.0, 0.0); // live desktop
 }
 )";
 
 struct AlphaGateConstants {
 	uint32_t tile_count[2];
-	uint32_t pad0[2];
+	uint32_t has_backdrop;
+	uint32_t pad0;
 	float    canvas_uv_origin[2];
 	float    canvas_uv_extent[2];
 };
@@ -330,6 +356,14 @@ struct leia_display_processor_d3d11_impl
 	ID3D11PixelShader *alpha_gate_ps;
 	ID3D11Buffer *alpha_gate_constants;  //!< sizeof(AlphaGateConstants).
 	//! @}
+
+	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
+	//! process_atlas (set via set_background_2d; same D3D11 device as the
+	//! compositor → the SRV is sampled directly, no open/import). The compose
+	//! pass composites `backdrop over captured-desktop`; the alpha-gate preserves
+	//! it over the live desktop. NULL ⟹ no backdrop (desktop-only).
+	ID3D11ShaderResourceView *backdrop_srv; //!< NOT owned (compositor-owned).
+	uint32_t backdrop_w, backdrop_h;
 };
 
 static inline struct leia_display_processor_d3d11_impl *
@@ -869,8 +903,16 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	cb->bg_uv_extent[1] = bg_extent[1];
 	cb->tile_count[0] = tile_columns;
 	cb->tile_count[1] = tile_rows;
-	cb->pad0[0] = 0;
-	cb->pad0[1] = 0;
+	cb->has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u; // #491 part 3
+	cb->pad0 = 0;
+	if (ldp->backdrop_srv != nullptr) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("Leia D3D11 DP #491 part3: compositing 2D-under backdrop %ux%u over desktop",
+			        ldp->backdrop_w, ldp->backdrop_h);
+		}
+	}
 	{
 		// Same key as the chroma-key post-weave strip uses (ck_color stays
 		// set in compose mode — see set_chroma_key).
@@ -911,14 +953,18 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
 	ctx->PSSetShader(ldp->compose_ps, nullptr, 0);
-	ID3D11ShaderResourceView *srvs[2] = {atlas_srv, ldp->bg_shared_srv};
-	ctx->PSSetShaderResources(0, 2, srvs);
+	// #491 part 3 — t2 = the 2D-under backdrop (dummy = bg when absent; gated by
+	// has_backdrop). Same device as the compositor, so the SRV is used directly.
+	ID3D11ShaderResourceView *backdrop_srv =
+	    (ldp->backdrop_srv != nullptr) ? ldp->backdrop_srv : ldp->bg_shared_srv;
+	ID3D11ShaderResourceView *srvs[3] = {atlas_srv, ldp->bg_shared_srv, backdrop_srv};
+	ctx->PSSetShaderResources(0, 3, srvs);
 	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
 	ctx->PSSetConstantBuffers(0, 1, &ldp->compose_constants);
 	ctx->Draw(4, 0);
 
-	ID3D11ShaderResourceView *null_srvs[2] = {nullptr, nullptr};
-	ctx->PSSetShaderResources(0, 2, null_srvs);
+	ID3D11ShaderResourceView *null_srvs[3] = {nullptr, nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 3, null_srvs);
 
 	ctx->OMSetRenderTargets(1, &prev_rtv, prev_dsv);
 	ctx->RSSetViewports(prev_vp_count, &prev_vp);
@@ -1014,8 +1060,8 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		AlphaGateConstants *cb = reinterpret_cast<AlphaGateConstants *>(m.pData);
 		cb->tile_count[0] = tile_columns;
 		cb->tile_count[1] = tile_rows;
-		cb->pad0[0] = 0;
-		cb->pad0[1] = 0;
+		cb->has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u; // #491 part 3
+		cb->pad0 = 0;
 		cb->canvas_uv_origin[0] = cu_ox;
 		cb->canvas_uv_origin[1] = cu_oy;
 		cb->canvas_uv_extent[0] = cu_ex;
@@ -1039,14 +1085,18 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
 	ctx->PSSetShader(ldp->alpha_gate_ps, nullptr, 0);
-	ID3D11ShaderResourceView *srvs[2] = {ldp->ck_strip_srv, atlas_srv};
-	ctx->PSSetShaderResources(0, 2, srvs);
+	// #491 part 3 — t2 = the 2D-under backdrop (dummy = strip copy when absent;
+	// gated by has_backdrop).
+	ID3D11ShaderResourceView *ag_backdrop =
+	    (ldp->backdrop_srv != nullptr) ? ldp->backdrop_srv : ldp->ck_strip_srv;
+	ID3D11ShaderResourceView *srvs[3] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop};
+	ctx->PSSetShaderResources(0, 3, srvs);
 	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
 	ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
 	ctx->Draw(4, 0);
 
-	ID3D11ShaderResourceView *null_srvs[2] = {nullptr, nullptr};
-	ctx->PSSetShaderResources(0, 2, null_srvs);
+	ID3D11ShaderResourceView *null_srvs[3] = {nullptr, nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 3, null_srvs);
 
 	back_buffer->Release();
 	rtv_res->Release();
@@ -1607,6 +1657,21 @@ leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
 	}
 }
 
+// #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
+// process_atlas. Same D3D11 device as the compositor → the SRV is used directly
+// (no open/import, unlike the WGC desktop). NULL ⟹ clear (desktop-only).
+static void
+leia_dp_d3d11_set_background_2d(struct xrt_display_processor_d3d11 *xdp,
+                                void *background_srv,
+                                uint32_t width,
+                                uint32_t height)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	ldp->backdrop_srv = static_cast<ID3D11ShaderResourceView *>(background_srv);
+	ldp->backdrop_w = width;
+	ldp->backdrop_h = height;
+}
+
 /*
  * ADR-021 §3/§4: the SR weaver has an explicit input/output sRGB-conversion
  * control (leiasr_d3d11_set_srgb_conversion → setShaderSRGBConversion), wired in
@@ -1681,6 +1746,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.get_display_pixel_info = leia_dp_d3d11_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_d3d11_set_chroma_key;
+	ldp->base.set_background_2d = leia_dp_d3d11_set_background_2d; // #491 part 3
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
