@@ -507,7 +507,14 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	// the core. If the core's orientation is stale in landscape, the landscape
 	// weave ghosts (clean portrait, double-image landscape). All four
 	// orientations are legal for us.
-	if (activity != NULL) {
+	// OrientationLimiter.configure() is a Java method typed to android.app.Activity
+	// and calls setRequestedOrientation — Activity-only. Out-of-process (#510) the
+	// host hands us the runtime SERVICE's Context (no Activity exists; the app owns
+	// its own orientation), so calling it would trip CheckJNI ("bad arguments
+	// passed to OrientationLimiter.configure(Activity,...)") and abort the service.
+	// Only register the limiter when the handle is really an Activity (in-process);
+	// the core's orientation auto-detect still follows rotations otherwise.
+	if (activity != NULL && android_globals_is_instance_of_activity((struct _JavaVM *)vm, activity)) {
 		struct leia_legal_orientations legal = {};
 		legal.portrait = 1;
 		legal.landscape = 1;
@@ -515,6 +522,9 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 		legal.reverseLandscape = 1;
 		leia_core_limit_orientations(lib, (jobject)activity, &legal);
 		DXR_HW_DBG("leia_cnsdk_create: limit_orientations(all) registered activity=%p", activity);
+	} else {
+		DXR_HW_DBG("leia_cnsdk_create: skipping limit_orientations (no Activity; "
+		           "out-of-process service Context=%p)", activity);
 	}
 #endif
 
