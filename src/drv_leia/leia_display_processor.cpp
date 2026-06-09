@@ -138,6 +138,15 @@ struct leia_display_processor
 	VkDeviceMemory bg_mem;
 	uint32_t bg_w, bg_h;
 
+	// #491 part 3 — the runtime's flattened 2D-under backdrop for the next
+	// process_atlas (set via set_background_2d). The Leia VK DP shares the
+	// compositor's VkDevice (ldp->vk), so this is sampled directly — no import
+	// dance like bg_image (which crosses the WGC D3D11 producer device). When
+	// set, the compose pass composites `backdrop over captured-desktop` before
+	// the atlas-over. VK_NULL_HANDLE ⟹ desktop-only background (today's path).
+	VkImageView backdrop_view;
+	uint32_t backdrop_w, backdrop_h;
+
 	VkSampler compose_sampler;               //!< Linear/clamp (vs ck's NEAREST).
 	VkDescriptorSetLayout compose_desc_layout;
 	VkPipelineLayout compose_pipeline_layout;
@@ -1190,17 +1199,20 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 	struct vk_bundle *vk = ldp->vk;
 	VkResult res;
 
-	// 2-binding descriptor set: atlas (0) + bg (1).
+	// 3-binding descriptor set: atlas (0) + bg/desktop (1) + 2D-under backdrop
+	// (2, #491 part 3).
 	{
-		VkDescriptorSetLayoutBinding bs[2] = {
+		VkDescriptorSetLayoutBinding bs[3] = {
 		    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 		     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 		    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 		     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		    {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 		};
 		VkDescriptorSetLayoutCreateInfo ci = {
 		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		    .bindingCount = 2, .pBindings = bs,
+		    .bindingCount = 3, .pBindings = bs,
 		};
 		res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->compose_desc_layout);
 		if (res != VK_SUCCESS) {
@@ -1252,7 +1264,7 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 	{
 		VkDescriptorPoolSize size = {
 		    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		    .descriptorCount = 2,
+		    .descriptorCount = 3, // atlas + bg + backdrop (#491 part 3)
 		};
 		VkDescriptorPoolCreateInfo dpi = {
 		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1276,22 +1288,32 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		}
 	}
 
-	// Bind the bg view to slot 1 once — it doesn't change across frames.
+	// Bind the bg view to slot 1 once — it doesn't change across frames. Also
+	// seed slot 2 (#491 part 3 backdrop) with the bg view as a valid dummy so
+	// the set is fully written before first use; compose_run_pre_weave
+	// overwrites slot 2 per-frame with the real backdrop when one is present
+	// (and gates sampling via the has_backdrop push constant otherwise).
 	{
 		VkDescriptorImageInfo info = {
 		    .sampler = ldp->compose_sampler,
 		    .imageView = ldp->bg_view,
 		    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		};
-		VkWriteDescriptorSet w = {
-		    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		    .dstSet = ldp->compose_set,
-		    .dstBinding = 1,
-		    .descriptorCount = 1,
-		    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		    .pImageInfo = &info,
+		VkWriteDescriptorSet w[2] = {
+		    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		     .dstSet = ldp->compose_set,
+		     .dstBinding = 1,
+		     .descriptorCount = 1,
+		     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		     .pImageInfo = &info},
+		    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		     .dstSet = ldp->compose_set,
+		     .dstBinding = 2,
+		     .descriptorCount = 1,
+		     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		     .pImageInfo = &info},
 		};
-		vk->vkUpdateDescriptorSets(vk->device, 1, &w, 0, NULL);
+		vk->vkUpdateDescriptorSets(vk->device, 2, w, 0, NULL);
 	}
 
 	// Build pipeline.
@@ -1583,6 +1605,34 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 	};
 	vk->vkUpdateDescriptorSets(vk->device, 1, &w, 0, NULL);
 
+	// #491 part 3 — refresh slot 2 with the runtime's flattened 2D-under
+	// backdrop when present (same VkDevice → sampled directly). Gated by
+	// has_backdrop below; when absent the slot keeps its dummy and is ignored.
+	const bool have_backdrop = (ldp->backdrop_view != VK_NULL_HANDLE);
+	if (have_backdrop) {
+		VkDescriptorImageInfo bd_info = {
+		    .sampler = ldp->compose_sampler,
+		    .imageView = ldp->backdrop_view,
+		    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		};
+		VkWriteDescriptorSet bw = {
+		    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		    .dstSet = ldp->compose_set,
+		    .dstBinding = 2,
+		    .descriptorCount = 1,
+		    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		    .pImageInfo = &bd_info,
+		};
+		vk->vkUpdateDescriptorSets(vk->device, 1, &bw, 0, NULL);
+
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("Leia VK DP #491 part3: compositing 2D-under backdrop %ux%u over desktop",
+			        ldp->backdrop_w, ldp->backdrop_h);
+		}
+	}
+
 	// ck_fill_image UNDEFINED → COLOR_ATTACHMENT.
 	VkImageMemoryBarrier pre = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1614,11 +1664,13 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 		float bg_uv_origin[2];
 		float bg_uv_extent[2];
 		uint32_t tile_count[2];
-		uint32_t pad[2];
+		uint32_t has_backdrop; // #491 part 3 — 1 ⟹ composite backdrop over desktop
+		uint32_t pad;
 	} push = {};
 	push.bg_uv_origin[0] = bg_origin[0]; push.bg_uv_origin[1] = bg_origin[1];
 	push.bg_uv_extent[0] = bg_extent[0]; push.bg_uv_extent[1] = bg_extent[1];
 	push.tile_count[0] = tile_columns;   push.tile_count[1] = tile_rows;
+	push.has_backdrop = have_backdrop ? 1u : 0u;
 	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
@@ -2166,6 +2218,22 @@ leia_dp_set_chroma_key(struct xrt_display_processor *xdp,
 	}
 }
 
+// #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
+// process_atlas. The compose-under-bg path (when WGC transparency is active)
+// composites it OVER the captured desktop before the atlas-over. Same VkDevice
+// as the compositor, so the view is used directly. NULL ⟹ clear (desktop-only).
+static void
+leia_dp_set_background_2d(struct xrt_display_processor *xdp,
+                          VkImageView background_view,
+                          uint32_t width,
+                          uint32_t height)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	ldp->backdrop_view = background_view;
+	ldp->backdrop_w = width;
+	ldp->backdrop_h = height;
+}
+
 static void
 leia_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -2303,6 +2371,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
+	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	ldp->base.destroy = leia_dp_destroy;
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -2401,6 +2470,7 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
+	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.destroy = leia_dp_destroy;
