@@ -128,6 +128,13 @@ struct leia_cnsdk
 	uint32_t display_pixel_w_cached{0};
 	uint32_t display_pixel_h_cached{0};
 
+	// Device's natural orientation (LANDSCAPE=0 / PORTRAIT=1 / …), cached from
+	// the device config in the worker. The predicted/non-predicted faces arrive
+	// in this natural-orientation display frame (weave-ready); the look-around
+	// face we return must be rotated into the CURRENT held orientation. -1 =
+	// unspecified (no rotation until known). Read on the render thread.
+	std::atomic<int> natural_orientation{-1};
+
 	// One-shot flag: once leia_interlacer_vulkan_initialize fails, give
 	// up rather than retrying every frame. Read + written only by the
 	// render thread (no concurrent access; no atomic needed).
@@ -390,8 +397,14 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 			cnsdk->display_pixel_w_cached = (uint32_t)panel_res_px[0];
 			cnsdk->display_pixel_h_cached = (uint32_t)panel_res_px[1];
 		}
+		int32_t natural_ori = -1;
+		if (leia_device_config_get_i32(
+		        cfg, LEIA_DEVICE_CONFIG_PROPERTY_DEVICE_NATURAL_ORIENTATION, 1, &natural_ori)) {
+			cnsdk->natural_orientation.store(natural_ori, std::memory_order_relaxed);
+		}
 		leia_device_config_release(cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
+		DXR_HW_DBG("worker: natural_orientation=%d", natural_ori);
 		DXR_HW_DBG("worker: cached metrics: %ux%u px, %.3fx%.3f m (size_ok=%d res_ok=%d)",
 		           cnsdk->display_pixel_w_cached, cnsdk->display_pixel_h_cached,
 		           cnsdk->display_width_m_cached, cnsdk->display_height_m_cached,
@@ -762,15 +775,11 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 		return false;
 	}
 
-	// The predicted face is latency-compensated and preferred, but on the
-	// nubia NP02J in portrait it can stay empty even while raw face frames
-	// stream in from the head-tracking service (HTS-Binder onMessage(Frame)).
-	// Query both and fall back to the latest non-predicted detection. The
-	// diagnostic is U_LOG_W (WARN) on purpose — aux INFO is dropped from the
-	// Android hot path, so a U_LOG_I here would be invisible.
-	// Primary source on this device: the frame listener (in-service detection).
-	// leia_core_get_primary_face / non_predicted stay empty in service mode, so
-	// they're only a fallback for in-app mode / other devices.
+	// Query all three face sources. The core's predicted / non-predicted faces
+	// are latency-compensated and, crucially, already in DISPLAY-CENTER mm (camera
+	// extrinsics applied). The frame-listener detection is raw CAMERA-space
+	// posePosition (a fallback for when the core face is empty). The diagnostic is
+	// U_LOG_W (WARN) on purpose — aux INFO is dropped from the Android hot path.
 	const bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
 	float lst_pos[3] = {
 	    cnsdk->listener_face_x_mm.load(std::memory_order_relaxed),
@@ -787,20 +796,33 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 
 	static int dbg = 0;
 	if ((dbg++ % 60) == 0) {
-		U_LOG_W("HW_FACE: listener=%d(%.0f,%.0f,%.0f) pred=%d(%.0f,%.0f,%.0f) nonpred=%d",
+		U_LOG_W("HW_FACE: listener=%d(%.0f,%.0f,%.0f) pred=%d(%.0f,%.0f,%.0f) nonpred=%d(%.0f,%.0f,%.0f)",
 		        (int)lst_ok, lst_pos[0], lst_pos[1], lst_pos[2],
-		        (int)pred_ok, pred_pos[0], pred_pos[1], pred_pos[2], (int)np_ok);
+		        (int)pred_ok, pred_pos[0], pred_pos[1], pred_pos[2],
+		        (int)np_ok, np_pos[0], np_pos[1], np_pos[2]);
 	}
 
+	// Source preference. This face drives the app's LOOK-AROUND (the runtime's
+	// Kooima off-axis projection / rendered parallax), which must follow the
+	// user's ACTUAL head — so use the NON-PREDICTED face. The PREDICTED face is
+	// latency-compensated for the lenticular and is consumed INTERNALLY by CNSDK
+	// for weaving (interlacer.cpp:527 GetPrimaryFace()); using it for rendering
+	// would over-compensate the geometry. Both the non-predicted and predicted
+	// faces are returned in DISPLAY-CENTER millimeters with the camera extrinsics
+	// already applied (same frame as showFacePosition()'s dot). The raw
+	// frame-listener detection is the head-tracking service's `posePosition`,
+	// which is CAMERA-space (origin at the camera, sensor axes, Y image-down);
+	// using it directly skips the extrinsics (the offset + inverted-Y we saw), so
+	// it is only a last resort when the core face is genuinely empty.
 	float position[3];
 	bool used_nonpred = false;
-	if (lst_ok) {
-		position[0] = lst_pos[0]; position[1] = lst_pos[1]; position[2] = lst_pos[2];
-	} else if (pred_ok) {
-		position[0] = pred_pos[0]; position[1] = pred_pos[1]; position[2] = pred_pos[2];
-	} else if (np_ok) {
+	if (np_ok) {
 		position[0] = np_pos[0]; position[1] = np_pos[1]; position[2] = np_pos[2];
 		used_nonpred = true;
+	} else if (pred_ok) {
+		position[0] = pred_pos[0]; position[1] = pred_pos[1]; position[2] = pred_pos[2];
+	} else if (lst_ok) {
+		position[0] = lst_pos[0]; position[1] = lst_pos[1]; position[2] = lst_pos[2];
 	} else {
 		return false;
 	}
@@ -812,33 +834,41 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
 	float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
 
-	// Orientation-aware face-axis mapping — NOT hardwired. The camera is
-	// landscape-native, so its X/Y map onto the view differently per device
-	// orientation. Derive the mapping from CNSDK's LIVE orientation (updates on
-	// physical rotation), so it adapts the way the Leia viewer does instead of
-	// being pinned to one orientation. Per-axis setprop overrides
-	// (debug.dxr.leia.face_swap_xy / face_flip_x/y/z = 0|1) win when set, for
-	// calibrating the per-orientation defaults without a rebuild.
-	// The head-tracking service delivers detected-face coordinates already in
-	// the current display-orientation frame, so the face axes need NO
-	// per-orientation remap here — identity. (A swap double-rotated and sent
-	// head left/right to the cube's vertical axis in portrait.) Kept
-	// overridable via setprop for any residual per-device calibration.
-	enum leia_orientation ori = leia_core_get_orientation(cnsdk->core);
-	bool swap = false, flip_x = false, flip_y = false;
-	swap          = prop_override("debug.dxr.leia.face_swap_xy", swap);
-	flip_x        = prop_override("debug.dxr.leia.face_flip_x", flip_x);
-	flip_y        = prop_override("debug.dxr.leia.face_flip_y", flip_y);
-	const bool fz = prop_override("debug.dxr.leia.face_flip_z", false);
-	if (swap)   { float tmp = pos_x_m; pos_x_m = pos_y_m; pos_y_m = tmp; }
-	if (flip_x) { pos_x_m = -pos_x_m; }
-	if (flip_y) { pos_y_m = -pos_y_m; }
-	if (fz)     { pos_z_m = -pos_z_m; }
+	// The predicted/non-predicted faces arrive in the display's NATURAL
+	// orientation frame (that's the frame CNSDK weaves in). Our look-around face
+	// must be expressed in the CURRENT held orientation.
+	//
+	// GetRelativeClockwiseAngle(natural, current) is how far the DEVICE FRAME
+	// actively turned from natural to current. But we're re-expressing a fixed
+	// point's COORDINATES from the natural frame into the current frame, which is
+	// the INVERSE (passive) rotation: when a frame turns clockwise by θ, a fixed
+	// point's coords in it turn counter-clockwise by θ. So we rotate by
+	// GetRelativeClockwiseAngle(current, natural) = (natural - current) steps,
+	// each step 90°. z (depth) is orientation-invariant.
+	const int natural = cnsdk->natural_orientation.load(std::memory_order_relaxed);
+	const enum leia_orientation cur = leia_core_get_orientation(cnsdk->core);
+	int steps = 0;
+	if (natural >= 0 && (int)cur >= 0) {
+		steps = (((natural - (int)cur) % 4) + 4) % 4; // inverse: (natural - current), × 90°
+	}
+	switch (steps) {
+	case 1: { float t = pos_x_m; pos_x_m = -pos_y_m; pos_y_m = t; break; }  //  90°: (-y,  x)
+	case 2: { pos_x_m = -pos_x_m; pos_y_m = -pos_y_m; break; }              // 180°: (-x, -y)
+	case 3: { float t = pos_x_m; pos_x_m = pos_y_m; pos_y_m = -t; break; }  // 270°: ( y, -x)
+	default: break;                                                        //   0°: ( x,  y)
+	}
+
+	// Residual per-device calibration overrides (all default OFF — the rotation
+	// above is the principled mapping). Applied after the rotation.
+	if (prop_override("debug.dxr.leia.face_swap_xy", false)) { float t = pos_x_m; pos_x_m = pos_y_m; pos_y_m = t; }
+	if (prop_override("debug.dxr.leia.face_flip_x", false))  { pos_x_m = -pos_x_m; }
+	if (prop_override("debug.dxr.leia.face_flip_y", false))  { pos_y_m = -pos_y_m; }
+	if (prop_override("debug.dxr.leia.face_flip_z", false))  { pos_z_m = -pos_z_m; }
 
 	static int oridbg = 0;
 	if ((oridbg++ % 120) == 0) {
-		U_LOG_W("HW_ORI: orientation=%d swap=%d flip_x=%d flip_y=%d",
-		        (int)ori, (int)swap, (int)flip_x, (int)flip_y);
+		U_LOG_W("HW_ORI: natural=%d current=%d steps=%d -> face=(%.3f,%.3f,%.3f)m",
+		        natural, (int)cur, steps, pos_x_m, pos_y_m, pos_z_m);
 	}
 
 	(void)used_nonpred;
