@@ -305,12 +305,44 @@ struct leia_display_processor_d3d12_impl
 	ID3D12Resource *backdrop_resource; //!< NOT owned (compositor-owned).
 	uint32_t backdrop_w, backdrop_h;
 	//! @}
+
+	//! One-shot guard for a lost device. The per-frame resource creates (the
+	//! alpha-gate's ck_ensure_strip_source, the chroma-key ck_ensure_fill_target)
+	//! would otherwise log an identical error EVERY frame once the D3D12 device
+	//! is removed (e.g. a GPU fault / TDR upstream), burying the real fault.
+	//! Set true the first time a removal is reported (with GetDeviceRemovedReason).
+	bool device_removed_reported;
 };
 
 static inline struct leia_display_processor_d3d12_impl *
 leia_dp_d3d12(struct xrt_display_processor_d3d12 *xdp)
 {
 	return (struct leia_display_processor_d3d12_impl *)xdp;
+}
+
+// On a failed D3D12 resource create, detect a lost device and report the real
+// fault (GetDeviceRemovedReason) ONCE. Returns true when the device is removed —
+// the caller should then SKIP its own per-frame error log, since the device is
+// dead and every subsequent create fails identically (DXGI_ERROR_DEVICE_REMOVED
+// on the symptom, not the cause). Returns false for an ordinary device-alive
+// failure, where the caller logs its specific error normally.
+static bool
+leia_dp_d3d12_device_removed(struct leia_display_processor_d3d12_impl *ldp)
+{
+	if (ldp->device == nullptr) {
+		return false;
+	}
+	HRESULT reason = ldp->device->GetDeviceRemovedReason();
+	if (reason == S_OK) {
+		return false; // device still alive — an ordinary create failure.
+	}
+	if (!ldp->device_removed_reported) {
+		ldp->device_removed_reported = true;
+		U_LOG_E("Leia D3D12 DP: device removed — GetDeviceRemovedReason=0x%08x. "
+		        "Suppressing further per-frame resource-create errors.",
+		        (unsigned)reason);
+	}
+	return true;
 }
 
 
@@ -557,8 +589,10 @@ ck_ensure_fill_target(struct leia_display_processor_d3d12_impl *ldp,
 	    __uuidof(ID3D12Resource),
 	    reinterpret_cast<void **>(&ldp->ck_fill_tex));
 	if (FAILED(hr)) {
-		U_LOG_E("Leia D3D12 DP: ck fill tex create (%ux%u) failed: 0x%08x",
-		        w, h, (unsigned)hr);
+		if (!leia_dp_d3d12_device_removed(ldp)) {
+			U_LOG_E("Leia D3D12 DP: ck fill tex create (%ux%u) failed: 0x%08x",
+			        w, h, (unsigned)hr);
+		}
 		return false;
 	}
 	ldp->ck_fill_w = w;
@@ -607,8 +641,10 @@ ck_ensure_strip_source(struct leia_display_processor_d3d12_impl *ldp,
 	    __uuidof(ID3D12Resource),
 	    reinterpret_cast<void **>(&ldp->ck_strip_tex));
 	if (FAILED(hr)) {
-		U_LOG_E("Leia D3D12 DP: ck strip tex create (%ux%u) failed: 0x%08x",
-		        w, h, (unsigned)hr);
+		if (!leia_dp_d3d12_device_removed(ldp)) {
+			U_LOG_E("Leia D3D12 DP: ck strip tex create (%ux%u) failed: 0x%08x",
+			        w, h, (unsigned)hr);
+		}
 		return false;
 	}
 	ldp->ck_strip_w = w;
