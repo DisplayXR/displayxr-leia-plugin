@@ -47,6 +47,52 @@ struct leia_android_hmd
 	struct xrt_device base;
 };
 
+// #518: per-view (tile) 3D scale baseline for the Lume Pad 2 / nubia NP02J golden
+// config, in the device NATURAL (portrait) orientation: panel 1600x2560, tile
+// (VIEW_RESOLUTION_PX) 1200x1920 → view_scale 0.75x0.75. The rendering modes +
+// display_info are set at xrCreateInstance, BEFORE the async CNSDK device config is
+// available, so a fixed-device baseline is used; the worker reads the live
+// VIEW_RESOLUTION_PX and logs it so the baseline can be confirmed on-device. Panel +
+// tile are device-intrinsic, so the baseline matches the hardware.
+#define LEIA_BASELINE_PANEL_W_NAT 1600
+#define LEIA_BASELINE_PANEL_H_NAT 2560
+#define LEIA_BASELINE_TILE_W_NAT  1200
+#define LEIA_BASELINE_TILE_H_NAT  1920
+#define LEIA_NATURAL_IS_LANDSCAPE false // nubia/Lume Pad 2 natural orientation = portrait
+
+/*!
+ * Per-view 3D view_scale = tile ÷ panel, expressed in the SAME orientation as the
+ * reported display dims. tile/panel come from CNSDK in the device NATURAL orientation;
+ * if the reported display orientation differs, the tile axes are swapped first. For the
+ * (symmetric) nubia the result is 0.75x0.75 either way. Clamped to (0,1] (no supersample
+ * for now). #518.
+ */
+static void
+leia_compute_view_scale(uint32_t display_w,
+                        uint32_t display_h,
+                        uint32_t tile_w_nat,
+                        uint32_t tile_h_nat,
+                        bool natural_is_landscape,
+                        float *out_sx,
+                        float *out_sy)
+{
+	uint32_t tw = tile_w_nat, th = tile_h_nat;
+	bool display_landscape = display_w >= display_h;
+	if (display_landscape != natural_is_landscape) {
+		uint32_t tmp = tw;
+		tw = th;
+		th = tmp;
+	}
+	float sx = (display_w > 0 && tw > 0) ? (float)tw / (float)display_w : 1.0f;
+	float sy = (display_h > 0 && th > 0) ? (float)th / (float)display_h : 1.0f;
+	if (sx <= 0.0f || sx > 1.0f)
+		sx = 1.0f;
+	if (sy <= 0.0f || sy > 1.0f)
+		sy = 1.0f;
+	*out_sx = sx;
+	*out_sy = sy;
+}
+
 static void
 leia_android_hmd_destroy(struct xrt_device *xdev)
 {
@@ -106,6 +152,48 @@ leia_android_hmd_create(void)
 	            85.0f * (float)M_PI / 180.0f},
 	};
 	u_device_setup_split_side_by_side(&hmd->base, &info);
+
+	// #518: advertise 2 rendering modes (mirrors the Windows DP, src/drv_leia/
+	// leia_device.c). Mode 0 = 2D (full res, mono); mode 1 = Leia 3D (2x1 SBS,
+	// per-view scale = tile ÷ panel). Both are orientation-independent and set
+	// XRT_RENDERING_MODE_FLAG_CAN_ROTATE so the runtime sizes the worst-case atlas
+	// across BOTH orientations (the app swapchain is never recreated on rotation).
+	// The 3D scale uses the device baseline (panel/tile are fixed per device); the
+	// worker logs the live VIEW_RESOLUTION_PX to confirm it.
+	float scale3d_x = 1.0f, scale3d_y = 1.0f;
+	leia_compute_view_scale(info.display.w_pixels, info.display.h_pixels,
+	                        LEIA_BASELINE_TILE_W_NAT, LEIA_BASELINE_TILE_H_NAT,
+	                        LEIA_NATURAL_IS_LANDSCAPE, &scale3d_x, &scale3d_y);
+
+	hmd->base.rendering_mode_count = 2;
+
+	// Mode 0: 2D (mono, full resolution, 1x1 tile). Untracked. Rotatable.
+	hmd->base.rendering_modes[0].mode_index = 0;
+	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
+	hmd->base.rendering_modes[0].view_count = 1;
+	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
+	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
+	hmd->base.rendering_modes[0].hardware_display_3d = false;
+	hmd->base.rendering_modes[0].tile_columns = 1;
+	hmd->base.rendering_modes[0].tile_rows = 1;
+	hmd->base.rendering_modes[0].mode_flags = XRT_RENDERING_MODE_FLAG_CAN_ROTATE;
+
+	// Mode 1: Leia 3D (two views, 2x1 SBS atlas, scale from device config). Tracked.
+	hmd->base.rendering_modes[1].mode_index = 1;
+	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
+	hmd->base.rendering_modes[1].view_count = 2;
+	hmd->base.rendering_modes[1].view_scale_x = scale3d_x;
+	hmd->base.rendering_modes[1].view_scale_y = scale3d_y;
+	hmd->base.rendering_modes[1].hardware_display_3d = true;
+	hmd->base.rendering_modes[1].tile_columns = 2;
+	hmd->base.rendering_modes[1].tile_rows = 1;
+	hmd->base.rendering_modes[1].mode_flags =
+	    XRT_RENDERING_MODE_FLAG_HAS_TRACKING | XRT_RENDERING_MODE_FLAG_CAN_ROTATE;
+
+	hmd->base.hmd->active_rendering_mode_index = 1; // default to Leia 3D
+
+	U_LOG_W("Leia Android: rendering modes — 0:2D(1x1) 1:LeiaSR(2x1, scale %.3fx%.3f)",
+	        (double)scale3d_x, (double)scale3d_y);
 
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Leia CNSDK (Android)");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "lume-pad-cnsdk");
@@ -172,8 +260,13 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	// CNSDK core is still booting.
 	out_info->display_pixel_width = 2560;
 	out_info->display_pixel_height = 1600;
-	out_info->recommended_view_scale_x = 1.0f;
-	out_info->recommended_view_scale_y = 1.0f;
+	// #518: 3D per-view scale = tile ÷ panel (device baseline; ~0.75x0.75 for nubia),
+	// in the reported display orientation. Replaces the old hardcoded 1.0x1.0, which
+	// over-rendered each eye. target_instance.c prefers this iface-supplied value.
+	leia_compute_view_scale(out_info->display_pixel_width, out_info->display_pixel_height,
+	                        LEIA_BASELINE_TILE_W_NAT, LEIA_BASELINE_TILE_H_NAT,
+	                        LEIA_NATURAL_IS_LANDSCAPE, &out_info->recommended_view_scale_x,
+	                        &out_info->recommended_view_scale_y);
 	out_info->display_width_m = 0.235f;
 	out_info->display_height_m = 0.147f;
 	out_info->nominal_viewer_x_m = 0.0f;
