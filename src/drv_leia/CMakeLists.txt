@@ -68,8 +68,10 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityOpenGL.lib")
     set(LEIA_SR_GL_AVAILABLE TRUE)
 endif()
 
-# Windows Graphics Capture for compose-under-bg transparency on DX paths.
-if(LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE)
+# Windows Graphics Capture for compose-under-bg transparency. The GL DP imports
+# the captured D3D11 desktop texture into GL via WGL_NV_DX_interop2, so it needs
+# this module too.
+if(LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE OR LEIA_SR_GL_AVAILABLE)
     list(APPEND LEIA_SOURCES leia_bg_capture_win.cpp leia_bg_capture_win.h)
 endif()
 
@@ -142,14 +144,19 @@ if(LEIA_SR_D3D12_AVAILABLE)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_HAVE_LEIA_SR_D3D12)
 endif()
 
-if(LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE)
+# WinRT (WGC) + DXGI GUID helpers — needed by leia_bg_capture_win.cpp, which the
+# GL path also pulls in for compose-under-bg.
+if(LEIA_SR_D3D11_AVAILABLE OR LEIA_SR_D3D12_AVAILABLE OR LEIA_SR_GL_AVAILABLE)
     target_link_libraries(DisplayXR-LeiaSR PRIVATE runtimeobject dxguid)
 endif()
 
 if(LEIA_SR_GL_AVAILABLE)
     target_link_libraries(DisplayXR-LeiaSR PRIVATE
         ${SR_PATH}/lib/SimulatedRealityOpenGL.lib
-        opengl32 aux_ogl)
+        opengl32 aux_ogl
+        # WGC desktop capture imported into GL via WGL_NV_DX_interop2 needs a
+        # DP-owned D3D11 device (D3D11CreateDevice).
+        d3d11 dxgi)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_HAVE_LEIA_SR_GL)
 endif()
 
