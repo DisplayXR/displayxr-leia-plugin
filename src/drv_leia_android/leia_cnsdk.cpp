@@ -127,6 +127,11 @@ struct leia_cnsdk
 	float display_height_m_cached{0.0f};
 	uint32_t display_pixel_w_cached{0};
 	uint32_t display_pixel_h_cached{0};
+	// Per-view (tile) resolution in pixels, in the device NATURAL orientation —
+	// CNSDK VIEW_RESOLUTION_PX. The 3D view_scale is tile ÷ panel (#518). Cached
+	// alongside the panel res under the same display_metrics_cached release flag.
+	uint32_t view_res_w_cached{0};
+	uint32_t view_res_h_cached{0};
 
 	// Device's natural orientation (LANDSCAPE=0 / PORTRAIT=1 / …), cached from
 	// the device config in the worker. The predicted/non-predicted faces arrive
@@ -389,6 +394,13 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		    cfg, LEIA_DEVICE_CONFIG_PROPERTY_DISPLAY_SIZE_MM, 2, display_size_mm);
 		bool got_res = leia_device_config_get_i32(
 		    cfg, LEIA_DEVICE_CONFIG_PROPERTY_PANEL_RESOLUTION_PX, 2, panel_res_px);
+		// #518: per-view (tile) resolution → the 3D view_scale = tile ÷ panel.
+		// Both are in the device NATURAL orientation. VIEW_RESOLUTION_PX is
+		// Read-Write (an app could override it) — log it so we can confirm it
+		// reads the device default (e.g. 1200x1920 on the nubia NP02J).
+		int32_t view_res_px[2] = {0, 0};
+		bool got_view = leia_device_config_get_i32(
+		    cfg, LEIA_DEVICE_CONFIG_PROPERTY_VIEW_RESOLUTION_PX, 2, view_res_px);
 		if (got_size) {
 			cnsdk->display_width_m_cached = display_size_mm[0] / 1000.0f;
 			cnsdk->display_height_m_cached = display_size_mm[1] / 1000.0f;
@@ -396,6 +408,10 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		if (got_res) {
 			cnsdk->display_pixel_w_cached = (uint32_t)panel_res_px[0];
 			cnsdk->display_pixel_h_cached = (uint32_t)panel_res_px[1];
+		}
+		if (got_view) {
+			cnsdk->view_res_w_cached = (uint32_t)view_res_px[0];
+			cnsdk->view_res_h_cached = (uint32_t)view_res_px[1];
 		}
 		int32_t natural_ori = -1;
 		if (leia_device_config_get_i32(
@@ -405,10 +421,12 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		leia_device_config_release(cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
 		DXR_HW_DBG("worker: natural_orientation=%d", natural_ori);
-		DXR_HW_DBG("worker: cached metrics: %ux%u px, %.3fx%.3f m (size_ok=%d res_ok=%d)",
+		DXR_HW_DBG("worker: cached metrics: panel=%ux%u px, view(tile)=%ux%u px, "
+		           "%.3fx%.3f m (size_ok=%d res_ok=%d view_ok=%d)",
 		           cnsdk->display_pixel_w_cached, cnsdk->display_pixel_h_cached,
+		           cnsdk->view_res_w_cached, cnsdk->view_res_h_cached,
 		           cnsdk->display_width_m_cached, cnsdk->display_height_m_cached,
-		           (int)got_size, (int)got_res);
+		           (int)got_size, (int)got_res, (int)got_view);
 	} else {
 		U_LOG_W("leia_core_get_device_config failed in worker; metrics stay default");
 	}
@@ -713,6 +731,33 @@ leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
 	}
 	if (out_pixel_h != NULL) {
 		*out_pixel_h = cnsdk->display_pixel_h_cached;
+	}
+	return true;
+}
+
+extern "C" bool
+leia_cnsdk_get_view_resolution(struct leia_cnsdk *cnsdk,
+                               uint32_t *out_view_w,
+                               uint32_t *out_view_h,
+                               int32_t *out_natural_orientation)
+{
+	// Per-view (tile) resolution in NATURAL orientation, cached by the worker
+	// under display_metrics_cached. Used to derive the 3D view_scale (#518).
+	if (cnsdk == NULL ||
+	    !cnsdk->display_metrics_cached.load(std::memory_order_acquire)) {
+		return false;
+	}
+	if (cnsdk->view_res_w_cached == 0 || cnsdk->view_res_h_cached == 0) {
+		return false;
+	}
+	if (out_view_w != NULL) {
+		*out_view_w = cnsdk->view_res_w_cached;
+	}
+	if (out_view_h != NULL) {
+		*out_view_h = cnsdk->view_res_h_cached;
+	}
+	if (out_natural_orientation != NULL) {
+		*out_natural_orientation = cnsdk->natural_orientation.load(std::memory_order_relaxed);
 	}
 	return true;
 }

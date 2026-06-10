@@ -125,6 +125,22 @@ leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
                                uint32_t *out_pixel_h);
 
 /*!
+ * Per-view (tile) resolution in pixels, in the device NATURAL orientation
+ * (CNSDK VIEW_RESOLUTION_PX). The 3D view_scale is this ÷ panel resolution
+ * (#518). Cached by the worker; poll across frames.
+ *
+ * @param[out] out_view_w              Per-view (tile) pixel width, natural frame.
+ * @param[out] out_view_h             Per-view (tile) pixel height, natural frame.
+ * @param[out] out_natural_orientation Device natural orientation (-1 if unknown).
+ * @return true once the worker has cached a non-zero view resolution.
+ */
+bool
+leia_cnsdk_get_view_resolution(struct leia_cnsdk *cnsdk,
+                               uint32_t *out_view_w,
+                               uint32_t *out_view_h,
+                               int32_t *out_natural_orientation);
+
+/*!
  * Non-blocking check for whether CNSDK face tracking is running.
  *
  * Enable + start happens asynchronously on a worker thread spawned by
