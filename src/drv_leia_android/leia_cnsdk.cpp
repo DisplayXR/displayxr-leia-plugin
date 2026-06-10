@@ -564,8 +564,15 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	leia_core_enable_3d(core, true);
-
+	// Do NOT touch the core here — leia_core_init_async() only *kicks off*
+	// asynchronous initialization (core.h: "while (!leia_core_is_initialized)"
+	// before any use). Calling leia_core_enable_3d() now, before the core is
+	// initialized, stalls the calling thread. Out-of-process (#510) this create
+	// runs marshaled on the service MAIN thread so init_async can post to the
+	// main Looper; blocking here would freeze that Looper, so the async init can
+	// never complete (core tears down: "Release refCount=0 / Shutdown"). The
+	// worker (face_tracking_worker) already polls leia_core_is_initialized and
+	// then calls enable_no_face_mode + enable_3d in the correct order — let it.
 	auto *cnsdk = new struct leia_cnsdk();
 	cnsdk->lib = lib;
 	cnsdk->core = core;

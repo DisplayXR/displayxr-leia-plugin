@@ -85,6 +85,14 @@ leia_android_hmd_create(void)
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
 	hmd->base.device_type = XRT_DEVICE_TYPE_HMD;
 
+	// Declare the head-pose input (U_DEVICE_ALLOCATE reserved one input slot and
+	// defaults it active). Out-of-process (#510) the IPC server gates
+	// get_tracked_pose on find_input() matching this name in shared memory — an
+	// unnamed input returns XRT_ERROR_IPC_FAILURE, which spins the client and
+	// stalls rendering (black). In-process this is invisible because oxr calls
+	// get_tracked_pose directly. Mirrors sim_display_device.c.
+	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
+
 	// Lume Pad 2 default panel + viewing distance. CNSDK fills these
 	// in lazily on first DP query once the async core init completes.
 	struct u_device_simple_info info = {
