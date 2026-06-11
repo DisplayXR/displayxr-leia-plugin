@@ -45,18 +45,20 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v1.14.0 (plug-in ABI v3 — v1.14.0 APPENDS
-    # the #224 local-zone DP vtable slots per ADR-020, no major bump; this
-    # plug-in implements them, so it needs headers that declare them. The
-    # previous pin, v1.13.0, was the ABI-v3 baseline per runtime#441 / this
-    # repo's #29). The DP vtables carry a struct_size header; the runtime's
+    # PRE-RELEASE PIN: a runtime main SHA (post-v1.16.0) that carries the
+    # ADR-027 zone-caps appends (wish_fractional / switch_granularity /
+    # XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1, runtime PR #539) this plug-in now
+    # reports against — no runtime tag ships them yet. Re-pin to the next
+    # runtime vX.Y.Z tag before tagging a plug-in release (the release
+    # tooling assumes a tag pin). ABI minor unchanged — append-only, no
+    # major bump. The DP vtables carry a struct_size header; the runtime's
     # loader rejects any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs
     # from its own. This plug-in MUST be built against headers that ship the
     # matching major, or the runtime will log "ABI major mismatch —
     # plugin_api=N, runtime expects M ... skipping (ADR-020 rule 3)" and fall
     # back to sim_display. The rule-5 CI self-check below asserts this value
     # equals the workflow's runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v1.15.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "fe509b180f790dd380531de979efba2c5158f05b" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(

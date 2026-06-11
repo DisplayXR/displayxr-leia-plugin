@@ -1432,7 +1432,12 @@ static bool
 leia_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_local_zone_caps *out_caps)
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	if (out_caps == nullptr || out_caps->struct_size < sizeof(struct xrt_dp_local_zone_caps)) {
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// The V1 shape is the floor — reject only callers older than the
+		// zone api itself. Comparing against sizeof(*out_caps) here would
+		// wrongly reject OLD (V1) runtimes after the ADR-027 append; the
+		// V1 fields are written always and the appended fields only when
+		// the caller's struct_size covers them.
 		return false;
 	}
 	// Zones are driven through the per-client SR lens hint — needs the hint
@@ -1446,6 +1451,15 @@ leia_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struc
 	out_caps->max_mask_width = 0; // no preference — content is reduced to one bit
 	out_caps->max_mask_height = 0;
 	out_caps->max_update_hz = 0; // edge-triggered internally (verdict changes only)
+	if (out_caps->struct_size >= sizeof(struct xrt_dp_local_zone_caps)) {
+		// SR weaver drives a binary panel state — the wish is consumed by
+		// the conformant any-nonzero quantization, not driven fractionally.
+		out_caps->wish_fractional = 0;
+		// Advisory only; no verified hardware claim (ADR-027 flags the
+		// lenticular column-band hypothesis as unverified).
+		out_caps->switch_granularity = (uint32_t)XRT_DP_SWITCH_GRANULARITY_UNKNOWN;
+		memset(out_caps->reserved, 0, sizeof(out_caps->reserved));
+	}
 	return true;
 }
 
