@@ -695,6 +695,17 @@ on_resume_cnsdk(struct xrt_display_processor *xdp)
 	}
 }
 
+// #522: the runtime's MANAGED/MANUAL selection. Forward to the CNSDK wrapper,
+// which toggles NoFaceMode (with the licensing/availability guard).
+void
+set_eye_tracking_mode_cnsdk(struct xrt_display_processor *xdp, uint32_t mode)
+{
+	leia_dp_cnsdk *impl = as_impl(xdp);
+	if (impl->cnsdk != nullptr) {
+		leia_cnsdk_set_eye_tracking_mode(impl->cnsdk, mode);
+	}
+}
+
 void
 destroy_impl(struct xrt_display_processor *xdp)
 {
@@ -762,6 +773,7 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->base.get_predicted_eye_positions = get_predicted_eye_positions_ipd;
 	impl->base.get_display_dimensions = get_display_dimensions_default;
 	impl->base.get_display_pixel_info = get_display_pixel_info_default;
+	impl->base.set_eye_tracking_mode = set_eye_tracking_mode_cnsdk; // #522
 	impl->base.destroy = destroy_impl;
 
 	*out_xdp = &impl->base;

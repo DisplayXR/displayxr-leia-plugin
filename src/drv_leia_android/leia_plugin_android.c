@@ -273,8 +273,12 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	out_info->nominal_viewer_y_m = 0.0f;
 	out_info->nominal_viewer_z_m = 0.50f;
 
-	// CNSDK exposes face position only — no MANUAL pose-stream API.
-	out_info->supported_eye_tracking_modes = 1u; // MANAGED_BIT
+	// MANAGED vs MANUAL is about WHO owns the tracking-loss lifecycle, not pose
+	// injection (docs/specs/vendor/eye-tracking-modes.md). CNSDK can do both on
+	// Android: MANAGED = NoFaceMode on (vendor runs grace + auto-2D + comfort
+	// animation); MANUAL = NoFaceMode off + immediate isTracking (the app drives
+	// 2D⇄3D via xrRequestDisplayRenderingModeEXT). Advertise both; default MANAGED.
+	out_info->supported_eye_tracking_modes = 3u; // MANAGED_BIT | MANUAL_BIT
 	out_info->default_eye_tracking_mode = 0u;    // MANAGED
 
 	return true;

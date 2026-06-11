@@ -102,6 +102,21 @@ void
 leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk);
 
 /*!
+ * Select the eye-tracking control mode (#522): 0 = MANAGED (CNSDK owns the
+ * tracking-loss lifecycle via NoFaceMode — grace + auto-2D), 1 = MANUAL (CNSDK
+ * stands down; the app drives 2D⇄3D). Stored and applied to the core; the
+ * face-tracking worker reconciles it once licensing/availability is known
+ * (MANAGED auto-2D only engages when face tracking is actually available, else
+ * the force-3D fallback persists). Safe to call any time after
+ * @ref leia_cnsdk_create.
+ *
+ * @param cnsdk  Opaque CNSDK handle.
+ * @param mode   0 = MANAGED, 1 = MANUAL.
+ */
+void
+leia_cnsdk_set_eye_tracking_mode(struct leia_cnsdk *cnsdk, uint32_t mode);
+
+/*!
  * Fetch native display metrics from CNSDK's device config.
  *
  * The four values are snapshotted once by the face-tracking worker

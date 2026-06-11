@@ -95,6 +95,14 @@ struct leia_cnsdk
 	std::atomic<bool> face_tracking_started{false};
 	std::atomic<bool> shutting_down{false};
 	std::thread worker;
+
+	// Eye-tracking control mode (#522): 0 = MANAGED (CNSDK owns the
+	// tracking-loss lifecycle — grace + auto-2D via NoFaceMode), 1 = MANUAL
+	// (CNSDK stands down; the app drives 2D⇄3D). Set by the runtime via
+	// leia_cnsdk_set_eye_tracking_mode; applied by apply_eye_tracking_mode once
+	// the core is initialized and the licensing/availability of face tracking is
+	// known. Default MANAGED, matching the plug-in's advertised default.
+	std::atomic<uint32_t> eye_tracking_mode{0};
 	float camera_center_x_m{0.0f};
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
@@ -337,6 +345,33 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 	leia_headtracking_frame_release(frame);
 }
 
+// Apply the current eye-tracking control mode (#522) to the CNSDK core. Safe to
+// call only once the core is initialized. The licensing/availability guard keys
+// off face_tracking_started: if in-app face tracking never licensed (no eye
+// position will ever arrive), MANAGED's auto-2D would collapse to PERMANENT flat
+// 2D — so we only engage CNSDK NoFaceMode (vendor-managed auto-2D) when MANAGED
+// is selected AND tracking is actually available; otherwise we force the 3D
+// light-field on (NoFaceMode off), which is also the correct MANUAL behavior
+// (the vendor stands down; the app drives 2D⇄3D).
+void
+apply_eye_tracking_mode(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == nullptr || cnsdk->core == nullptr) {
+		return;
+	}
+	uint32_t mode = cnsdk->eye_tracking_mode.load(std::memory_order_acquire);
+	bool tracking_available = cnsdk->face_tracking_started.load(std::memory_order_acquire);
+	bool managed_auto_2d = (mode == 0u /*MANAGED*/) && tracking_available;
+
+	// NoFaceMode ON => CNSDK owns grace + auto-drop-to-2D on tracking loss
+	// (MANAGED). NoFaceMode OFF => force the 3D light-field regardless of face
+	// (MANUAL, or MANAGED-without-license POC guard).
+	leia_core_enable_no_face_mode(cnsdk->core, managed_auto_2d);
+	leia_core_enable_3d(cnsdk->core, true);
+	DXR_HW_DBG("apply_eye_tracking_mode: mode=%u tracking_available=%d -> no_face_mode=%d",
+	           mode, (int)tracking_available, (int)managed_auto_2d);
+}
+
 void
 face_tracking_worker(struct leia_cnsdk *cnsdk)
 {
@@ -363,16 +398,15 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	}
 	DXR_HW_DBG("worker: core initialized after %d polls", poll_count);
 
-	// Force the 3D light-field ON. Face tracking may fail to license on this
-	// build (no eye position), and CNSDK's no-face mode would then auto-drop
-	// the backlight to flat 2D — making the weave look wrong/flat on the
-	// panel. Disable no-face mode and force the backlight on so the
-	// light-field is driven regardless of face tracking. Do this BEFORE the
-	// (possibly-failing) face-tracking enable below so it always runs. A live
-	// 2D/3D A-B toggle is available via debug.dxr.leia.backlight (see weave).
+	// BOOTSTRAP (pre-tracking): force the 3D light-field ON until we know whether
+	// face tracking licenses. NoFaceMode would otherwise auto-drop to flat 2D
+	// before any face arrives. The FINAL eye-tracking-mode policy (#522) is
+	// applied by apply_eye_tracking_mode() below, once face_tracking_started is
+	// known: MANAGED + licensed -> NoFaceMode on; MANUAL or unlicensed -> stays
+	// force-3D. A live 2D/3D A-B toggle is available via debug.dxr.leia.backlight.
 	leia_core_enable_no_face_mode(cnsdk->core, false);
 	leia_core_enable_3d(cnsdk->core, true);
-	DXR_HW_DBG("worker: forced backlight ON + no-face mode OFF (3D light-field)");
+	DXR_HW_DBG("worker: bootstrap force-3D (no-face mode OFF) until tracking status known");
 
 	// Phase 2a: snapshot all device-config values we need on the render
 	// thread (camera center for face-position translation; display
@@ -452,6 +486,12 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 
 	cnsdk->face_tracking_started.store(true, std::memory_order_release);
 	U_LOG_W("CNSDK face tracking started (worker)");
+
+	// Tracking is now available (licensed): apply the eye-tracking-mode policy
+	// (#522). If the runtime already selected MANUAL, or selected MANAGED, this
+	// reconciles NoFaceMode accordingly (replacing the bootstrap force-3D). If no
+	// explicit request arrived, the default MANAGED now engages vendor auto-2D.
+	apply_eye_tracking_mode(cnsdk);
 }
 
 } // namespace
@@ -703,6 +743,22 @@ leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
 	}
 	DXR_HW_DBG("on_resume: forwarding to leia_core_on_resume");
 	leia_core_on_resume(cnsdk->core);
+}
+
+extern "C" void
+leia_cnsdk_set_eye_tracking_mode(struct leia_cnsdk *cnsdk, uint32_t mode)
+{
+	if (cnsdk == NULL) {
+		return;
+	}
+	cnsdk->eye_tracking_mode.store(mode, std::memory_order_release);
+	DXR_HW_DBG("set_eye_tracking_mode: mode=%u (0=MANAGED,1=MANUAL)", mode);
+
+	// Apply immediately if the core is up; otherwise the face-tracking worker
+	// applies the stored mode once it knows the licensing/availability status.
+	if (cnsdk->core != NULL && leia_core_is_initialized(cnsdk->core)) {
+		apply_eye_tracking_mode(cnsdk);
+	}
 }
 
 extern "C" bool
