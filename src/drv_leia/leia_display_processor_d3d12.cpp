@@ -1500,11 +1500,16 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		    0, ldp->blit_srv_heap->GetGPUDescriptorHandleForHeapStart());
 
 		// Atlas is guaranteed content-sized by compositor crop-blit.
-		// In 2D mode, content occupies min(target, atlas) of the atlas.
+		// runtime#542: hardware-2D shows TILE 0 flat — not the whole atlas —
+		// so a multi-tile submission (an app-authored hardware/content
+		// divergence) renders as one clean flat view instead of a side-by-
+		// side squish. A matched 1×1 atlas (tile == atlas) keeps the previous
+		// whole-atlas math unchanged. Mirrors the GL/VK 2D blits, which
+		// already source view_width × view_height only.
 		uint32_t atlas_w = tile_columns * view_width;
 		uint32_t atlas_h = tile_rows * view_height;
-		uint32_t content_w = (target_width < atlas_w) ? target_width : atlas_w;
-		uint32_t content_h = (target_height < atlas_h) ? target_height : atlas_h;
+		uint32_t content_w = (target_width < view_width) ? target_width : view_width;
+		uint32_t content_h = (target_height < view_height) ? target_height : view_height;
 		float u_scale = (atlas_w > 0) ? (float)content_w / (float)atlas_w : 1.0f;
 		float v_scale = (atlas_h > 0) ? (float)content_h / (float)atlas_h : 1.0f;
 		uint32_t constants[4];

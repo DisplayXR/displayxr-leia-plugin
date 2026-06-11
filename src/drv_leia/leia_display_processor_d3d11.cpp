@@ -1199,8 +1199,15 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 				srv = composed;
 			}
 		}
-		uint32_t content_w = (vp_w < atlas_w) ? vp_w : atlas_w;
-		uint32_t content_h = (vp_h < atlas_h) ? vp_h : atlas_h;
+		// runtime#542: hardware-2D shows TILE 0 flat — not the whole atlas —
+		// so a multi-tile submission (an app-authored hardware/content
+		// divergence, e.g. MANUAL tracking-loss: panel flat while the app
+		// fades its 2 tiles) renders as one clean flat view instead of a
+		// side-by-side squish. A matched 1×1 atlas (tile == atlas) keeps the
+		// previous whole-atlas math unchanged. Mirrors the GL/VK 2D blits,
+		// which already source view_width × view_height only.
+		uint32_t content_w = (vp_w < view_width) ? vp_w : view_width;
+		uint32_t content_h = (vp_h < view_height) ? vp_h : view_height;
 		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
 		cb_data.u_scale = (atlas_w > 0) ? (float)content_w / (float)atlas_w : 1.0f;
 		cb_data.v_scale = (atlas_h > 0) ? (float)content_h / (float)atlas_h : 1.0f;
