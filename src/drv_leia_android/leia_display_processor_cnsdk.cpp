@@ -434,10 +434,21 @@ get_or_create_weave_fb(leia_dp_cnsdk *impl)
 		}
 	}
 	if (impl->weave_fb_count >= 8) {
-		// Swapchains have only a handful of images; a full cache means the
-		// view set churned unexpectedly. Don't grow unbounded.
-		U_LOG_W("get_or_create_weave_fb: cache full, skipping weave");
-		return VK_NULL_HANDLE;
+		// The compositor recreated its swapchain (surface re-sync on a
+		// background→resume cycle, runtime#528, or live rotation): every
+		// cached entry references a view from a destroyed swapchain, so a
+		// full cache on a miss means stale entries — flush and rebuild on
+		// demand. The recreate idled the device, so the old framebuffers
+		// are not in flight. (Previously this skipped the weave forever →
+		// black panel after the second picker round-trip.)
+		U_LOG_W("get_or_create_weave_fb: view set churned (swapchain recreate) — flushing fb cache");
+		for (uint32_t i = 0; i < impl->weave_fb_count; i++) {
+			if (impl->weave_fb_cache[i].fb != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, impl->weave_fb_cache[i].fb, nullptr);
+			}
+			impl->weave_fb_cache[i] = {};
+		}
+		impl->weave_fb_count = 0;
 	}
 	VkImageView atts[2] = {color_view, impl->weave_depth_view};
 	VkFramebufferCreateInfo fbci = {};
