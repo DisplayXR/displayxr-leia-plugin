@@ -686,6 +686,23 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 		}
 	}
 
+	// Stop face tracking BEFORE releasing the core (#39). The worker enabled +
+	// started tracking and registered a frame listener; leia_core_release joins
+	// leiaCore's internal tracking/service threads, and with tracking still
+	// started that join never returns — the service then hangs inside
+	// multi_compositor_end_session, the IPC session_end reply is never sent and
+	// the client deadlocks in xrEndSession (black screen on resume,
+	// runtime#528's picker scenario). Tear down in the reverse order of the
+	// worker's bring-up: listener → started → enabled.
+	if (cnsdk->core != NULL && cnsdk->face_tracking_started.load(std::memory_order_acquire)) {
+		leia_core_set_face_tracking_frame_listener(cnsdk->core, NULL);
+		cnsdk->frame_listener = NULL; // core owned it; cleared with the listener slot
+		leia_core_start_face_tracking(cnsdk->core, false);
+		leia_core_enable_face_tracking(cnsdk->core, false);
+		cnsdk->face_tracking_started.store(false, std::memory_order_release);
+		DXR_HW_DBG("leia_cnsdk_destroy: face tracking stopped + disabled (#39)");
+	}
+
 	if (cnsdk->interlacer != NULL) {
 		// CNSDK 0.10.x: single-arg interlacer release.
 		leia_interlacer_release(cnsdk->interlacer);
