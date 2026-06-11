@@ -281,6 +281,16 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	out_info->supported_eye_tracking_modes = 3u; // MANAGED_BIT | MANUAL_BIT
 	out_info->default_eye_tracking_mode = 0u;    // MANAGED
 
+	// Panel refresh for the runtime's null-compositor frame pacer (the DP owns
+	// present/weave on Android, so there's no swapchain vblank to source). 60 Hz
+	// = the nubia's current display mode (baseline, like the dims above); without
+	// it the null compositor falls back to a 20 FPS placeholder. struct_size
+	// guards an older runtime whose struct predates this append-only field.
+	if (out_info->struct_size >=
+	    offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(out_info->refresh_mhz)) {
+		out_info->refresh_mhz = 60000u;
+	}
+
 	return true;
 }
 
