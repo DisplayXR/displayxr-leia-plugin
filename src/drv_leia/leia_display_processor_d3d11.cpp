@@ -1634,22 +1634,21 @@ leia_dp_d3d11_is_alpha_native(struct xrt_display_processor_d3d11 *xdp)
 	return false;
 }
 
+// Shared transparency enable used by both set_transparent_background (#551, the
+// chroma-key-free entry) and the legacy set_chroma_key. Preferred path: WGC
+// desktop capture so we composite the desktop UNDER the atlas tiles (from the
+// premultiplied alpha) instead of the chroma-key trick. On any failure (older
+// Windows, capture blocked, env-disabled, or — pre-#551 — a cross-process
+// HWND), fall through to chroma-key using ldp->ck_color.
 static void
-leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
-                              uint32_t key_color,
-                              bool transparent_bg_enabled)
+leia_dp_d3d11_enable_transparency(struct leia_display_processor_d3d11_impl *ldp, bool transparent_bg_enabled)
 {
-	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-
-	// Preserve the ck_color/ck_enabled values regardless of path — they
-	// are the fallback if WGC fails or gets disabled mid-session.
-	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
+	// Ensure a valid fallback key color even when the caller never supplied one.
+	if (ldp->ck_color == 0) {
+		ldp->ck_color = kDefaultChromaKey;
+	}
 	ldp->ck_enabled = transparent_bg_enabled;
 
-	// Preferred path: try to initialize WGC-based desktop capture so we can
-	// pre-composite the desktop UNDER the atlas tiles instead of using the
-	// chroma-key trick. On any failure (older Windows, capture blocked,
-	// env-disabled), fall through to chroma-key.
 	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
 		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
 		if (ldp->bg_capture != nullptr && ldp->device != nullptr) {
@@ -1672,11 +1671,33 @@ leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
 		}
 	}
 	if (!ldp->bg_compose_enabled) {
-		U_LOG_W("Leia D3D11 DP: transparency = chroma-key %s (key=0x%08X%s)",
-		        ldp->ck_enabled ? "ENABLED" : "disabled",
-		        ldp->ck_color,
-		        (key_color == 0) ? " — DP default" : " — app override");
+		U_LOG_W("Leia D3D11 DP: transparency = chroma-key %s (key=0x%08X)",
+		        ldp->ck_enabled ? "ENABLED" : "disabled", ldp->ck_color);
 	}
+}
+
+// #551: the clean, chroma-key-free transparency enable. The runtime calls this
+// in preference to set_chroma_key; behaviour is compose-under-bg (WGC) with the
+// chroma-key trick kept only as the last-resort fallback if WGC can't init.
+static void
+leia_dp_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp, bool enabled)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	leia_dp_d3d11_enable_transparency(ldp, enabled);
+}
+
+static void
+leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
+                              uint32_t key_color,
+                              bool transparent_bg_enabled)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	// An explicit app key overrides the default; 0 keeps the DP default
+	// (applied in the shared helper).
+	if (key_color != 0) {
+		ldp->ck_color = key_color;
+	}
+	leia_dp_d3d11_enable_transparency(ldp, transparent_bg_enabled);
 }
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
@@ -1769,6 +1790,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
 	ldp->base.set_chroma_key = leia_dp_d3d11_set_chroma_key;
 	ldp->base.set_background_2d = leia_dp_d3d11_set_background_2d; // #491 part 3
+	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #551 (slot 17)
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
