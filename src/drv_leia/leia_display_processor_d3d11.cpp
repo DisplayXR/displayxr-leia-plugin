@@ -346,6 +346,13 @@ struct leia_display_processor_d3d11_impl
 	//! @{
 	struct leia_bg_capture *bg_capture; //!< Owned; NULL if WGC init failed → fall back to ck.
 	bool bg_compose_enabled;            //!< True when the new path is active for this session.
+	//! #551 client-present mode: the runtime owns a transparent DComp present on
+	//! the app window, so DWM blends the LIVE desktop into the alpha-gate holes.
+	//! In this mode we run ONLY the post-weave alpha-gate (punching all-views-
+	//! transparent pixels to (0,0,0,0)) and SKIP compose-under-bg entirely — no
+	//! WGC capture, so no stale-frame lag. Set by set_transparent_background's
+	//! client_presents arg.
+	bool client_present_mode;
 	ID3D11Texture2D *bg_shared_tex;     //!< Opened from bg_capture's shared NT handle.
 	ID3D11ShaderResourceView *bg_shared_srv;
 	ID3D11Fence *bg_fence;              //!< Opened from bg_capture's shared fence handle.
@@ -732,6 +739,17 @@ compose_should_run(struct leia_display_processor_d3d11_impl *ldp)
 	return ldp->bg_compose_enabled && ldp->bg_capture != nullptr && ldp->bg_shared_srv != nullptr;
 }
 
+// The post-weave alpha-gate runs in two cases:
+//   - compose-under-bg active (it pairs with the pre-weave compose), OR
+//   - #551 client-present mode: the runtime owns a transparent present, so we
+//     skip compose entirely (no WGC) and rely on the alpha-gate alone to punch
+//     (0,0,0,0) holes for DWM to blend the live desktop. No captured-frame lag.
+static bool
+alpha_gate_should_run(struct leia_display_processor_d3d11_impl *ldp)
+{
+	return compose_should_run(ldp) || ldp->client_present_mode;
+}
+
 static bool
 compose_init_pipeline(struct leia_display_processor_d3d11_impl *ldp)
 {
@@ -995,6 +1013,12 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
                           uint32_t canvas_width,
                           uint32_t canvas_height)
 {
+	// #551 client-present mode reaches the gate without compose_run_pre_weave
+	// ever having lazily built the pipeline — init it here on first use. (In the
+	// compose path this is already a no-op; the pre-weave pass built it.)
+	if (ldp->alpha_gate_ps == nullptr) {
+		compose_init_pipeline(ldp);
+	}
 	if (atlas_srv == nullptr || ldp->alpha_gate_ps == nullptr) {
 		return;
 	}
@@ -1080,6 +1104,15 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	D3D11_RECT sc = { vp_x, vp_y, vp_x + (int32_t)vp_w, vp_y + (int32_t)vp_h };
 	ctx->RSSetScissorRects(1, &sc);
 	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+
+	// The gate REPLACES the back buffer (including its alpha) — it must not be
+	// alpha-blended. The service zones composite / weave can leave a src-over
+	// blend state bound; under that state the gate's float4(0,0,0,0) output for a
+	// transparent pixel computes dst*(1-0)=dst (a no-op), so the opaque black
+	// weave survives and the live desktop never shows. Force the default
+	// (blend-disabled, write-all-channels) state so α=0 actually lands. (#551 —
+	// in-process this happened to inherit a default state, masking the bug.)
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
 
 	ctx->IASetInputLayout(nullptr);
 	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -1244,7 +1277,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		//   - compose path: alpha-gate samples the atlas to find "all views
 		//     α==0" screen pixels and zeroes their alpha — no chroma keying.
 		//   - chroma-key fallback: legacy strip pass on the magenta sentinel.
-		if (compose_should_run(ldp)) {
+		if (alpha_gate_should_run(ldp)) {
 			alpha_gate_run_post_weave(
 			    ldp, ctx,
 			    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
@@ -1343,7 +1376,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	//     No chroma keying — no magenta enters the weaver, no exact-match
 	//     fringe artifact at silhouettes.
 	//   - chroma-key fallback: legacy strip pass.
-	if (compose_should_run(ldp)) {
+	if (alpha_gate_should_run(ldp)) {
 		alpha_gate_run_post_weave(
 		    ldp, ctx,
 		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
@@ -1641,13 +1674,34 @@ leia_dp_d3d11_is_alpha_native(struct xrt_display_processor_d3d11 *xdp)
 // Windows, capture blocked, env-disabled, or — pre-#551 — a cross-process
 // HWND), fall through to chroma-key using ldp->ck_color.
 static void
-leia_dp_d3d11_enable_transparency(struct leia_display_processor_d3d11_impl *ldp, bool transparent_bg_enabled)
+leia_dp_d3d11_enable_transparency(struct leia_display_processor_d3d11_impl *ldp,
+                                  bool transparent_bg_enabled,
+                                  bool client_presents)
 {
 	// Ensure a valid fallback key color even when the caller never supplied one.
 	if (ldp->ck_color == 0) {
 		ldp->ck_color = kDefaultChromaKey;
 	}
 	ldp->ck_enabled = transparent_bg_enabled;
+
+	// #551 client-present mode: the runtime owns a transparent DComp present on
+	// the app window, so DWM blends the LIVE desktop into the holes. We must NOT
+	// compose-under-bg (that bakes a stale WGC-captured desktop = a frame of lag)
+	// — run only the post-weave alpha-gate. Skip WGC capture entirely.
+	if (transparent_bg_enabled && client_presents) {
+		ldp->client_present_mode = true;
+		ldp->ck_enabled = false;
+		// Tear down any compose path enabled on a prior (non-client) call.
+		if (ldp->bg_compose_enabled) {
+			compose_release_resources(ldp);
+			ldp->bg_compose_enabled = false;
+		}
+		U_LOG_W("Leia D3D11 DP: transparency = client-present (alpha-gate only, no WGC)");
+		return;
+	}
+	if (!transparent_bg_enabled) {
+		ldp->client_present_mode = false;
+	}
 
 	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
 		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
@@ -1680,10 +1734,10 @@ leia_dp_d3d11_enable_transparency(struct leia_display_processor_d3d11_impl *ldp,
 // in preference to set_chroma_key; behaviour is compose-under-bg (WGC) with the
 // chroma-key trick kept only as the last-resort fallback if WGC can't init.
 static void
-leia_dp_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp, bool enabled)
+leia_dp_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp, bool enabled, bool client_presents)
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	leia_dp_d3d11_enable_transparency(ldp, enabled);
+	leia_dp_d3d11_enable_transparency(ldp, enabled, client_presents);
 }
 
 static void
@@ -1697,7 +1751,9 @@ leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
 	if (key_color != 0) {
 		ldp->ck_color = key_color;
 	}
-	leia_dp_d3d11_enable_transparency(ldp, transparent_bg_enabled);
+	// Legacy chroma-key entry — never client-present (the runtime presents
+	// opaque on this path); the DP owns see-through via compose/chroma-key.
+	leia_dp_d3d11_enable_transparency(ldp, transparent_bg_enabled, /*client_presents=*/false);
 }
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
