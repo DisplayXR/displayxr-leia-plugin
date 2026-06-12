@@ -20,3 +20,17 @@ is shaped as a *request* (returning `XR_SUCCESS` on acceptance, not on physical 
 
 On Android, `leia_core_set_backlight` is direct: enabling the backlight engages the lightfield
 optics, disabling it returns the panel to conventional 2D.
+
+## Hardware vs processing (runtime ADR-028, runtime#542)
+
+`request_display_mode` is **hardware-only**: it drives the lens hint / backlight and nothing
+else. The DP's atlas processing — weave vs flat-blit, and the mono eye-position centering —
+follows the **per-frame atlas grid** the runtime hands to `process_atlas`
+(`tile_columns × tile_rows > 1` ⇒ weave, `1×1` ⇒ flat blit), tracked as `ldp->view_count`.
+
+The two channels are deliberately independent: the repurposed `xrRequestDisplayModeEXT`
+(spec v15) overrides the hardware state for the current mode without changing it, so a
+hardware-2D override over an active 3D mode keeps the weave running with the lens off — the
+panel shows the woven atlas flat, and an app fading its parallax to zero converges back to a
+sharp image (the MANUAL tracking-loss transition). Implemented in all four API variants
+(PR #45); contract: runtime `docs/reference/xrt_plugin_iface.md` + ADR-028.
