@@ -27,6 +27,12 @@
 
 #include "util/u_logging.h"
 
+/* CMake injects the plug-in semver (PROJECT_VERSION) here; guard so the
+ * file still compiles standalone (e.g. a tooling/IDE build with no define). */
+#ifndef LEIA_PLUGIN_VERSION
+#define LEIA_PLUGIN_VERSION ""
+#endif
+
 #include "leia_interface.h"
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_D3D11
@@ -242,7 +248,7 @@ static struct xrt_plugin_iface g_leia_iface = {
     .id = "leia-sr",
     .display_name = "DisplayXR Leia SR",
     .vendor = "Leia Inc.",
-    .version = NULL, /* runtime release tag; filled in at install time when needed */
+    .version = LEIA_PLUGIN_VERSION, /* PROJECT_VERSION via CMake; CI patches it from the vX.Y.Z tag */
 
     .probe = leia_plugin_probe,
     .create_device = leia_plugin_create_device,

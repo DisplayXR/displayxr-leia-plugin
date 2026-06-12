@@ -92,6 +92,13 @@ set_target_properties(DisplayXR-LeiaSR PROPERTIES CXX_STANDARD 20)
 
 target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_USING_RUNTIME_DLL)
 
+# Surface the plug-in's semver through xrt_plugin_iface::version (reported by
+# `displayxr-cli info` + the Control Panel). Same PROJECT_VERSION the
+# VERSIONINFO resource embeds, and which CI patches from the vX.Y.Z tag at
+# release — so a release DLL reports its real tag and a local dev build
+# reports the (baseline) CMake VERSION.
+target_compile_definitions(DisplayXR-LeiaSR PRIVATE LEIA_PLUGIN_VERSION="${PROJECT_VERSION}")
+
 target_include_directories(DisplayXR-LeiaSR PRIVATE
     ${SR_PATH}/include
     ${SR_PATH}/third_party/OpenCV/include
