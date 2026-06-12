@@ -1944,7 +1944,14 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	struct vk_bundle *vk = ldp->vk;
 
-	// 2D mode: bypass weaver, blit atlas content directly to target
+	// runtime#542: atlas processing follows the CONTENT, not the lens. The
+	// runtime hands us the grid it packed; a multi-view atlas weaves, a
+	// single-view atlas flat-blits — regardless of the hardware state set
+	// via request_display_mode. view_count also feeds the eye-position
+	// centering below.
+	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
+
+	// Single-view content: bypass weaver, blit atlas content directly to target
 	if (ldp->view_count == 1 && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
 		// Barrier: atlas SHADER_READ → TRANSFER_SRC, target COLOR_ATTACHMENT → TRANSFER_DST
 		VkImageMemoryBarrier pre[2] = {
@@ -2135,12 +2142,13 @@ leia_dp_get_window_metrics(struct xrt_display_processor *xdp, struct xrt_window_
 static bool
 leia_dp_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
 {
+	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
+	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
+	// tracks the per-frame atlas grid in process_atlas, so a hardware
+	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
-	bool ok = leiasr_request_display_mode(ldp->leiasr, enable_3d);
-	if (ok) {
-		ldp->view_count = enable_3d ? 2 : 1;
-	}
-	return ok;
+	return leiasr_request_display_mode(ldp->leiasr, enable_3d);
 }
 
 static bool

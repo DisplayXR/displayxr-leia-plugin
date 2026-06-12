@@ -1411,6 +1411,13 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	// passthrough only); wiring EITHER + the weaver sRGB control here is a
 	// tracked follow-up.
 
+	// runtime#542: atlas processing follows the CONTENT, not the lens. The
+	// runtime hands us the grid it packed; a multi-view atlas weaves, a
+	// single-view atlas flat-blits — regardless of the hardware state set
+	// via request_display_mode. view_count also feeds the eye-position
+	// centering below.
+	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
+
 	// Compute effective viewport: canvas sub-rect when set, else full target.
 	// The SR SDK weaver uses viewport offset in its phase calculation:
 	//   xOffset = window_WeavingX + vpX
@@ -1500,16 +1507,11 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		    0, ldp->blit_srv_heap->GetGPUDescriptorHandleForHeapStart());
 
 		// Atlas is guaranteed content-sized by compositor crop-blit.
-		// runtime#542: hardware-2D shows TILE 0 flat — not the whole atlas —
-		// so a multi-tile submission (an app-authored hardware/content
-		// divergence) renders as one clean flat view instead of a side-by-
-		// side squish. A matched 1×1 atlas (tile == atlas) keeps the previous
-		// whole-atlas math unchanged. Mirrors the GL/VK 2D blits, which
-		// already source view_width × view_height only.
+		// In 2D mode, content occupies min(target, atlas) of the atlas.
 		uint32_t atlas_w = tile_columns * view_width;
 		uint32_t atlas_h = tile_rows * view_height;
-		uint32_t content_w = (target_width < view_width) ? target_width : view_width;
-		uint32_t content_h = (target_height < view_height) ? target_height : view_height;
+		uint32_t content_w = (target_width < atlas_w) ? target_width : atlas_w;
+		uint32_t content_h = (target_height < atlas_h) ? target_height : atlas_h;
 		float u_scale = (atlas_w > 0) ? (float)content_w / (float)atlas_w : 1.0f;
 		float v_scale = (atlas_h > 0) ? (float)content_h / (float)atlas_h : 1.0f;
 		uint32_t constants[4];
@@ -1748,12 +1750,13 @@ leia_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xd
 static bool
 leia_dp_d3d12_request_display_mode(struct xrt_display_processor_d3d12 *xdp, bool enable_3d)
 {
+	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
+	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
+	// tracks the per-frame atlas grid in process_atlas, so a hardware
+	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
-	bool ok = leiasr_d3d12_request_display_mode(ldp->leiasr, enable_3d);
-	if (ok) {
-		ldp->view_count = enable_3d ? 2 : 1;
-	}
-	return ok;
+	return leiasr_d3d12_request_display_mode(ldp->leiasr, enable_3d);
 }
 
 static bool
