@@ -13,12 +13,8 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT WIN32 AND NOT ANDROID)
-    message(FATAL_ERROR
-        "The Leia plug-in supports two targets:\n"
-        "  - Windows / Leia SR (DisplayXR-LeiaSR.dll, drv_leia)\n"
-        "  - Android / Leia CNSDK (libdxrp050_leia_cnsdk.so, drv_leia_android)\n"
-        "Configured platform is neither WIN32 nor ANDROID.")
+if(NOT WIN32)
+    message(FATAL_ERROR "The Leia SR plug-in is Windows-only.")
 endif()
 
 if(NOT DEFINED BUILD_NUM)
@@ -45,20 +41,20 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # PRE-RELEASE PIN: a runtime main SHA (post-v1.16.0) that carries the
-    # ADR-027 zone-caps appends (wish_fractional / switch_granularity /
-    # XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1, runtime PR #539) this plug-in now
-    # reports against — no runtime tag ships them yet. Re-pin to the next
-    # runtime vX.Y.Z tag before tagging a plug-in release (the release
-    # tooling assumes a tag pin). ABI minor unchanged — append-only, no
-    # major bump. The DP vtables carry a struct_size header; the runtime's
-    # loader rejects any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs
-    # from its own. This plug-in MUST be built against headers that ship the
-    # matching major, or the runtime will log "ABI major mismatch —
-    # plugin_api=N, runtime expects M ... skipping (ADR-020 rule 3)" and fall
-    # back to sim_display. The rule-5 CI self-check below asserts this value
-    # equals the workflow's runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "fe509b180f790dd380531de979efba2c5158f05b" CACHE STRING
+    # Pinned to displayxr-runtime v1.17.0 — the tag that supersedes the prior
+    # pre-release SHA pin (fe509b180): v1.17.0 carries BOTH the ADR-027
+    # zone-caps appends (runtime PR #539) and the #551 D3D11 DP
+    # `set_transparent_background(.,enabled,client_presents)` slot
+    # (ADR-020/ADR-029), no major bump. This plug-in reports the zone caps and
+    # implements client-present mode, so it needs headers that declare both.
+    # The DP vtables carry a struct_size header; the runtime's loader rejects
+    # any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
+    # This plug-in MUST be built against headers that ship the matching major,
+    # or the runtime will log "ABI major mismatch — plugin_api=N, runtime
+    # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
+    # The rule-5 CI self-check below asserts this value equals the workflow's
+    # runtime checkout ref so the two can't drift.
+    set(DXR_RUNTIME_GIT_TAG "v1.17.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
@@ -69,26 +65,17 @@ else()
     FetchContent_MakeAvailable(displayxr_runtime)
 endif()
 
-if(WIN32)
-    # --- SR SDK (Windows / Leia SR plug-in) ----------------------------
-    if(NOT DEFINED ENV{LEIASR_SDKROOT})
-        message(FATAL_ERROR
-            "LEIASR_SDKROOT env var not set. Point at an extracted LeiaSR-SDK-*-win64 directory. "
-            "scripts/build-windows.bat fetches it from the sr-sdk-v* release on this repo.")
-    endif()
-    set(SR_PATH "$ENV{LEIASR_SDKROOT}")
-    list(APPEND CMAKE_PREFIX_PATH "${SR_PATH}")
-    find_package(simulatedreality CONFIG REQUIRED GLOBAL)
-    find_package(srDirectX CONFIG REQUIRED GLOBAL)
-    message(STATUS "Leia SR SDK at ${SR_PATH}")
-
-    add_subdirectory(src/drv_leia)
-    add_subdirectory(installer)
-elseif(ANDROID)
-    # --- CNSDK (Android / Leia CNSDK plug-in) --------------------------
-    # CNSDK setup (find_package(CNSDK CONFIG)) lives inside
-    # src/drv_leia_android/CMakeLists.txt — it consumes CNSDK_ROOT,
-    # which the build environment supplies. No NSIS installer on
-    # Android; the .so ships in the runtime APK's jniLibs/<ABI>/.
-    add_subdirectory(src/drv_leia_android)
+# --- SR SDK -------------------------------------------------------------
+if(NOT DEFINED ENV{LEIASR_SDKROOT})
+    message(FATAL_ERROR
+        "LEIASR_SDKROOT env var not set. Point at an extracted LeiaSR-SDK-*-win64 directory. "
+        "scripts/build-windows.bat fetches it from the sr-sdk-v* release on this repo.")
 endif()
+set(SR_PATH "$ENV{LEIASR_SDKROOT}")
+list(APPEND CMAKE_PREFIX_PATH "${SR_PATH}")
+find_package(simulatedreality CONFIG REQUIRED GLOBAL)
+find_package(srDirectX CONFIG REQUIRED GLOBAL)
+message(STATUS "Leia SR SDK at ${SR_PATH}")
+
+add_subdirectory(src/drv_leia)
+add_subdirectory(installer)
