@@ -46,6 +46,7 @@ using IDxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfa
 struct leia_bg_capture
 {
 	HWND hwnd;
+	bool affinity_owned; //!< true ⟹ WE set WDA_EXCLUDEFROMCAPTURE; reset it on teardown (#551).
 	HMONITOR monitor;
 	UINT monitor_w;
 	UINT monitor_h;
@@ -195,18 +196,46 @@ leia_bg_capture_create(HWND hwnd)
 		U_LOG_W("leia_bg_capture: OS < Win10 2004 lacks WDA_EXCLUDEFROMCAPTURE — falling back to chroma-key");
 		return nullptr;
 	}
-	if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
-		U_LOG_W("leia_bg_capture: SetWindowDisplayAffinity failed (err=%lu) — falling back to chroma-key",
-		        GetLastError());
-		return nullptr;
+	// WDA_EXCLUDEFROMCAPTURE excludes this window from our WGC monitor capture
+	// so we composite over the desktop BEHIND it, not our own weave. The call
+	// requires owning the window. For an out-of-process DP — the service-side
+	// compositor weaving an IPC client's cross-process HWND — it returns
+	// ERROR_ACCESS_DENIED; there the runtime sets the affinity from the
+	// window-owning process, so we detect the already-set state (via
+	// GetWindowDisplayAffinity, which works from any process) and proceed
+	// instead of falling back to chroma-key. (#551)
+	bool affinity_owned = false;
+	if (SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
+		affinity_owned = true;
+	} else {
+		DWORD err = GetLastError();
+		DWORD aff = WDA_NONE;
+		bool already_excluded = GetWindowDisplayAffinity(hwnd, &aff) && (aff == WDA_EXCLUDEFROMCAPTURE);
+		if (err == ERROR_ACCESS_DENIED && already_excluded) {
+			U_LOG_W("leia_bg_capture: cross-process window — capture-exclusion affinity "
+			        "pre-set by the runtime; proceeding with WGC compose-under");
+		} else {
+			U_LOG_W("leia_bg_capture: SetWindowDisplayAffinity failed (err=%lu, aff=0x%lx) — "
+			        "falling back to chroma-key",
+			        err, aff);
+			return nullptr;
+		}
 	}
+	// Only undo the affinity on an error path / teardown if WE set it — the
+	// runtime owns it on the cross-process path. (Capture by value: both are
+	// fixed hereafter; [&] would self-capture on MSVC.)
+	auto reset_affinity = [affinity_owned, hwnd]() {
+		if (affinity_owned) {
+			SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		}
+	};
 
 	HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 	MONITORINFO mi = {};
 	mi.cbSize = sizeof(mi);
 	if (monitor == nullptr || !GetMonitorInfoW(monitor, &mi)) {
 		U_LOG_W("leia_bg_capture: monitor info lookup failed");
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 	UINT monitor_w = mi.rcMonitor.right - mi.rcMonitor.left;
@@ -215,7 +244,7 @@ leia_bg_capture_create(HWND hwnd)
 	HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
 	if (FAILED(hr) && hr != RPC_E_CHANGED_MODE && hr != S_FALSE) {
 		U_LOG_W("leia_bg_capture: RoInitialize failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -224,7 +253,7 @@ leia_bg_capture_create(HWND hwnd)
 	hr = create_internal_d3d11(d3d11_device.GetAddressOf(), d3d11_context.GetAddressOf());
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: D3D11CreateDevice failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -232,7 +261,7 @@ leia_bg_capture_create(HWND hwnd)
 	hr = wrap_d3d11_as_winrt(d3d11_device.Get(), wg_device.GetAddressOf());
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: WinRT D3D11 device wrap failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -244,13 +273,13 @@ leia_bg_capture_create(HWND hwnd)
 		if (FAILED(hr)) {
 			U_LOG_W("leia_bg_capture: WGC item activation factory unavailable: 0x%08x — falling back to chroma-key",
 			        (unsigned)hr);
-			SetWindowDisplayAffinity(hwnd, WDA_NONE);
+			reset_affinity();
 			return nullptr;
 		}
 		hr = factory.As(&interop);
 		if (FAILED(hr)) {
 			U_LOG_W("leia_bg_capture: IGraphicsCaptureItemInterop QI failed: 0x%08x", (unsigned)hr);
-			SetWindowDisplayAffinity(hwnd, WDA_NONE);
+			reset_affinity();
 			return nullptr;
 		}
 	}
@@ -259,7 +288,7 @@ leia_bg_capture_create(HWND hwnd)
 	hr = interop->CreateForMonitor(monitor, IID_PPV_ARGS(capture_item.GetAddressOf()));
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: CreateForMonitor failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -272,7 +301,7 @@ leia_bg_capture_create(HWND hwnd)
 		hr = RoGetActivationFactory(cls.Get(), IID_PPV_ARGS(&pool_statics));
 		if (FAILED(hr)) {
 			U_LOG_W("leia_bg_capture: FramePool statics unavailable: 0x%08x", (unsigned)hr);
-			SetWindowDisplayAffinity(hwnd, WDA_NONE);
+			reset_affinity();
 			return nullptr;
 		}
 	}
@@ -285,7 +314,7 @@ leia_bg_capture_create(HWND hwnd)
 	                                      frame_pool.GetAddressOf());
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: FramePool::CreateFreeThreaded failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -293,7 +322,7 @@ leia_bg_capture_create(HWND hwnd)
 	hr = frame_pool->CreateCaptureSession(capture_item.Get(), capture_session.GetAddressOf());
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: CreateCaptureSession failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -317,7 +346,7 @@ leia_bg_capture_create(HWND hwnd)
 	                            staging_tex.GetAddressOf(), &staging_handle);
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: staging tex create failed: 0x%08x", (unsigned)hr);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -327,7 +356,7 @@ leia_bg_capture_create(HWND hwnd)
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: shared fence create failed: 0x%08x", (unsigned)hr);
 		CloseHandle(staging_handle);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -337,7 +366,7 @@ leia_bg_capture_create(HWND hwnd)
 		U_LOG_W("leia_bg_capture: ID3D11DeviceContext4 QI failed: 0x%08x", (unsigned)hr);
 		CloseHandle(shared_fence_handle);
 		CloseHandle(staging_handle);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
@@ -346,12 +375,13 @@ leia_bg_capture_create(HWND hwnd)
 		U_LOG_W("leia_bg_capture: StartCapture failed: 0x%08x", (unsigned)hr);
 		CloseHandle(shared_fence_handle);
 		CloseHandle(staging_handle);
-		SetWindowDisplayAffinity(hwnd, WDA_NONE);
+		reset_affinity();
 		return nullptr;
 	}
 
 	auto *c = new leia_bg_capture();
 	c->hwnd = hwnd;
+	c->affinity_owned = affinity_owned;
 	c->monitor = monitor;
 	c->monitor_w = monitor_w;
 	c->monitor_h = monitor_h;
@@ -560,7 +590,9 @@ leia_bg_capture_destroy(struct leia_bg_capture *c)
 	if (c->shared_fence_handle != nullptr) {
 		CloseHandle(c->shared_fence_handle);
 	}
-	if (c->hwnd != nullptr) {
+	// Only undo the affinity if WE set it — on the cross-process path the
+	// runtime owns it (and will clear it) (#551).
+	if (c->hwnd != nullptr && c->affinity_owned) {
 		SetWindowDisplayAffinity(c->hwnd, WDA_NONE);
 	}
 	delete c;
