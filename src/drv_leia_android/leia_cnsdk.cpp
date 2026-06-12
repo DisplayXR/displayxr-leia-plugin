@@ -103,6 +103,16 @@ struct leia_cnsdk
 	// the core is initialized and the licensing/availability of face tracking is
 	// known. Default MANAGED, matching the plug-in's advertised default.
 	std::atomic<uint32_t> eye_tracking_mode{0};
+
+	// Hardware 2D/3D backlight state actually APPLIED to the panel (-1 =
+	// unknown, 0 = 2D, 1 = 3D). Per-instance (NOT a function-local static):
+	// pause/destroy force it to 2D from the IPC/teardown threads while the
+	// weave loop re-applies the wanted state on the render thread, and the
+	// panel's switchable backlight is system-global — it stays however we
+	// leave it (stuck-3D-after-close bug). throttle is render-thread-only.
+	std::atomic<int> backlight_applied{-1};
+	int backlight_throttle{0};
+
 	float camera_center_x_m{0.0f};
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
@@ -153,6 +163,9 @@ struct leia_cnsdk
 	// render thread (no concurrent access; no atomic needed).
 	bool interlacer_init_failed{false};
 };
+
+static void
+force_backlight_2d(struct leia_cnsdk *cnsdk, const char *reason);
 
 
 /*
@@ -659,6 +672,12 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	//
 	// Detaching leaks the std::thread but is the only option short of
 	// CNSDK exposing a cancel API.
+	// Panel back to flat 2D FIRST, while the core is healthiest — the
+	// switchable backlight is system-global and outlives this process
+	// (stuck-3D-after-close). Even if the worker join below times out,
+	// this call has already gone out to the display service.
+	force_backlight_2d(cnsdk, "destroy");
+
 	cnsdk->shutting_down.store(true, std::memory_order_release);
 	if (cnsdk->worker.joinable()) {
 		constexpr auto kWorkerJoinTimeoutMs = std::chrono::milliseconds(2000);
@@ -744,6 +763,10 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 		DXR_HW_DBG("on_pause: skipped (core not initialized yet)");
 		return;
 	}
+	// Drop the panel to flat 2D before pausing — the backlight is
+	// system-global and the home screen / picker behind us is 2D content.
+	// The weave loop re-enables 3D on the first frame after resume.
+	force_backlight_2d(cnsdk, "on_pause");
 	DXR_HW_DBG("on_pause: forwarding to leia_core_on_pause");
 	leia_core_on_pause(cnsdk->core);
 }
@@ -1025,19 +1048,38 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 	if (cnsdk == NULL || cnsdk->core == NULL) {
 		return;
 	}
-	static int throttle = 0;
-	static int last = -1;
-	if ((throttle++ % 30) != 0) {
+	if ((cnsdk->backlight_throttle++ % 30) != 0) {
 		return;
 	}
 	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
 
-	if (want != last) {
+	// Compare against the instance's APPLIED state: pause/destroy force it
+	// to 2D out-of-band, so the first weave after a resume re-enables 3D.
+	if (want != cnsdk->backlight_applied.load(std::memory_order_acquire)) {
 		leia_core_enable_3d(cnsdk->core, want != 0);
-		last = want;
-		U_LOG_W("HW_DBG_CNSDK: backlight -> %s (debug.dxr.leia.backlight)",
-		        want ? "3D ON" : "2D OFF");
+		cnsdk->backlight_applied.store(want, std::memory_order_release);
+		U_LOG_W("HW_DBG_CNSDK: backlight -> %s (weave)", want ? "3D ON" : "2D OFF");
 	}
+}
+
+/*!
+ * Force the panel back to flat 2D. The switchable backlight is system-global
+ * state held by the Leia display service — it stays 3D forever if the last
+ * weaving client goes away without this (stuck-3D-after-close). Called from
+ * on_pause (session end / backgrounding) and destroy (client teardown).
+ */
+static void
+force_backlight_2d(struct leia_cnsdk *cnsdk, const char *reason)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL || !leia_core_is_initialized(cnsdk->core)) {
+		return;
+	}
+	if (cnsdk->backlight_applied.load(std::memory_order_acquire) == 0) {
+		return; // already 2D
+	}
+	leia_core_enable_3d(cnsdk->core, false);
+	cnsdk->backlight_applied.store(0, std::memory_order_release);
+	U_LOG_W("HW_DBG_CNSDK: backlight -> 2D OFF (%s)", reason);
 }
 
 extern "C" void
