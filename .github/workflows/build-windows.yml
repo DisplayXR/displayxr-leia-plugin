@@ -20,7 +20,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: filter
@@ -53,13 +53,10 @@ jobs:
       # equals this value so the FetchContent pin and the workflow checkout
       # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
       # regression originally).
-      # PRE-RELEASE PIN: runtime main SHA carrying the ADR-027 zone-caps
-      # appends (runtime PR #539, post-v1.16.0 — no tag ships them yet).
-      # Re-pin to the next runtime vX.Y.Z tag before a plug-in release.
-      RUNTIME_REF: fe509b180f790dd380531de979efba2c5158f05b
+      RUNTIME_REF: v1.17.0
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Rule-5 ABI pin self-check (ADR-020)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -89,7 +86,7 @@ jobs:
         # use its vcpkg.json for vcpkg manifest-mode (Eigen3, glslang, etc.).
         # KEEP IN SYNC with DXR_RUNTIME_GIT_TAG in CMakeLists.txt — enforced
         # by the Rule-5 self-check step above (ADR-020).
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
           ref: ${{ env.RUNTIME_REF }}
@@ -233,7 +230,7 @@ jobs:
 
       - name: Upload artifacts
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: DisplayXR-LeiaSR
           path: |
@@ -252,7 +249,7 @@ jobs:
       # artifact bundle for debugging access via `gh run download`.
       - name: Attach Windows installer to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           files: _package/DisplayXRLeiaSRSetup-*.exe
           fail_on_unmatched_files: true
@@ -275,7 +272,7 @@ jobs:
     steps:
       - name: Mint dispatch token
         id: dispatch-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.DISPLAYXR_APP_ID }}
           private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
@@ -283,7 +280,7 @@ jobs:
           repositories: displayxr-runtime
 
       - name: Dispatch versions.json bump
-        uses: peter-evans/repository-dispatch@v4
+        uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ steps.dispatch-token.outputs.token }}
           repository: DisplayXR/displayxr-runtime
