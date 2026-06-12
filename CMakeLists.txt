@@ -28,6 +28,26 @@ if(NOT DEFINED BUILD_NUM)
     set(BUILD_NUM "0")
 endif()
 
+# --- Plug-in build identity (#47) ----------------------------------------
+#
+# git-describe baked into the iface's `.version` so every consumer — the
+# runtime's loader log, `displayxr-cli info`, the Android diagnostics
+# dashboard (runtime#558) — can tell WHICH plug-in build is loaded. The
+# Android .so is hand-dropped into the runtime's untracked jniLibs, so a
+# stale binary is otherwise invisible (it cost a debugging session when a
+# pre-#522 .so silently reported MANAGED-only eye tracking).
+execute_process(
+    COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE DXR_PLUGIN_GIT_DESC
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT DXR_PLUGIN_GIT_DESC)
+    set(DXR_PLUGIN_GIT_DESC "v${PROJECT_VERSION}")
+endif()
+message(STATUS "Plug-in version (iface .version): ${DXR_PLUGIN_GIT_DESC}")
+
 # --- Runtime dependency -------------------------------------------------
 #
 # The plug-in DLL consumes the runtime's public ABI (xrt/xrt_plugin.h,

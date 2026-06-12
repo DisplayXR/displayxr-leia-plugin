@@ -27,12 +27,6 @@
 
 #include "util/u_logging.h"
 
-/* CMake injects the plug-in semver (PROJECT_VERSION) here; guard so the
- * file still compiles standalone (e.g. a tooling/IDE build with no define). */
-#ifndef LEIA_PLUGIN_VERSION
-#define LEIA_PLUGIN_VERSION ""
-#endif
-
 #include "leia_interface.h"
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_D3D11
@@ -241,6 +235,12 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
  *
  */
 
+// Baked in by CMake from `git describe` (#47) so consumers (loader log,
+// displayxr-cli, the Android diagnostics dashboard) can spot stale builds.
+#ifndef DXR_PLUGIN_GIT_DESC
+#define DXR_PLUGIN_GIT_DESC "unknown"
+#endif
+
 static struct xrt_plugin_iface g_leia_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
@@ -248,7 +248,7 @@ static struct xrt_plugin_iface g_leia_iface = {
     .id = "leia-sr",
     .display_name = "DisplayXR Leia SR",
     .vendor = "Leia Inc.",
-    .version = LEIA_PLUGIN_VERSION, /* PROJECT_VERSION via CMake; CI patches it from the vX.Y.Z tag */
+    .version = DXR_PLUGIN_GIT_DESC,
 
     .probe = leia_plugin_probe,
     .create_device = leia_plugin_create_device,

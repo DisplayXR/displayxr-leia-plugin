@@ -71,6 +71,9 @@ set(DRV_LEIA_ANDROID_SOURCES
 
 add_library(dxrp050_leia_cnsdk SHARED ${DRV_LEIA_ANDROID_SOURCES})
 
+# Build identity for the iface's .version (#47).
+target_compile_definitions(dxrp050_leia_cnsdk PRIVATE DXR_PLUGIN_GIT_DESC="${DXR_PLUGIN_GIT_DESC}")
+
 target_include_directories(dxrp050_leia_cnsdk PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

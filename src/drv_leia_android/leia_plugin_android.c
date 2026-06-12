@@ -291,6 +291,13 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
  *
  */
 
+// Baked in by CMake from `git describe` (#47) so consumers (loader log,
+// displayxr-cli, the Android diagnostics dashboard) can spot stale builds —
+// the .so is hand-dropped into the runtime's untracked jniLibs.
+#ifndef DXR_PLUGIN_GIT_DESC
+#define DXR_PLUGIN_GIT_DESC "unknown"
+#endif
+
 static struct xrt_plugin_iface g_leia_android_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
@@ -298,7 +305,7 @@ static struct xrt_plugin_iface g_leia_android_iface = {
     .id = "leia-cnsdk",
     .display_name = "DisplayXR Leia CNSDK (Android)",
     .vendor = "Leia Inc.",
-    .version = NULL,
+    .version = DXR_PLUGIN_GIT_DESC,
 
     .probe = leia_plugin_android_probe,
     .create_device = leia_plugin_android_create_device,

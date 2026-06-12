@@ -91,13 +91,12 @@ add_library(DisplayXR-LeiaSR SHARED ${LEIA_SOURCES})
 set_target_properties(DisplayXR-LeiaSR PROPERTIES CXX_STANDARD 20)
 
 target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_USING_RUNTIME_DLL)
-
-# Surface the plug-in's semver through xrt_plugin_iface::version (reported by
-# `displayxr-cli info` + the Control Panel). Same PROJECT_VERSION the
-# VERSIONINFO resource embeds, and which CI patches from the vX.Y.Z tag at
-# release — so a release DLL reports its real tag and a local dev build
-# reports the (baseline) CMake VERSION.
-target_compile_definitions(DisplayXR-LeiaSR PRIVATE LEIA_PLUGIN_VERSION="${PROJECT_VERSION}")
+# Surface the plug-in build identity through xrt_plugin_iface::version
+# (reported by the loader log, `displayxr-cli info`, the Control Panel, and
+# the Android diagnostics dashboard). git-describe supersedes the older
+# PROJECT_VERSION wiring (#47) so dev builds report their real commit and a
+# release DLL reports its tag — and a stale hand-dropped .so is identifiable.
+target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_PLUGIN_GIT_DESC="${DXR_PLUGIN_GIT_DESC}")
 
 target_include_directories(DisplayXR-LeiaSR PRIVATE
     ${SR_PATH}/include
