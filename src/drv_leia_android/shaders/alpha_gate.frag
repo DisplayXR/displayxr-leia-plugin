@@ -14,8 +14,10 @@
 // the original Windows-derived all-or-nothing mask, kept for on-device A/B
 // (debug.dxr.alphagate).
 //
-// Screen UV equals tile-local UV when target = (tile_columns × view_w,
-// tile_rows × view_h), the canvas-fills-target case (always true on Android).
+// Screen UV equals tile-local UV when the woven content fills the target
+// (canvas == (0,0,1,1)). With XR_EXT_display_zones (#568) the content may
+// instead occupy a canvas sub-rect (e.g. the avatar's bottom-75% tiger band);
+// the band-local remap below handles both cases (identity when canvas fills).
 
 #version 450
 
@@ -31,6 +33,14 @@ layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // always 0 on Android
 	uint  mode;           // 0 = legacy all-or-nothing, 1 = woven view-select (#568 de-occlusion fix)
+	// XR_EXT_display_zones (#568): the woven content occupies only this canvas
+	// sub-rect of the target (normalized: xy = offset, zw = extent). For a
+	// full-canvas avatar this is (0,0,1,1) and every branch below is identity.
+	// For a zone (the bottom-75% tiger band) the gate runs over the WHOLE target
+	// but punches everything OUTSIDE the band fully transparent, and remaps the
+	// atlas lookup INSIDE the band to band-local UV (the CNSDK weave landed the
+	// eyes 1:1 in the band via leia_interlacer_set_viewport).
+	vec4  canvas;         // (offset.x, offset.y, extent.x, extent.y), all 0..1
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -38,6 +48,22 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
+	// Outside the canvas band → fully transparent (the live screen shows
+	// through the reserved margin; also overwrites whatever opaque fill CNSDK
+	// left outside its viewport). Identity no-op when canvas == (0,0,1,1).
+	vec2 band_lo = pc.canvas.xy;
+	vec2 band_hi = pc.canvas.xy + pc.canvas.zw;
+	if (in_uv.x < band_lo.x || in_uv.x >= band_hi.x ||
+	    in_uv.y < band_lo.y || in_uv.y >= band_hi.y) {
+		out_color = vec4(0.0, 0.0, 0.0, 0.0);
+		return;
+	}
+
+	// Band-local UV for atlas sampling: the eyes fill the band, so a fragment at
+	// band fraction f maps to atlas tile-local f. (in_uv samples the backbuffer
+	// directly — the woven content sits at these same target coords in the strip.)
+	vec2 uv_band = (in_uv - pc.canvas.xy) / pc.canvas.zw;
+
 	vec3 woven = texture(backbuffer, in_uv).rgb;
 
 	if (pc.mode != 0u) {
@@ -65,7 +91,7 @@ void main()
 		float sel_a = 1.0;
 		for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 			for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-				vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
+				vec2 uv_at_tile = (vec2(tx, ty) + uv_band) / vec2(pc.tile_count);
 				vec4 s = textureLod(atlas, uv_at_tile, 0.0);
 				float d = distance(woven, s.rgb);
 				if (d < best_d) {
@@ -84,7 +110,7 @@ void main()
 	bool all_transparent = true;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-			vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
+			vec2 uv_at_tile = (vec2(tx, ty) + uv_band) / vec2(pc.tile_count);
 			if (textureLod(atlas, uv_at_tile, 0.0).a > 0.0) {
 				all_transparent = false;
 			}

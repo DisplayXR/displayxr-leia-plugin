@@ -1123,7 +1123,11 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  uint32_t w,
                  uint32_t h,
                  VkFramebuffer fb,
-                 VkImage targetImage)
+                 VkImage targetImage,
+                 int32_t vp_x,
+                 int32_t vp_y,
+                 uint32_t vp_w,
+                 uint32_t vp_h)
 {
 	(void)device; (void)physDev; (void)targetFmt;
 
@@ -1153,6 +1157,22 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	leia_interlacer_set_source_views_size(
 	    cnsdk->interlacer, (int32_t)atlas_width, (int32_t)atlas_height,
 	    /*isHorizontalViews=*/true);
+
+	// XR_EXT_display_zones (#568): confine the interlace to the canvas sub-rect
+	// (e.g. the avatar's bottom-75% band). The weaver folds vpX/vpY into its
+	// phase math, so the lenticular alignment is correct at the offset. Always
+	// set the viewport explicitly each frame (band OR full target) so a prior
+	// frame's band rect never leaks into a full-target frame. The render target
+	// is the full panel surface, so the viewport origin already equals the
+	// on-screen position (screen position default 0,0).
+	if (vp_w > 0u && vp_h > 0u) {
+		leia_interlacer_set_viewport(cnsdk->interlacer, vp_x, vp_y,
+		                             (int32_t)vp_w, (int32_t)vp_h);
+		DXR_HW_DBG_ONCE("weave: viewport sub-rect %d,%d %ux%u in target %ux%u",
+		                vp_x, vp_y, vp_w, vp_h, w, h);
+	} else {
+		leia_interlacer_set_viewport(cnsdk->interlacer, 0, 0, (int32_t)w, (int32_t)h);
+	}
 
 	DXR_HW_DBG_ONCE("weave: first do_post_process atlas=%ux%u target=%ux%u",
 	                atlas_width, atlas_height, w, h);

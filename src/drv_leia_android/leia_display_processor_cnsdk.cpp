@@ -689,12 +689,13 @@ alpha_gate_ensure_pipeline(leia_dp_cnsdk *impl, VkFormat target_format)
 		}
 	}
 
-	// Pipeline layout: 16-byte push constant (uvec2 tile_count + uint has_backdrop + pad).
+	// Pipeline layout: 32-byte push constant (uvec2 tile_count + uint has_backdrop
+	// + uint mode + vec4 canvas — the canvas sub-rect for XR_EXT_display_zones, #568).
 	{
 		VkPushConstantRange pc = {};
 		pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 		pc.offset = 0;
-		pc.size = 16;
+		pc.size = 32;
 		VkPipelineLayoutCreateInfo pli = {};
 		pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 		pli.setLayoutCount = 1;
@@ -1015,7 +1016,11 @@ alpha_gate_run(leia_dp_cnsdk *impl,
                uint32_t h,
                uint32_t tile_columns,
                uint32_t tile_rows,
-               VkFormat target_format)
+               VkFormat target_format,
+               int32_t canvas_offset_x,
+               int32_t canvas_offset_y,
+               uint32_t canvas_width,
+               uint32_t canvas_height)
 {
 	DXR_ATRACE("dxr_dp:alpha_gate_run");
 	struct vk_bundle *vk = impl->vk;
@@ -1165,11 +1170,24 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		uint32_t tile_count[2];
 		uint32_t has_backdrop;
 		uint32_t mode;
+		float    canvas[4];   // normalized (offset.x, offset.y, extent.x, extent.y)
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = 0u;            // no Local2D under-layer on Android yet (#491)
 	push.mode = alpha_gate_mode();     // #568: 1=woven view-select (de-occlusion fix), 0=legacy
+	// XR_EXT_display_zones (#568): the canvas sub-rect the weave occupies, in
+	// normalized target coords. A zero/empty rect means the content fills the
+	// target → (0,0,1,1), the identity that reproduces the pre-zone behavior.
+	if (canvas_width > 0u && canvas_height > 0u && w > 0u && h > 0u) {
+		push.canvas[0] = (float)canvas_offset_x / (float)w;
+		push.canvas[1] = (float)canvas_offset_y / (float)h;
+		push.canvas[2] = (float)canvas_width   / (float)w;
+		push.canvas[3] = (float)canvas_height  / (float)h;
+	} else {
+		push.canvas[0] = 0.0f; push.canvas[1] = 0.0f;
+		push.canvas[2] = 1.0f; push.canvas[3] = 1.0f;
+	}
 	vk->vkCmdPushConstants(cmd, impl->ag_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
@@ -1230,8 +1248,14 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	(void)cmd_buffer;     // self-submitting: compositor passes VK_NULL_HANDLE
 	(void)view_format;
 	(void)target_fb;      // self-submit: compositor has no CNSDK-compatible FB; we build our own
-	(void)canvas_offset_x; (void)canvas_offset_y;
-	(void)canvas_width; (void)canvas_height;
+
+	// XR_EXT_display_zones (#568): a zone layer confines the woven output to a
+	// canvas sub-rect (e.g. the avatar's bottom-75% tiger band). A zero/empty
+	// rect means "fill the target" — collapse it to the full target so the weave
+	// viewport + alpha-gate canvas are uniform downstream.
+	const bool canvas_subrect = canvas_width > 0u && canvas_height > 0u &&
+	                            (canvas_offset_x != 0 || canvas_offset_y != 0 ||
+	                             canvas_width != target_width || canvas_height != target_height);
 
 	leia_dp_cnsdk *impl = as_impl(xdp);
 
@@ -1330,15 +1354,27 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                 target_width,
 	                 target_height,
 	                 dest_fb,
-	                 (VkImage)(uintptr_t)target_image);
+	                 (VkImage)(uintptr_t)target_image,
+	                 canvas_subrect ? canvas_offset_x : 0,
+	                 canvas_subrect ? canvas_offset_y : 0,
+	                 canvas_subrect ? canvas_width    : 0u,
+	                 canvas_subrect ? canvas_height   : 0u);
 
 	// #568: the weave interlaced into opaque RGB — reconstruct per-pixel alpha
 	// so SurfaceFlinger shows the live screen through the transparent regions.
 	// Gated on the session transparency flag + a 2x1 multiview grid (the only
 	// layout the alpha-gate UV math handles; the mono 1x1 path returned above).
 	if (impl->transparent_bg_enabled && tile_columns == 2 && tile_rows == 1) {
+		// The gate runs over the WHOLE target: inside the canvas band it
+		// reconstructs the woven view-select alpha; outside it punches fully
+		// transparent (clearing whatever CNSDK left beyond its viewport). When
+		// there is no sub-rect it passes 0s → the gate treats it as full-target.
 		alpha_gate_run(impl, (VkImage)(uintptr_t)target_image, atlas_view, target_width,
-		               target_height, tile_columns, tile_rows, (VkFormat)target_format);
+		               target_height, tile_columns, tile_rows, (VkFormat)target_format,
+		               canvas_subrect ? canvas_offset_x : 0,
+		               canvas_subrect ? canvas_offset_y : 0,
+		               canvas_subrect ? canvas_width    : 0u,
+		               canvas_subrect ? canvas_height   : 0u);
 	}
 }
 
