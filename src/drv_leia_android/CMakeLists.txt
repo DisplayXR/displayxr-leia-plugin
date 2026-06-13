@@ -69,6 +69,19 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_plugin_android.c
 )
 
+# Post-weave alpha-gate shaders (#568) compiled to SPIR-V headers. Ported
+# verbatim from the desktop driver (src/drv_leia/shaders/). The runtime tree
+# owns the spirv_shaders macro; it's available because the runtime is added as
+# a subdirectory above (and glslangValidator runs on the host, not the target).
+spirv_shaders(
+    LEIA_ANDROID_SHADER_HEADERS
+    SPIRV_VERSION 1.0
+    SOURCES
+        shaders/fullscreen_tri.vert
+        shaders/alpha_gate.frag
+)
+list(APPEND DRV_LEIA_ANDROID_SOURCES ${LEIA_ANDROID_SHADER_HEADERS})
+
 add_library(dxrp050_leia_cnsdk SHARED ${DRV_LEIA_ANDROID_SOURCES})
 
 # Build identity for the iface's .version (#47).
@@ -76,6 +89,7 @@ target_compile_definitions(dxrp050_leia_cnsdk PRIVATE DXR_PLUGIN_GIT_DESC="${DXR
 
 target_include_directories(dxrp050_leia_cnsdk PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}    # generated spirv headers (#568 alpha-gate)
 )
 
 target_link_libraries(dxrp050_leia_cnsdk
