@@ -35,6 +35,10 @@
 
 #include <stdlib.h>
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h> // debug.dxr.alphagate A/B knob (#568)
+#endif
+
 #if defined(XRT_OS_ANDROID) && defined(XRT_DEBUG_ANDROID_VERBOSE)
 #include <android/trace.h>
 #endif
@@ -143,10 +147,16 @@ struct leia_dp_cnsdk
 	uint32_t ag_strip_w, ag_strip_h;
 	// Output framebuffer cache keyed by the compositor's color view (reuse
 	// pending_target_view — never mint our own swapchain-image view; Adreno
-	// faults on that, same rationale as weave_fb_cache).
+	// faults on that, same rationale as weave_fb_cache). Also keyed on (w,h):
+	// on a portrait⇄landscape rotation the swapchain recreates and the driver
+	// can RECYCLE a destroyed view handle for the new orientation, so a
+	// view-only match could hand back a framebuffer built at the OLD dims —
+	// rendering a 2560x1600 pass into a 1600x2560 framebuffer shears the image
+	// (the landscape #568 bug). Matching on dims too forces a rebuild.
 	struct {
 		VkImageView view;   //!< Borrowed key (compositor-owned).
 		VkFramebuffer fb;   //!< Owned.
+		uint32_t w, h;      //!< Dims this fb was built for (rotation guard).
 	} ag_fb_cache[8];
 	uint32_t ag_fb_count;
 };
@@ -904,7 +914,36 @@ alpha_gate_get_fb(leia_dp_cnsdk *impl, uint32_t w, uint32_t h)
 	}
 	for (uint32_t i = 0; i < impl->ag_fb_count; i++) {
 		if (impl->ag_fb_cache[i].view == color_view) {
-			return impl->ag_fb_cache[i].fb;
+			if (impl->ag_fb_cache[i].w == w && impl->ag_fb_cache[i].h == h) {
+				return impl->ag_fb_cache[i].fb;
+			}
+			// Same view handle, different dims — the driver recycled a
+			// destroyed view across a rotation (portrait⇄landscape). The
+			// cached fb is the OLD orientation's size; rendering into it
+			// shears the image (#568 landscape bug). Rebuild this entry at
+			// the new dims.
+			if (impl->ag_fb_cache[i].fb != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, impl->ag_fb_cache[i].fb, nullptr);
+				impl->ag_fb_cache[i].fb = VK_NULL_HANDLE;
+			}
+			VkFramebufferCreateInfo fbci2 = {};
+			fbci2.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+			fbci2.renderPass = impl->ag_rp;
+			fbci2.attachmentCount = 1;
+			fbci2.pAttachments = &color_view;
+			fbci2.width = w;
+			fbci2.height = h;
+			fbci2.layers = 1;
+			VkFramebuffer rfb = VK_NULL_HANDLE;
+			if (vk->vkCreateFramebuffer(vk->device, &fbci2, nullptr, &rfb) != VK_SUCCESS) {
+				U_LOG_W("alpha-gate: framebuffer rebuild (rotation) failed");
+				return VK_NULL_HANDLE;
+			}
+			impl->ag_fb_cache[i].fb = rfb;
+			impl->ag_fb_cache[i].w = w;
+			impl->ag_fb_cache[i].h = h;
+			U_LOG_W("alpha-gate: rebuilt fb for recycled view at new dims %ux%u (rotation guard, #568)", w, h);
+			return rfb;
 		}
 	}
 	if (impl->ag_fb_count >= 8) {
@@ -934,8 +973,35 @@ alpha_gate_get_fb(leia_dp_cnsdk *impl, uint32_t w, uint32_t h)
 	}
 	impl->ag_fb_cache[impl->ag_fb_count].view = color_view;
 	impl->ag_fb_cache[impl->ag_fb_count].fb = fb;
+	impl->ag_fb_cache[impl->ag_fb_count].w = w;
+	impl->ag_fb_cache[impl->ag_fb_count].h = h;
 	impl->ag_fb_count++;
 	return fb;
+}
+
+// Alpha-gate mode (#568), read once from `debug.dxr.alphagate`:
+//   1 (default) = woven per-pixel view-select — makes the parallax
+//                 de-occlusion band see-through (the fix).
+//   0           = legacy all-or-nothing mask (kept for on-device A/B; this is
+//                 the mode that produced the black de-occlusion fringe).
+// Cached because __system_property_get isn't free and a mid-session flip would
+// race in-flight frames; force-stop the app to re-read.
+uint32_t
+alpha_gate_mode()
+{
+	static uint32_t cached = UINT32_MAX;
+	if (cached != UINT32_MAX) {
+		return cached;
+	}
+	cached = 1u; // default: the fix
+#ifdef XRT_OS_ANDROID
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.alphagate", buf) > 0 && buf[0] == '0') {
+		cached = 0u;
+	}
+#endif
+	U_LOG_W("Leia CNSDK DP: alpha-gate mode=%u (1=woven-select, 0=legacy)", cached);
+	return cached;
 }
 
 // Post-weave alpha-gate executor. Self-submits (the weave already submitted on
@@ -965,6 +1031,19 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 	VkFramebuffer fb = alpha_gate_get_fb(impl, w, h);
 	if (fb == VK_NULL_HANDLE) {
 		return;
+	}
+
+	// Always-on diagnostic, re-logged whenever the geometry changes (e.g. on a
+	// portrait⇄landscape rotation, #568) so a device log shows exactly what the
+	// gate sampled in each orientation. The gate is driven entirely by these
+	// per-frame target + tile dims — no worst-case/portrait assumptions.
+	{
+		static uint32_t last_w = 0, last_h = 0, last_c = 0, last_r = 0;
+		if (w != last_w || h != last_h || tile_columns != last_c || tile_rows != last_r) {
+			last_w = w; last_h = h; last_c = tile_columns; last_r = tile_rows;
+			U_LOG_W("AG_GEO: target=%ux%u tiles=%ux%u mode=%u (strip+fb+viewport all driven by this target)",
+			        w, h, tile_columns, tile_rows, alpha_gate_mode());
+		}
 	}
 
 	// The CNSDK weave self-submitted (possibly on its own queue); drain ALL
@@ -1085,12 +1164,12 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 	struct {
 		uint32_t tile_count[2];
 		uint32_t has_backdrop;
-		uint32_t pad;
+		uint32_t mode;
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
-	push.has_backdrop = 0u; // no Local2D under-layer on Android yet (#491)
-	push.pad = 0u;
+	push.has_backdrop = 0u;            // no Local2D under-layer on Android yet (#491)
+	push.mode = alpha_gate_mode();     // #568: 1=woven view-select (de-occlusion fix), 0=legacy
 	vk->vkCmdPushConstants(cmd, impl->ag_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
