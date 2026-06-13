@@ -113,6 +113,14 @@ struct leia_cnsdk
 	std::atomic<int> backlight_applied{-1};
 	int backlight_throttle{0};
 
+	// True when the host context handed to CNSDK is a real Activity
+	// (in-process). leia_core_on_pause/on_resume internally call
+	// Activity-typed Java helpers (FaceTrackingHelper.checkPermission) —
+	// out-of-process the context is the runtime SERVICE, and the call
+	// trips CheckJNI and aborts the service. Same gate as the
+	// limit_orientations registration below.
+	bool host_is_activity{false};
+
 	float camera_center_x_m{0.0f};
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
@@ -647,6 +655,12 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	auto *cnsdk = new struct leia_cnsdk();
 	cnsdk->lib = lib;
 	cnsdk->core = core;
+#ifdef XRT_OS_ANDROID
+	// Same gate as limit_orientations above: Activity-typed CNSDK calls
+	// (leia_core_on_pause/on_resume) are only safe with a real Activity.
+	cnsdk->host_is_activity =
+	    activity != NULL && android_globals_is_instance_of_activity((struct _JavaVM *)vm, activity);
+#endif
 	cnsdk->worker = std::thread(face_tracking_worker, cnsdk);
 
 	DXR_HW_DBG("leia_cnsdk_create: core=%p, worker thread spawned", (void *)core);
@@ -767,6 +781,14 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 	// system-global and the home screen / picker behind us is 2D content.
 	// The weave loop re-enables 3D on the first frame after resume.
 	force_backlight_2d(cnsdk, "on_pause");
+	if (!cnsdk->host_is_activity) {
+		// Out-of-process: leia_core_on_pause/on_resume are Activity-
+		// lifecycle APIs (on_resume calls FaceTrackingHelper.
+		// checkPermission(Activity,...) → CheckJNI abort with a Service
+		// context). The backlight drop above is the part that matters.
+		DXR_HW_DBG("on_pause: backlight only (service context, no Activity)");
+		return;
+	}
 	DXR_HW_DBG("on_pause: forwarding to leia_core_on_pause");
 	leia_core_on_pause(cnsdk->core);
 }
@@ -779,6 +801,13 @@ leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
 	}
 	if (!leia_core_is_initialized(cnsdk->core)) {
 		DXR_HW_DBG("on_resume: skipped (core not initialized yet)");
+		return;
+	}
+	if (!cnsdk->host_is_activity) {
+		// Out-of-process: see on_pause — the Activity-lifecycle API would
+		// abort the service. Nothing to do; the weave loop re-enables the
+		// 3D backlight on the first frame after resume.
+		DXR_HW_DBG("on_resume: no-op (service context, no Activity)");
 		return;
 	}
 	DXR_HW_DBG("on_resume: forwarding to leia_core_on_resume");
