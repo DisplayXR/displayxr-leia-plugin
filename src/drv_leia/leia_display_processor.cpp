@@ -20,6 +20,7 @@
 #include "leia_display_processor.h"
 #include "leia_sr.h"
 
+#include "xrt/xrt_display_processor_vk.h" // #573 — the Vulkan transparency-enable variant
 #include "xrt/xrt_display_metrics.h"
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
@@ -56,7 +57,10 @@ static constexpr uint32_t kMaxStripFramebuffers = 8;
  */
 struct leia_display_processor
 {
-	struct xrt_display_processor base;
+	// #573 — the Vulkan variant: the generic base at offset 0 plus the appended
+	// set_transparent_background slot (the v4 transparency enable that replaced
+	// set_chroma_key). Base vtable members are reached via base.base.
+	struct xrt_display_processor_vk base;
 	struct leiasr *leiasr; //!< Owned — destroyed in leia_dp_destroy.
 	struct vk_bundle *vk;  //!< Cached vk_bundle (not owned).
 
@@ -2195,15 +2199,62 @@ static bool
 leia_dp_is_alpha_native(struct xrt_display_processor *xdp)
 {
 	(void)xdp;
-	// SR Vulkan weaver outputs opaque RGB; transparency requires the
-	// chroma-key fill+strip trick implemented in this DP.
+	// SR Vulkan weaver outputs opaque RGB; transparency is reconstructed by the
+	// compose-under-bg + post-weave alpha-gate passes this DP runs (enabled via
+	// set_transparent_background), not by a natively-alpha weave.
 	return false;
 }
 
-// #573 — chroma-key removed. The VK leia DP's transparency enable
-// (set_transparent_background on the xrt_display_processor_vk variant) is the
-// remaining lockstep item; this base vtable no longer advertises any transparency
-// enable, so VK in-process transparency is temporarily disabled until that lands.
+// #573 — the sole transparency enable (chroma-key removed). Mirrors the D3D12
+// sibling: compose-under-bg uses ldp->ck_color purely as the α==0 sentinel (see
+// process_atlas), so it stays the internal default — there is no chroma-key
+// fill/strip pass anymore. The leia VK DP only ever runs IN-PROCESS on Windows
+// (the runtime's vk_native compositor presents opaque and the DP owns
+// see-through via WGC compose-under-bg, client_presents=false); IPC VK clients
+// route through the D3D11 service DP, so the client-present branch never fires
+// here but is kept for symmetry with the D3D11/D3D12 slots.
+static void
+leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+
+	// Sentinel for α==0 atlas pixels in the compose-under-bg shader (NOT a
+	// user-facing chroma key — kept internal).
+	ldp->ck_color = kDefaultChromaKey;
+	ldp->ck_enabled = false; // no chroma-key strip/fill pass (#573)
+
+	// Client-present mode: the runtime owns a transparent present and blends the
+	// live screen into the holes, so the DP must NOT compose-under-bg.
+	if (enabled && client_presents) {
+#ifdef _WIN32
+		if (ldp->bg_compose_enabled) {
+			compose_release_resources(ldp);
+			ldp->bg_compose_enabled = false;
+		}
+#endif
+		U_LOG_W("Leia VK DP: transparency = client-present (alpha-gate only, no WGC)");
+		return;
+	}
+
+#ifdef _WIN32
+	// In-process path: WGC desktop capture + per-tile compose-under-bg.
+	if (enabled && !ldp->bg_compose_enabled && ldp->hwnd_opaque != nullptr) {
+		ldp->bg_capture = leia_bg_capture_create((HWND)ldp->hwnd_opaque);
+		if (ldp->bg_capture != nullptr) {
+			if (compose_import_bg_image(ldp)) {
+				ldp->bg_compose_enabled = true;
+				U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
+				return;
+			}
+			U_LOG_W("Leia VK DP: bg image import failed — staying opaque");
+			leia_bg_capture_destroy(ldp->bg_capture);
+			ldp->bg_capture = nullptr;
+		}
+	}
+#else
+	(void)enabled;
+#endif
+}
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. The compose-under-bg path (when WGC transparency is active)
@@ -2346,19 +2397,22 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	}
 
 	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
-	// Tells the runtime which slots this plug-in actually built.
-	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor));
-	ldp->base.process_atlas = leia_dp_process_atlas;
-	ldp->base.get_render_pass = leia_dp_get_render_pass;
-	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
-	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
-	ldp->base.request_display_mode = leia_dp_request_display_mode;
-	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
-	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
-	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
-	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
-	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
-	ldp->base.destroy = leia_dp_destroy;
+	// Tells the runtime which slots this plug-in actually built. #573: advertise
+	// the _vk variant size so the runtime recognizes the appended
+	// set_transparent_background slot (the per-API struct_size gate).
+	ldp->base.base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_vk));
+	ldp->base.base.process_atlas = leia_dp_process_atlas;
+	ldp->base.base.get_render_pass = leia_dp_get_render_pass;
+	ldp->base.base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
+	ldp->base.base.get_window_metrics = leia_dp_get_window_metrics;
+	ldp->base.base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
+	ldp->base.base.get_display_dimensions = leia_dp_get_display_dimensions;
+	ldp->base.base.get_display_pixel_info = leia_dp_get_display_pixel_info;
+	ldp->base.base.is_alpha_native = leia_dp_is_alpha_native;
+	ldp->base.base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
+	ldp->base.base.destroy = leia_dp_destroy;
+	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
 	ldp->hwnd_opaque = window_handle;
@@ -2417,7 +2471,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	// weaver) for heap-isolation; only the render pass remains.
 	ldp->render_pass = render_pass;
 
-	*out_xdp = &ldp->base;
+	*out_xdp = &ldp->base.base;
 
 	U_LOG_W("Created Leia SR display processor (factory, owns weaver, render_pass=%p)",
 	        (void *)render_pass);
@@ -2446,24 +2500,29 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	}
 
 	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
-	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor));
-	ldp->base.process_atlas = leia_dp_process_atlas;
-	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
-	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
-	ldp->base.request_display_mode = leia_dp_request_display_mode;
-	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
-	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
-	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
-	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
-	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
+	// #573: advertise the _vk variant size (see factory note).
+	ldp->base.base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_vk));
+	ldp->base.base.process_atlas = leia_dp_process_atlas;
+	ldp->base.base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
+	ldp->base.base.get_window_metrics = leia_dp_get_window_metrics;
+	ldp->base.base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
+	ldp->base.base.get_display_dimensions = leia_dp_get_display_dimensions;
+	ldp->base.base.get_display_pixel_info = leia_dp_get_display_pixel_info;
+	ldp->base.base.is_alpha_native = leia_dp_is_alpha_native;
+	ldp->base.base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
+	// #573 — appended transparency slot. The legacy path never sets hwnd_opaque,
+	// so the enable degrades to a graceful no-op (compose can't start without an
+	// HWND); kept wired for vtable parity with the factory.
+	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background;
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.
-	ldp->base.destroy = leia_dp_destroy;
+	ldp->base.base.destroy = leia_dp_destroy;
 
 	ldp->leiasr = leiasr;
 	ldp->view_count = 2;
 
-	*out_xdp = &ldp->base;
+	*out_xdp = &ldp->base.base;
 
 	U_LOG_W("Created Leia SR display processor (legacy, owns weaver)");
 
