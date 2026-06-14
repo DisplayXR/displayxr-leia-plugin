@@ -28,10 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 
-// SPIR-V chroma-key shaders (generated at build time by spirv_shaders()).
+// SPIR-V shaders (generated at build time by spirv_shaders()). The fullscreen
+// triangle vertex shader is shared by the compose-under-bg + alpha-gate passes.
 #include "shaders/fullscreen_tri.vert.h"
-#include "shaders/ck_fill.frag.h"
-#include "shaders/ck_strip.frag.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -40,12 +39,6 @@
 #include "shaders/compose_under_bg.frag.h"
 #include "shaders/alpha_gate.frag.h"
 #endif
-
-
-// Default chroma key when the app didn't supply one (set_chroma_key key=0).
-// Magenta — matches the D3D11/D3D12 DPs' kDefaultChromaKey for cross-API parity.
-// Layout 0x00BBGGRR: R=0xFF, G=0x00, B=0xFF.
-static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
 
 // Maximum number of cached strip framebuffers (one per swapchain image view).
 // Typical swapchains have 2–3 images; 8 is a safe upper bound.
@@ -68,51 +61,37 @@ struct leia_display_processor
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
 
 	//
-	// Chroma-key transparency support (lazy-initialized on first frame).
+	// Shared render targets + render passes for the transparency passes
+	// (compose-under-bg pre-weave + alpha-gate post-weave). #573 removed the
+	// chroma-key fill/strip passes; the `ck_`-named resources below survive
+	// because the compose/alpha-gate passes reuse them:
+	//   - ck_fill_image / ck_fill_view / ck_fill_fb / ck_fill_rp — the
+	//     R8G8B8A8_UNORM intermediate the compose pass renders into and the
+	//     weaver then samples (ck_ensure_fill_target).
+	//   - ck_strip_image / ck_strip_view + ck_strip_fbs + ck_strip_rp — the
+	//     back-buffer copy the alpha-gate samples and the per-target framebuffer
+	//     cache it renders back through (ck_ensure_strip_source / ck_get_strip_fb).
+	// All lazy-allocated; ck_init_pipeline builds the two render passes once.
 	//
-	// When @ref ck_enabled is true, process_atlas runs:
-	//   1. Pre-weave fill: atlas RGBA -> ck_fill_image (alpha=0 -> chroma_rgb,
-	//      output alpha=1) so the SR weaver receives opaque RGB.
-	//   2. Pass ck_fill_view (image view) to the weaver instead of the
-	//      caller-supplied atlas.
-	//   3. Post-weave strip: copy back-buffer -> ck_strip_image, then run
-	//      strip render pass back into the back-buffer (chroma match -> alpha=0,
-	//      RGB premultiplied for DWM).
-	//
-	// All resources lazy-allocated; ck_init_pipeline is called once on the
-	// first frame the strip pass needs to run.
-	//
-	bool ck_enabled;
-	uint32_t ck_color;             //!< 0x00BBGGRR; effective key.
-
-	// Pipeline / descriptor / sampler shared by both fill and strip.
-	bool ck_inited;                //!< True once the pipeline objects are built.
-	VkRenderPass ck_fill_rp;       //!< Render pass writing to ck_fill_image.
-	VkRenderPass ck_strip_rp;      //!< Render pass writing to swapchain image (final layout PRESENT_SRC_KHR).
-	VkPipelineLayout ck_pipeline_layout;
-	VkDescriptorSetLayout ck_desc_layout;
-	VkDescriptorPool ck_desc_pool;
-	VkDescriptorSet ck_fill_set;
-	VkDescriptorSet ck_strip_set;
-	VkPipeline ck_fill_pipeline;
-	VkPipeline ck_strip_pipeline;
-	VkSampler ck_sampler;          //!< Point/clamp; required for strip's exact-equality test.
+	bool ck_inited;                //!< True once the render passes are built.
+	VkRenderPass ck_fill_rp;       //!< Render pass writing to ck_fill_image (compose intermediate).
+	VkRenderPass ck_strip_rp;      //!< Render pass writing the swapchain image (final layout PRESENT_SRC_KHR; alpha-gate output).
 	VkFormat ck_strip_target_format; //!< Swapchain format the strip render pass was built for.
 
-	// Pre-weave fill target — RT-bindable and SRV-readable.
+	// Compose intermediate target — RT-bindable and SRV-readable.
 	VkImage ck_fill_image;
 	VkImageView ck_fill_view;
 	VkDeviceMemory ck_fill_mem;
 	VkFramebuffer ck_fill_fb;
 	uint32_t ck_fill_w, ck_fill_h;
 
-	// Post-weave strip source — copy of the back buffer for the strip pass to sample.
+	// Alpha-gate back-buffer copy — sampled by the alpha-gate pass.
 	VkImage ck_strip_image;
 	VkImageView ck_strip_view;
 	VkDeviceMemory ck_strip_mem;
 	uint32_t ck_strip_w, ck_strip_h;
 
-	// Per-swapchain-image strip-output cache. The DP vtable doesn't expose a
+	// Per-swapchain-image alpha-gate output cache. The DP vtable doesn't expose a
 	// VkImageView for the target, only the target VkImage — so we own a view
 	// per image and cache the framebuffer alongside it.
 	struct {
@@ -124,17 +103,16 @@ struct leia_display_processor
 	uint32_t ck_strip_fbs_count;
 
 	//
-	// Compose-under-bg transparency support (preferred over chroma-key on
-	// Windows when WGC desktop capture is available). Reuses ck_fill_image
-	// /ck_fill_view / ck_fill_fb / ck_fill_rp as the intermediate target —
-	// same R8G8B8A8_UNORM format. Distinct pipeline (2 SRVs + 24-byte push
-	// constants for bg_uv + tile_count) and descriptor set.
+	// Compose-under-bg transparency support (Windows, when WGC desktop capture
+	// is available). Reuses ck_fill_image / ck_fill_view / ck_fill_fb / ck_fill_rp
+	// as the intermediate target — same R8G8B8A8_UNORM format. Distinct pipeline
+	// (2 SRVs + 24-byte push constants for bg_uv + tile_count) and descriptor set.
 	//
-	// On non-Windows or WGC-init failure, bg_compose_enabled stays false and
-	// the chroma-key path runs unchanged.
+	// On non-Windows or WGC-init failure, bg_compose_enabled stays false and the
+	// DP stays opaque.
 	//
 	void *hwnd_opaque;                       //!< HWND from factory (Win-only). void* so the struct stays cross-platform.
-	struct leia_bg_capture *bg_capture;      //!< Owned (Win-only). NULL → fall back to ck.
+	struct leia_bg_capture *bg_capture;      //!< Owned (Win-only). NULL → DP stays opaque.
 	bool bg_compose_enabled;
 
 	VkImage bg_image;
@@ -151,7 +129,7 @@ struct leia_display_processor
 	VkImageView backdrop_view;
 	uint32_t backdrop_w, backdrop_h;
 
-	VkSampler compose_sampler;               //!< Linear/clamp (vs ck's NEAREST).
+	VkSampler compose_sampler;               //!< Linear/clamp.
 	VkDescriptorSetLayout compose_desc_layout;
 	VkPipelineLayout compose_pipeline_layout;
 	VkDescriptorPool compose_desc_pool;
@@ -179,25 +157,18 @@ leia_display_processor(struct xrt_display_processor *xdp)
 
 /*
  *
- * Chroma-key fill/strip helpers (transparency support).
+ * Transparency render-target helpers (compose-under-bg + alpha-gate support).
  *
- * Lazy-allocated on first frame the pass runs. ck_should_run() gates the
- * whole flow — when false (the common case) none of these execute and
- * process_atlas behaves identically to the pre-transparency path.
- *
- * The fill pass writes ck_fill_image (R8G8B8A8_UNORM) and the SR weaver
- * samples it instead of the original atlas. The strip pass copies the
- * presented swapchain image to ck_strip_image then renders premultiplied
- * alpha back into the swapchain image (PRESENT_SRC_KHR -> ... ->
- * PRESENT_SRC_KHR via per-target-view framebuffers).
+ * Lazy-allocated on the first transparent frame. ck_init_pipeline builds the
+ * two render passes (fill = R8G8B8A8_UNORM compose intermediate; strip =
+ * swapchain-format alpha-gate output → PRESENT_SRC_KHR); the compose pass renders
+ * ck_fill_image (which the weaver then samples) and the alpha-gate pass copies the
+ * presented swapchain image to ck_strip_image and renders it back through a
+ * per-target-view framebuffer. (#573 removed the chroma-key fill/strip passes; the
+ * `ck_`-named resources are retained because the compose/alpha-gate passes reuse
+ * them.)
  *
  */
-
-static bool
-ck_should_run(struct leia_display_processor *ldp)
-{
-	return ldp->ck_enabled && ldp->ck_color != 0;
-}
 
 static VkResult
 ck_create_shader_module(struct vk_bundle *vk,
@@ -213,20 +184,9 @@ ck_create_shader_module(struct vk_bundle *vk,
 	return vk->vkCreateShaderModule(vk->device, &ci, NULL, out_module);
 }
 
-static void
-ck_unpack_chroma_rgb(uint32_t color, float out_rgb[3])
-{
-	// 0x00BBGGRR layout matches D3D11/D3D12 DPs.
-	uint8_t r = (uint8_t)((color >> 0) & 0xff);
-	uint8_t g = (uint8_t)((color >> 8) & 0xff);
-	uint8_t b = (uint8_t)((color >> 16) & 0xff);
-	out_rgb[0] = (float)r / 255.0f;
-	out_rgb[1] = (float)g / 255.0f;
-	out_rgb[2] = (float)b / 255.0f;
-}
-
-// Build the descriptor set layout / pipeline layout / sampler / render passes /
-// pipelines. Idempotent: returns true if already inited.
+// Build the two render passes the transparency passes render into (fill = compose
+// intermediate, strip = alpha-gate swapchain output). Idempotent: returns true if
+// already inited.
 static bool
 ck_init_pipeline(struct leia_display_processor *ldp, VkFormat target_format)
 {
@@ -313,239 +273,8 @@ ck_init_pipeline(struct leia_display_processor *ldp, VkFormat target_format)
 		ldp->ck_strip_target_format = target_format;
 	}
 
-	// Descriptor set layout: 1 combined image sampler at binding 0.
-	{
-		VkDescriptorSetLayoutBinding b = {
-		    .binding = 0,
-		    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		    .descriptorCount = 1,
-		    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-		};
-		VkDescriptorSetLayoutCreateInfo ci = {
-		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		    .bindingCount = 1,
-		    .pBindings = &b,
-		};
-		res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->ck_desc_layout);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Leia VK DP: ck desc set layout failed: %d", res);
-			return false;
-		}
-	}
-
-	// Pipeline layout: push constants for chroma_rgb, single descriptor set.
-	{
-		VkPushConstantRange pc = {
-		    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-		    .offset = 0,
-		    .size = 4 * sizeof(float), // vec3 chroma_rgb + pad
-		};
-		VkPipelineLayoutCreateInfo pli = {
-		    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		    .setLayoutCount = 1,
-		    .pSetLayouts = &ldp->ck_desc_layout,
-		    .pushConstantRangeCount = 1,
-		    .pPushConstantRanges = &pc,
-		};
-		res = vk->vkCreatePipelineLayout(vk->device, &pli, NULL, &ldp->ck_pipeline_layout);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Leia VK DP: ck pipeline layout failed: %d", res);
-			return false;
-		}
-	}
-
-	// Sampler: NEAREST/CLAMP — strip's exact-equality test must not see
-	// linear blending across the chroma boundary.
-	{
-		VkSamplerCreateInfo si = {
-		    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-		    .magFilter = VK_FILTER_NEAREST,
-		    .minFilter = VK_FILTER_NEAREST,
-		    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-		    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-		    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-		    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-		    .maxLod = 1.0f,
-		};
-		res = vk->vkCreateSampler(vk->device, &si, NULL, &ldp->ck_sampler);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Leia VK DP: ck sampler failed: %d", res);
-			return false;
-		}
-	}
-
-	// Descriptor pool + 2 sets (fill, strip).
-	{
-		VkDescriptorPoolSize size = {
-		    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		    .descriptorCount = 2,
-		};
-		VkDescriptorPoolCreateInfo dpi = {
-		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		    .maxSets = 2,
-		    .poolSizeCount = 1,
-		    .pPoolSizes = &size,
-		};
-		res = vk->vkCreateDescriptorPool(vk->device, &dpi, NULL, &ldp->ck_desc_pool);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Leia VK DP: ck desc pool failed: %d", res);
-			return false;
-		}
-
-		VkDescriptorSetLayout layouts[2] = {ldp->ck_desc_layout, ldp->ck_desc_layout};
-		VkDescriptorSetAllocateInfo ai = {
-		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		    .descriptorPool = ldp->ck_desc_pool,
-		    .descriptorSetCount = 2,
-		    .pSetLayouts = layouts,
-		};
-		VkDescriptorSet sets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-		res = vk->vkAllocateDescriptorSets(vk->device, &ai, sets);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Leia VK DP: ck desc set alloc failed: %d", res);
-			return false;
-		}
-		ldp->ck_fill_set = sets[0];
-		ldp->ck_strip_set = sets[1];
-	}
-
-	// Compile shaders + build the two graphics pipelines.
-	VkShaderModule vs = VK_NULL_HANDLE;
-	VkShaderModule fs_fill = VK_NULL_HANDLE;
-	VkShaderModule fs_strip = VK_NULL_HANDLE;
-	res = ck_create_shader_module(vk, shaders_fullscreen_tri_vert,
-	                              sizeof(shaders_fullscreen_tri_vert), &vs);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Leia VK DP: ck vs create failed: %d", res);
-		return false;
-	}
-	res = ck_create_shader_module(vk, shaders_ck_fill_frag,
-	                              sizeof(shaders_ck_fill_frag), &fs_fill);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Leia VK DP: ck fill fs create failed: %d", res);
-		vk->vkDestroyShaderModule(vk->device, vs, NULL);
-		return false;
-	}
-	res = ck_create_shader_module(vk, shaders_ck_strip_frag,
-	                              sizeof(shaders_ck_strip_frag), &fs_strip);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Leia VK DP: ck strip fs create failed: %d", res);
-		vk->vkDestroyShaderModule(vk->device, fs_fill, NULL);
-		vk->vkDestroyShaderModule(vk->device, vs, NULL);
-		return false;
-	}
-
-	VkPipelineVertexInputStateCreateInfo vi = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-	};
-	VkPipelineInputAssemblyStateCreateInfo ia = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-	    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-	};
-	VkPipelineViewportStateCreateInfo vps = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-	    .viewportCount = 1,
-	    .scissorCount = 1,
-	};
-	VkPipelineRasterizationStateCreateInfo rs = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-	    .polygonMode = VK_POLYGON_MODE_FILL,
-	    .cullMode = VK_CULL_MODE_NONE,
-	    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-	    .lineWidth = 1.0f,
-	};
-	VkPipelineMultisampleStateCreateInfo ms = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-	};
-	VkPipelineColorBlendAttachmentState ba = {
-	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-	                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-	};
-	VkPipelineColorBlendStateCreateInfo cb = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-	    .attachmentCount = 1,
-	    .pAttachments = &ba,
-	};
-	VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-	VkPipelineDynamicStateCreateInfo dynstate = {
-	    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-	    .dynamicStateCount = 2,
-	    .pDynamicStates = dyn,
-	};
-
-	VkPipelineShaderStageCreateInfo stages[2][2] = {
-	    {
-	        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-	         .module = vs,
-	         .pName = "main"},
-	        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	         .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-	         .module = fs_fill,
-	         .pName = "main"},
-	    },
-	    {
-	        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-	         .module = vs,
-	         .pName = "main"},
-	        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	         .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-	         .module = fs_strip,
-	         .pName = "main"},
-	    },
-	};
-
-	VkGraphicsPipelineCreateInfo pis[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-	        .stageCount = 2,
-	        .pStages = stages[0],
-	        .pVertexInputState = &vi,
-	        .pInputAssemblyState = &ia,
-	        .pViewportState = &vps,
-	        .pRasterizationState = &rs,
-	        .pMultisampleState = &ms,
-	        .pColorBlendState = &cb,
-	        .pDynamicState = &dynstate,
-	        .layout = ldp->ck_pipeline_layout,
-	        .renderPass = ldp->ck_fill_rp,
-	        .subpass = 0,
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-	        .stageCount = 2,
-	        .pStages = stages[1],
-	        .pVertexInputState = &vi,
-	        .pInputAssemblyState = &ia,
-	        .pViewportState = &vps,
-	        .pRasterizationState = &rs,
-	        .pMultisampleState = &ms,
-	        .pColorBlendState = &cb,
-	        .pDynamicState = &dynstate,
-	        .layout = ldp->ck_pipeline_layout,
-	        .renderPass = ldp->ck_strip_rp,
-	        .subpass = 0,
-	    },
-	};
-	VkPipeline out_pipes[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-	res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 2, pis, NULL, out_pipes);
-
-	vk->vkDestroyShaderModule(vk->device, fs_strip, NULL);
-	vk->vkDestroyShaderModule(vk->device, fs_fill, NULL);
-	vk->vkDestroyShaderModule(vk->device, vs, NULL);
-
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Leia VK DP: ck pipelines create failed: %d", res);
-		return false;
-	}
-	ldp->ck_fill_pipeline = out_pipes[0];
-	ldp->ck_strip_pipeline = out_pipes[1];
-
 	ldp->ck_inited = true;
-	U_LOG_W("Leia VK DP: chroma-key pipelines initialized (key=0x%06x, target_fmt=%d)",
-	        ldp->ck_color & 0x00FFFFFFu, (int)target_format);
+	U_LOG_W("Leia VK DP: transparency render passes initialized (target_fmt=%d)", (int)target_format);
 	return true;
 }
 
@@ -766,233 +495,6 @@ ck_get_strip_fb(struct leia_display_processor *ldp,
 	return f;
 }
 
-// Pre-weave fill: render atlas RGBA -> ck_fill_image with alpha=0 pixels filled
-// by the chroma key. Returns the ck_fill_view to be passed to the weaver as
-// input. Caller must already have transitioned atlas_image to
-// SHADER_READ_ONLY_OPTIMAL (the SR weaver expects the same).
-//
-// On failure returns VK_NULL_HANDLE; caller falls back to the original atlas.
-static VkImageView
-ck_run_pre_weave_fill(struct leia_display_processor *ldp,
-                      VkCommandBuffer cmd,
-                      VkImageView atlas_view,
-                      uint32_t atlas_w,
-                      uint32_t atlas_h)
-{
-	struct vk_bundle *vk = ldp->vk;
-
-	if (!ck_ensure_fill_target(ldp, atlas_w, atlas_h)) return VK_NULL_HANDLE;
-
-	// Update the fill descriptor set to point at the atlas.
-	VkDescriptorImageInfo img_info = {
-	    .sampler = ldp->ck_sampler,
-	    .imageView = atlas_view,
-	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	};
-	VkWriteDescriptorSet w = {
-	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	    .dstSet = ldp->ck_fill_set,
-	    .dstBinding = 0,
-	    .descriptorCount = 1,
-	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .pImageInfo = &img_info,
-	};
-	vk->vkUpdateDescriptorSets(vk->device, 1, &w, 0, NULL);
-
-	// Transition ck_fill_image (UNDEFINED or SHADER_READ on second+ frame) ->
-	// COLOR_ATTACHMENT_OPTIMAL.
-	VkImageMemoryBarrier pre = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, // contents discarded; loadOp=DONT_CARE
-	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	    .image = ldp->ck_fill_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    0, 0, NULL, 0, NULL, 1, &pre);
-
-	VkRenderPassBeginInfo rpbi = {
-	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = ldp->ck_fill_rp,
-	    .framebuffer = ldp->ck_fill_fb,
-	    .renderArea = {{0, 0}, {atlas_w, atlas_h}},
-	};
-	vk->vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->ck_fill_pipeline);
-	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                             ldp->ck_pipeline_layout, 0, 1, &ldp->ck_fill_set, 0, NULL);
-
-	float pc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	ck_unpack_chroma_rgb(ldp->ck_color, pc);
-	vk->vkCmdPushConstants(cmd, ldp->ck_pipeline_layout,
-	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
-
-	VkViewport vp = {
-	    .x = 0.0f, .y = 0.0f,
-	    .width = (float)atlas_w, .height = (float)atlas_h,
-	    .minDepth = 0.0f, .maxDepth = 1.0f,
-	};
-	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D sc = {{0, 0}, {atlas_w, atlas_h}};
-	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
-
-	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
-	vk->vkCmdEndRenderPass(cmd);
-
-	// Transition fill image to SHADER_READ_ONLY_OPTIMAL so the weaver can sample it.
-	VkImageMemoryBarrier post = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    .image = ldp->ck_fill_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    0, 0, NULL, 0, NULL, 1, &post);
-
-	return ldp->ck_fill_view;
-}
-
-// Post-weave strip: copy presented swapchain image to ck_strip_image, then
-// render the strip pass back into the swapchain image with chroma-matching
-// pixels set to alpha=0 (premultiplied for DWM).
-//
-// On entry: target_image is in PRESENT_SRC_KHR (post-weave finalLayout).
-// On exit:  target_image is in PRESENT_SRC_KHR (strip render pass finalLayout).
-static void
-ck_run_post_weave_strip(struct leia_display_processor *ldp,
-                        VkCommandBuffer cmd,
-                        VkImage target_image,
-                        uint32_t w, uint32_t h)
-{
-	struct vk_bundle *vk = ldp->vk;
-
-	if (!ck_ensure_strip_source(ldp, w, h)) return;
-	VkFramebuffer strip_fb = ck_get_strip_fb(ldp, target_image, w, h);
-	if (strip_fb == VK_NULL_HANDLE) return;
-
-	// Update strip descriptor set to point at ck_strip_view.
-	VkDescriptorImageInfo img_info = {
-	    .sampler = ldp->ck_sampler,
-	    .imageView = ldp->ck_strip_view,
-	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	};
-	VkWriteDescriptorSet wr = {
-	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	    .dstSet = ldp->ck_strip_set,
-	    .dstBinding = 0,
-	    .descriptorCount = 1,
-	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .pImageInfo = &img_info,
-	};
-	vk->vkUpdateDescriptorSets(vk->device, 1, &wr, 0, NULL);
-
-	// 1) target PRESENT_SRC_KHR -> TRANSFER_SRC_OPTIMAL ;
-	//    ck_strip_image UNDEFINED/SHADER_READ -> TRANSFER_DST_OPTIMAL.
-	VkImageMemoryBarrier pre[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .image = target_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, // contents replaced
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .image = ldp->ck_strip_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    0, 0, NULL, 0, NULL, 2, pre);
-
-	VkImageCopy cp = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffset = {0, 0, 0},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffset = {0, 0, 0},
-	    .extent = {w, h, 1},
-	};
-	vk->vkCmdCopyImage(cmd,
-	    target_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	    ldp->ck_strip_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    1, &cp);
-
-	// 2) target TRANSFER_SRC -> COLOR_ATTACHMENT_OPTIMAL (matches strip rp initialLayout)
-	//    ck_strip_image TRANSFER_DST -> SHADER_READ_ONLY_OPTIMAL
-	VkImageMemoryBarrier mid[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	        .image = target_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = ldp->ck_strip_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    0, 0, NULL, 0, NULL, 2, mid);
-
-	// Strip render pass writes back into the swapchain image with finalLayout=PRESENT_SRC_KHR.
-	VkRenderPassBeginInfo rpbi = {
-	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = ldp->ck_strip_rp,
-	    .framebuffer = strip_fb,
-	    .renderArea = {{0, 0}, {w, h}},
-	};
-	vk->vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->ck_strip_pipeline);
-	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                             ldp->ck_pipeline_layout, 0, 1, &ldp->ck_strip_set, 0, NULL);
-
-	float pc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	ck_unpack_chroma_rgb(ldp->ck_color, pc);
-	vk->vkCmdPushConstants(cmd, ldp->ck_pipeline_layout,
-	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
-
-	VkViewport vp = {
-	    .x = 0.0f, .y = 0.0f,
-	    .width = (float)w, .height = (float)h,
-	    .minDepth = 0.0f, .maxDepth = 1.0f,
-	};
-	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D sc = {{0, 0}, {w, h}};
-	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
-
-	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
-	vk->vkCmdEndRenderPass(cmd);
-}
-
 static void
 ck_release_resources(struct leia_display_processor *ldp)
 {
@@ -1018,12 +520,6 @@ ck_release_resources(struct leia_display_processor *ldp)
 	if (ldp->ck_strip_image != VK_NULL_HANDLE) vk->vkDestroyImage(vk->device, ldp->ck_strip_image, NULL);
 	if (ldp->ck_strip_mem != VK_NULL_HANDLE)  vk->vkFreeMemory(vk->device, ldp->ck_strip_mem, NULL);
 
-	if (ldp->ck_fill_pipeline != VK_NULL_HANDLE)  vk->vkDestroyPipeline(vk->device, ldp->ck_fill_pipeline, NULL);
-	if (ldp->ck_strip_pipeline != VK_NULL_HANDLE) vk->vkDestroyPipeline(vk->device, ldp->ck_strip_pipeline, NULL);
-	if (ldp->ck_pipeline_layout != VK_NULL_HANDLE) vk->vkDestroyPipelineLayout(vk->device, ldp->ck_pipeline_layout, NULL);
-	if (ldp->ck_desc_pool != VK_NULL_HANDLE) vk->vkDestroyDescriptorPool(vk->device, ldp->ck_desc_pool, NULL);
-	if (ldp->ck_desc_layout != VK_NULL_HANDLE) vk->vkDestroyDescriptorSetLayout(vk->device, ldp->ck_desc_layout, NULL);
-	if (ldp->ck_sampler != VK_NULL_HANDLE) vk->vkDestroySampler(vk->device, ldp->ck_sampler, NULL);
 	if (ldp->ck_fill_rp != VK_NULL_HANDLE) vk->vkDestroyRenderPass(vk->device, ldp->ck_fill_rp, NULL);
 	if (ldp->ck_strip_rp != VK_NULL_HANDLE) vk->vkDestroyRenderPass(vk->device, ldp->ck_strip_rp, NULL);
 
@@ -1035,12 +531,6 @@ ck_release_resources(struct leia_display_processor *ldp)
 	ldp->ck_strip_view = VK_NULL_HANDLE;
 	ldp->ck_strip_image = VK_NULL_HANDLE;
 	ldp->ck_strip_mem = VK_NULL_HANDLE;
-	ldp->ck_fill_pipeline = VK_NULL_HANDLE;
-	ldp->ck_strip_pipeline = VK_NULL_HANDLE;
-	ldp->ck_pipeline_layout = VK_NULL_HANDLE;
-	ldp->ck_desc_pool = VK_NULL_HANDLE;
-	ldp->ck_desc_layout = VK_NULL_HANDLE;
-	ldp->ck_sampler = VK_NULL_HANDLE;
 	ldp->ck_fill_rp = VK_NULL_HANDLE;
 	ldp->ck_strip_rp = VK_NULL_HANDLE;
 	ldp->ck_inited = false;
@@ -1708,10 +1198,10 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 }
 
 /*
- * Post-weave alpha-gate. Mirrors ck_run_post_weave_strip's backbuffer copy
- * dance but binds 2 SRVs (strip_view = back-buffer copy, atlas_view) and
- * the alpha-gate pipeline. Output is premultiplied RGBA — pixels matching
- * the "all views α==0" mask get (0,0,0,0); others get woven RGB at α=1.
+ * Post-weave alpha-gate. Copies the presented back-buffer to ck_strip_image then
+ * binds 2 SRVs (strip_view = back-buffer copy, atlas_view) and the alpha-gate
+ * pipeline. Output is premultiplied RGBA — pixels matching the "all views α==0"
+ * mask get (0,0,0,0); others get woven RGB at α=1.
  *
  * On entry: target_image is in PRESENT_SRC_KHR. On exit: same.
  */
@@ -2033,26 +1523,19 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	viewport.extent.width = target_width;
 	viewport.extent.height = target_height;
 
-	// Transparency support — two paths:
-	//
-	//   1. Compose-under-bg (preferred, Windows + WGC): pre-composite the
-	//      captured desktop region UNDER each per-view atlas tile so the
-	//      weaver consumes opaque RGB with the desktop already integrated.
-	//      No post-weave strip needed. Activated by set_chroma_key when WGC
-	//      init succeeded. Correct on AA edges and semi-transparent pixels.
-	//
-	//   2. Chroma-key (fallback): replace alpha=0 with key color pre-weave,
-	//      strip back to alpha=0 post-weave. Hard mask on AA edges. Used
-	//      when WGC is unavailable.
+	// Transparency (#573 — chroma-key-free). Windows + WGC only: compose the
+	// captured desktop region UNDER each per-view atlas tile pre-weave so the
+	// weaver consumes opaque RGB with the desktop already integrated, then run a
+	// post-weave alpha-gate to reconstruct the α==0 holes. Correct on AA edges
+	// and semi-transparent pixels. On non-Windows / no WGC the DP stays opaque.
 	VkImageView weaver_input = atlas_view;
-	bool ck_active = false;
-	uint32_t atlas_w = view_width * tile_columns;
-	uint32_t atlas_h = view_height * tile_rows;
 #ifdef _WIN32
 	bool compose_active = compose_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
 	if (compose_active) {
-		// Compose needs the ck pipeline pieces too (ck_fill_rp + ck_fill_image).
-		// ck_init_pipeline is idempotent and self-contained.
+		uint32_t atlas_w = view_width * tile_columns;
+		uint32_t atlas_h = view_height * tile_rows;
+		// Compose reuses the fill render pass + intermediate (ck_fill_rp +
+		// ck_fill_image). ck_init_pipeline is idempotent and self-contained.
 		if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
 			VkImageView composed = compose_run_pre_weave(ldp, cmd_buffer, atlas_view,
 			                                              atlas_w, atlas_h,
@@ -2064,24 +1547,8 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 			// — atlas alpha=0 regions render as black RGB through the weaver,
 			// recovers next frame once WGC produces a frame.
 		}
-	} else
-#endif
-	{
-		ck_active = ck_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
-		if (ck_active) {
-			if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
-				VkImageView filled = ck_run_pre_weave_fill(ldp, cmd_buffer, atlas_view,
-				                                            atlas_w, atlas_h);
-				if (filled != VK_NULL_HANDLE) {
-					weaver_input = filled;
-				} else {
-					ck_active = false;
-				}
-			} else {
-				ck_active = false;
-			}
-		}
 	}
+#endif
 
 	// SR weaver expects SBS atlas as left_view, VK_NULL_HANDLE as right
 	leiasr_weave(ldp->leiasr,
@@ -2097,24 +1564,18 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	             (int)target_height,
 	             (VkFormat)target_format);
 
-	// Post-weave transparency pass:
-	//   - compose path: alpha-gate samples the ORIGINAL atlas to derive
-	//     the screen-space "all views α==0" mask, zeroes alpha on those
-	//     pixels — DWM blends the LIVE desktop (no captured-bg lag, no
-	//     magenta fringe at silhouettes).
-	//   - chroma-key fallback: legacy strip.
+	// Post-weave alpha-gate (compose path): samples the ORIGINAL atlas to derive
+	// the screen-space "all views α==0" mask and zeroes alpha on those pixels —
+	// DWM blends the LIVE desktop into the holes (no captured-bg lag, no fringe
+	// at silhouettes).
 #ifdef _WIN32
 	if (compose_active && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
 		alpha_gate_run_post_weave(ldp, cmd_buffer,
 		                          (VkImage)target_image, atlas_view,
 		                          target_width, target_height,
 		                          tile_columns, tile_rows);
-	} else
-#endif
-	if (ck_active) {
-		ck_run_post_weave_strip(ldp, cmd_buffer, (VkImage)target_image,
-		                         target_width, target_height);
 	}
+#endif
 }
 
 static bool
@@ -2205,23 +1666,17 @@ leia_dp_is_alpha_native(struct xrt_display_processor *xdp)
 	return false;
 }
 
-// #573 — the sole transparency enable (chroma-key removed). Mirrors the D3D12
-// sibling: compose-under-bg uses ldp->ck_color purely as the α==0 sentinel (see
-// process_atlas), so it stays the internal default — there is no chroma-key
-// fill/strip pass anymore. The leia VK DP only ever runs IN-PROCESS on Windows
-// (the runtime's vk_native compositor presents opaque and the DP owns
-// see-through via WGC compose-under-bg, client_presents=false); IPC VK clients
-// route through the D3D11 service DP, so the client-present branch never fires
-// here but is kept for symmetry with the D3D11/D3D12 slots.
+// #573 — the sole transparency enable (chroma-key removed). The transparency is
+// pure compose-under-bg + post-weave alpha-gate (no chroma-key fill/strip pass).
+// The leia VK DP only ever runs IN-PROCESS on Windows (the runtime's vk_native
+// compositor presents opaque and the DP owns see-through via WGC compose-under-bg,
+// client_presents=false); IPC VK clients route through the D3D11 service DP, so
+// the client-present branch never fires here but is kept for symmetry with the
+// D3D11/D3D12 slots.
 static void
 leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
 {
 	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
-
-	// Sentinel for α==0 atlas pixels in the compose-under-bg shader (NOT a
-	// user-facing chroma key — kept internal).
-	ldp->ck_color = kDefaultChromaKey;
-	ldp->ck_enabled = false; // no chroma-key strip/fill pass (#573)
 
 	// Client-present mode: the runtime owns a transparent present and blends the
 	// live screen into the holes, so the DP must NOT compose-under-bg.

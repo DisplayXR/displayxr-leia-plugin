@@ -34,8 +34,6 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
         SPIRV_VERSION 1.0
         SOURCES
             shaders/fullscreen_tri.vert
-            shaders/ck_fill.frag
-            shaders/ck_strip.frag
             shaders/compose_under_bg.frag
             shaders/alpha_gate.frag
     )
