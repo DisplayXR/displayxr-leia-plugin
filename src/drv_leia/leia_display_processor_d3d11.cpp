@@ -1740,22 +1740,6 @@ leia_dp_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp
 	leia_dp_d3d11_enable_transparency(ldp, enabled, client_presents);
 }
 
-static void
-leia_dp_d3d11_set_chroma_key(struct xrt_display_processor_d3d11 *xdp,
-                              uint32_t key_color,
-                              bool transparent_bg_enabled)
-{
-	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	// An explicit app key overrides the default; 0 keeps the DP default
-	// (applied in the shared helper).
-	if (key_color != 0) {
-		ldp->ck_color = key_color;
-	}
-	// Legacy chroma-key entry — never client-present (the runtime presents
-	// opaque on this path); the DP owns see-through via compose/chroma-key.
-	leia_dp_d3d11_enable_transparency(ldp, transparent_bg_enabled, /*client_presents=*/false);
-}
-
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. Same D3D11 device as the compositor → the SRV is used directly
 // (no open/import, unlike the WGC desktop). NULL ⟹ clear (desktop-only).
@@ -1844,9 +1828,8 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.get_display_dimensions = leia_dp_d3d11_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_d3d11_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_d3d11_set_chroma_key;
 	ldp->base.set_background_2d = leia_dp_d3d11_set_background_2d; // #491 part 3
-	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #551 (slot 17)
+	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #573 (sole transparency enable)
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;

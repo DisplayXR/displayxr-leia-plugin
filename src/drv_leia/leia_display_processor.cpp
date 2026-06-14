@@ -2200,44 +2200,10 @@ leia_dp_is_alpha_native(struct xrt_display_processor *xdp)
 	return false;
 }
 
-static void
-leia_dp_set_chroma_key(struct xrt_display_processor *xdp,
-                       uint32_t key_color,
-                       bool transparent_bg_enabled)
-{
-	struct leia_display_processor *ldp = leia_display_processor(xdp);
-	// Keep ck_color/ck_enabled current — chroma-key is the fallback.
-	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
-	ldp->ck_enabled = transparent_bg_enabled;
-
-#ifdef _WIN32
-	// Preferred path: WGC desktop capture + per-tile compose-under-bg.
-	// On any failure (older Windows, capture blocked, env-disabled), fall
-	// through to chroma-key.
-	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd_opaque != nullptr) {
-		ldp->bg_capture = leia_bg_capture_create((HWND)ldp->hwnd_opaque);
-		if (ldp->bg_capture != nullptr) {
-			if (compose_import_bg_image(ldp)) {
-				ldp->bg_compose_enabled = true;
-				ldp->ck_enabled = false;
-				U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
-				return;
-			}
-			U_LOG_W("Leia VK DP: bg image import failed — falling back to chroma-key");
-			leia_bg_capture_destroy(ldp->bg_capture);
-			ldp->bg_capture = nullptr;
-		}
-	}
-#endif
-
-	if (transparent_bg_enabled) {
-		U_LOG_W("Leia VK DP: transparency = chroma-key (key=0x%06x %s)",
-		        ldp->ck_color & 0x00FFFFFFu,
-		        (key_color != 0) ? "— app override" : "— DP default magenta");
-	} else {
-		U_LOG_I("Leia VK DP: chroma-key disabled");
-	}
-}
+// #573 — chroma-key removed. The VK leia DP's transparency enable
+// (set_transparent_background on the xrt_display_processor_vk variant) is the
+// remaining lockstep item; this base vtable no longer advertises any transparency
+// enable, so VK in-process transparency is temporarily disabled until that lands.
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. The compose-under-bg path (when WGC transparency is active)
@@ -2391,7 +2357,6 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
 	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	ldp->base.destroy = leia_dp_destroy;
 	ldp->vk = vk;
@@ -2490,7 +2455,6 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_set_chroma_key;
 	ldp->base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.
