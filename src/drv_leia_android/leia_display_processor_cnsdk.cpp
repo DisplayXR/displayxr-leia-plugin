@@ -1327,11 +1327,14 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
-			U_LOG_W("HW_GEO: view=%ux%u (aspect %.3f) tiles=%ux%u atlas=%ux%u target=%ux%u fmt=%d",
+			U_LOG_W("HW_GEO: view=%ux%u (aspect %.3f) tiles=%ux%u atlas=%ux%u target=%ux%u fmt=%d"
+			        " canvas=%d,%d %ux%u subrect=%d (#53 zone phase)",
 			        view_width, view_height,
 			        view_height ? (float)view_width / (float)view_height : 0.0f,
 			        tile_columns, tile_rows, atlas_w, atlas_h, target_width, target_height,
-			        (int)target_format);
+			        (int)target_format,
+			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
+			        (int)canvas_subrect);
 		}
 	}
 
