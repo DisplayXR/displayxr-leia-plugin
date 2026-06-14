@@ -1227,28 +1227,32 @@ leia_dp_gl_is_alpha_native(struct xrt_display_processor_gl *xdp)
 	return false;
 }
 
+// #573 — the sole transparency enable (chroma-key removed). The leia GL DP only
+// ever runs IN-PROCESS, where the runtime presents (its own DComp transparent
+// present) and the DP does compose-under-bg. ck_color is kept purely as the α==0
+// sentinel for the compose shader — there is no chroma-key fill/strip pass.
 static void
-leia_dp_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
-                          uint32_t key_color,
-                          bool transparent_bg_enabled)
+leia_dp_gl_set_transparent_background(struct xrt_display_processor_gl *xdp, bool enabled, bool client_presents)
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
-	// Preserve ck_color/ck_enabled regardless of path — they are the fallback
-	// if compose-under-bg (WGC/interop) fails to initialize.
-	ldp->ck_enabled = transparent_bg_enabled;
-	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
+	// Sentinel for α==0 atlas pixels in the compose-under-bg shader (internal).
+	ldp->ck_color = kDefaultChromaKey;
+	ldp->ck_enabled = false; // no chroma-key strip/fill pass (#573)
 
-	// Request the preferred compose-under-bg path. The actual WGC + WGL interop
+	// Client-present mode: the runtime's transparent present blends the live
+	// desktop into the holes, so the DP must NOT compose-under-bg.
+	if (enabled && client_presents) {
+		ldp->compose_requested = false;
+		U_LOG_W("Leia GL DP: transparency = client-present (alpha-gate only, no WGC)");
+		return;
+	}
+
+	// In-process path: request compose-under-bg. The actual WGC + WGL interop
 	// bring-up is deferred to the first process_atlas (compose_try_init_gl),
-	// where the GL context is guaranteed current. On success it flips
-	// ck_enabled off; on failure the chroma-key path above runs.
-	ldp->compose_requested = transparent_bg_enabled;
-
-	if (transparent_bg_enabled) {
-		U_LOG_W("Leia GL DP: transparency requested (key=0x%06x %s) — compose-under-bg "
-		        "preferred, chroma-key fallback",
-		        ldp->ck_color & 0x00FFFFFFu,
-		        (key_color != 0) ? "app override" : "DP default magenta");
+	// where the GL context is guaranteed current.
+	ldp->compose_requested = enabled;
+	if (enabled) {
+		U_LOG_W("Leia GL DP: transparency = compose-under-bg (WGC, deferred interop init)");
 	} else {
 		U_LOG_I("Leia GL DP: transparency disabled");
 	}
@@ -1410,7 +1414,7 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.get_display_dimensions = leia_dp_gl_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_gl_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_gl_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_gl_set_chroma_key;
+	ldp->base.set_transparent_background = leia_dp_gl_set_transparent_background; // #573
 	ldp->base.set_background_2d = leia_dp_gl_set_background_2d; // #491 part 3 (no-op store; GL composite deferred)
 	ldp->base.destroy = leia_dp_gl_destroy;
 }

@@ -1803,22 +1803,35 @@ leia_dp_d3d12_is_alpha_native(struct xrt_display_processor_d3d12 *xdp)
 	return false;
 }
 
+// #573 — the sole transparency enable (chroma-key removed). The leia D3D12 DP
+// only ever runs IN-PROCESS (IPC D3D12 clients route through the D3D11 service
+// DP), where the runtime presents opaque and the DP owns see-through via WGC
+// compose-under-bg (client_presents=false). compose-under-bg uses ldp->ck_color
+// purely as the α==0 sentinel (see process_atlas), so it stays set to the
+// internal default — there is no chroma-key fill/strip pass anymore.
 static void
-leia_dp_d3d12_set_chroma_key(struct xrt_display_processor_d3d12 *xdp,
-                              uint32_t key_color,
-                              bool transparent_bg_enabled)
+leia_dp_d3d12_set_transparent_background(struct xrt_display_processor_d3d12 *xdp, bool enabled, bool client_presents)
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
-	// Preserve ck_color/ck_enabled regardless of path — chroma-key is the
-	// fallback if WGC init fails.
-	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
-	ldp->ck_enabled = transparent_bg_enabled;
+	// Sentinel for α==0 atlas pixels in the compose-under-bg shader (NOT a
+	// user-facing chroma key — kept internal).
+	ldp->ck_color = kDefaultChromaKey;
+	ldp->ck_enabled = false; // no chroma-key strip/fill pass (#573)
 
-	// Preferred path: WGC desktop capture + per-tile compose-under-bg.
-	// On any failure (older Windows, capture blocked, env-disabled), fall
-	// back to chroma-key.
-	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
+	// Client-present mode: the runtime owns a transparent present and blends the
+	// live desktop into the holes, so the DP must NOT compose-under-bg.
+	if (enabled && client_presents) {
+		if (ldp->bg_compose_enabled) {
+			compose_release_resources(ldp);
+			ldp->bg_compose_enabled = false;
+		}
+		U_LOG_W("Leia D3D12 DP: transparency = client-present (alpha-gate only, no WGC)");
+		return;
+	}
+
+	// In-process path: WGC desktop capture + per-tile compose-under-bg.
+	if (enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
 		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
 		if (ldp->bg_capture != nullptr && ldp->device != nullptr) {
 			HRESULT hr = leia_bg_capture_open_d3d12(
@@ -1829,20 +1842,13 @@ leia_dp_d3d12_set_chroma_key(struct xrt_display_processor_d3d12 *xdp,
 			}
 			if (SUCCEEDED(hr)) {
 				ldp->bg_compose_enabled = true;
-				ldp->ck_enabled = false;
 				U_LOG_W("Leia D3D12 DP: transparency = compose-under-bg (WGC)");
 			} else {
-				U_LOG_W("Leia D3D12 DP: WGC import failed (0x%08x) — falling back to chroma-key",
+				U_LOG_W("Leia D3D12 DP: WGC import failed (0x%08x) — staying opaque",
 				        (unsigned)hr);
 				compose_release_resources(ldp);
 			}
 		}
-	}
-	if (!ldp->bg_compose_enabled) {
-		U_LOG_W("Leia D3D12 DP: transparency = chroma-key %s (key=0x%08X%s)",
-		        ldp->ck_enabled ? "ENABLED" : "disabled",
-		        ldp->ck_color,
-		        (key_color == 0) ? " — DP default" : " — app override");
 	}
 }
 
@@ -2013,8 +2019,8 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.get_display_dimensions = leia_dp_d3d12_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_d3d12_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_d3d12_is_alpha_native;
-	ldp->base.set_chroma_key = leia_dp_d3d12_set_chroma_key;
 	ldp->base.set_background_2d = leia_dp_d3d12_set_background_2d; // #491 part 3
+	ldp->base.set_transparent_background = leia_dp_d3d12_set_transparent_background; // #573
 	ldp->base.destroy = leia_dp_d3d12_destroy;
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
