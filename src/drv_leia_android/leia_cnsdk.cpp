@@ -1159,19 +1159,40 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	    /*isHorizontalViews=*/true);
 
 	// XR_EXT_display_zones (#568): confine the interlace to the canvas sub-rect
-	// (e.g. the avatar's bottom-75% band). The weaver folds vpX/vpY into its
-	// phase math, so the lenticular alignment is correct at the offset. Always
-	// set the viewport explicitly each frame (band OR full target) so a prior
-	// frame's band rect never leaks into a full-target frame. The render target
-	// is the full panel surface, so the viewport origin already equals the
-	// on-screen position (screen position default 0,0).
+	// (e.g. the avatar's bottom-75% band). CNSDK splits placement and phase into
+	// TWO decoupled knobs:
+	//   * set_viewport(posX,posY,w,h)         — where the output lands in the
+	//                                            render-target (pixel placement).
+	//   * set_viewport_screen_position(x,y)   — the origin ON THE SCREEN that the
+	//                                            lenticular interlace PHASE is
+	//                                            referenced to (default 0,0).
+	// The render-target viewport alone does NOT re-reference the phase, so a band
+	// drawn 25% down weaves at the full-panel phase → the 3D registers shifted
+	// (#53). Set BOTH: the viewport for placement, the screen position so the
+	// phase tracks the band's panel origin. This is the CNSDK analog of the
+	// desktop SR SDK auto-folding vpX/vpY from the single D3D viewport. Set both
+	// explicitly each frame (band OR full target) so a prior frame's offset never
+	// leaks. A/B: `setprop debug.dxr.leia.zonephase 0` reverts to the (shifted)
+	// pre-#53 phase for on-device comparison; 1 (default) applies the fix.
+	const bool zonephase = prop_override("debug.dxr.leia.zonephase", true);
 	if (vp_w > 0u && vp_h > 0u) {
 		leia_interlacer_set_viewport(cnsdk->interlacer, vp_x, vp_y,
 		                             (int32_t)vp_w, (int32_t)vp_h);
-		DXR_HW_DBG_ONCE("weave: viewport sub-rect %d,%d %ux%u in target %ux%u",
-		                vp_x, vp_y, vp_w, vp_h, w, h);
+		const int32_t sp_x = zonephase ? vp_x : 0;
+		const int32_t sp_y = zonephase ? vp_y : 0;
+		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, sp_x, sp_y);
+		// #53 diagnostic: re-log whenever the band/phase changes (covers the live
+		// `debug.dxr.leia.zonephase` A/B toggle) — one WARN per distinct state.
+		static int32_t last_vpx = INT32_MIN, last_vpy = INT32_MIN;
+		static int32_t last_spx = INT32_MIN, last_spy = INT32_MIN;
+		if (vp_x != last_vpx || vp_y != last_vpy || sp_x != last_spx || sp_y != last_spy) {
+			last_vpx = vp_x; last_vpy = vp_y; last_spx = sp_x; last_spy = sp_y;
+			U_LOG_W("HW_DBG_CNSDK: weave band %d,%d %ux%u screen-pos %d,%d (zonephase=%d) target %ux%u (#53)",
+			        vp_x, vp_y, vp_w, vp_h, sp_x, sp_y, (int)zonephase, w, h);
+		}
 	} else {
 		leia_interlacer_set_viewport(cnsdk->interlacer, 0, 0, (int32_t)w, (int32_t)h);
+		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, 0, 0);
 	}
 
 	DXR_HW_DBG_ONCE("weave: first do_post_process atlas=%ux%u target=%ux%u",
