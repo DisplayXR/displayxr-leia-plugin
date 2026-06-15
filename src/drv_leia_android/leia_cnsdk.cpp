@@ -227,6 +227,16 @@ get_prop_bool(const char *name, bool default_val)
 }
 #endif
 
+// #558 per-app: overlay mode is decided per-session by the runtime (from the
+// connecting app's manifest) and published into android_globals (service
+// process), so read it there instead of a global sysprop. debug.dxr.overlay
+// stays as a dev force-all override.
+static bool
+overlay_mode_active(void)
+{
+	return android_globals_get_overlay_mode() || get_prop_bool("debug.dxr.overlay", false);
+}
+
 #ifdef XRT_OS_ANDROID
 // Tri-state property override: returns `derived` when the property is unset,
 // otherwise the property's boolean value. Lets orientation-derived axis
@@ -783,7 +793,7 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 	// #558 overlay mode is the exception: the avatar intentionally backgrounds
 	// while still weaving the tiger on top of the launcher, so it must STAY 3D —
 	// skip the 2D drop (the weave loop keeps forcing 3D each frame).
-	if (get_prop_bool("debug.dxr.overlay", false)) {
+	if (overlay_mode_active()) {
 		DXR_HW_DBG("on_pause: overlay mode — keeping 3D (skip force-2D)");
 		return;
 	}
@@ -1094,8 +1104,8 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 	// WEAVE to flat 2D (lens may be on but the tiger looks flat) and on_pause would
 	// drop the BACKLIGHT to 2D. Force the light-field 3D + NoFaceMode OFF every
 	// weave so the tiger stays 3D regardless of face/foreground state. Gated on
-	// `debug.dxr.overlay` — the same prop the avatar + runtime read.
-	if (get_prop_bool("debug.dxr.overlay", false)) {
+	// overlay mode — per-session, from the runtime (the app's manifest flag).
+	if (overlay_mode_active()) {
 		want = 1;
 		leia_core_enable_no_face_mode(cnsdk->core, false);
 	}
