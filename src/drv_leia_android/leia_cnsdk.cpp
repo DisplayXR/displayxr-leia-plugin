@@ -780,6 +780,13 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 	// Drop the panel to flat 2D before pausing — the backlight is
 	// system-global and the home screen / picker behind us is 2D content.
 	// The weave loop re-enables 3D on the first frame after resume.
+	// #558 overlay mode is the exception: the avatar intentionally backgrounds
+	// while still weaving the tiger on top of the launcher, so it must STAY 3D —
+	// skip the 2D drop (the weave loop keeps forcing 3D each frame).
+	if (get_prop_bool("debug.dxr.overlay", false)) {
+		DXR_HW_DBG("on_pause: overlay mode — keeping 3D (skip force-2D)");
+		return;
+	}
 	force_backlight_2d(cnsdk, "on_pause");
 	if (!cnsdk->host_is_activity) {
 		// Out-of-process: leia_core_on_pause/on_resume are Activity-
@@ -1081,6 +1088,17 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 		return;
 	}
 	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
+
+	// #558 overlay mode: the avatar runs as a backgrounded system overlay over the
+	// 2D launcher, so face tracking is lost — MANAGED NoFaceMode would drop the
+	// WEAVE to flat 2D (lens may be on but the tiger looks flat) and on_pause would
+	// drop the BACKLIGHT to 2D. Force the light-field 3D + NoFaceMode OFF every
+	// weave so the tiger stays 3D regardless of face/foreground state. Gated on
+	// `debug.dxr.overlay` — the same prop the avatar + runtime read.
+	if (get_prop_bool("debug.dxr.overlay", false)) {
+		want = 1;
+		leia_core_enable_no_face_mode(cnsdk->core, false);
+	}
 
 	// Compare against the instance's APPLIED state: pause/destroy force it
 	// to 2D out-of-band, so the first weave after a resume re-enables 3D.
