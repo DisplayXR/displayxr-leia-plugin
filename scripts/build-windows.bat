@@ -15,11 +15,11 @@ setlocal enabledelayedexpansion
 ::
 :: Optional environment:
 ::   DXR_RUNTIME_SOURCE_DIR — path to a local displayxr-runtime checkout.
-::                            Defaults to ..\openxr-3d-display.
-::                            If unset and the default isn't found, the
-::                            plug-in's CMake falls back to FetchContent
-::                            against the displayxr-runtime tag pinned in
-::                            CMakeLists.txt (slow first build).
+::                            If unset, probes the sibling ..\displayxr-runtime
+::                            (and legacy ..\openxr-3d-display) automatically.
+::                            If none is found, the plug-in's CMake falls back
+::                            to FetchContent against the displayxr-runtime tag
+::                            pinned in CMakeLists.txt (slow first build).
 ::
 :: Runtime-side build deps (vcpkg, Vulkan SDK, OpenXR loader, VS 2022,
 :: ninja, gh) must be installed and configured the same way as for the

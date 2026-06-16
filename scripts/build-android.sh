@@ -32,9 +32,10 @@
 # Optional env (auto-detected with defaults):
 #   ANDROID_NDK_VERSION   — NDK to use (default: 26.3.11579264)
 #   CNSDK_ROOT            — extracted CNSDK 0.7.28 release tree
-#                            (default: ../openxr-3d-display/cnsdk)
+#                            (default: <runtime checkout>/cnsdk)
 #   DXR_RUNTIME_SOURCE_DIR — local runtime checkout
-#                            (default: ../openxr-3d-display)
+#                            (default: ../displayxr-runtime; legacy
+#                             ../openxr-3d-display probed as a fallback)
 #   EIGEN3_DIR            — Eigen3Config.cmake location. If unset,
 #                            the script points at the gradle-fetched
 #                            Eigen under the runtime checkout's
@@ -82,8 +83,18 @@ if [ -z "${NINJA}" ]; then
 fi
 echo "Ninja:  ${NINJA}"
 
-# Resolve runtime source dir
-: "${DXR_RUNTIME_SOURCE_DIR:=${REPO}/../openxr-3d-display}"
+# Resolve runtime source dir — probe current + legacy sibling clone names.
+# "displayxr-runtime" is the repo name today; "openxr-3d-display" is a legacy
+# local clone name kept as a fallback. Final default is the current name.
+if [ -z "${DXR_RUNTIME_SOURCE_DIR:-}" ]; then
+    for _d in displayxr-runtime openxr-3d-display; do
+        if [ -f "${REPO}/../${_d}/CMakeLists.txt" ]; then
+            DXR_RUNTIME_SOURCE_DIR="${REPO}/../${_d}"
+            break
+        fi
+    done
+    : "${DXR_RUNTIME_SOURCE_DIR:=${REPO}/../displayxr-runtime}"
+fi
 if [ ! -f "${DXR_RUNTIME_SOURCE_DIR}/CMakeLists.txt" ]; then
     echo "ERROR: DXR_RUNTIME_SOURCE_DIR=${DXR_RUNTIME_SOURCE_DIR} doesn't look like a runtime checkout."
     echo "  Point it at a local clone of DisplayXR/displayxr-runtime."
