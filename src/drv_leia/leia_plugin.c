@@ -11,10 +11,12 @@
  * ADR-019; lower than sim_display's 200, so this wins on machines
  * with SR hardware).
  *
- * The probe is intentionally fast — EDID + SR-SDK/service presence
- * check only; no SR context creation. The slower
- * `leiasr_probe_display(timeout)` path stays as the in-tree builder's
- * fallback and is not on the hot path here.
+ * The probe is fast on the common path — EDID + SR-SDK/service presence
+ * check only, no SR context creation. The slower
+ * `leiasr_probe_display(timeout)` path is invoked only as a fallback when
+ * the static EDID table misses but SR is installed and running (see
+ * `leia_plugin_probe`), so a panel that SR accepts but our frozen table
+ * has not yet learned still binds.
  *
  * Issue #256 — vendor plug-in re-architecture.
  *
@@ -49,25 +51,57 @@
  *
  */
 
+/*
+ * Fallback SR-context probe timeout, used only when the fast EDID table
+ * misses. SR SDK + SRService are already confirmed present at that point, so
+ * the context should come up quickly; keep the wait short to stay friendly on
+ * the xrCreateInstance path.
+ */
+#define LEIA_PLUGIN_SR_PROBE_TIMEOUT_S 2.0
+
 static xrt_result_t
 leia_plugin_probe(struct xrt_plugin_instance **out_inst)
 {
 	/*
-	 * Fast EDID-based detection. We require all three layers:
-	 *   1. EDID panel match (hw_found),
-	 *   2. SR SDK installed on this machine (sdk_installed),
-	 *   3. SRService running (service_running).
-	 * Any one missing → decline cleanly so the next plug-in (or the
-	 * sim_display fallback) gets a turn. Skipping the slower
-	 * leiasr_probe_display(3.0) path keeps probe sub-millisecond on
-	 * the xrCreateInstance hot path; the in-tree builder retains the
-	 * full-context probe for diagnostic logging.
+	 * SR presence is required regardless of how the panel is identified:
+	 *   - SR SDK installed on this machine (sdk_installed),
+	 *   - SRService running (service_running).
+	 * If either is missing there is no SR display — decline cleanly so the
+	 * next plug-in (or the sim_display fallback) gets a turn.
 	 */
 	struct leia_display_probe_result edid = {0};
-	bool found = leia_edid_probe_display(&edid);
-	if (!found || !edid.hw_found || !edid.sdk_installed || !edid.service_running) {
-		U_LOG_I("leia_plugin: probe declined — hw=%d sdk=%d service=%d", edid.hw_found,
-		        edid.sdk_installed, edid.service_running);
+	leia_edid_probe_display(&edid);
+
+	if (!edid.sdk_installed || !edid.service_running) {
+		U_LOG_I("leia_plugin: probe declined — sdk=%d service=%d", edid.sdk_installed,
+		        edid.service_running);
+		*out_inst = NULL;
+		return XRT_ERROR_PROBER_NOT_SUPPORTED;
+	}
+
+	/*
+	 * Panel identification. The fast path is the EDID table match
+	 * (hw_found). That table is a frozen copy of SR's product-code map and
+	 * drifts: SR's ProductCodeInstaller registers new panels in SR's own
+	 * registry, which our table cannot see. So on a table miss we defer to
+	 * the authoritative source — the SR runtime itself. If SR reports an
+	 * active SR display, trust it. This costs one SR-context creation, but
+	 * only on the rare miss and only on a machine that already has the SDK +
+	 * a running service, so it stays off the common hot path.
+	 */
+	bool panel_ok = edid.hw_found;
+	if (!panel_ok) {
+		U_LOG_W("leia_plugin: EDID table miss with SR present — deferring to SR runtime probe "
+		        "(table is stale relative to SR's product-code registry)");
+		panel_ok = leiasr_probe_display(LEIA_PLUGIN_SR_PROBE_TIMEOUT_S);
+		if (panel_ok) {
+			U_LOG_W("leia_plugin: SR runtime confirms an active SR display — binding");
+		}
+	}
+
+	if (!panel_ok) {
+		U_LOG_I("leia_plugin: probe declined — no SR display (hw=%d sdk=%d service=%d)",
+		        edid.hw_found, edid.sdk_installed, edid.service_running);
 		*out_inst = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}

@@ -232,42 +232,49 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 
 	if (!edid_ok) {
 		U_LOG_W("EDID probe: enumeration failed (diag=%d)", (int)edid_list.diag_error);
-		goto done;
+	} else {
+		U_LOG_W("EDID probe: enumerated %u monitors", edid_list.count);
+		for (uint32_t i = 0; i < edid_list.count; i++) {
+			U_LOG_W("EDID probe:   monitor[%u] mfr=0x%04X prod=0x%04X %ux%u @%d,%d %s",
+			        i, edid_list.monitors[i].manufacturer_id, edid_list.monitors[i].product_id,
+			        edid_list.monitors[i].pixel_width, edid_list.monitors[i].pixel_height,
+			        edid_list.monitors[i].screen_left, edid_list.monitors[i].screen_top,
+			        edid_list.monitors[i].is_primary ? "(primary)" : "");
+		}
+
+		const struct os_display_edid_monitor *match =
+		    os_display_edid_find_in_table(&edid_list, leia_edid_table, LEIA_EDID_TABLE_LEN);
+
+		if (match == NULL) {
+			U_LOG_W("EDID probe: no known Leia/Dimenco display matched among %u monitors",
+			        edid_list.count);
+		} else {
+			out->hw_found = true;
+			out->manufacturer_id = match->manufacturer_id;
+			out->product_id = match->product_id;
+			out->pixel_w = match->pixel_width;
+			out->pixel_h = match->pixel_height;
+			out->refresh_hz = (float)match->refresh_hz;
+			out->screen_left = match->screen_left;
+			out->screen_top = match->screen_top;
+			out->hmonitor = match->hmonitor;
+
+			U_LOG_W("EDID probe: Leia display found (mfr=0x%04X prod=0x%04X) at %ux%u @ %d,%d",
+			        match->manufacturer_id, match->product_id, match->pixel_width,
+			        match->pixel_height, match->screen_left, match->screen_top);
+		}
 	}
 
-	U_LOG_W("EDID probe: enumerated %u monitors", edid_list.count);
-	for (uint32_t i = 0; i < edid_list.count; i++) {
-		U_LOG_W("EDID probe:   monitor[%u] mfr=0x%04X prod=0x%04X %ux%u @%d,%d %s",
-		        i, edid_list.monitors[i].manufacturer_id, edid_list.monitors[i].product_id,
-		        edid_list.monitors[i].pixel_width, edid_list.monitors[i].pixel_height,
-		        edid_list.monitors[i].screen_left, edid_list.monitors[i].screen_top,
-		        edid_list.monitors[i].is_primary ? "(primary)" : "");
-	}
-
-	const struct os_display_edid_monitor *match =
-	    os_display_edid_find_in_table(&edid_list, leia_edid_table, LEIA_EDID_TABLE_LEN);
-
-	if (match == NULL) {
-		U_LOG_W("EDID probe: no known Leia/Dimenco display matched among %u monitors", edid_list.count);
-		goto done;
-	}
-
-	out->hw_found = true;
-	out->manufacturer_id = match->manufacturer_id;
-	out->product_id = match->product_id;
-	out->pixel_w = match->pixel_width;
-	out->pixel_h = match->pixel_height;
-	out->refresh_hz = (float)match->refresh_hz;
-	out->screen_left = match->screen_left;
-	out->screen_top = match->screen_top;
-	out->hmonitor = match->hmonitor;
-
-	U_LOG_W("EDID probe: Leia display found (mfr=0x%04X prod=0x%04X) at %ux%u @ %d,%d",
-	        match->manufacturer_id, match->product_id, match->pixel_width, match->pixel_height,
-	        match->screen_left, match->screen_top);
-
+	/*
+	 * SR runtime presence — probed regardless of the EDID table match. The
+	 * static leia_edid_table[] is a frozen copy of SR's product-code map
+	 * (WindowsDisplayUtilities.cpp) and drifts as new panels ship: SR's
+	 * ProductCodeInstaller registers a new prototype's EDID IDs in SR's own
+	 * registry, invisible to our table. leia_plugin_probe() defers to the SR
+	 * runtime on a table miss (the authoritative check), so it needs
+	 * sdk_installed/service_running populated even when hw_found is false.
+	 */
 #ifdef _WIN32
-	// Step 2: Check if SR SDK is installed (registry key)
 	{
 		HKEY hKey;
 		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Dimenco\\Simulated Reality", 0, KEY_READ, &hKey) ==
@@ -275,11 +282,10 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 			out->sdk_installed = true;
 			RegCloseKey(hKey);
 		} else {
-			U_LOG_W("EDID probe: Leia display detected but SR SDK not installed");
+			U_LOG_W("EDID probe: SR SDK not installed");
 		}
 	}
 
-	// Step 3: Check if SRService is running (shared memory)
 	if (out->sdk_installed) {
 		HANDLE hMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Global\\sharedDeviceSerialMemory");
 		if (hMapping != NULL) {
@@ -291,7 +297,6 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 	}
 #endif
 
-done:
 	// Cache the result
 	g_leia_edid_result = *out;
 	g_leia_edid_probed = true;
