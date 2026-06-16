@@ -35,21 +35,48 @@ set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
 :: --- Resolve runtime source dir ---
+:: Probe the sibling runtime checkout by its known directory names. The repo is
+:: "displayxr-runtime" today; "openxr-3d-display" is the legacy clone name kept
+:: as a fallback. Without this, DXR_RUNTIME_SOURCE_DIR stays empty, the
+:: vcpkg-toolchain block below is skipped, and the runtime's find_package
+:: (Eigen3) fails ("Could not find a package configuration file ... Eigen3").
 if "%DXR_RUNTIME_SOURCE_DIR%"=="" (
-    if exist "%REPO%..\openxr-3d-display\CMakeLists.txt" (
-        set DXR_RUNTIME_SOURCE_DIR=%REPO%..\openxr-3d-display
-        echo Detected local runtime at !DXR_RUNTIME_SOURCE_DIR!
-    ) else (
-        echo Local runtime checkout not found at %REPO%..\openxr-3d-display
+    for %%D in (displayxr-runtime openxr-3d-display) do (
+        if not defined DXR_RUNTIME_SOURCE_DIR if exist "%REPO%..\%%D\CMakeLists.txt" (
+            set DXR_RUNTIME_SOURCE_DIR=%REPO%..\%%D
+            echo Detected local runtime at !DXR_RUNTIME_SOURCE_DIR!
+        )
+    )
+    if not defined DXR_RUNTIME_SOURCE_DIR (
+        echo Local runtime checkout not found next to %REPO% ^(displayxr-runtime / openxr-3d-display^)
         echo CMake will FetchContent the runtime from GitHub ^(slow first build^).
     )
 )
 
 :: --- MSVC env ---
+:: Locate any VS 2022 edition via vswhere (the official MS way) so Community /
+:: Professional / Enterprise / BuildTools all work without hand-editing. Falls
+:: back to probing the known editions if vswhere is absent.
 echo === Setting up MSVC environment ===
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VCVARS="
+if exist "%VSWHERE%" (
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+        if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+if not defined VCVARS (
+    for %%E in (Community Professional Enterprise BuildTools) do (
+        if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+if not defined VCVARS (
+    echo ERROR: VS 2022 with the C++ workload not found.
+    exit /b 1
+)
+call "%VCVARS%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: VS 2022 not found.
+    echo ERROR: vcvars64.bat failed: %VCVARS%
     exit /b 1
 )
 
