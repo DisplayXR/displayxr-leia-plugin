@@ -471,8 +471,20 @@ ck_get_strip_fb(struct leia_display_processor *ldp,
 	}
 
 	if (ldp->ck_strip_fbs_count >= kMaxStripFramebuffers) {
-		U_LOG_W("Leia VK DP: ck strip fb cache full (%u entries) — dropping oldest",
-		        ldp->ck_strip_fbs_count);
+		// LRU eviction. This recurs when the present target is recreated as a
+		// content-fit zone (P6 XR_EXT_display_zones, e.g. the avatar tracking
+		// its silhouette) renegotiates size every few frames: each fresh present
+		// image adds an entry keyed by image, so the bounded cache cycles. The
+		// eviction is correct and harmless — only the per-occurrence WARN is
+		// noise (runtime convention: never spam WARN). Log it once for
+		// visibility, then stay silent.
+		static bool warned_cache_full = false;
+		if (!warned_cache_full) {
+			warned_cache_full = true;
+			U_LOG_W("Leia VK DP: ck strip fb cache full (%u entries) — evicting oldest (LRU). "
+			        "Recurs as a content-fit zone resizes; subsequent evictions are not logged.",
+			        ldp->ck_strip_fbs_count);
+		}
 		vk->vkDestroyFramebuffer(vk->device, ldp->ck_strip_fbs[0].fb, NULL);
 		vk->vkDestroyImageView(vk->device, ldp->ck_strip_fbs[0].view, NULL);
 		for (uint32_t i = 1; i < ldp->ck_strip_fbs_count; i++) {
