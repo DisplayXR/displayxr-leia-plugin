@@ -4,11 +4,13 @@ setlocal enabledelayedexpansion
 :: ============================================================
 :: DisplayXR Leia SR Plug-in — Local Windows Build Script
 :: ============================================================
-:: Usage: scripts\build-windows.bat [generate|build|installer|all]
+:: Usage: scripts\build-windows.bat [generate|build|installer|all] [config]
 ::   generate   - CMake configure only
 ::   build      - Build the plug-in DLL + install
 ::   installer  - Build the NSIS installer (depends on build)
 ::   all        - Everything (default)
+::   config     - Release (default) | RelWithDebInfo | Debug. Use RelWithDebInfo
+::                to debug the plug-in (PDBs + Release CRT for the SR SDK).
 ::
 :: Required environment (auto-fetched if missing):
 ::   LEIASR_SDKROOT       — extracted LeiaSR-SDK-*-win64 dir
@@ -33,6 +35,12 @@ set REPO=%SCRIPT_DIR%..\
 set SR_TAG=1.35.0.2011
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
+
+REM Build config (2nd arg). Default Release. Use RelWithDebInfo to debug the
+REM plug-in: it gives PDBs while keeping the Release CRT the SR SDK requires
+REM (the SR SDK ships Release-only, so a pure Debug plug-in CRT-mismatches it).
+set CONFIG=%~2
+if "%CONFIG%"=="" set CONFIG=Release
 
 :: --- Resolve runtime source dir ---
 :: Probe the sibling runtime checkout by its known directory names. The repo is
@@ -159,7 +167,7 @@ if "%TARGET%"=="generate" goto :end
 
 :do_build
 echo === Build ===
-cmake --build "%REPO%build" --config Release --target install
+cmake --build "%REPO%build" --config !CONFIG! --target install
 if %ERRORLEVEL% NEQ 0 (
     echo Build FAILED
     exit /b 1
@@ -168,7 +176,7 @@ if "%TARGET%"=="build" goto :end
 
 :do_installer
 echo === Build Installer ===
-cmake --build "%REPO%build" --config Release --target installer
+cmake --build "%REPO%build" --config !CONFIG! --target installer
 if %ERRORLEVEL% NEQ 0 (
     echo Installer build FAILED
     exit /b 1
