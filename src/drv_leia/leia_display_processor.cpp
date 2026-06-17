@@ -102,6 +102,12 @@ struct leia_display_processor
 	} ck_strip_fbs[kMaxStripFramebuffers];
 	uint32_t ck_strip_fbs_count;
 
+	//! #602: last target image-set generation we flushed ck_strip_fbs for.
+	//! The compositor bumps its generation on every resize and notifies us via
+	//! notify_target_recreated; we drop the (now-dangling) strip cache once per
+	//! new generation. Init 0 matches the compositor's freshly-created target.
+	uint32_t ck_target_generation;
+
 	//
 	// Compose-under-bg transparency support (Windows, when WGC desktop capture
 	// is available). Reuses ck_fill_image / ck_fill_view / ck_fill_fb / ck_fill_rp
@@ -345,15 +351,25 @@ ck_ensure_fill_target(struct leia_display_processor *ldp, uint32_t w, uint32_t h
 	return true;
 }
 
-// Create or recreate the strip sampling image+view to match (w, h).
+// Ensure the strip sampling image+view can hold at least (w, h). #602: the
+// runtime hands a content-fit display zone (P6) a target size that renegotiates
+// ~6x/sec; previously this recreated the image+view on every change. Allocate
+// at a high-water-mark and never shrink so it stops churning — the alpha-gate
+// copies/samples only the top-left (w, h) sub-rect (the shader applies a UV
+// scale), so an over-allocated backing image is correct. ck_strip_w/h hold the
+// ALLOCATED extent.
 static bool
 ck_ensure_strip_source(struct leia_display_processor *ldp, uint32_t w, uint32_t h)
 {
-	if (ldp->ck_strip_image != VK_NULL_HANDLE && ldp->ck_strip_w == w && ldp->ck_strip_h == h) {
+	if (ldp->ck_strip_image != VK_NULL_HANDLE && ldp->ck_strip_w >= w && ldp->ck_strip_h >= h) {
 		return true;
 	}
 
 	struct vk_bundle *vk = ldp->vk;
+
+	// Grow to the per-dimension high-water-mark; never shrink.
+	uint32_t alloc_w = w > ldp->ck_strip_w ? w : ldp->ck_strip_w;
+	uint32_t alloc_h = h > ldp->ck_strip_h ? h : ldp->ck_strip_h;
 
 	if (ldp->ck_strip_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, ldp->ck_strip_view, NULL);
@@ -368,7 +384,7 @@ ck_ensure_strip_source(struct leia_display_processor *ldp, uint32_t w, uint32_t 
 		ldp->ck_strip_mem = VK_NULL_HANDLE;
 	}
 
-	VkExtent2D ext = {w, h};
+	VkExtent2D ext = {alloc_w, alloc_h};
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
 	                          VK_IMAGE_USAGE_SAMPLED_BIT;
 	// Use the swapchain target format for the sampling image so vkCmdCopyImage
@@ -389,8 +405,8 @@ ck_ensure_strip_source(struct leia_display_processor *ldp, uint32_t w, uint32_t 
 		return false;
 	}
 
-	ldp->ck_strip_w = w;
-	ldp->ck_strip_h = h;
+	ldp->ck_strip_w = alloc_w;
+	ldp->ck_strip_h = alloc_h;
 	return true;
 }
 
@@ -447,25 +463,32 @@ ck_get_strip_fb(struct leia_display_processor *ldp,
 {
 	struct vk_bundle *vk = ldp->vk;
 
+	// #602: the cached entry's w/h are the ALLOCATED framebuffer extent (a
+	// high-water-mark). The alpha-gate renders only a (w, h) top-left sub-rect
+	// (renderArea/viewport/scissor), so a larger framebuffer over the same
+	// target image is reused as long as it covers (w, h) — only a genuine grow
+	// rebuilds. This stops the per-frame rebuild as a content-fit zone resizes.
 	for (uint32_t i = 0; i < ldp->ck_strip_fbs_count; i++) {
 		if (ldp->ck_strip_fbs[i].image == target_image) {
-			if (ldp->ck_strip_fbs[i].w == w && ldp->ck_strip_fbs[i].h == h) {
+			if (ldp->ck_strip_fbs[i].w >= w && ldp->ck_strip_fbs[i].h >= h) {
 				return ldp->ck_strip_fbs[i].fb;
 			}
-			// Dimensions changed — tear down and rebuild.
+			// Needs a bigger framebuffer — grow to the high-water-mark.
+			uint32_t alloc_w = w > ldp->ck_strip_fbs[i].w ? w : ldp->ck_strip_fbs[i].w;
+			uint32_t alloc_h = h > ldp->ck_strip_fbs[i].h ? h : ldp->ck_strip_fbs[i].h;
 			vk->vkDestroyFramebuffer(vk->device, ldp->ck_strip_fbs[i].fb, NULL);
 			vk->vkDestroyImageView(vk->device, ldp->ck_strip_fbs[i].view, NULL);
 			VkImageView v = VK_NULL_HANDLE;
 			VkFramebuffer f = VK_NULL_HANDLE;
-			if (!ck_build_strip_entry(ldp, target_image, w, h, &v, &f)) {
+			if (!ck_build_strip_entry(ldp, target_image, alloc_w, alloc_h, &v, &f)) {
 				ldp->ck_strip_fbs[i].view = VK_NULL_HANDLE;
 				ldp->ck_strip_fbs[i].fb = VK_NULL_HANDLE;
 				return VK_NULL_HANDLE;
 			}
 			ldp->ck_strip_fbs[i].view = v;
 			ldp->ck_strip_fbs[i].fb = f;
-			ldp->ck_strip_fbs[i].w = w;
-			ldp->ck_strip_fbs[i].h = h;
+			ldp->ck_strip_fbs[i].w = alloc_w;
+			ldp->ck_strip_fbs[i].h = alloc_h;
 			return f;
 		}
 	}
@@ -926,12 +949,13 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 				return false;
 			}
 		}
-		// Push constants: uvec2 tile_count + uint has_backdrop + uint pad = 16 bytes.
+		// Push constants: uvec2 tile_count + uint has_backdrop + uint pad +
+		// vec2 strip_uv_scale (#602) = 24 bytes.
 		{
 			VkPushConstantRange pc = {
 			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 			    .offset = 0,
-			    .size = 16,
+			    .size = 24,
 			};
 			VkPipelineLayoutCreateInfo pli = {
 			    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1327,10 +1351,20 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                             ldp->alpha_gate_pipeline_layout, 0, 1, &ldp->alpha_gate_set, 0, NULL);
 
-	struct { uint32_t tile_count[2]; uint32_t has_backdrop; uint32_t pad; } push = {};
+	struct {
+		uint32_t tile_count[2];
+		uint32_t has_backdrop;
+		uint32_t pad;
+		float strip_uv_scale[2]; // #602
+	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u; // #491 part 3
+	// #602 — ck_strip_image is allocated at a high-water-mark; only its
+	// top-left (w, h) holds this frame's back-buffer copy. Scale screen UV into
+	// that sub-rect so the gate samples the valid region (1,1 when exact).
+	push.strip_uv_scale[0] = ldp->ck_strip_w > 0 ? (float)w / (float)ldp->ck_strip_w : 1.0f;
+	push.strip_uv_scale[1] = ldp->ck_strip_h > 0 ? (float)h / (float)ldp->ck_strip_h : 1.0f;
 	vk->vkCmdPushConstants(cmd, ldp->alpha_gate_pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
@@ -1739,6 +1773,41 @@ leia_dp_set_background_2d(struct xrt_display_processor *xdp,
 	ldp->backdrop_h = height;
 }
 
+// #602: the compositor recreated its target image set (window resize rebuilt
+// the swapchain / DComp-bridge ring). Our ck_strip_fbs cache keys entries by
+// the target VkImage handle (see ck_strip_get_fb) — but Vulkan recycles freed
+// image handles, so an entry can survive the size-high-water check and alias a
+// destroyed image, faulting the device on the next strip render. Drop the whole
+// strip framebuffer cache; process_atlas rebuilds it over the fresh targets.
+// The compositor drains the device before calling us, so destroying these
+// objects synchronously here is safe. ck_fill_* / ck_strip_image are DP-owned
+// offscreen resources (not keyed by the target image) and stay put.
+static void
+leia_dp_notify_target_recreated(struct xrt_display_processor_vk *xdp, uint32_t generation)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	if (ldp->vk == NULL) {
+		return;
+	}
+	if (generation == ldp->ck_target_generation) {
+		return; // already flushed for this generation — idempotent.
+	}
+	ldp->ck_target_generation = generation;
+
+	struct vk_bundle *vk = ldp->vk;
+	for (uint32_t i = 0; i < ldp->ck_strip_fbs_count; i++) {
+		if (ldp->ck_strip_fbs[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, ldp->ck_strip_fbs[i].fb, NULL);
+		}
+		if (ldp->ck_strip_fbs[i].view != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, ldp->ck_strip_fbs[i].view, NULL);
+		}
+	}
+	std::memset(&ldp->ck_strip_fbs, 0, sizeof(ldp->ck_strip_fbs));
+	ldp->ck_strip_fbs_count = 0;
+	U_LOG_W("Leia VK DP: #602 target images recreated (gen %u) — strip fb cache flushed", generation);
+}
+
 static void
 leia_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -1879,6 +1948,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.base.is_alpha_native = leia_dp_is_alpha_native;
 	ldp->base.base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	ldp->base.base.destroy = leia_dp_destroy;
+	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -1985,6 +2055,7 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.base.destroy = leia_dp_destroy;
+	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
 
 	ldp->leiasr = leiasr;
 	ldp->view_count = 2;

@@ -30,6 +30,11 @@ layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
 	uint  pad;
+	// #602 — the back-buffer copy (ck_strip_image) is allocated at a
+	// high-water-mark so content-fit zones stop churning it; only its top-left
+	// (w, h) sub-rect holds this frame's copy. Scale screen UV into that
+	// sub-rect: (w/alloc_w, h/alloc_h). (1,1) when the image matches exactly.
+	vec2  strip_uv_scale;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -49,8 +54,9 @@ void main()
 
 	if (!all_transparent) {
 		// Woven 3D content (over the backdrop-over-desktop baked pre-weave):
-		// opaque so DWM shows it as-is.
-		out_color = vec4(texture(backbuffer, in_uv).rgb, 1.0);
+		// opaque so DWM shows it as-is. #602 — sample the strip's valid
+		// top-left sub-rect (the image may be over-allocated).
+		out_color = vec4(texture(backbuffer, in_uv * pc.strip_uv_scale).rgb, 1.0);
 		return;
 	}
 
