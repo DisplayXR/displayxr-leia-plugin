@@ -1,21 +1,19 @@
-# displayxr-leia-plugin
+# DisplayXR — Leia SR Plug-in
 
-Leia SR display-processor plug-in for [DisplayXR Runtime](https://github.com/DisplayXR/displayxr-runtime).
+**The first hardware integration for DisplayXR — and the reference example of a vendor plug-in.**
 
-Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_iface` from the runtime's public ABI (`xrt/xrt_plugin.h`). Loaded at `xrCreateInstance` time via registry-driven discovery (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
+This plug-in turns Leia SR glasses-free 3D displays (e.g. Samsung Odyssey 3D, Acer SpatialLabs) into OpenXR targets for the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime). Building a plug-in for your own display? Start from this worked example, alongside the [vendor onboarding guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/guides/vendor-plugin-onboarding.md).
 
-Distributed as `DisplayXRLeiaSRSetup-<version>.exe`. Hard prereq: the DisplayXR runtime must be installed (the installer reads `HKLM\Software\DisplayXR\Runtime\InstallPath`).
+**Get it:** download `DisplayXRLeiaSRSetup-<version>.exe` from the [Releases page](https://github.com/DisplayXR/displayxr-leia-plugin/releases). The DisplayXR runtime must be installed first (the installer reads `HKLM\Software\DisplayXR\Runtime\InstallPath`).
 
-## Status
+## How it works
 
-This repo was extracted from `DisplayXR/displayxr-runtime` per issue [#263](https://github.com/DisplayXR/displayxr-runtime/issues/263) (ADR-019 follow-up). The source under `src/drv_leia/` was previously at `src/xrt/drivers/leia/` in the runtime tree. The pre-extraction history lives in the runtime repo at the `pre-leia-extraction-*` tag.
+Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_iface` from the runtime's public ABI (`xrt/xrt_plugin.h`). It loads at `xrCreateInstance` time via registry-driven discovery (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
 
 ## Architecture
 
 - **`src/drv_leia/`** — driver source: device, EDID probe, plug-in entry point (`xrtPluginNegotiate`), per-API display processors (D3D11, D3D12, OpenGL), SR SDK weavers, eye-tracking listener, WGC background capture.
 - **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `$RuntimeInstall\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`.
-
-CMake build glue + CI workflow + `scripts/build-windows.bat` follow in a separate commit (see issue #263 plan).
 
 ## Documentation
 
