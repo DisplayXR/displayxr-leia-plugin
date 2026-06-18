@@ -332,6 +332,7 @@ struct leia_display_processor_d3d11_impl
 	ID3D11Texture2D *ck_strip_tex;
 	ID3D11ShaderResourceView *ck_strip_srv;
 	uint32_t ck_strip_w, ck_strip_h;
+	uint32_t ck_strip_fmt; //!< DXGI format of ck_strip_tex — MUST match the RTV/back-buffer for CopyResource (#610: texture apps use BGRA, not RGBA).
 	//! @}
 
 	//! @name Compose-under-bg transparency support (lazy-allocated on first frame)
@@ -524,9 +525,18 @@ ck_ensure_fill_target(struct leia_display_processor_d3d11_impl *ldp, uint32_t w,
 }
 
 static bool
-ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w, uint32_t h)
+ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 {
-	if (ldp->ck_strip_tex != nullptr && ldp->ck_strip_w == w && ldp->ck_strip_h == h) {
+	// #610: the strip/gate source is a CopyResource of the RTV/back-buffer, which
+	// requires an IDENTICAL format. _handle apps render to an RGBA back buffer, but
+	// _texture apps' shared texture is BGRA (B8G8R8A8_UNORM, DXGI 87) — a hardcoded
+	// RGBA strip tex makes CopyResource fail silently → strip tex stays black → the
+	// gate's keep-path resamples black, blacking all opaque woven content. Match the
+	// actual back-buffer format. Sampling stays correct: the format maps channels to
+	// RGBA in the shader regardless of byte order, and we read-then-write the same
+	// format, so the round trip is identity.
+	if (ldp->ck_strip_tex != nullptr && ldp->ck_strip_w == w && ldp->ck_strip_h == h &&
+	    ldp->ck_strip_fmt == (uint32_t)fmt) {
 		return true;
 	}
 	if (ldp->ck_strip_srv) { ldp->ck_strip_srv->Release(); ldp->ck_strip_srv = nullptr; }
@@ -537,13 +547,14 @@ ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.Format = fmt;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	HRESULT hr = ldp->device->CreateTexture2D(&td, nullptr, &ldp->ck_strip_tex);
 	if (FAILED(hr)) {
-		U_LOG_E("Leia D3D11 DP: ck strip tex create (%ux%u) failed: 0x%08x", w, h, (unsigned)hr);
+		U_LOG_E("Leia D3D11 DP: ck strip tex create (%ux%u fmt=%u) failed: 0x%08x", w, h, (unsigned)fmt,
+		        (unsigned)hr);
 		return false;
 	}
 	hr = ldp->device->CreateShaderResourceView(ldp->ck_strip_tex, nullptr, &ldp->ck_strip_srv);
@@ -553,6 +564,7 @@ ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w
 	}
 	ldp->ck_strip_w = w;
 	ldp->ck_strip_h = h;
+	ldp->ck_strip_fmt = (uint32_t)fmt;
 	return true;
 }
 
@@ -669,7 +681,7 @@ ck_run_post_weave_strip(struct leia_display_processor_d3d11_impl *ldp,
 
 	D3D11_TEXTURE2D_DESC bb_desc = {};
 	back_buffer->GetDesc(&bb_desc);
-	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height)) {
+	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height, bb_desc.Format)) {
 		back_buffer->Release();
 		rtv_res->Release();
 		rtv->Release();
@@ -1047,7 +1059,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 
 	D3D11_TEXTURE2D_DESC bb_desc = {};
 	back_buffer->GetDesc(&bb_desc);
-	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height)) {
+	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height, bb_desc.Format)) {
 		back_buffer->Release();
 		rtv_res->Release();
 		rtv->Release();
