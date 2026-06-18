@@ -304,13 +304,14 @@ struct leia_display_processor_d3d11_impl
 	bool zone_active;              //!< A publish is live (not cleared).
 	ID3D11Texture2D *zone_staging; //!< Readback scratch (mask-sized, R8).
 	uint32_t zone_staging_w, zone_staging_h;
-	//! #68 PROTOTYPE — DISPLAYXR_ZONES_TEXTURE_FIX=1. A texture-zones app
-	//! self-presents an OPAQUE swapchain showing ONLY the canvas, not the
-	//! panel-sized shared texture. When set, the compose bg-UV remap (which
-	//! assumes the window shows the whole target) is skipped in a zones frame so
-	//! the captured desktop lands 1:1 instead of ~target/window× magnified.
-	//! This is pure bg geometry — it does NOT read the hardware zone mask.
-	bool zones_texture_fix;
+	//! #68 — set by set_shared_texture_present (from the compositor's
+	//! has_shared_texture). A _texture app self-presents its shared texture's
+	//! canvas to its own window, so for a zones frame the canvas fills the window
+	//! and the compose bg-UV remap (which assumes the window shows the whole
+	//! panel-sized target) must be skipped, else the captured desktop renders
+	//! ~target/window× magnified. Combined with @ref zone_active in
+	//! compose_run_pre_weave. Pure bg geometry — does NOT read the hardware mask.
+	bool shared_texture_present;
 	//! @}
 
 	//! @name Chroma-key transparency support (lazy-allocated on first frame)
@@ -922,7 +923,7 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	// extra canvas/target factor over-shrinks the bg-UV region and the desktop
 	// renders ~target/window× magnified. Skip the remap in that case (factor 1.0):
 	// bg_extent from leia_bg_capture_poll is already the window's monitor footprint.
-	bool skip_bg_remap = ldp->zones_texture_fix && ldp->zone_active;
+	bool skip_bg_remap = ldp->shared_texture_present && ldp->zone_active;
 	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 &&
 	    target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
@@ -1766,6 +1767,18 @@ leia_dp_d3d11_set_transparent_background(struct xrt_display_processor_d3d11 *xdp
 	leia_dp_d3d11_enable_transparency(ldp, enabled, client_presents);
 }
 
+// #68 — the app self-presents its shared texture's canvas to its own window
+// (vs the runtime presenting the full target). Drives the compose bg-UV
+// remap-skip in compose_run_pre_weave (see @ref shared_texture_present).
+static void
+leia_dp_d3d11_set_shared_texture_present(struct xrt_display_processor_d3d11 *xdp, bool enabled)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	ldp->shared_texture_present = enabled;
+	U_LOG_W("Leia D3D11 DP: shared-texture present = %d (#68 bg-UV remap %s in zones frames)",
+	        enabled, enabled ? "SKIPPED" : "applied");
+}
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. Same D3D11 device as the compositor → the SRV is used directly
 // (no open/import, unlike the WGC desktop). NULL ⟹ clear (desktop-only).
@@ -1845,15 +1858,6 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	// ADR-020 rule 1: advertise the vtable size (caller calloc'd the struct
 	// so reserved_0 is already zero). Tells the runtime which slots this
 	// plug-in actually built.
-	// #68 PROTOTYPE gate (default off → no behavior change for any app).
-	{
-		const char *e = getenv("DISPLAYXR_ZONES_TEXTURE_FIX");
-		ldp->zones_texture_fix = (e != nullptr && e[0] == '1' && e[1] == '\0');
-		if (ldp->zones_texture_fix) {
-			U_LOG_W("Leia D3D11 DP: #68 PROTOTYPE — texture-zones bg-UV 1:1 fix ENABLED "
-			        "(skip compose bg-UV remap in zones frames; mask untouched)");
-		}
-	}
 	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d11));
 	ldp->base.process_atlas = leia_dp_d3d11_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d11_get_predicted_eye_positions;
@@ -1865,6 +1869,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
 	ldp->base.set_background_2d = leia_dp_d3d11_set_background_2d; // #491 part 3
 	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #573 (sole transparency enable)
+	ldp->base.set_shared_texture_present = leia_dp_d3d11_set_shared_texture_present; // #68
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
