@@ -304,6 +304,13 @@ struct leia_display_processor_d3d11_impl
 	bool zone_active;              //!< A publish is live (not cleared).
 	ID3D11Texture2D *zone_staging; //!< Readback scratch (mask-sized, R8).
 	uint32_t zone_staging_w, zone_staging_h;
+	//! #68 PROTOTYPE — DISPLAYXR_ZONES_TEXTURE_FIX=1. A texture-zones app
+	//! self-presents an OPAQUE swapchain showing ONLY the canvas, not the
+	//! panel-sized shared texture. When set, the compose bg-UV remap (which
+	//! assumes the window shows the whole target) is skipped in a zones frame so
+	//! the captured desktop lands 1:1 instead of ~target/window× magnified.
+	//! This is pure bg geometry — it does NOT read the hardware zone mask.
+	bool zones_texture_fix;
 	//! @}
 
 	//! @name Chroma-key transparency support (lazy-allocated on first frame)
@@ -909,7 +916,14 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	// (canvas_w/h == 0) leaves the full-window mapping unchanged.
 	// NOTE: offsets assume bg UVs are top-left origin (bg_origin = window TL);
 	// if the desktop appears vertically misplaced on device, negate the fy term.
-	if (canvas_width > 0 && canvas_height > 0 &&
+	// #68 (BUG ②): this remap assumes the on-screen window shows the ENTIRE target
+	// (handle/surround apps). A texture-zones app's window shows only the canvas of
+	// the panel-sized shared texture, so the canvas already FILLS the window — the
+	// extra canvas/target factor over-shrinks the bg-UV region and the desktop
+	// renders ~target/window× magnified. Skip the remap in that case (factor 1.0):
+	// bg_extent from leia_bg_capture_poll is already the window's monitor footprint.
+	bool skip_bg_remap = ldp->zones_texture_fix && ldp->zone_active;
+	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 &&
 	    target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
 		float fy = (float)canvas_offset_y / (float)target_height;
@@ -1831,6 +1845,15 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	// ADR-020 rule 1: advertise the vtable size (caller calloc'd the struct
 	// so reserved_0 is already zero). Tells the runtime which slots this
 	// plug-in actually built.
+	// #68 PROTOTYPE gate (default off → no behavior change for any app).
+	{
+		const char *e = getenv("DISPLAYXR_ZONES_TEXTURE_FIX");
+		ldp->zones_texture_fix = (e != nullptr && e[0] == '1' && e[1] == '\0');
+		if (ldp->zones_texture_fix) {
+			U_LOG_W("Leia D3D11 DP: #68 PROTOTYPE — texture-zones bg-UV 1:1 fix ENABLED "
+			        "(skip compose bg-UV remap in zones frames; mask untouched)");
+		}
+	}
 	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d11));
 	ldp->base.process_atlas = leia_dp_d3d11_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d11_get_predicted_eye_positions;
