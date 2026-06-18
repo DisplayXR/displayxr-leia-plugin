@@ -273,6 +273,7 @@ struct leia_display_processor_d3d12_impl
 	// to sample.
 	ID3D12Resource *ck_strip_tex;
 	uint32_t ck_strip_w, ck_strip_h;
+	uint32_t ck_strip_fmt; //!< DXGI format of ck_strip_tex — MUST match the back-buffer for CopyResource (#610: texture apps use BGRA, not RGBA).
 	D3D12_RESOURCE_STATES ck_strip_state;
 	//! @}
 
@@ -445,11 +446,15 @@ ck_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
 	return true;
 }
 
-// Build a chroma-key PSO for the given pixel-shader source. RTV format is
-// R8G8B8A8_UNORM in both passes (fill_tex format and back-buffer format).
+// Build a chroma-key PSO for the given pixel-shader source. The RTV format
+// must match the render target the pass writes to: the fill pass renders to
+// ck_fill_tex (always R8G8B8A8_UNORM), but the strip pass renders to the
+// back buffer, which is BGRA for _texture apps (#610) — pass the back-buffer
+// (swap-chain) format for the strip PSO.
 static bool
 ck_build_pso(struct leia_display_processor_d3d12_impl *ldp,
              const char *ps_source,
+             DXGI_FORMAT rtv_format,
              ID3D12PipelineState **out_pso)
 {
 	ID3DBlob *vs_blob = ck_compile_shader(ck_vs_source, "main", "vs_5_0");
@@ -475,7 +480,7 @@ ck_build_pso(struct leia_display_processor_d3d12_impl *ldp,
 	pso_desc.DepthStencilState.StencilEnable = FALSE;
 	pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	pso_desc.NumRenderTargets = 1;
-	pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	pso_desc.RTVFormats[0] = rtv_format;
 	pso_desc.SampleDesc.Count = 1;
 
 	HRESULT hr = ldp->device->CreateGraphicsPipelineState(
@@ -504,10 +509,18 @@ ck_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 	if (ldp->ck_root_sig == nullptr && !ck_build_root_sig(ldp)) {
 		return false;
 	}
-	if (ldp->ck_fill_pso == nullptr && !ck_build_pso(ldp, ck_fill_ps_source, &ldp->ck_fill_pso)) {
+	// Fill PSO renders to ck_fill_tex (always RGBA); strip PSO renders to the
+	// back buffer (BGRA for _texture apps — #610). Mirror the alpha-gate PSO:
+	// use the swap-chain format the compositor set via set_output_format.
+	DXGI_FORMAT strip_rtv_fmt = ldp->blit_output_format != DXGI_FORMAT_UNKNOWN
+	                                ? ldp->blit_output_format
+	                                : DXGI_FORMAT_R8G8B8A8_UNORM;
+	if (ldp->ck_fill_pso == nullptr &&
+	    !ck_build_pso(ldp, ck_fill_ps_source, DXGI_FORMAT_R8G8B8A8_UNORM, &ldp->ck_fill_pso)) {
 		return false;
 	}
-	if (ldp->ck_strip_pso == nullptr && !ck_build_pso(ldp, ck_strip_ps_source, &ldp->ck_strip_pso)) {
+	if (ldp->ck_strip_pso == nullptr &&
+	    !ck_build_pso(ldp, ck_strip_ps_source, strip_rtv_fmt, &ldp->ck_strip_pso)) {
 		return false;
 	}
 
@@ -610,11 +623,21 @@ ck_ensure_fill_target(struct leia_display_processor_d3d12_impl *ldp,
 
 // Allocate ck_strip_tex sized to the back buffer. State at exit:
 // PIXEL_SHADER_RESOURCE.
+//
+// #610: the strip source is a CopyResource of the back buffer, which requires
+// an IDENTICAL format. _handle apps render to an RGBA back buffer, but
+// _texture apps' shared texture is BGRA (B8G8R8A8_UNORM, DXGI 87) — a hardcoded
+// RGBA strip tex makes CopyResource fail silently → strip tex stays black → the
+// alpha-gate's keep-path resamples black, blacking all opaque woven content
+// (e.g. the opaque Zone A in a texture+zones frame). Match the actual
+// back-buffer format. Sampling stays correct: the SRV maps channels to RGBA in
+// the shader regardless of byte order, and we read-then-write the same format.
 static bool
 ck_ensure_strip_source(struct leia_display_processor_d3d12_impl *ldp,
-                        uint32_t w, uint32_t h)
+                        uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 {
-	if (ldp->ck_strip_tex != nullptr && ldp->ck_strip_w == w && ldp->ck_strip_h == h) {
+	if (ldp->ck_strip_tex != nullptr && ldp->ck_strip_w == w && ldp->ck_strip_h == h &&
+	    ldp->ck_strip_fmt == (uint32_t)fmt) {
 		return true;
 	}
 	if (ldp->ck_strip_tex != nullptr) {
@@ -630,7 +653,7 @@ ck_ensure_strip_source(struct leia_display_processor_d3d12_impl *ldp,
 	td.Height = h;
 	td.DepthOrArraySize = 1;
 	td.MipLevels = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.Format = fmt;
 	td.SampleDesc.Count = 1;
 	td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	td.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -649,10 +672,11 @@ ck_ensure_strip_source(struct leia_display_processor_d3d12_impl *ldp,
 	}
 	ldp->ck_strip_w = w;
 	ldp->ck_strip_h = h;
+	ldp->ck_strip_fmt = (uint32_t)fmt;
 	ldp->ck_strip_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srv_desc.Format = fmt;
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srv_desc.Texture2D.MipLevels = 1;
@@ -768,7 +792,11 @@ ck_run_post_weave_strip(struct leia_display_processor_d3d12_impl *ldp,
                          D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv,
                          uint32_t bb_w, uint32_t bb_h)
 {
-	if (!ck_init_pipeline(ldp) || !ck_ensure_strip_source(ldp, bb_w, bb_h)) {
+	// #610: ck_strip_tex must match the back-buffer format (BGRA for _texture
+	// apps) or CopyResource fails silently. The strip PSO RTV format is set
+	// to the same swap-chain format in ck_init_pipeline.
+	DXGI_FORMAT bb_fmt = back_buffer->GetDesc().Format;
+	if (!ck_init_pipeline(ldp) || !ck_ensure_strip_source(ldp, bb_w, bb_h, bb_fmt)) {
 		return;
 	}
 
@@ -1247,7 +1275,11 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 	if (atlas_resource == nullptr || ldp->alpha_gate_pso == nullptr) {
 		return;
 	}
-	if (!ck_ensure_strip_source(ldp, bb_w, bb_h)) {
+	// #610: ck_strip_tex (the CopyResource of the back buffer) must match the
+	// back-buffer format — BGRA for _texture apps, else CopyResource fails
+	// silently and the gate resamples black over all opaque woven content.
+	DXGI_FORMAT bb_fmt = back_buffer->GetDesc().Format;
+	if (!ck_ensure_strip_source(ldp, bb_w, bb_h, bb_fmt)) {
 		return;
 	}
 
@@ -1259,7 +1291,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 	    ldp->alpha_gate_srv_heap->GetCPUDescriptorHandleForHeapStart();
 	{
 		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		sd.Format = (DXGI_FORMAT)ldp->ck_strip_fmt; // #610: matches the back-buffer copy (BGRA for _texture apps)
 		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		sd.Texture2D.MipLevels = 1;
@@ -1283,7 +1315,11 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 		ID3D12Resource *bd_res =
 		    (ldp->backdrop_resource != nullptr) ? ldp->backdrop_resource : ldp->ck_strip_tex;
 		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // backdrop_scratch + ck_strip_tex both UNORM
+		// backdrop is RGBA (runtime's flattened 2D); the ck_strip_tex dummy
+		// (no-backdrop case) must match its own format — BGRA for _texture
+		// apps (#610), else the SRV format mismatches the resource.
+		sd.Format = (ldp->backdrop_resource != nullptr) ? DXGI_FORMAT_R8G8B8A8_UNORM
+		                                                : (DXGI_FORMAT)ldp->ck_strip_fmt;
 		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		sd.Texture2D.MipLevels = 1;
