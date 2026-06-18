@@ -305,6 +305,10 @@ struct leia_display_processor_d3d12_impl
 	//! live desktop. NULL ⟹ no backdrop (desktop-only).
 	ID3D12Resource *backdrop_resource; //!< NOT owned (compositor-owned).
 	uint32_t backdrop_w, backdrop_h;
+
+	//! #68 — set by set_shared_texture_present (compositor's has_shared_texture).
+	//! Skips the compose bg-UV remap for a self-presenting texture-zones app.
+	bool shared_texture_present;
 	//! @}
 
 	//! One-shot guard for a lost device. The per-frame resource creates (the
@@ -1137,7 +1141,21 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	// (canvas_w/h == 0) leaves the full-window mapping unchanged.
 	// NOTE: offsets assume bg UVs are top-left origin (bg_origin = window TL);
 	// if the desktop appears vertically misplaced on device, negate the fy term.
-	if (canvas_width > 0 && canvas_height > 0 &&
+	//
+	// #68: a `_texture` app self-presents its shared texture's canvas to its own
+	// window — for a TEXTURE-ZONES frame the canvas IS the whole window, so the
+	// window does NOT show the whole panel-sized target and this canvas/target
+	// remap would magnify the captured desktop (#68). On D3D11 the skip is gated on
+	// `shared_texture_present && zone_active` — the zones gate is what keeps the
+	// remap for a texture-SURROUND app (window == full target). The D3D12 Leia DP
+	// has NO zones path (no publish_local_zone_mask / zone_active), so we cannot
+	// distinguish zones from surround here — and every texture app on D3D12 today
+	// is surround (window == full target, remap NEEDED). So keep the remap (do not
+	// skip). shared_texture_present is plumbed for ABI parity; wire the skip to
+	// `shared_texture_present && zone_active` if/when D3D12 gains a zones path.
+	bool skip_bg_remap = false;
+	(void)ldp->shared_texture_present;
+	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 &&
 	    target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
 		float fy = (float)canvas_offset_y / (float)target_height;
@@ -1888,6 +1906,20 @@ leia_dp_d3d12_set_transparent_background(struct xrt_display_processor_d3d12 *xdp
 	}
 }
 
+// #68 — the app self-presents its shared texture's canvas to its own window
+// (vs the runtime presenting the full target). Drives the compose bg-UV
+// remap-skip in compose_run_pre_weave (see @ref shared_texture_present).
+static void
+leia_dp_d3d12_set_shared_texture_present(struct xrt_display_processor_d3d12 *xdp, bool enabled)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	ldp->shared_texture_present = enabled;
+	// #68 — plumbed for ABI parity; the bg-UV remap-skip stays OFF on D3D12 (no
+	// zones path to distinguish texture-zones from texture-surround — see the gate
+	// in compose_run_pre_weave).
+	U_LOG_W("Leia D3D12 DP: shared-texture present = %d (#68 plumbing)", enabled);
+}
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. Same D3D12 device as the compositor → the resource is sampled
 // directly via an SRV we create into heap slot 2 (no open/import, unlike the
@@ -2057,6 +2089,7 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.is_alpha_native = leia_dp_d3d12_is_alpha_native;
 	ldp->base.set_background_2d = leia_dp_d3d12_set_background_2d; // #491 part 3
 	ldp->base.set_transparent_background = leia_dp_d3d12_set_transparent_background; // #573
+	ldp->base.set_shared_texture_present = leia_dp_d3d12_set_shared_texture_present; // #68
 	ldp->base.destroy = leia_dp_d3d12_destroy;
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
