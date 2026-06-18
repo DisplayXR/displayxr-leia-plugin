@@ -272,6 +272,9 @@ struct leia_display_processor_gl_impl
 	//! the GL 2D-under backdrop is a no-op store for now. 0 ⟹ no backdrop.
 	GLuint backdrop_tex; //!< NOT owned (compositor-owned). 0 ⟹ no backdrop.
 	uint32_t backdrop_w, backdrop_h;
+
+	//! #68 — set by set_shared_texture_present (compositor's has_shared_texture).
+	bool shared_texture_present;
 };
 
 static inline struct leia_display_processor_gl_impl *
@@ -891,7 +894,18 @@ compose_run_pre_weave_gl(struct leia_display_processor_gl_impl *ldp,
 	// sub-rect viewport, so remap the bg window UVs to the sub-rect fraction —
 	// the desktop then lands 1:1 behind the sub-rect after the downscale.
 	// Verbatim from the D3D11 DP.
-	if (canvas_width > 0 && canvas_height > 0 && target_width > 0 && target_height > 0) {
+	//
+	// (#68) The remap would magnify the captured desktop for a TEXTURE-ZONES app
+	// (window == canvas). On D3D11 the skip is gated on `shared_texture_present &&
+	// zone_active`; the zones gate keeps the remap for a texture-SURROUND app
+	// (window == full target). The GL Leia DP has NO zones path (no
+	// publish_local_zone_mask) AND no GL _texture app exists — every case here is
+	// the full-target present that NEEDS the remap. So keep it (do not skip).
+	// shared_texture_present is plumbed for ABI parity; wire the skip to
+	// `shared_texture_present && zone_active` if/when GL gains a zones path + app.
+	bool skip_bg_remap = false;
+	(void)ldp->shared_texture_present;
+	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 && target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
 		float fy = (float)canvas_offset_y / (float)target_height;
 		float fw = (float)canvas_width  / (float)target_width;
@@ -1258,6 +1272,23 @@ leia_dp_gl_set_transparent_background(struct xrt_display_processor_gl *xdp, bool
 	}
 }
 
+// #68 — record whether the app self-presents only its shared-texture canvas to
+// its own window (texture app) vs the runtime presenting the full weave target
+// (handle app). When set, the compose-under-bg desktop-UV remap is skipped (the
+// window IS the canvas, so the captured desktop already lands 1:1) — otherwise
+// the remap magnifies the captured desktop (#68). NOTE: the GL DP implements no
+// zones-active state (no get_local_zone_caps / publish_local_zone_mask here), so
+// the skip is gated on shared_texture_present ALONE — see leia_dp_gl_process_atlas.
+static void
+leia_dp_gl_set_shared_texture_present(struct xrt_display_processor_gl *xdp, bool enabled)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	ldp->shared_texture_present = enabled;
+	// #68 — plumbed for ABI parity; the bg-UV remap-skip stays OFF on GL (no zones
+	// path + no GL _texture app — see the gate in compose_run_pre_weave_gl).
+	U_LOG_W("Leia GL DP: shared-texture present = %d (#68 plumbing)", enabled);
+}
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop (a GL texture on
 // the compositor's context). STORED ONLY on GL: the compose/alpha-gate carry the
 // shader support, but sampling this runtime-owned texture from the plug-in
@@ -1416,6 +1447,7 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.is_alpha_native = leia_dp_gl_is_alpha_native;
 	ldp->base.set_transparent_background = leia_dp_gl_set_transparent_background; // #573
 	ldp->base.set_background_2d = leia_dp_gl_set_background_2d; // #491 part 3 (no-op store; GL composite deferred)
+	ldp->base.set_shared_texture_present = leia_dp_gl_set_shared_texture_present; // #68
 	ldp->base.destroy = leia_dp_gl_destroy;
 }
 
