@@ -67,6 +67,27 @@ struct leiasr
 
 	// Thread-safe eye position storage (for getPredictedEyePositions)
 	std::mutex eyeMutex;
+
+	// --- Adaptive weave-latency estimation (VK), microseconds ---------------
+	// The SR Vulkan weaver does NOT implement late latching, and its
+	// setLatencyInFrames() is a no-op (the frames->time conversion is commented
+	// out in the SDK: vkweaver.cpp "todo:????"). Only setLatency() (absolute
+	// microseconds) actually feeds the eye-position predictor. The SDK defines
+	// that value as the motion-to-photon horizon "from the moment weave() is
+	// called until presenting the current frame", i.e. n * (1e6/framerate) us
+	// (IWeaverBase.h). We measure the achieved weave() interval at runtime and
+	// push that horizon every frame, so prediction tracks the avatar's real
+	// frame rate (e.g. when the transparency compose pass lowers FPS) instead
+	// of the fixed 40000 us default.
+	bool     adaptive_latency_enabled = true;
+	float    latency_frames_factor = 1.0f;   // horizon = factor * frame_interval
+	uint64_t latency_min_us = 5000;          // clamp floor
+	uint64_t latency_max_us = 60000;         // clamp ceiling
+	uint64_t latency_fixed_us = 0;           // >0 => bypass adaptive, set once
+	double   latency_ema_alpha = 0.15;       // EMA smoothing for frame interval
+	uint64_t prev_weave_ns = 0;              // timestamp of previous weave()
+	double   ema_interval_ns = 0.0;          // smoothed weave interval (ns)
+	uint64_t last_set_latency_us = 0;        // last value pushed to setLatency()
 };
 
 namespace {
@@ -212,6 +233,54 @@ CreateSRWeaver(SR::SRContext *context,
 	return true;
 }
 
+/*!
+ * Read adaptive-latency knobs from the environment and apply the initial
+ * setLatency() state. Env overrides (dev-only; product default is adaptive on):
+ *   LEIA_VK_ADAPTIVE_LATENCY=0   disable adaptive estimation (keep SDK default)
+ *   LEIA_VK_LATENCY_FIXED_US=N   bypass adaptive, pin setLatency(N) once (A/B)
+ *   LEIA_VK_LATENCY_FRAMES=f     frames-in-flight factor (default 1.0)
+ *   LEIA_VK_LATENCY_MIN_US=N     clamp floor (default 5000)
+ *   LEIA_VK_LATENCY_MAX_US=N     clamp ceiling (default 60000)
+ *   LEIA_VK_LATENCY_EMA_ALPHA=a  interval smoothing 0.01..1.0 (default 0.15)
+ */
+void
+ConfigureAdaptiveLatency(leiasr *sr)
+{
+	auto getf = [](const char *n, float def) -> float {
+		const char *v = std::getenv(n);
+		return (v == nullptr || v[0] == '\0') ? def : (float)atof(v);
+	};
+	auto getu = [](const char *n, uint64_t def) -> uint64_t {
+		const char *v = std::getenv(n);
+		if (v == nullptr || v[0] == '\0') return def;
+		long long x = atoll(v);
+		return x < 0 ? def : (uint64_t)x;
+	};
+
+	const char *en = std::getenv("LEIA_VK_ADAPTIVE_LATENCY");
+	sr->adaptive_latency_enabled = !(en != nullptr && en[0] == '0');
+	sr->latency_frames_factor = getf("LEIA_VK_LATENCY_FRAMES", 1.0f);
+	sr->latency_min_us = getu("LEIA_VK_LATENCY_MIN_US", 5000);
+	sr->latency_max_us = getu("LEIA_VK_LATENCY_MAX_US", 60000);
+	sr->latency_fixed_us = getu("LEIA_VK_LATENCY_FIXED_US", 0);
+	float a = getf("LEIA_VK_LATENCY_EMA_ALPHA", 0.15f);
+	sr->latency_ema_alpha = a < 0.01f ? 0.01f : (a > 1.0f ? 1.0f : a);
+
+	if (sr->latency_fixed_us > 0) {
+		sr->weaver->setLatency(sr->latency_fixed_us);
+		sr->last_set_latency_us = sr->latency_fixed_us;
+		U_LOG_W("Leia VK weave latency: FIXED %llu us (adaptive disabled)",
+		        (unsigned long long)sr->latency_fixed_us);
+	} else if (sr->adaptive_latency_enabled) {
+		U_LOG_W("Leia VK weave latency: ADAPTIVE (x%.2f frame interval, clamp %llu..%llu us, alpha %.2f)",
+		        (double)sr->latency_frames_factor,
+		        (unsigned long long)sr->latency_min_us,
+		        (unsigned long long)sr->latency_max_us, sr->latency_ema_alpha);
+	} else {
+		U_LOG_W("Leia VK weave latency: SDK default (adaptive off, no override)");
+	}
+}
+
 } // namespace anonymous
 
 extern "C" {
@@ -264,6 +333,10 @@ leiasr_create(double maxTime,
 	}
 
 	sr->context->initialize();
+
+	// Apply adaptive weave-latency policy (VK-only setLatency tuning; the app
+	// never calls anything Leia-specific — we derive FPS from the weave cadence).
+	ConfigureAdaptiveLatency(sr);
 
 	*out = sr;
 
@@ -393,6 +466,57 @@ leiasr_weave(struct leiasr *leiasr,
 	if (framebuffer != VK_NULL_HANDLE) {
 		leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
 	}
+
+	// Adaptive weave latency: estimate the motion-to-photon horizon from the
+	// achieved weave() interval (= the app's frame period, observed entirely
+	// inside the plugin — no app-side Leia call) and feed it to the predictor
+	// via setLatency() BEFORE weave() so this frame's eye prediction uses it.
+	if (leiasr->adaptive_latency_enabled && leiasr->latency_fixed_us == 0) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (leiasr->prev_weave_ns != 0) {
+			const uint64_t dt_ns = now_ns - leiasr->prev_weave_ns;
+			// Ignore hitches / first-frame gaps (>250 ms) so a stall doesn't
+			// spike the smoothed interval.
+			if (dt_ns < 250ULL * 1000 * 1000) {
+				if (leiasr->ema_interval_ns <= 0.0) {
+					leiasr->ema_interval_ns = (double)dt_ns;
+				} else {
+					const double a = leiasr->latency_ema_alpha;
+					leiasr->ema_interval_ns =
+					    a * (double)dt_ns + (1.0 - a) * leiasr->ema_interval_ns;
+				}
+			}
+		}
+		leiasr->prev_weave_ns = now_ns;
+
+		if (leiasr->ema_interval_ns > 0.0) {
+			double horizon_us = (double)leiasr->latency_frames_factor *
+			                    leiasr->ema_interval_ns / 1000.0;
+			if (horizon_us < (double)leiasr->latency_min_us)
+				horizon_us = (double)leiasr->latency_min_us;
+			if (horizon_us > (double)leiasr->latency_max_us)
+				horizon_us = (double)leiasr->latency_max_us;
+			const uint64_t latency_us = (uint64_t)(horizon_us + 0.5);
+
+			// Deadband: only re-push (and log) on a meaningful change (>=250 us)
+			// to avoid per-frame churn from sub-ms jitter.
+			const uint64_t prev = leiasr->last_set_latency_us;
+			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
+			if (prev == 0 || diff >= 250) {
+				leiasr->weaver->setLatency(latency_us);
+				// Throttle log to ~2 ms steps (not per frame; see debug-logging.md).
+				if (prev == 0 || (latency_us > prev ? latency_us - prev : prev - latency_us) >= 2000) {
+					U_LOG_I("Leia VK adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps, x%.2f)",
+					        (unsigned long long)latency_us,
+					        leiasr->ema_interval_ns / 1e6,
+					        1e9 / leiasr->ema_interval_ns,
+					        (double)leiasr->latency_frames_factor);
+				}
+				leiasr->last_set_latency_us = latency_us;
+			}
+		}
+	}
+
 	leiasr->weaver->weave();
 }
 
