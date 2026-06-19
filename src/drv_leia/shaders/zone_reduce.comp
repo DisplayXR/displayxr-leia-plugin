@@ -1,0 +1,36 @@
+#version 450
+
+// #613 / ADR-027 — local 2D/3D zone mask "any non-zero" reduction.
+//
+// The VK display-processor's publish_local_zone_mask receives only a
+// VkImageView of the runtime-owned R8_UNORM wish mask (no VkImage), so the
+// any-non-zero verdict (mask pixel != 0 ⟹ this client wishes the panel 3D,
+// the 1x1-grid collapse the SR weaver consumes — ADR-027 Decision 5) can't be
+// read back with a host copy like the D3D11 DP does. This compute pass samples
+// every mask texel and atomically OR-folds "saw a non-zero pixel" into a single
+// host-visible storage-buffer word the DP maps after the dispatch. Edge-
+// triggered (run once per mask content generation), so the cost is negligible.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D mask;
+layout(set = 0, binding = 1) buffer Result {
+    uint any_nonzero;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+void main()
+{
+    uvec2 c = gl_GlobalInvocationID.xy;
+    if (c.x >= pc.width || c.y >= pc.height) {
+        return;
+    }
+    // R8_UNORM: a non-zero stored byte reads back > 0.0.
+    if (texelFetch(mask, ivec2(c), 0).r > 0.0) {
+        atomicOr(any_nonzero, 1u);
+    }
+}

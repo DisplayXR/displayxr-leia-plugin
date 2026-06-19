@@ -26,8 +26,8 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
         leia_sr.cpp leia_sr.h
         leia_display_processor.cpp leia_display_processor.h)
 
-    # Chroma-key + compose-under-bg shaders compiled to SPIR-V headers.
-    # The runtime tree owns the spirv_shaders macro; it's available
+    # Chroma-key + compose-under-bg + zone-reduce shaders compiled to SPIR-V
+    # headers. The runtime tree owns the spirv_shaders macro; it's available
     # because the runtime is added as a subdirectory above.
     spirv_shaders(
         LEIA_SHADER_HEADERS
@@ -36,6 +36,7 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
             shaders/fullscreen_tri.vert
             shaders/compose_under_bg.frag
             shaders/alpha_gate.frag
+            shaders/zone_reduce.comp
     )
     list(APPEND LEIA_SOURCES ${LEIA_SHADER_HEADERS})
     set(LEIA_SR_VULKAN_AVAILABLE TRUE)

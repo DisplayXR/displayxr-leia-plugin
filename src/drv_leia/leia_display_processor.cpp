@@ -23,6 +23,7 @@
 #include "xrt/xrt_display_processor_vk.h" // #573 — the Vulkan transparency-enable variant
 #include "xrt/xrt_display_metrics.h"
 #include "vk/vk_helpers.h"
+#include "vk/vk_cmd_pool.h" // #613 — one-shot cmd buffer for the zone-mask reduction
 #include "util/u_logging.h"
 #include <cstdint>
 #include <cstdlib>
@@ -31,6 +32,10 @@
 // SPIR-V shaders (generated at build time by spirv_shaders()). The fullscreen
 // triangle vertex shader is shared by the compose-under-bg + alpha-gate passes.
 #include "shaders/fullscreen_tri.vert.h"
+// #613 / ADR-027 — compute "any non-zero" reduction of the zone wish mask.
+// Cross-platform (zones drive the lens on every VK target), so NOT gated behind
+// the Windows-only compose/alpha-gate frags below.
+#include "shaders/zone_reduce.comp.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -152,6 +157,42 @@ struct leia_display_processor
 	VkDescriptorPool alpha_gate_desc_pool;
 	VkDescriptorSet alpha_gate_set;
 	VkPipeline alpha_gate_pipeline;
+
+	//
+	// #613 / ADR-027 — local 2D/3D zones (1×1 collapse, VK port of the D3D11
+	// slots 11/12/13 → base slots 18/19/20). The wish mask drives ONLY the SR
+	// lens hint (request_display_mode) — never content (ADR-028). State machine
+	// mirrors leia_display_processor_d3d11.cpp:300-314.
+	//
+	uint64_t zone_eval_seq;  //!< Generation last content-evaluated.
+	bool zone_eval_valid;    //!< zone_eval_seq / zone_want_3d are valid.
+	bool zone_want_3d;       //!< Verdict for zone_eval_seq (any non-zero mask pixel).
+	bool zone_hint_3d;       //!< Lens-hint state the zone path last set.
+	bool zone_active;        //!< A publish is live (not cleared).
+
+	//! #68 (task #5) — set by set_shared_texture_present (from the compositor's
+	//! has_shared_texture). Gates the compose-under-bg canvas bg-UV remap skip.
+	bool shared_texture_present;
+
+	//
+	// Zone-mask "any non-zero" reduction (compute atomicOr → host-visible word).
+	// The base publish slot hands only a VkImageView (no VkImage), so the verdict
+	// is read via a compute dispatch rather than the D3D11 CopyResource+Map. All
+	// lazy-allocated on the first publish (zone_reduce_init); torn down in destroy.
+	//
+	bool zone_reduce_inited;
+	VkShaderModule zone_reduce_shader;
+	VkDescriptorSetLayout zone_reduce_desc_layout;
+	VkPipelineLayout zone_reduce_pipeline_layout;
+	VkPipeline zone_reduce_pipeline;
+	VkDescriptorPool zone_reduce_desc_pool;
+	VkDescriptorSet zone_reduce_set;
+	VkSampler zone_reduce_sampler;
+	VkBuffer zone_reduce_buf;       //!< Host-visible coherent, holds one uint result.
+	VkDeviceMemory zone_reduce_mem; //!< Backing memory for zone_reduce_buf.
+	void *zone_reduce_ptr;          //!< Persistent map of zone_reduce_mem.
+	struct vk_cmd_pool zone_pool;   //!< Own pool for the one-shot reduction submit.
+	bool zone_pool_inited;
 };
 
 static inline struct leia_display_processor *
@@ -159,6 +200,12 @@ leia_display_processor(struct xrt_display_processor *xdp)
 {
 	return (struct leia_display_processor *)xdp;
 }
+
+// #613 — defined alongside the zone vtable (below the factory helpers) but used
+// earlier in leia_dp_destroy; forward-declare so the destroy path can free the
+// zone-reduction resources.
+static void
+zone_reduce_fini(struct leia_display_processor *ldp);
 
 
 /*
@@ -1087,7 +1134,13 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
                       uint32_t atlas_w,
                       uint32_t atlas_h,
                       uint32_t tile_columns,
-                      uint32_t tile_rows)
+                      uint32_t tile_rows,
+                      int32_t canvas_offset_x,
+                      int32_t canvas_offset_y,
+                      uint32_t canvas_width,
+                      uint32_t canvas_height,
+                      uint32_t target_width,
+                      uint32_t target_height)
 {
 	struct vk_bundle *vk = ldp->vk;
 	if (!ck_ensure_fill_target(ldp, atlas_w, atlas_h)) return VK_NULL_HANDLE;
@@ -1099,6 +1152,28 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 	bool have_bg = leia_bg_capture_poll(ldp->bg_capture, bg_origin, bg_extent, &unused);
 	if (!have_bg) {
 		return VK_NULL_HANDLE;
+	}
+
+	// #68 / #613 — canvas bg-UV remap. The atlas is full-size but the weaver
+	// downscales it into the canvas sub-rect viewport, so the composited desktop
+	// must be pre-remapped to the sub-rect's fraction of the window to land 1:1
+	// behind the sub-rect after the weave downscale. SKIP for a shared-texture
+	// zones frame: there the app's window shows ONLY the canvas (the canvas fills
+	// the window), so leia_bg_capture_poll already returns the window = canvas
+	// footprint and the extra canvas/target factor would over-shrink the desktop
+	// (~target/window× magnified). Mirrors the D3D11 reference
+	// (leia_display_processor_d3d11.cpp ~911-937). A full-window canvas makes the
+	// factor the identity, so handle apps are unaffected.
+	bool skip_bg_remap = ldp->shared_texture_present && ldp->zone_active;
+	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 && target_width > 0 && target_height > 0) {
+		float fx = (float)canvas_offset_x / (float)target_width;
+		float fy = (float)canvas_offset_y / (float)target_height;
+		float fw = (float)canvas_width / (float)target_width;
+		float fh = (float)canvas_height / (float)target_height;
+		bg_origin[0] += fx * bg_extent[0];
+		bg_origin[1] += fy * bg_extent[1];
+		bg_extent[0] *= fw;
+		bg_extent[1] *= fh;
 	}
 
 	// First-use barrier on the imported bg image: UNDEFINED → SHADER_READ_ONLY.
@@ -1474,12 +1549,23 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
                       uint32_t canvas_width,
                       uint32_t canvas_height)
 {
-	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
+	// #85 / #613 — honor the canvas sub-rect. A `_texture` app confines the
+	// weave/blit to a sub-region of the panel-sized target
+	// (xrSetSharedTextureOutputRectEXT; in a zones frame the canvas is the full
+	// client window, so this is the identity). canvas_*==0 ⟹ full target. The SR
+	// Vulkan weaver reads this VkRect2D via setViewport/setScissorRect
+	// (leia_sr.cpp), incorporating vpX/vpY into the interlacing phase — so unlike
+	// the stale TODO claimed, no SR SDK change is needed; the offset just has to
+	// be forwarded. Mirrors the D3D11 reference (leia_display_processor_d3d11.cpp
+	// :1232-1241).
+	int32_t vp_x = 0, vp_y = 0;
+	uint32_t vp_w = target_width, vp_h = target_height;
+	if (canvas_width > 0 && canvas_height > 0) {
+		vp_x = canvas_offset_x;
+		vp_y = canvas_offset_y;
+		vp_w = canvas_width;
+		vp_h = canvas_height;
+	}
 
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	struct vk_bundle *vk = ldp->vk;
@@ -1519,12 +1605,14 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 		    VK_PIPELINE_STAGE_TRANSFER_BIT,
 		    0, 0, NULL, 0, NULL, 2, pre);
 
-		// Blit atlas content region (single view) to full target
+		// Blit atlas content region (single view) into the canvas sub-rect (full
+		// target when no canvas). Outside-canvas pixels are owned by the
+		// compositor's Local2D/surround composite, not this blit.
 		VkImageBlit blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .srcOffsets = {{0, 0, 0}, {(int32_t)view_width, (int32_t)view_height, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{0, 0, 0}, {(int32_t)target_width, (int32_t)target_height, 1}},
+		    .dstOffsets = {{vp_x, vp_y, 0}, {vp_x + (int32_t)vp_w, vp_y + (int32_t)vp_h, 1}},
 		};
 		vk->vkCmdBlitImage(cmd_buffer,
 		    (VkImage)atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1562,12 +1650,13 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	// Atlas is guaranteed content-sized SBS (2*view_width x view_height)
 	// by compositor crop-blit. Pass directly to weaver.
 
-	// Build a fullscreen viewport from target dimensions.
+	// Weave region = the canvas sub-rect (full target when no canvas). The SR
+	// weaver folds vp_x/vp_y into the interlacing phase (#85).
 	VkRect2D viewport = {};
-	viewport.offset.x = 0;
-	viewport.offset.y = 0;
-	viewport.extent.width = target_width;
-	viewport.extent.height = target_height;
+	viewport.offset.x = vp_x;
+	viewport.offset.y = vp_y;
+	viewport.extent.width = vp_w;
+	viewport.extent.height = vp_h;
 
 	// Transparency (#573 — chroma-key-free). Windows + WGC only: compose the
 	// captured desktop region UNDER each per-view atlas tile pre-weave so the
@@ -1585,7 +1674,10 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 		if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
 			VkImageView composed = compose_run_pre_weave(ldp, cmd_buffer, atlas_view,
 			                                              atlas_w, atlas_h,
-			                                              tile_columns, tile_rows);
+			                                              tile_columns, tile_rows,
+			                                              canvas_offset_x, canvas_offset_y,
+			                                              canvas_width, canvas_height,
+			                                              target_width, target_height);
 			if (composed != VK_NULL_HANDLE) {
 				weaver_input = composed;
 			}
@@ -1757,6 +1849,19 @@ leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool
 #endif
 }
 
+// #613 / #68 — VK port of the D3D11 shared-texture-present slot. Pure state set:
+// records whether the app self-presents only the canvas (texture apps) vs the
+// full target (handle apps). Combined with zone_active, gates the compose-under-bg
+// canvas bg-UV remap skip (see compose_run_pre_weave). Reads no hardware/mask.
+static void
+leia_dp_vk_set_shared_texture_present(struct xrt_display_processor_vk *xdp, bool enabled)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	ldp->shared_texture_present = enabled;
+	U_LOG_W("Leia VK DP: shared-texture present = %d (#68 bg-UV remap %s in zones frames)", enabled,
+	        enabled ? "SKIPPED" : "applied");
+}
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. The compose-under-bg path (when WGC transparency is active)
 // composites it OVER the captured desktop before the atlas-over. Same VkDevice
@@ -1817,6 +1922,7 @@ leia_dp_destroy(struct xrt_display_processor *xdp)
 	if (vk != NULL) {
 		compose_release_resources(ldp);
 		ck_release_resources(ldp);
+		zone_reduce_fini(ldp); // #613 — zone-mask reduction resources
 		if (ldp->render_pass != VK_NULL_HANDLE) {
 			vk->vkDestroyRenderPass(vk->device, ldp->render_pass, NULL);
 		}
@@ -1897,6 +2003,382 @@ ensure_sr_vulkan_dll_loaded(void)
 
 /*
  *
+ * #613 / ADR-027 — local 2D/3D zone vtable (base slots 18/19/20).
+ *
+ * The published R8_UNORM wish mask drives ONLY the SR lens hint
+ * (leiasr_request_display_mode) — never content compositing (ADR-028). The
+ * 1×1-grid collapse ("any non-zero pixel ⟹ this client wishes 3D", OR-union'd
+ * across clients by the runtime) is evaluated once per mask content generation
+ * (seq), then edge-triggered onto the lens. Ported from the D3D11 reference
+ * (leia_display_processor_d3d11.cpp:1499-1651); the only divergence is the mask
+ * readback — the VK base slot hands a VkImageView (no VkImage), so the verdict
+ * is read via a compute reduction (zone_reduce.comp) rather than CopyResource+Map.
+ *
+ */
+
+// Lazy-build the compute reduction pipeline + result buffer + own command pool.
+// Returns false (leaving the DP in tier-1 fallback) on any failure.
+static bool
+zone_reduce_init(struct leia_display_processor *ldp)
+{
+	if (ldp->zone_reduce_inited) {
+		return true;
+	}
+	struct vk_bundle *vk = ldp->vk;
+	if (vk == NULL) {
+		return false;
+	}
+
+	// Own command pool for the one-shot reduction submit (kept off the SR
+	// weaver's pool to avoid recording/reset hazards).
+	if (!ldp->zone_pool_inited) {
+		if (vk_cmd_pool_init(vk, &ldp->zone_pool, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT) !=
+		    VK_SUCCESS) {
+			return false;
+		}
+		ldp->zone_pool_inited = true;
+	}
+
+	VkShaderModuleCreateInfo smci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_zone_reduce_comp),
+	    .pCode = shaders_zone_reduce_comp,
+	};
+	if (vk->vkCreateShaderModule(vk->device, &smci, NULL, &ldp->zone_reduce_shader) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkDescriptorSetLayoutBinding binds[2] = {
+	    {.binding = 0,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	     .descriptorCount = 1,
+	     .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+	    {.binding = 1,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	     .descriptorCount = 1,
+	     .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+	};
+	VkDescriptorSetLayoutCreateInfo dlci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	    .bindingCount = 2,
+	    .pBindings = binds,
+	};
+	if (vk->vkCreateDescriptorSetLayout(vk->device, &dlci, NULL, &ldp->zone_reduce_desc_layout) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkPushConstantRange pcr = {
+	    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+	    .offset = 0,
+	    .size = 2 * sizeof(uint32_t),
+	};
+	VkPipelineLayoutCreateInfo plci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &ldp->zone_reduce_desc_layout,
+	    .pushConstantRangeCount = 1,
+	    .pPushConstantRanges = &pcr,
+	};
+	if (vk->vkCreatePipelineLayout(vk->device, &plci, NULL, &ldp->zone_reduce_pipeline_layout) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkComputePipelineCreateInfo cpci = {
+	    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+	    .stage =
+	        {
+	            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+	            .module = ldp->zone_reduce_shader,
+	            .pName = "main",
+	        },
+	    .layout = ldp->zone_reduce_pipeline_layout,
+	};
+	if (vk->vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &cpci, NULL, &ldp->zone_reduce_pipeline) !=
+	    VK_SUCCESS) {
+		return false;
+	}
+
+	VkDescriptorPoolSize psizes[2] = {
+	    {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1},
+	    {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1},
+	};
+	VkDescriptorPoolCreateInfo dpci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    .maxSets = 1,
+	    .poolSizeCount = 2,
+	    .pPoolSizes = psizes,
+	};
+	if (vk->vkCreateDescriptorPool(vk->device, &dpci, NULL, &ldp->zone_reduce_desc_pool) != VK_SUCCESS) {
+		return false;
+	}
+	VkDescriptorSetAllocateInfo dsai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = ldp->zone_reduce_desc_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &ldp->zone_reduce_desc_layout,
+	};
+	if (vk->vkAllocateDescriptorSets(vk->device, &dsai, &ldp->zone_reduce_set) != VK_SUCCESS) {
+		return false;
+	}
+
+	// texelFetch ignores filtering, but a combined image sampler still needs a sampler.
+	VkSamplerCreateInfo sci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_NEAREST,
+	    .minFilter = VK_FILTER_NEAREST,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	};
+	if (vk->vkCreateSampler(vk->device, &sci, NULL, &ldp->zone_reduce_sampler) != VK_SUCCESS) {
+		return false;
+	}
+
+	VkBufferCreateInfo bci = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = sizeof(uint32_t),
+	    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bci, NULL, &ldp->zone_reduce_buf) != VK_SUCCESS) {
+		return false;
+	}
+	VkMemoryRequirements mreq = {};
+	vk->vkGetBufferMemoryRequirements(vk->device, ldp->zone_reduce_buf, &mreq);
+	uint32_t mtype = 0;
+	if (!vk_get_memory_type(vk, mreq.memoryTypeBits,
+	                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mtype)) {
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mreq.size,
+	    .memoryTypeIndex = mtype,
+	};
+	if (vk->vkAllocateMemory(vk->device, &mai, NULL, &ldp->zone_reduce_mem) != VK_SUCCESS) {
+		return false;
+	}
+	if (vk->vkBindBufferMemory(vk->device, ldp->zone_reduce_buf, ldp->zone_reduce_mem, 0) != VK_SUCCESS) {
+		return false;
+	}
+	if (vk->vkMapMemory(vk->device, ldp->zone_reduce_mem, 0, VK_WHOLE_SIZE, 0, &ldp->zone_reduce_ptr) !=
+	    VK_SUCCESS) {
+		return false;
+	}
+
+	// Bind the stable result buffer once; the mask view (binding 0) is refreshed per call.
+	VkDescriptorBufferInfo dbi = {.buffer = ldp->zone_reduce_buf, .offset = 0, .range = VK_WHOLE_SIZE};
+	VkWriteDescriptorSet bw = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = ldp->zone_reduce_set,
+	    .dstBinding = 1,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	    .pBufferInfo = &dbi,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &bw, 0, NULL);
+
+	ldp->zone_reduce_inited = true;
+	return true;
+}
+
+// Evaluate "any non-zero pixel" in the published mask view via a compute
+// dispatch. On any failure returns true conservatively (treat as a 3D wish) so
+// a transient GPU error never strands the panel flat under an active mask.
+static bool
+zone_mask_any_nonzero(struct leia_display_processor *ldp, VkImageView mask_view, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (!zone_reduce_init(ldp)) {
+		return true; // conservative fallback (see contract above)
+	}
+
+	VkDescriptorImageInfo dii = {
+	    .sampler = ldp->zone_reduce_sampler,
+	    .imageView = mask_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet iw = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = ldp->zone_reduce_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &dii,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &iw, 0, NULL);
+
+	// Zero the result. The queue submit makes this host write visible to the device.
+	*(uint32_t *)ldp->zone_reduce_ptr = 0;
+
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk_cmd_pool_create_and_begin_cmd_buffer(vk, &ldp->zone_pool, 0, &cmd) != VK_SUCCESS) {
+		return true;
+	}
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ldp->zone_reduce_pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ldp->zone_reduce_pipeline_layout, 0, 1,
+	                            &ldp->zone_reduce_set, 0, NULL);
+	uint32_t pc[2] = {w, h};
+	vk->vkCmdPushConstants(cmd, ldp->zone_reduce_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+	vk->vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+
+	// Make the compute store available to the post-fence host read.
+	VkBufferMemoryBarrier bmb = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .buffer = ldp->zone_reduce_buf,
+	    .offset = 0,
+	    .size = VK_WHOLE_SIZE,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1,
+	                         &bmb, 0, NULL);
+
+	if (vk_cmd_pool_end_submit_wait_and_free_cmd_buffer(vk, &ldp->zone_pool, cmd) != VK_SUCCESS) {
+		return true;
+	}
+
+	return *(const uint32_t *)ldp->zone_reduce_ptr != 0;
+}
+
+static bool
+leia_dp_get_local_zone_caps(struct xrt_display_processor *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	if (out_caps == NULL || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// V1 is the floor — reject only callers older than the zone API itself;
+		// the appended ADR-027 fields are written only when struct_size covers them.
+		return false;
+	}
+	// Needs the VK device (factory path) + the SR lens-hint channel. The legacy
+	// create path sets neither ldp->vk nor a mode-switch-capable weaver, so it
+	// reports unsupported and the runtime keeps the tier-1 global fallback.
+	if (ldp->vk == NULL || !leiasr_supports_display_mode_switch(ldp->leiasr)) {
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = 1; // single-zone panel: union collapses to global on/off
+	out_caps->zone_grid_height = 1;
+	out_caps->max_mask_width = 0;  // no preference — content is reduced to one bit
+	out_caps->max_mask_height = 0;
+	out_caps->max_update_hz = 0;   // edge-triggered internally (verdict changes only)
+	if (out_caps->struct_size >= sizeof(struct xrt_dp_local_zone_caps)) {
+		out_caps->wish_fractional = 0; // SR weaver drives a binary panel state
+		out_caps->switch_granularity = (uint32_t)XRT_DP_SWITCH_GRANULARITY_UNKNOWN;
+		memset(out_caps->reserved, 0, sizeof(out_caps->reserved));
+	}
+	return true;
+}
+
+static bool
+leia_dp_publish_local_zone_mask(struct xrt_display_processor *xdp,
+                                VkImageView mask_view,
+                                uint32_t mask_width,
+                                uint32_t mask_height,
+                                int32_t screen_x,
+                                int32_t screen_y,
+                                uint32_t screen_w,
+                                uint32_t screen_h,
+                                uint64_t seq)
+{
+	// 1×1 grid: the screen anchor can't change the verdict — only content
+	// matters, and content only changes per generation (seq).
+	(void)screen_x;
+	(void)screen_y;
+	(void)screen_w;
+	(void)screen_h;
+
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	if (ldp->vk == NULL || mask_view == VK_NULL_HANDLE || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+
+	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
+	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
+	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
+		ldp->zone_want_3d = zone_mask_any_nonzero(ldp, mask_view, mask_width, mask_height);
+		ldp->zone_eval_seq = seq;
+		ldp->zone_eval_valid = true;
+		U_LOG_W("SR VK zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
+		        (unsigned long long)seq, ldp->zone_want_3d ? "3D" : "2D", mask_width, mask_height);
+	}
+
+	// Edge-triggered lens hint: flip only when the verdict changes (or on the
+	// first publish), so per-frame republish costs nothing SR-side.
+	if (!ldp->zone_active || ldp->zone_hint_3d != ldp->zone_want_3d) {
+		if (!leiasr_request_display_mode(ldp->leiasr, ldp->zone_want_3d)) {
+			return false;
+		}
+		ldp->zone_hint_3d = ldp->zone_want_3d;
+	}
+	ldp->zone_active = true;
+	return true;
+}
+
+static bool
+leia_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	// End of zone authority for this client — hand the lens back to the MODE
+	// authority: restore the hint to what the active rendering mode implies
+	// (view_count ≥ 2 ⟹ a 3D mode is active and the compositor snaps back to the
+	// canvas weave, needing a 3D panel; view_count 1 ⟹ 2D). Blindly disabling
+	// would strand a 3D-mode canvas weave on a 2D panel after mask destroy.
+	if (ldp->zone_active) {
+		bool mode_wants_3d = ldp->view_count >= 2;
+		if (ldp->zone_hint_3d != mode_wants_3d) {
+			leiasr_request_display_mode(ldp->leiasr, mode_wants_3d);
+		}
+		ldp->zone_hint_3d = false;
+		U_LOG_W("SR VK zone: cleared — lens handed back to mode authority (%s)", mode_wants_3d ? "3D" : "2D");
+	}
+	ldp->zone_active = false;
+	ldp->zone_eval_valid = false;
+	return true;
+}
+
+// Tear down the zone-reduction resources (zone_reduce_init counterpart).
+static void
+zone_reduce_fini(struct leia_display_processor *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (vk == NULL) {
+		return;
+	}
+	if (ldp->zone_reduce_ptr != NULL) {
+		vk->vkUnmapMemory(vk->device, ldp->zone_reduce_mem);
+		ldp->zone_reduce_ptr = NULL;
+	}
+	if (ldp->zone_reduce_buf != VK_NULL_HANDLE)
+		vk->vkDestroyBuffer(vk->device, ldp->zone_reduce_buf, NULL);
+	if (ldp->zone_reduce_mem != VK_NULL_HANDLE)
+		vk->vkFreeMemory(vk->device, ldp->zone_reduce_mem, NULL);
+	if (ldp->zone_reduce_sampler != VK_NULL_HANDLE)
+		vk->vkDestroySampler(vk->device, ldp->zone_reduce_sampler, NULL);
+	if (ldp->zone_reduce_pipeline != VK_NULL_HANDLE)
+		vk->vkDestroyPipeline(vk->device, ldp->zone_reduce_pipeline, NULL);
+	if (ldp->zone_reduce_pipeline_layout != VK_NULL_HANDLE)
+		vk->vkDestroyPipelineLayout(vk->device, ldp->zone_reduce_pipeline_layout, NULL);
+	if (ldp->zone_reduce_desc_pool != VK_NULL_HANDLE)
+		vk->vkDestroyDescriptorPool(vk->device, ldp->zone_reduce_desc_pool, NULL);
+	if (ldp->zone_reduce_desc_layout != VK_NULL_HANDLE)
+		vk->vkDestroyDescriptorSetLayout(vk->device, ldp->zone_reduce_desc_layout, NULL);
+	if (ldp->zone_reduce_shader != VK_NULL_HANDLE)
+		vk->vkDestroyShaderModule(vk->device, ldp->zone_reduce_shader, NULL);
+	if (ldp->zone_pool_inited) {
+		vk_cmd_pool_destroy(vk, &ldp->zone_pool);
+		ldp->zone_pool_inited = false;
+	}
+}
+
+
+/*
+ *
  * Factory function — matches xrt_dp_factory_vk_fn_t signature.
  *
  */
@@ -1950,6 +2432,13 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
+	// #613 / ADR-027 — local 2D/3D zones (base slots 18/19/20). struct_size
+	// already covers them (the _vk variant size > sizeof(xrt_display_processor)),
+	// so no ABI bump — the slots ship in the runtime base header already.
+	ldp->base.base.get_local_zone_caps = leia_dp_get_local_zone_caps;
+	ldp->base.base.publish_local_zone_mask = leia_dp_publish_local_zone_mask;
+	ldp->base.base.clear_local_zone_mask = leia_dp_clear_local_zone_mask;
+	ldp->base.set_shared_texture_present = leia_dp_vk_set_shared_texture_present; // #613/#68 (appended VK slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
 	ldp->hwnd_opaque = window_handle;
@@ -2056,6 +2545,13 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
+	// #613 — zone slots wired for vtable parity; the legacy path leaves ldp->vk
+	// NULL, so get_local_zone_caps reports unsupported and the runtime keeps the
+	// tier-1 global fallback (no readback path needed here).
+	ldp->base.base.get_local_zone_caps = leia_dp_get_local_zone_caps;
+	ldp->base.base.publish_local_zone_mask = leia_dp_publish_local_zone_mask;
+	ldp->base.base.clear_local_zone_mask = leia_dp_clear_local_zone_mask;
+	ldp->base.set_shared_texture_present = leia_dp_vk_set_shared_texture_present; // #613/#68 (appended VK slot)
 
 	ldp->leiasr = leiasr;
 	ldp->view_count = 2;
