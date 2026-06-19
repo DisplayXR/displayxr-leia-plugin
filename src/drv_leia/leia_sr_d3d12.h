@@ -182,6 +182,20 @@ bool
 leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d);
 
 /*!
+ * Whether the per-client SR lens hint channel exists (the same gate as
+ * @ref leiasr_d3d12_request_display_mode support). Used by the display-zones
+ * DP path to advertise zone capability — zones drive the panel through the
+ * lens hint, so without it there is nothing to switch.
+ *
+ * @param leiasr The D3D12 weaver instance.
+ * @return true if SwitchableLensHint is available.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d12_supports_display_mode_switch(struct leiasr_d3d12 *leiasr);
+
+/*!
  * Query hardware 3D display state from SR SwitchableLensHint.
  *
  * @param leiasr The D3D12 weaver instance.
