@@ -69,18 +69,25 @@ struct leiasr
 	std::mutex eyeMutex;
 
 	// --- Adaptive weave-latency estimation (VK), microseconds ---------------
-	// The SR Vulkan weaver does NOT implement late latching, and its
-	// setLatencyInFrames() is a no-op (the frames->time conversion is commented
-	// out in the SDK: vkweaver.cpp "todo:????"). Only setLatency() (absolute
-	// microseconds) actually feeds the eye-position predictor. The SDK defines
-	// that value as the motion-to-photon horizon "from the moment weave() is
-	// called until presenting the current frame", i.e. n * (1e6/framerate) us
-	// (IWeaverBase.h). We measure the achieved weave() interval at runtime and
-	// push that horizon every frame, so prediction tracks the avatar's real
-	// frame rate (e.g. when the transparency compose pass lowers FPS) instead
-	// of the fixed 40000 us default.
+	// TEMPORARY WORKAROUND. The SR Vulkan weaver does NOT implement late
+	// latching, and its setLatencyInFrames() is a no-op (the frames->time
+	// conversion is commented out in the SDK: vkweaver.cpp "todo:????"). Only
+	// setLatency() (absolute microseconds) actually feeds the eye-position
+	// predictor. Until the SR VK weaver gains real late-latching / predictive
+	// tracking in frames, we synthesize the motion-to-photon horizon here and
+	// push it every frame. REMOVE this whole block and switch to the SDK's
+	// frames-based predictive path once it is implemented in VK.
+	//
+	// Motion-to-photon is structurally ADDITIVE, not a single multiplier:
+	//     horizon = N_buffered * frame_interval  +  T_display
+	// The first term scales with the app's frame period (1/fps) — N_buffered
+	// frames sit in the swapchain, each ~one frame "old". The second term is a
+	// CONSTANT tied to the PANEL refresh (scanout/raster), independent of app
+	// fps — ~one 60 Hz refresh = 16667 us. A pure multiplicative factor would
+	// wrongly scale the display term with fps; keep it separate.
 	bool     adaptive_latency_enabled = true;
-	float    latency_frames_factor = 1.0f;   // horizon = factor * frame_interval
+	float    latency_frames_factor = 1.0f;   // N_buffered (frames in flight)
+	uint64_t display_term_us = 16667;        // T_display, constant (~1 panel refresh @60Hz)
 	uint64_t latency_min_us = 5000;          // clamp floor
 	uint64_t latency_max_us = 60000;         // clamp ceiling
 	uint64_t latency_fixed_us = 0;           // >0 => bypass adaptive, set once
@@ -238,7 +245,11 @@ CreateSRWeaver(SR::SRContext *context,
  * setLatency() state. Env overrides (dev-only; product default is adaptive on):
  *   LEIA_VK_ADAPTIVE_LATENCY=0   disable adaptive estimation (keep SDK default)
  *   LEIA_VK_LATENCY_FIXED_US=N   bypass adaptive, pin setLatency(N) once (A/B)
- *   LEIA_VK_LATENCY_FRAMES=f     frames-in-flight factor (default 1.0)
+ *   LEIA_VK_LATENCY_FRAMES=f     N_buffered, frames in flight (default 1.0)
+ *   LEIA_VK_PANEL_HZ=hz          panel refresh for display term (default 60)
+ *   LEIA_VK_LATENCY_DISPLAY_US=N override the constant display term in us
+ *                                (default 1e6/PANEL_HZ; set 0 for pure
+ *                                multiplicative A/B)
  *   LEIA_VK_LATENCY_MIN_US=N     clamp floor (default 5000)
  *   LEIA_VK_LATENCY_MAX_US=N     clamp ceiling (default 60000)
  *   LEIA_VK_LATENCY_EMA_ALPHA=a  interval smoothing 0.01..1.0 (default 0.15)
@@ -266,14 +277,22 @@ ConfigureAdaptiveLatency(leiasr *sr)
 	float a = getf("LEIA_VK_LATENCY_EMA_ALPHA", 0.15f);
 	sr->latency_ema_alpha = a < 0.01f ? 0.01f : (a > 1.0f ? 1.0f : a);
 
+	// Constant display/scanout term: default to one panel refresh. PANEL_HZ
+	// gives it from the refresh rate; DISPLAY_US overrides it outright (0 =
+	// pure multiplicative, for A/B against the old shape).
+	float panel_hz = getf("LEIA_VK_PANEL_HZ", 60.0f);
+	uint64_t disp_default = (panel_hz > 1.0f) ? (uint64_t)(1.0e6 / panel_hz + 0.5) : 16667;
+	sr->display_term_us = getu("LEIA_VK_LATENCY_DISPLAY_US", disp_default);
+
 	if (sr->latency_fixed_us > 0) {
 		sr->weaver->setLatency(sr->latency_fixed_us);
 		sr->last_set_latency_us = sr->latency_fixed_us;
 		U_LOG_W("Leia VK weave latency: FIXED %llu us (adaptive disabled)",
 		        (unsigned long long)sr->latency_fixed_us);
 	} else if (sr->adaptive_latency_enabled) {
-		U_LOG_W("Leia VK weave latency: ADAPTIVE (x%.2f frame interval, clamp %llu..%llu us, alpha %.2f)",
+		U_LOG_W("Leia VK weave latency: ADAPTIVE (horizon = %.2f x frame_interval + %llu us display, clamp %llu..%llu us, alpha %.2f)",
 		        (double)sr->latency_frames_factor,
+		        (unsigned long long)sr->display_term_us,
 		        (unsigned long long)sr->latency_min_us,
 		        (unsigned long long)sr->latency_max_us, sr->latency_ema_alpha);
 	} else {
@@ -490,8 +509,12 @@ leiasr_weave(struct leiasr *leiasr,
 		leiasr->prev_weave_ns = now_ns;
 
 		if (leiasr->ema_interval_ns > 0.0) {
+			// Additive motion-to-photon model (see struct comment):
+			//   horizon = N_buffered * frame_interval + T_display
+			// The display term is a constant (panel scanout), NOT fps-scaled.
 			double horizon_us = (double)leiasr->latency_frames_factor *
-			                    leiasr->ema_interval_ns / 1000.0;
+			                        leiasr->ema_interval_ns / 1000.0 +
+			                    (double)leiasr->display_term_us;
 			if (horizon_us < (double)leiasr->latency_min_us)
 				horizon_us = (double)leiasr->latency_min_us;
 			if (horizon_us > (double)leiasr->latency_max_us)
@@ -506,11 +529,12 @@ leiasr_weave(struct leiasr *leiasr,
 				leiasr->weaver->setLatency(latency_us);
 				// Throttle log to ~2 ms steps (not per frame; see debug-logging.md).
 				if (prev == 0 || (latency_us > prev ? latency_us - prev : prev - latency_us) >= 2000) {
-					U_LOG_I("Leia VK adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps, x%.2f)",
+					U_LOG_I("Leia VK adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
 					        (unsigned long long)latency_us,
 					        leiasr->ema_interval_ns / 1e6,
 					        1e9 / leiasr->ema_interval_ns,
-					        (double)leiasr->latency_frames_factor);
+					        (double)leiasr->latency_frames_factor,
+					        (unsigned long long)leiasr->display_term_us);
 				}
 				leiasr->last_set_latency_us = latency_us;
 			}
