@@ -463,6 +463,16 @@ leiasr_d3d12_get_display_pixel_info(struct leiasr_d3d12 *leiasr,
 }
 
 bool
+leiasr_d3d12_supports_display_mode_switch(struct leiasr_d3d12 *leiasr)
+{
+	if (leiasr == nullptr) {
+		return false;
+	}
+
+	return leiasr->lens_hint != nullptr;
+}
+
+bool
 leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d)
 {
 	if (leiasr == nullptr || leiasr->lens_hint == nullptr) {

@@ -311,6 +311,38 @@ struct leia_display_processor_d3d12_impl
 	bool shared_texture_present;
 	//! @}
 
+	//! @name #224 / ADR-027 local 2D/3D zones — 1×1 leg (D3D12 port of D3D11)
+	//! The runtime publishes the XR_EXT_local_3d_zone wish mask per frame; on this
+	//! single-zone panel the OR-collapse is "any non-zero mask pixel ⟹ this client
+	//! hints 3D", driven onto the per-client SR lens hint
+	//! (leiasr_d3d12_request_display_mode). Content is evaluated once per mask
+	//! GENERATION (the publish seq bumps only on submit/re-raster). The mask is a
+	//! PHYSICAL lens signal ONLY (ADR-028) — it is NEVER sampled to gate or
+	//! composite content; the zone path deliberately does NOT touch view_count.
+	//!
+	//! Unlike D3D11 (which gets an immediate context + SRV and reads back via
+	//! ctx->Map), the D3D12 publish slot hands us a bare ID3D12Resource* with no
+	//! context — so the verdict needs an OWNED readback pipeline (own allocator +
+	//! list + READBACK buffer + fence) run on @ref command_queue. It is
+	//! edge-triggered (once per generation), so the synchronous fence wait is
+	//! cheap.
+	//! @{
+	uint64_t zone_eval_seq;  //!< Generation last content-evaluated.
+	bool zone_eval_valid;    //!< zone_eval_seq/zone_want_3d are valid.
+	bool zone_want_3d;       //!< Verdict for zone_eval_seq (any non-zero).
+	bool zone_hint_3d;       //!< Lens-hint state the zone path last set.
+	bool zone_active;        //!< A publish is live (not cleared). Also gates the
+	                         //!< #68 bg-UV remap-skip in compose_run_pre_weave.
+	ID3D12CommandAllocator *zone_cmd_alloc;    //!< Owned readback allocator.
+	ID3D12GraphicsCommandList *zone_cmd_list;  //!< Owned readback list.
+	ID3D12Resource *zone_readback;             //!< HEAP_TYPE_READBACK buffer (mask-sized).
+	uint32_t zone_readback_w, zone_readback_h; //!< Dims the readback buffer was sized for.
+	uint32_t zone_readback_pitch;              //!< Aligned row pitch of the readback footprint.
+	ID3D12Fence *zone_fence;                   //!< Owned; gates the synchronous readback.
+	HANDLE zone_fence_event;                   //!< Owned; CloseHandle in destroy.
+	uint64_t zone_fence_value;                 //!< Monotonic fence signal counter.
+	//! @}
+
 	//! One-shot guard for a lost device. The per-frame resource creates (the
 	//! alpha-gate's ck_ensure_strip_source, the chroma-key ck_ensure_fill_target)
 	//! would otherwise log an identical error EVERY frame once the D3D12 device
@@ -1145,16 +1177,12 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	// #68: a `_texture` app self-presents its shared texture's canvas to its own
 	// window — for a TEXTURE-ZONES frame the canvas IS the whole window, so the
 	// window does NOT show the whole panel-sized target and this canvas/target
-	// remap would magnify the captured desktop (#68). On D3D11 the skip is gated on
-	// `shared_texture_present && zone_active` — the zones gate is what keeps the
-	// remap for a texture-SURROUND app (window == full target). The D3D12 Leia DP
-	// has NO zones path (no publish_local_zone_mask / zone_active), so we cannot
-	// distinguish zones from surround here — and every texture app on D3D12 today
-	// is surround (window == full target, remap NEEDED). So keep the remap (do not
-	// skip). shared_texture_present is plumbed for ABI parity; wire the skip to
-	// `shared_texture_present && zone_active` if/when D3D12 gains a zones path.
-	bool skip_bg_remap = false;
-	(void)ldp->shared_texture_present;
+	// remap would magnify the captured desktop (#68). Gated on
+	// `shared_texture_present && zone_active` (mirrors D3D11): the zones gate is
+	// what keeps the remap for a texture-SURROUND app (no zone mask published →
+	// zone_active false → window == full target, remap NEEDED), and skips it only
+	// for a self-presenting texture-ZONES app where the canvas fills the window.
+	bool skip_bg_remap = ldp->shared_texture_present && ldp->zone_active;
 	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 &&
 	    target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
@@ -1801,6 +1829,266 @@ leia_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xd
 	return true;
 }
 
+/*
+ *
+ * #224 / ADR-027 local 2D/3D zones — 1×1 leg (D3D12 port of the D3D11 slot).
+ *
+ * The mask is the WISH = a physical 2D/3D lens signal only (ADR-028). It is
+ * NEVER sampled to decide content; it only drives request_display_mode.
+ *
+ */
+
+static bool
+leia_dp_d3d12_get_local_zone_caps(struct xrt_display_processor_d3d12 *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// The V1 shape is the floor — reject only callers older than the zone
+		// api itself. The V1 fields are written always; appended fields only
+		// when the caller's struct_size covers them (ADR-027 append).
+		return false;
+	}
+	// Zones are driven through the per-client SR lens hint — needs the hint
+	// channel to exist (same gate as request_display_mode support).
+	if (!leiasr_d3d12_supports_display_mode_switch(ldp->leiasr)) {
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = 1; // single-zone panel: union collapses to global on/off
+	out_caps->zone_grid_height = 1;
+	out_caps->max_mask_width = 0; // no preference — content is reduced to one bit
+	out_caps->max_mask_height = 0;
+	out_caps->max_update_hz = 0; // edge-triggered internally (verdict changes only)
+	if (out_caps->struct_size >= sizeof(struct xrt_dp_local_zone_caps)) {
+		// SR weaver drives a binary panel state — the wish is consumed by the
+		// conformant any-nonzero quantization, not driven fractionally.
+		out_caps->wish_fractional = 0;
+		// Advisory only; no verified hardware claim (ADR-027 flags the
+		// lenticular column-band hypothesis as unverified).
+		out_caps->switch_granularity = (uint32_t)XRT_DP_SWITCH_GRANULARITY_UNKNOWN;
+		memset(out_caps->reserved, 0, sizeof(out_caps->reserved));
+	}
+	return true;
+}
+
+// GPU→CPU readback of the R8 wish mask on the DP's OWN queue (D3D12 has no
+// immediate context like D3D11). Edge-triggered — runs once per mask generation,
+// so the synchronous fence wait is cheap. Returns false on any failure (caller
+// must NOT flip the lens on an unevaluated mask). On success *out_any reports the
+// 1×1 OR-collapse verdict (any non-zero pixel ⟹ 3D). The mask is borrowed and
+// arrives in PIXEL_SHADER_RESOURCE state (compositor contract) — restored before
+// return.
+static bool
+leia_dp_d3d12_zone_readback(struct leia_display_processor_d3d12_impl *ldp,
+                            ID3D12Resource *mask,
+                            uint32_t mask_width,
+                            uint32_t mask_height,
+                            bool *out_any)
+{
+	ID3D12Device *dev = ldp->device;
+
+	// Lazy one-time allocator + list + fence + event.
+	if (ldp->zone_cmd_alloc == nullptr) {
+		if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+		                                       IID_PPV_ARGS(&ldp->zone_cmd_alloc)))) {
+			return false;
+		}
+	}
+	if (ldp->zone_cmd_list == nullptr) {
+		if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, ldp->zone_cmd_alloc,
+		                                  nullptr, IID_PPV_ARGS(&ldp->zone_cmd_list)))) {
+			return false;
+		}
+		ldp->zone_cmd_list->Close(); // created open; we Reset() before each use
+	}
+	if (ldp->zone_fence == nullptr) {
+		if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&ldp->zone_fence)))) {
+			return false;
+		}
+		ldp->zone_fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+		if (ldp->zone_fence_event == nullptr) {
+			return false;
+		}
+		ldp->zone_fence_value = 0;
+	}
+
+	// The mask footprint — R8_UNORM rows aligned to 256 in the readback buffer.
+	D3D12_RESOURCE_DESC md = mask->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+	UINT num_rows = 0;
+	UINT64 row_bytes = 0, total_bytes = 0;
+	dev->GetCopyableFootprints(&md, 0, 1, 0, &fp, &num_rows, &row_bytes, &total_bytes);
+
+	// (Re)allocate the readback buffer when the mask size changes.
+	if (ldp->zone_readback == nullptr || ldp->zone_readback_w != mask_width ||
+	    ldp->zone_readback_h != mask_height) {
+		if (ldp->zone_readback != nullptr) {
+			ldp->zone_readback->Release();
+			ldp->zone_readback = nullptr;
+		}
+		D3D12_HEAP_PROPERTIES hp = {};
+		hp.Type = D3D12_HEAP_TYPE_READBACK;
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bd.Width = total_bytes;
+		bd.Height = 1;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.Format = DXGI_FORMAT_UNKNOWN;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+		                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+		                                        IID_PPV_ARGS(&ldp->zone_readback)))) {
+			ldp->zone_readback = nullptr;
+			return false; // can't evaluate — don't flip the lens blindly
+		}
+		ldp->zone_readback_w = mask_width;
+		ldp->zone_readback_h = mask_height;
+		ldp->zone_readback_pitch = fp.Footprint.RowPitch;
+	}
+
+	// Record: mask PIXEL_SHADER_RESOURCE → COPY_SOURCE, copy into readback, back.
+	if (FAILED(ldp->zone_cmd_alloc->Reset()) || FAILED(ldp->zone_cmd_list->Reset(ldp->zone_cmd_alloc, nullptr))) {
+		return false;
+	}
+
+	D3D12_RESOURCE_BARRIER to_src = {};
+	to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_src.Transition.pResource = mask;
+	to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	ldp->zone_cmd_list->ResourceBarrier(1, &to_src);
+
+	D3D12_TEXTURE_COPY_LOCATION dst = {};
+	dst.pResource = ldp->zone_readback;
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dst.PlacedFootprint = fp;
+	D3D12_TEXTURE_COPY_LOCATION src = {};
+	src.pResource = mask;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src.SubresourceIndex = 0;
+	ldp->zone_cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	D3D12_RESOURCE_BARRIER to_psr = to_src;
+	to_psr.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	to_psr.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	ldp->zone_cmd_list->ResourceBarrier(1, &to_psr);
+
+	if (FAILED(ldp->zone_cmd_list->Close())) {
+		return false;
+	}
+	ID3D12CommandList *lists[] = {ldp->zone_cmd_list};
+	ldp->command_queue->ExecuteCommandLists(1, lists);
+	const uint64_t signal = ++ldp->zone_fence_value;
+	if (FAILED(ldp->command_queue->Signal(ldp->zone_fence, signal))) {
+		return false;
+	}
+	if (ldp->zone_fence->GetCompletedValue() < signal) {
+		if (FAILED(ldp->zone_fence->SetEventOnCompletion(signal, ldp->zone_fence_event))) {
+			return false;
+		}
+		WaitForSingleObject(ldp->zone_fence_event, INFINITE);
+	}
+
+	// Map + any-nonzero over rows (pitch is the footprint's aligned RowPitch).
+	void *mapped = nullptr;
+	D3D12_RANGE read_range = {0, (SIZE_T)total_bytes};
+	if (FAILED(ldp->zone_readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
+		return false;
+	}
+	bool any = false;
+	for (uint32_t y = 0; y < mask_height && !any; y++) {
+		const uint8_t *row = static_cast<const uint8_t *>(mapped) + (size_t)y * fp.Footprint.RowPitch;
+		for (uint32_t x = 0; x < mask_width; x++) {
+			if (row[x] != 0) {
+				any = true;
+				break;
+			}
+		}
+	}
+	D3D12_RANGE no_write = {0, 0};
+	ldp->zone_readback->Unmap(0, &no_write);
+
+	*out_any = any;
+	return true;
+}
+
+static bool
+leia_dp_d3d12_publish_local_zone_mask(struct xrt_display_processor_d3d12 *xdp,
+                                      void *mask_resource,
+                                      uint32_t mask_width,
+                                      uint32_t mask_height,
+                                      int32_t screen_x,
+                                      int32_t screen_y,
+                                      uint32_t screen_w,
+                                      uint32_t screen_h,
+                                      uint64_t seq)
+{
+	// 1×1 grid: the screen anchor can't change the verdict — only content
+	// matters, and content only changes per generation (seq).
+	(void)screen_x;
+	(void)screen_y;
+	(void)screen_w;
+	(void)screen_h;
+
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	ID3D12Resource *mask = static_cast<ID3D12Resource *>(mask_resource);
+	if (mask == nullptr || mask_width == 0 || mask_height == 0 || ldp->device == nullptr ||
+	    ldp->command_queue == nullptr) {
+		return false;
+	}
+
+	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
+	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
+	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
+		bool any = false;
+		if (!leia_dp_d3d12_zone_readback(ldp, mask, mask_width, mask_height, &any)) {
+			return false; // can't evaluate — don't flip the lens blindly
+		}
+		ldp->zone_want_3d = any;
+		ldp->zone_eval_seq = seq;
+		ldp->zone_eval_valid = true;
+		U_LOG_W("SR D3D12 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
+		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+	}
+
+	// Edge-triggered lens hint: flip only when the verdict changes (or on the
+	// first publish), so per-frame republish costs nothing SR-side.
+	if (!ldp->zone_active || ldp->zone_hint_3d != ldp->zone_want_3d) {
+		if (!leiasr_d3d12_request_display_mode(ldp->leiasr, ldp->zone_want_3d)) {
+			return false;
+		}
+		ldp->zone_hint_3d = ldp->zone_want_3d;
+	}
+	ldp->zone_active = true;
+	return true;
+}
+
+static bool
+leia_dp_d3d12_clear_local_zone_mask(struct xrt_display_processor_d3d12 *xdp)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	// End of zone authority for this client — hand the lens back to the MODE
+	// authority: restore the hint to what the active rendering mode implies
+	// (view_count ≥ 2 ⟹ a 3D mode is active and the compositor snaps back to the
+	// canvas weave, which needs a 3D panel; view_count 1 ⟹ 2D mode). Blindly
+	// disabling here would strand a 3D-mode canvas weave on a 2D panel.
+	if (ldp->zone_active) {
+		bool mode_wants_3d = ldp->view_count >= 2;
+		if (ldp->zone_hint_3d != mode_wants_3d) {
+			leiasr_d3d12_request_display_mode(ldp->leiasr, mode_wants_3d);
+		}
+		ldp->zone_hint_3d = false;
+		U_LOG_W("SR D3D12 zone: cleared — lens handed back to mode authority (%s)",
+		        mode_wants_3d ? "3D" : "2D");
+	}
+	ldp->zone_active = false;
+	ldp->zone_eval_valid = false;
+	return true;
+}
+
 static bool
 leia_dp_d3d12_request_display_mode(struct xrt_display_processor_d3d12 *xdp, bool enable_3d)
 {
@@ -1914,10 +2202,11 @@ leia_dp_d3d12_set_shared_texture_present(struct xrt_display_processor_d3d12 *xdp
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 	ldp->shared_texture_present = enabled;
-	// #68 — plumbed for ABI parity; the bg-UV remap-skip stays OFF on D3D12 (no
-	// zones path to distinguish texture-zones from texture-surround — see the gate
-	// in compose_run_pre_weave).
-	U_LOG_W("Leia D3D12 DP: shared-texture present = %d (#68 plumbing)", enabled);
+	// #68 — combined with @ref zone_active in compose_run_pre_weave: the bg-UV
+	// remap is skipped only for a self-presenting texture-ZONES frame (a published
+	// zone mask), and kept for a texture-SURROUND app.
+	U_LOG_W("Leia D3D12 DP: shared-texture present = %d (#68 bg-UV remap %s in zones frames)",
+	        enabled, enabled ? "SKIPPED" : "applied");
 }
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
@@ -1943,6 +2232,23 @@ leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 
 	compose_release_resources(ldp);
 	ck_release_resources(ldp);
+
+	// #224 zone readback machinery.
+	if (ldp->zone_readback != NULL) {
+		ldp->zone_readback->Release();
+	}
+	if (ldp->zone_cmd_list != NULL) {
+		ldp->zone_cmd_list->Release();
+	}
+	if (ldp->zone_cmd_alloc != NULL) {
+		ldp->zone_cmd_alloc->Release();
+	}
+	if (ldp->zone_fence != NULL) {
+		ldp->zone_fence->Release();
+	}
+	if (ldp->zone_fence_event != NULL) {
+		CloseHandle(ldp->zone_fence_event);
+	}
 
 	if (ldp->blit_pso != NULL) {
 		ldp->blit_pso->Release();
@@ -2090,6 +2396,10 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.set_background_2d = leia_dp_d3d12_set_background_2d; // #491 part 3
 	ldp->base.set_transparent_background = leia_dp_d3d12_set_transparent_background; // #573
 	ldp->base.set_shared_texture_present = leia_dp_d3d12_set_shared_texture_present; // #68
+	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
+	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;
+	ldp->base.publish_local_zone_mask = leia_dp_d3d12_publish_local_zone_mask;
+	ldp->base.clear_local_zone_mask = leia_dp_d3d12_clear_local_zone_mask;
 	ldp->base.destroy = leia_dp_d3d12_destroy;
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
