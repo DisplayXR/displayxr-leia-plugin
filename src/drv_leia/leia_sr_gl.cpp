@@ -389,4 +389,14 @@ leiasr_gl_get_hardware_3d_state(struct leiasr_gl *leiasr, bool *out_is_3d)
 	}
 }
 
+bool
+leiasr_gl_supports_display_mode_switch(struct leiasr_gl *leiasr)
+{
+	if (leiasr == nullptr) {
+		return false;
+	}
+
+	return leiasr->lens_hint != nullptr;
+}
+
 } // extern "C"

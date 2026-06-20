@@ -166,6 +166,19 @@ leiasr_gl_request_display_mode(struct leiasr_gl *leiasr, bool enable_3d);
 bool
 leiasr_gl_get_hardware_3d_state(struct leiasr_gl *leiasr, bool *out_is_3d);
 
+/*!
+ * Whether this weaver can drive the per-client SR lens hint (the channel both
+ * @ref leiasr_gl_request_display_mode and the display-zones path use). Same gate
+ * the D3D11/D3D12 DPs apply before advertising zone caps (#613 / ADR-027).
+ *
+ * @param leiasr The GL weaver instance.
+ * @return true if the SwitchableLensHint is available.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_gl_supports_display_mode_switch(struct leiasr_gl *leiasr);
+
 #ifdef __cplusplus
 }
 #endif
