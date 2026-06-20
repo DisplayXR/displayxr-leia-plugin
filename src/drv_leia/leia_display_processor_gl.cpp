@@ -33,6 +33,7 @@
 #include <d3d11_4.h>
 
 #include <cstdlib>
+#include <cstring>
 
 // WGL_NV_DX_interop2 entry points — not declared by ogl_api.h. Mirrors the
 // runtime's comp_gl_compositor.cpp typedef block. This is the GL analogue of
@@ -275,6 +276,23 @@ struct leia_display_processor_gl_impl
 
 	//! #68 — set by set_shared_texture_present (compositor's has_shared_texture).
 	bool shared_texture_present;
+
+	//
+	// Display-zones (#613 / ADR-027) — 1×1 single-zone panel, GL port of the
+	// D3D11 DP zone vtable. The published R8 wish mask is reduced to one bit
+	// (any non-zero ⟹ 3D) and edge-triggers the SR lens hint. The mask is a GL
+	// texture name (R8), so the readback is an FBO-attach + glReadPixels (the GL
+	// analogue of D3D11's CopyResource-to-staging + Map).
+	//
+	bool zone_active;        //!< A mask is currently published (drives lens authority).
+	bool zone_want_3d;       //!< Latest evaluated verdict (any non-zero mask pixel).
+	bool zone_hint_3d;       //!< Last lens hint we issued (edge-trigger memo).
+	bool zone_eval_valid;    //!< zone_eval_seq holds a real evaluation.
+	uint64_t zone_eval_seq;  //!< Generation of the last content evaluation.
+
+	GLuint zone_read_fbo;    //!< Dedicated FBO for attaching the mask tex to read it.
+	uint8_t *zone_buf;       //!< Reused CPU readback buffer (R8, zone_buf_w*zone_buf_h).
+	uint32_t zone_buf_w, zone_buf_h;
 };
 
 static inline struct leia_display_processor_gl_impl *
@@ -896,15 +914,12 @@ compose_run_pre_weave_gl(struct leia_display_processor_gl_impl *ldp,
 	// Verbatim from the D3D11 DP.
 	//
 	// (#68) The remap would magnify the captured desktop for a TEXTURE-ZONES app
-	// (window == canvas). On D3D11 the skip is gated on `shared_texture_present &&
-	// zone_active`; the zones gate keeps the remap for a texture-SURROUND app
-	// (window == full target). The GL Leia DP has NO zones path (no
-	// publish_local_zone_mask) AND no GL _texture app exists — every case here is
-	// the full-target present that NEEDS the remap. So keep it (do not skip).
-	// shared_texture_present is plumbed for ABI parity; wire the skip to
-	// `shared_texture_present && zone_active` if/when GL gains a zones path + app.
-	bool skip_bg_remap = false;
-	(void)ldp->shared_texture_present;
+	// (window == canvas). The skip is gated on `shared_texture_present &&
+	// zone_active` (matching the D3D11 DP): a texture app self-presenting only its
+	// canvas needs the desktop 1:1 (skip), but a texture-SURROUND app (window ==
+	// full target, no active zone) still needs the remap. Handle apps have
+	// shared_texture_present=false → remap kept. (#613 wired the GL zones path.)
+	bool skip_bg_remap = ldp->shared_texture_present && ldp->zone_active;
 	if (!skip_bg_remap && canvas_width > 0 && canvas_height > 0 && target_width > 0 && target_height > 0) {
 		float fx = (float)canvas_offset_x / (float)target_width;
 		float fy = (float)canvas_offset_y / (float)target_height;
@@ -1276,17 +1291,15 @@ leia_dp_gl_set_transparent_background(struct xrt_display_processor_gl *xdp, bool
 // its own window (texture app) vs the runtime presenting the full weave target
 // (handle app). When set, the compose-under-bg desktop-UV remap is skipped (the
 // window IS the canvas, so the captured desktop already lands 1:1) — otherwise
-// the remap magnifies the captured desktop (#68). NOTE: the GL DP implements no
-// zones-active state (no get_local_zone_caps / publish_local_zone_mask here), so
-// the skip is gated on shared_texture_present ALONE — see leia_dp_gl_process_atlas.
+// the remap magnifies the captured desktop (#68). The skip is gated on
+// `shared_texture_present && zone_active` (#613 wired the GL zones path) — see the
+// gate in compose_run_pre_weave_gl.
 static void
 leia_dp_gl_set_shared_texture_present(struct xrt_display_processor_gl *xdp, bool enabled)
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 	ldp->shared_texture_present = enabled;
-	// #68 — plumbed for ABI parity; the bg-UV remap-skip stays OFF on GL (no zones
-	// path + no GL _texture app — see the gate in compose_run_pre_weave_gl).
-	U_LOG_W("Leia GL DP: shared-texture present = %d (#68 plumbing)", enabled);
+	U_LOG_W("Leia GL DP: shared-texture present = %d (#68)", enabled);
 }
 
 // #491 part 3 — store the runtime's flattened 2D-under backdrop (a GL texture on
@@ -1359,6 +1372,157 @@ leia_dp_gl_get_window_metrics(struct xrt_display_processor_gl *xdp,
 	return false;
 }
 
+/*
+ *
+ * Display-zones vtable (#613 / ADR-027) — GL port of the D3D11 DP zone path.
+ * Single-zone (1×1) panel: the published R8 wish mask is reduced to one bit
+ * (any non-zero ⟹ 3D) and edge-triggers the SR lens hint. The mask arrives as a
+ * GL texture name, so the readback attaches it to a dedicated FBO and reads it
+ * with glReadPixels (the GL analogue of D3D11's CopyResource-to-staging + Map).
+ * The mask is a HARDWARE-LENS signal only (ADR-028) — it never gates content.
+ *
+ */
+
+static bool
+leia_dp_gl_get_local_zone_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// The V1 shape is the floor — reject only callers older than the zone
+		// api itself (mirrors the D3D11 DP).
+		return false;
+	}
+	// Zones are driven through the per-client SR lens hint — needs the hint
+	// channel to exist (same gate as request_display_mode support).
+	if (!leiasr_gl_supports_display_mode_switch(ldp->leiasr)) {
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = 1; // single-zone panel: union collapses to global on/off
+	out_caps->zone_grid_height = 1;
+	out_caps->max_mask_width = 0; // no preference — content is reduced to one bit
+	out_caps->max_mask_height = 0;
+	out_caps->max_update_hz = 0; // edge-triggered internally (verdict changes only)
+	if (out_caps->struct_size >= sizeof(struct xrt_dp_local_zone_caps)) {
+		out_caps->wish_fractional = 0; // binary panel state, any-nonzero quantization
+		out_caps->switch_granularity = (uint32_t)XRT_DP_SWITCH_GRANULARITY_UNKNOWN;
+		memset(out_caps->reserved, 0, sizeof(out_caps->reserved));
+	}
+	return true;
+}
+
+static bool
+leia_dp_gl_publish_local_zone_mask(struct xrt_display_processor_gl *xdp,
+                                   uint32_t mask_tex,
+                                   uint32_t mask_width,
+                                   uint32_t mask_height,
+                                   int32_t screen_x,
+                                   int32_t screen_y,
+                                   uint32_t screen_w,
+                                   uint32_t screen_h,
+                                   uint64_t seq)
+{
+	// 1×1 grid: the screen anchor can't change the verdict — only content
+	// matters, and content only changes per generation (seq).
+	(void)screen_x;
+	(void)screen_y;
+	(void)screen_w;
+	(void)screen_h;
+
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	if (mask_tex == 0 || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+
+	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
+	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
+	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
+		size_t need = (size_t)mask_width * mask_height;
+		if (ldp->zone_buf == nullptr || ldp->zone_buf_w != mask_width || ldp->zone_buf_h != mask_height) {
+			uint8_t *nb = (uint8_t *)realloc(ldp->zone_buf, need);
+			if (nb == nullptr) {
+				return false; // can't evaluate — don't flip the lens blindly
+			}
+			ldp->zone_buf = nb;
+			ldp->zone_buf_w = mask_width;
+			ldp->zone_buf_h = mask_height;
+		}
+		if (ldp->zone_read_fbo == 0) {
+			glGenFramebuffers(1, &ldp->zone_read_fbo);
+		}
+
+		// Attach the R8 mask to our read FBO and glReadPixels it. Restore the
+		// prior read-FBO binding so we don't perturb the runtime's GL state
+		// (publish runs on the runtime's context right after present composite).
+		GLint prev_read_fbo = 0;
+		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->zone_read_fbo);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_tex, 0);
+		if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+			U_LOG_W("SR GL zone: mask FBO incomplete (gen %llu) — can't evaluate",
+			        (unsigned long long)seq);
+			return false; // mirror D3D11: don't flip on a failed readback
+		}
+		glReadBuffer(GL_COLOR_ATTACHMENT0);
+		GLint prev_pack = 4;
+		glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glReadPixels(0, 0, (GLsizei)mask_width, (GLsizei)mask_height, GL_RED, GL_UNSIGNED_BYTE, ldp->zone_buf);
+		glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+
+		bool any = false;
+		for (size_t i = 0; i < need; i++) {
+			if (ldp->zone_buf[i] != 0) {
+				any = true;
+				break;
+			}
+		}
+		ldp->zone_want_3d = any;
+		ldp->zone_eval_seq = seq;
+		ldp->zone_eval_valid = true;
+		U_LOG_W("SR GL zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
+		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+	}
+
+	// Edge-triggered lens hint: flip only when the verdict changes (or on the
+	// first publish), so per-frame republish costs nothing SR-side.
+	if (!ldp->zone_active || ldp->zone_hint_3d != ldp->zone_want_3d) {
+		if (!leiasr_gl_request_display_mode(ldp->leiasr, ldp->zone_want_3d)) {
+			return false;
+		}
+		ldp->zone_hint_3d = ldp->zone_want_3d;
+	}
+	ldp->zone_active = true;
+	return true;
+}
+
+static bool
+leia_dp_gl_clear_local_zone_mask(struct xrt_display_processor_gl *xdp)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	// End of zone authority for this client — hand the lens back to the MODE
+	// authority: restore the hint to what the active rendering mode implies
+	// (view_count ≥ 2 ⟹ a 3D mode is active and the compositor snaps back to
+	// the canvas weave, which needs a 3D panel; view_count 1 ⟹ 2D mode).
+	// Blindly disabling here would strand a 3D-mode canvas weave on a 2D panel.
+	if (ldp->zone_active) {
+		bool mode_wants_3d = ldp->view_count >= 2;
+		if (ldp->zone_hint_3d != mode_wants_3d) {
+			leiasr_gl_request_display_mode(ldp->leiasr, mode_wants_3d);
+		}
+		ldp->zone_hint_3d = false;
+		U_LOG_W("SR GL zone: cleared — lens handed back to mode authority (%s)",
+		        mode_wants_3d ? "3D" : "2D");
+	}
+	ldp->zone_active = false;
+	ldp->zone_eval_valid = false;
+	return true;
+}
+
 static bool
 leia_dp_gl_request_display_mode(struct xrt_display_processor_gl *xdp, bool enable_3d)
 {
@@ -1417,6 +1581,13 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 	if (ldp->read_fbo != 0) {
 		glDeleteFramebuffers(1, &ldp->read_fbo);
 	}
+	if (ldp->zone_read_fbo != 0) {
+		glDeleteFramebuffers(1, &ldp->zone_read_fbo);
+	}
+	if (ldp->zone_buf != NULL) {
+		free(ldp->zone_buf);
+		ldp->zone_buf = NULL;
+	}
 
 	if (ldp->leiasr != NULL) {
 		leiasr_gl_destroy(&ldp->leiasr);
@@ -1448,6 +1619,10 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.set_transparent_background = leia_dp_gl_set_transparent_background; // #573
 	ldp->base.set_background_2d = leia_dp_gl_set_background_2d; // #491 part 3 (no-op store; GL composite deferred)
 	ldp->base.set_shared_texture_present = leia_dp_gl_set_shared_texture_present; // #68
+	// #613 / ADR-027 — display-zones vtable (slots 13/14/15, GL port of D3D11).
+	ldp->base.get_local_zone_caps = leia_dp_gl_get_local_zone_caps;
+	ldp->base.publish_local_zone_mask = leia_dp_gl_publish_local_zone_mask;
+	ldp->base.clear_local_zone_mask = leia_dp_gl_clear_local_zone_mask;
 	ldp->base.destroy = leia_dp_gl_destroy;
 }
 
