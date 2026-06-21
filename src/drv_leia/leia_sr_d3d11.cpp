@@ -409,6 +409,22 @@ leiasr_d3d11_snap_probe_ensure(struct leiasr_d3d11 *leiasr)
 		return false;
 	}
 
+	// Creating a 2nd weaver on the shared SR context transiently perturbs the
+	// physical lens (a brief 2D blip) — which, with the present-owner still
+	// feeding full-disparity content, would surface as one mismatched
+	// 2D-lens+disparity frame (the drag-time crosstalk). Capture the lens state
+	// NOW and re-assert it synchronously right after the create (below), so no
+	// presented frame ever sees the lens demoted. (We only run lazily, after 3D
+	// is already locked, so re-asserting is safe — it never forces 3D inside the
+	// SR init-settle window, unlike pre-creating the probe early.)
+	bool lens_was_3d = false;
+	if (leiasr->lens_hint != nullptr) {
+		try {
+			lens_was_3d = leiasr->lens_hint->isEnabled();
+		} catch (...) {
+		}
+	}
+
 	// Bind an SR weaver to the probe window — this installs the SDK's real
 	// phase-snap WndProc (SetWindowLongPtr on GA_ROOT of hwnd), in-process.
 	DPI_AWARENESS_CONTEXT oldDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -424,10 +440,20 @@ leiasr_d3d11_snap_probe_ensure(struct leiasr_d3d11 *leiasr)
 		return false;
 	}
 
+	// Re-assert the pre-create lens state so the probe's creation blip never
+	// reaches a presented frame (see the capture above). Idempotent.
+	if (lens_was_3d && leiasr->lens_hint != nullptr) {
+		try {
+			leiasr->lens_hint->enable();
+		} catch (...) {
+		}
+	}
+
 	leiasr->snap_probe_hwnd = hwnd;
 	leiasr->snap_probe_weaver = probe;
 	leiasr->snap_probe_thread = GetCurrentThreadId();
-	U_LOG_W("#625 snap: probe window %p + weaver ready (thread %lu)", (void *)hwnd, leiasr->snap_probe_thread);
+	U_LOG_W("#625 snap: probe window %p + weaver ready (thread %lu, lens_was_3d=%d)", (void *)hwnd,
+	        leiasr->snap_probe_thread, (int)lens_was_3d);
 	return true;
 }
 
