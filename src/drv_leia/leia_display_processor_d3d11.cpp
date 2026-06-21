@@ -1482,6 +1482,23 @@ leia_dp_d3d11_request_display_mode(struct xrt_display_processor_d3d11 *xdp, bool
 	return leiasr_d3d11_request_display_mode(ldp->leiasr, enable_3d);
 }
 
+//! #625 window-drag phase lock — forward the proposed/origin screen rect to the
+//! SR weaver's real SnapToPhase (via the hidden probe window) and return the
+//! phase-snapped top-left. The snap math + lens params stay vendor-internal
+//! (ADR-019); the runtime only learns the snapped pixel position.
+static bool
+leia_dp_d3d11_snap_window_rect(struct xrt_display_processor_d3d11 *xdp,
+                               int32_t origin_x,
+                               int32_t origin_y,
+                               int32_t target_x,
+                               int32_t target_y,
+                               int32_t *out_x,
+                               int32_t *out_y)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	return leiasr_d3d11_snap_window_rect(ldp->leiasr, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
 
 /*
  *
@@ -1877,6 +1894,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.get_local_zone_caps = leia_dp_d3d11_get_local_zone_caps;
 	ldp->base.publish_local_zone_mask = leia_dp_d3d11_publish_local_zone_mask;
 	ldp->base.clear_local_zone_mask = leia_dp_d3d11_clear_local_zone_mask;
+	ldp->base.snap_window_rect = leia_dp_d3d11_snap_window_rect; // #625 window-drag phase lock (slot 18)
 }
 
 

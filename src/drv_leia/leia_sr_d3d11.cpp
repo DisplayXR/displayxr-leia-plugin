@@ -63,6 +63,25 @@ struct leiasr_d3d11
 	// Configuration
 	bool srgb_read = false;
 	bool srgb_write = false;
+
+	// --- #625 window-drag phase-snap probe ---------------------------------
+	// A present-owner (CEF host) that drags its OWN window across processes can't
+	// get the SR weaver's WndProc phase-snap, because that subclass installs
+	// in-process via SetWindowLongPtr and the real weaver runs here in the
+	// service against the host's CROSS-process HWND (SetWindowLongPtr fails
+	// cross-process). To still snap, we drive the SDK's REAL SnapToPhase (no
+	// reimplementation, ADR-019) through a service-owned hidden probe window
+	// bound to its own SR weaver: that weaver's WndProc subclass installs
+	// in-process, and SnapToPhase reads the DLL-global slant/pitch/user-distance
+	// that the MAIN weaver already populates every frame in weave(). Created
+	// lazily on the first snap; the probe weaver never weaves (it only carries
+	// the WndProc). All driving happens on the snap-calling (IPC) thread —
+	// SetWindowPos/SendMessage dispatch WM_WINDOWPOSCHANGING synchronously to the
+	// WndProc only on the owning thread.
+	HWND snap_probe_hwnd = nullptr;
+	SR::IDX11Weaver1 *snap_probe_weaver = nullptr;
+	DWORD snap_probe_thread = 0;    //!< Thread that created/owns snap_probe_hwnd.
+	bool snap_probe_failed = false; //!< Lazy-init tried and failed — don't retry.
 };
 
 namespace {
@@ -257,6 +276,17 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 
 	leiasr_d3d11 *sr = *leiasr_ptr;
 
+	// #625: tear down the phase-snap probe (weaver restores the probe window's
+	// WndProc) before the SRContext goes away.
+	if (sr->snap_probe_weaver != nullptr) {
+		sr->snap_probe_weaver->destroy();
+		sr->snap_probe_weaver = nullptr;
+	}
+	if (sr->snap_probe_hwnd != nullptr) {
+		DestroyWindow(sr->snap_probe_hwnd);
+		sr->snap_probe_hwnd = nullptr;
+	}
+
 	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
 	// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
 	// Manually deleting it causes a crash (double-free).
@@ -330,6 +360,135 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
 	}
+}
+
+/*!
+ * #625: lazily create the hidden probe window + its SR weaver (which installs
+ * the SDK's phase-snap WndProc subclass in-process). Reuses the live SRContext +
+ * immediate context; the probe weaver never weaves. Returns true when the probe
+ * is ready. Must run on the snap-calling thread (WndProc dispatch is
+ * thread-affine) and under the render mutex (shared immediate context).
+ */
+static bool
+leiasr_d3d11_snap_probe_ensure(struct leiasr_d3d11 *leiasr)
+{
+	if (leiasr->snap_probe_weaver != nullptr) {
+		return true;
+	}
+	if (leiasr->snap_probe_failed) {
+		return false; // tried once, don't thrash the SR SDK every drag step
+	}
+	if (leiasr->context == nullptr || leiasr->d3d11_context == nullptr) {
+		leiasr->snap_probe_failed = true;
+		return false;
+	}
+
+	// Register the probe window class once per process.
+	static const wchar_t *kProbeClass = L"DXRLeiaSnapProbe";
+	static bool class_registered = false;
+	HINSTANCE hinst = GetModuleHandleW(nullptr);
+	if (!class_registered) {
+		WNDCLASSW wc = {};
+		wc.lpfnWndProc = DefWindowProcW;
+		wc.hInstance = hinst;
+		wc.lpszClassName = kProbeClass;
+		RegisterClassW(&wc); // benign if already registered
+		class_registered = true;
+	}
+
+	// Hidden, non-activating popup on the 3D display. Position is overwritten
+	// per-snap (SnapToPhase keys off absolute screen coords) and the window is
+	// never shown, so it never paints.
+	int px = leiasr->display_screen_left;
+	int py = leiasr->display_screen_top;
+	HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kProbeClass, L"", WS_POPUP, px, py, 1, 1,
+	                            nullptr, nullptr, hinst, nullptr);
+	if (hwnd == nullptr) {
+		U_LOG_W("#625 snap: probe CreateWindowEx failed (err=%lu)", GetLastError());
+		leiasr->snap_probe_failed = true;
+		return false;
+	}
+
+	// Bind an SR weaver to the probe window — this installs the SDK's real
+	// phase-snap WndProc (SetWindowLongPtr on GA_ROOT of hwnd), in-process.
+	DPI_AWARENESS_CONTEXT oldDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+	SR::IDX11Weaver1 *probe = nullptr;
+	WeaverErrorCode result = SR::CreateDX11Weaver(leiasr->context, leiasr->d3d11_context, hwnd, &probe);
+	if (oldDpi != NULL) {
+		SetThreadDpiAwarenessContext(oldDpi);
+	}
+	if (result != WeaverErrorCode::WeaverSuccess || probe == nullptr) {
+		U_LOG_W("#625 snap: probe CreateDX11Weaver failed (%d) — drag phase-snap unavailable", (int)result);
+		DestroyWindow(hwnd);
+		leiasr->snap_probe_failed = true;
+		return false;
+	}
+
+	leiasr->snap_probe_hwnd = hwnd;
+	leiasr->snap_probe_weaver = probe;
+	leiasr->snap_probe_thread = GetCurrentThreadId();
+	U_LOG_W("#625 snap: probe window %p + weaver ready (thread %lu)", (void *)hwnd, leiasr->snap_probe_thread);
+	return true;
+}
+
+bool
+leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
+                              int32_t origin_x,
+                              int32_t origin_y,
+                              int32_t target_x,
+                              int32_t target_y,
+                              int32_t *out_x,
+                              int32_t *out_y)
+{
+	if (out_x == nullptr || out_y == nullptr) {
+		return false;
+	}
+	*out_x = target_x; // default: no-op snap
+	*out_y = target_y;
+	if (leiasr == nullptr) {
+		return false;
+	}
+	if (!leiasr_d3d11_snap_probe_ensure(leiasr)) {
+		return false;
+	}
+	// The SDK WndProc only sees SetWindowPos/SendMessage dispatched on the
+	// window's OWNING thread — we created the probe on this (IPC) thread.
+	if (GetCurrentThreadId() != leiasr->snap_probe_thread) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("#625 snap: called from thread %lu but probe owned by %lu — skipping",
+			        GetCurrentThreadId(), leiasr->snap_probe_thread);
+			warned = true;
+		}
+		return false;
+	}
+
+	HWND h = leiasr->snap_probe_hwnd;
+	DPI_AWARENESS_CONTEXT oldDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	// Drive the SDK's real drag-snap sequence synthetically:
+	//   1. place the probe at the drag-start ORIGIN (moving=false ⟹ no snap);
+	const UINT kSwp = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+	SetWindowPos(h, nullptr, origin_x, origin_y, 0, 0, kSwp);
+	//   2. begin the move — the WndProc records initialX/Y = GetWindowRect (=origin);
+	SendMessageW(h, WM_ENTERSIZEMOVE, 0, 0);
+	//   3. propose the TARGET — WM_WINDOWPOSCHANGING runs SnapToPhase, rewrites pos->x/y;
+	SetWindowPos(h, nullptr, target_x, target_y, 0, 0, kSwp);
+	//   4. read back the phase-snapped position the SDK committed;
+	RECT r = {};
+	bool got = GetWindowRect(h, &r) != 0;
+	//   5. end the move.
+	SendMessageW(h, WM_EXITSIZEMOVE, 0, 0);
+
+	if (oldDpi != NULL) {
+		SetThreadDpiAwarenessContext(oldDpi);
+	}
+	if (!got) {
+		return false;
+	}
+	*out_x = r.left;
+	*out_y = r.top;
+	return true;
 }
 
 /*!
