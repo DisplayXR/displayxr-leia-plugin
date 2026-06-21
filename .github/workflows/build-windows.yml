@@ -53,9 +53,10 @@ jobs:
       # equals this value so the FetchContent pin and the workflow checkout
       # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
       # regression originally).
-      # #68: runtime v1.22.0 ships the appended set_shared_texture_present DP
-      # vtable slot (ADR-020 append-only — no major bump).
-      RUNTIME_REF: v1.22.0
+      # #625: runtime v1.24.0 ships the appended snap_window_rect DP vtable
+      # slot 18 (xrWeaveSnapWindowRectEXT window-drag phase lock; ADR-020
+      # append-only — no major bump).
+      RUNTIME_REF: v1.24.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
