@@ -305,6 +305,36 @@ leiasr_d3d11_supports_display_mode_switch(struct leiasr_d3d11 *leiasr);
 bool
 leiasr_d3d11_get_hardware_3d_state(struct leiasr_d3d11 *leiasr, bool *out_is_3d);
 
+/*!
+ * Snap a proposed window rect to the nearest interlace-phase-aligned screen
+ * position (#625 window-drag phase lock). Drives the SR SDK's real SnapToPhase
+ * through a service-owned hidden probe window bound to its own SR weaver (the
+ * weaver's WndProc subclass carries the snap; the probe is created lazily on the
+ * first call and never weaves). Only the top-left is snapped.
+ *
+ * Must be called on a single consistent thread (the WndProc dispatch is
+ * thread-affine) and serialized against the weave (shared immediate context).
+ *
+ * @param leiasr   The D3D11 weaver instance.
+ * @param origin_x Drag-start window left, absolute screen px.
+ * @param origin_y Drag-start window top, absolute screen px.
+ * @param target_x Proposed window left, absolute screen px.
+ * @param target_y Proposed window top, absolute screen px.
+ * @param[out] out_x Phase-snapped window left, absolute screen px.
+ * @param[out] out_y Phase-snapped window top, absolute screen px.
+ * @return true if a snap was produced; false ⟹ caller uses target unchanged.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
+                              int32_t origin_x,
+                              int32_t origin_y,
+                              int32_t target_x,
+                              int32_t target_y,
+                              int32_t *out_x,
+                              int32_t *out_y);
+
 #ifdef __cplusplus
 }
 #endif
