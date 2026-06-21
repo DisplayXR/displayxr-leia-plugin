@@ -68,12 +68,10 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v1.17.0 — the tag that supersedes the prior
-    # pre-release SHA pin (fe509b180): v1.17.0 carries BOTH the ADR-027
-    # zone-caps appends (runtime PR #539) and the #551 D3D11 DP
-    # `set_transparent_background(.,enabled,client_presents)` slot
-    # (ADR-020/ADR-029), no major bump. This plug-in reports the zone caps and
-    # implements client-present mode, so it needs headers that declare both.
+    # Pinned to displayxr-runtime v1.24.0 — the tag that ships the appended
+    # D3D11 DP `snap_window_rect` slot 18 (#625 window-drag phase lock,
+    # ADR-020 append-only, no major bump). This plug-in implements that slot
+    # (the probe-window SnapToPhase), so it needs headers that declare it.
     # The DP vtables carry a struct_size header; the runtime's loader rejects
     # any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
     # This plug-in MUST be built against headers that ship the matching major,
@@ -81,7 +79,7 @@ else()
     # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
     # The rule-5 CI self-check below asserts this value equals the workflow's
     # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v1.22.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "v1.24.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
     FetchContent_Declare(
