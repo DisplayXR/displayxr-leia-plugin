@@ -136,7 +136,11 @@ jobs:
       - name: Install OpenXR loader
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          $openxrVersion = "1.1.43"
+          # Loader .lib used to link the plug-in's runtime subdirectory; pinned to
+          # match the runtime's vendored openxr_includes/ spec rev (1.1.51). Loader
+          # exports are ABI-stable, so this is decoupled from the FetchContent
+          # runtime-tag pin — kept aligned only for consistency across repos.
+          $openxrVersion = "1.1.51"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
