@@ -39,6 +39,21 @@
 !endif
 
 ;--------------------------------
+; Code signing (SIGN_CMD passed from CMake; empty = unsigned build).
+; !finalize signs the installer .exe and !uninstfinalize signs the
+; embedded uninstaller stub at makensis time. Bundled third-party DLLs
+; keep their existing signatures; this signs the plug-in DLL (done before
+; NSIS in build-windows.bat) and the installer/uninstaller.
+; SIGN_CMD carries no secret — on a signing-capable build machine it points
+; at the configured signer; elsewhere it is empty and the build is unsigned.
+!ifdef SIGN_CMD
+	!if "${SIGN_CMD}" != ""
+		!finalize '${SIGN_CMD} "%1"'
+		!uninstfinalize '${SIGN_CMD} "%1"'
+	!endif
+!endif
+
+;--------------------------------
 ; General Attributes
 
 Name "DisplayXR Leia SR Plug-in ${VERSION}"

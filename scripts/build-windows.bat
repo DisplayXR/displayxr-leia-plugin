@@ -175,11 +175,40 @@ if %ERRORLEVEL% NEQ 0 (
 if "%TARGET%"=="build" goto :end
 
 :do_installer
+:: ── Code signing (gated on %SIGN_CMD%) ──────────────────────────────
+:: Off unless SIGN_CMD is set (only on a signing-capable build machine,
+:: where it points at the configured signer). No cert/secret lives in this
+:: repo — just this "honor SIGN_CMD" hook, mirroring displayxr-runtime.
+:: The plug-in DLL MUST be signed here, BEFORE makensis packs it — Smart
+:: App Control checks the DLL extracted at load time. Bundled third-party
+:: DLLs are already signed, so sign-release.ps1 skips them.
+if defined SIGN_CMD (
+    echo === Signing plug-in binaries [SIGN_CMD set] ===
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%scripts\sign-release.ps1" -Path "%REPO%_package\bin" -SignCmd "%SIGN_CMD%"
+    if errorlevel 1 (
+        echo Binary signing FAILED
+        exit /b 1
+    )
+) else (
+    echo === Signing skipped [SIGN_CMD not set] - installer will be UNSIGNED ===
+)
+
 echo === Build Installer ===
 cmake --build "%REPO%build" --config !CONFIG! --target installer
 if %ERRORLEVEL% NEQ 0 (
     echo Installer build FAILED
     exit /b 1
+)
+
+:: Sign the installer .exe (uninstaller is signed at makensis time via
+:: !uninstfinalize in DisplayXRLeiaSRInstaller.nsi).
+if defined SIGN_CMD (
+    echo === Signing installer .exe ===
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%REPO%scripts\sign-release.ps1" -Path "%REPO%_package" -SignCmd "%SIGN_CMD%"
+    if errorlevel 1 (
+        echo Installer signing FAILED
+        exit /b 1
+    )
 )
 
 :end
