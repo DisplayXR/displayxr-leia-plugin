@@ -178,3 +178,13 @@ install(
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
     LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
 )
+
+# Stage the SR Vulkan Beta DLL alongside the plug-in in _package/bin/plugins so
+# the installer packs it from the *signed* tree (the raw SDK-dir copy bypasses
+# the code-signing pass that covers _package/bin, so it would ship unsigned and
+# trip Smart App Control at delay-load time). app-local deps do not reliably
+# stage this delay-loaded DLL on CI, so copy it explicitly.
+if(LEIA_SR_VULKAN_AVAILABLE AND EXISTS "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
+    install(FILES "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime)
+endif()

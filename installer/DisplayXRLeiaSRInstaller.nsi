@@ -182,7 +182,12 @@ Section "Leia SR Plug-in" SecPlugin
 	; SR Platform's own installer may also provide
 	; SimulatedRealityVulkanBeta.dll on machine PATH; either resolution
 	; works.
-	File "${SR_VK_BETA_DLL}"
+	;
+	; Source the copy that build staging placed in BIN_DIR\plugins (the
+	; tree the signing step covers) rather than the raw SDK dir, so the
+	; bundled DLL ships code-signed — SAC checks it at delay-load time.
+	; (${SR_VK_BETA_DLL} is the unsigned SDK dir; kept defined but unused.)
+	File "${BIN_DIR}\plugins\SimulatedRealityVulkanBeta.dll"
 
 	; -----------------------------------------------------------------
 	; Register at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr per
