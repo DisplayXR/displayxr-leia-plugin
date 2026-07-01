@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc / DisplayXR
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.22)
 project(

@@ -150,4 +150,4 @@ Full spec:
 
 ## License
 
-[BSL-1.0](LICENSE) — same as all other DisplayXR repos.
+[Apache-2.0](LICENSE) — same as the other wholly-owned DisplayXR repos (the runtime stays BSL-1.0 as a Monado-aligned fork).

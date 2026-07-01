@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 
 // Post-weave alpha-gate: compose-mode replacement for the chroma-key strip.
 // Samples the woven back-buffer and the original atlas. For each screen pixel

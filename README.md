@@ -31,7 +31,7 @@ The vendor-neutral contract (what any plug-in must implement) stays in the runti
 
 ## License
 
-[BSL-1.0](LICENSE) — same as the DisplayXR runtime.
+[Apache-2.0](LICENSE).
 
 ## Related
 

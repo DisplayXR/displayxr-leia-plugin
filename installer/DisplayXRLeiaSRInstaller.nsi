@@ -1,6 +1,6 @@
 ; DisplayXR Leia SR Plug-in Installer Script
 ; Copyright 2026, DisplayXR
-; SPDX-License-Identifier: BSL-1.0
+; SPDX-License-Identifier: Apache-2.0
 ;
 ; Ships the Leia SR display-processor plug-in DLL (issue #256 /
 ; ADR-019 / plan §4.6). Registers it at
