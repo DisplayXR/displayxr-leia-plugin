@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  Leia D3D11 display processor: wraps SR SDK D3D11 weaver
