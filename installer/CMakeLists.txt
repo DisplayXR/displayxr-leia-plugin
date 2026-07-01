@@ -29,6 +29,19 @@ set(DXR_LEIA_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJEC
 
 set(DXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
+# Optional code-signing command, sourced from the SIGN_CMD environment
+# variable at configure time. Empty on any machine without it (clones,
+# GitHub-hosted CI) -> installer + uninstaller build unsigned. On a
+# signing-capable build machine SIGN_CMD points at the configured signer.
+# Passed to makensis for !finalize/!uninstfinalize.
+# No cert/secret lives in this repo. Mirrors displayxr-runtime.
+#
+# FORCE so the live SIGN_CMD env always wins on reconfigure: a plain CACHE
+# var is seeded only on the first configure, so a build tree first configured
+# with SIGN_CMD unset would keep caching "" even after SIGN_CMD is later set,
+# silently leaving the embedded uninstaller unsigned (#664 validation).
+set(SIGN_CMD "$ENV{SIGN_CMD}" CACHE STRING "Code-signing command for installer/uninstaller (empty = unsigned)" FORCE)
+
 # SR Vulkan Beta runtime DLL — fetched into ${SR_PATH}/bin by
 # scripts/build-windows.bat from the sr-sdk-v* release. REQUIRED, not
 # optional: the plug-in delay-loads SimulatedRealityVulkanBeta.dll and must
@@ -61,6 +74,7 @@ add_custom_target(installer
         "/DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}"
         "/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
+        "/DSIGN_CMD=${SIGN_CMD}"
         "${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building DisplayXR Leia SR plug-in installer..."

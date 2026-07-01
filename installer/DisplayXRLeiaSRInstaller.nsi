@@ -39,13 +39,54 @@
 !endif
 
 ;--------------------------------
+; Code signing (SIGN_CMD passed from CMake; empty = unsigned build).
+; SIGN_CMD carries no secret — on a signing-capable build machine it points
+; at the configured signer; elsewhere it is empty and the build is unsigned.
+;
+; The installer .exe is signed via !finalize. The UNINSTALLER is signed via a
+; two-pass build instead of !uninstfinalize: !uninstfinalize is unreliable —
+; the uninstaller NSIS writes at install time is a self-copy of the (signed)
+; installer's exe header, so it inherits the INSTALLER's cert-table pointer,
+; which dangles past the smaller uninstaller file => effectively unsigned
+; (signtool even refuses to re-sign it, 0x800700C1). Confirmed #664: the
+; runtime's larger installer happened to survive, leia/shell's did not.
+;
+; Two-pass (the canonical NSIS recipe, kept in-script so the CMake `installer`
+; target needs no change): compile an INNER installer whose only job is to
+; WriteUninstaller to %TEMP% and Quit; run it; sign that %TEMP%\Uninstall.exe;
+; then File-include the pre-signed uninstaller in the real pass (see .onInit
+; and the WriteUninstaller site). INNER is RequestExecutionLevel user so it
+; never triggers UAC when run from makensis on a non-elevated build host.
+!ifndef INNER
+	!ifdef SIGN_CMD
+		!if "${SIGN_CMD}" != ""
+			!finalize '${SIGN_CMD} "%1"'
+			; Build the inner installer (passes every define it needs to
+			; compile; OUTPUT_DIR/SIGN_CMD are deliberately omitted).
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "${__FILE__}"' = 0
+			; Run it: .onInit writes %TEMP%\Uninstall.exe then Quit (exit 2).
+			!system '"$%TEMP%\DisplayXRLeiaSR_inner.exe"' = 2
+			; Sign the emitted uninstaller, then File it in the real pass.
+			!system '${SIGN_CMD} "$%TEMP%\Uninstall.exe"' = 0
+			!define USE_PRESIGNED_UNINST
+		!endif
+	!endif
+!endif
+
+;--------------------------------
 ; General Attributes
 
 Name "DisplayXR Leia SR Plug-in ${VERSION}"
-OutFile "${OUTPUT_DIR}\DisplayXRLeiaSRSetup-${VERSION}.${BUILD_NUM}.exe"
+!ifdef INNER
+	; Throwaway inner installer: only emits the uninstaller to %TEMP%.
+	OutFile "$%TEMP%\DisplayXRLeiaSR_inner.exe"
+	RequestExecutionLevel user
+!else
+	OutFile "${OUTPUT_DIR}\DisplayXRLeiaSRSetup-${VERSION}.${BUILD_NUM}.exe"
+	RequestExecutionLevel admin
+!endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Plugins\LeiaSR"
 InstallDirRegKey HKLM "Software\DisplayXR\Plugins\LeiaSR" "InstallPath"
-RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
 ; #461 (runtime repo): a silent install must NEVER skip a locked file and
@@ -172,8 +213,14 @@ Section "Leia SR Plug-in" SecPlugin
 	WriteRegStr HKLM "Software\DisplayXR\Plugins\LeiaSR" "InstallPath" "$INSTDIR"
 	WriteRegStr HKLM "Software\DisplayXR\Plugins\LeiaSR" "Version"     "${VERSION}"
 
-	; Write uninstaller.
+	; Write uninstaller. In a signed build, install the pre-signed uninstaller
+	; produced by the inner pass (two-pass signing — see the code-signing block
+	; in the header). Otherwise (unsigned build / CI) write it normally.
+!ifdef USE_PRESIGNED_UNINST
+	File "/oname=Uninstall.exe" "$%TEMP%\Uninstall.exe"
+!else
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
+!endif
 
 	; Add to Add/Remove Programs.
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR" \
@@ -268,6 +315,14 @@ SectionEnd
 ; Installer Functions
 
 Function .onInit
+!ifdef INNER
+	; Inner pass only: emit the uninstaller to %TEMP% (this is the binary that
+	; gets signed and File-included by the real pass) then bail immediately —
+	; no UI, no install. This whole path is absent from the real installer.
+	SetSilent silent
+	WriteUninstaller "$%TEMP%\Uninstall.exe"
+	Quit
+!endif
 	${IfNot} ${RunningX64}
 		MessageBox MB_ICONSTOP "DisplayXR Leia SR Plug-in requires 64-bit Windows."
 		Abort
