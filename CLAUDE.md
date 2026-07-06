@@ -5,11 +5,21 @@ Guidance for Claude Code (claude.ai/code) when working in this repo.
 ## What this repo is
 
 The **Leia SR display-processor plug-in** for the DisplayXR runtime.
-Ships `DisplayXR-LeiaSR.dll` — a vendor plug-in implementing the
-`xrt_plugin_iface` ABI from
-[`displayxr-runtime/src/xrt/include/xrt/xrt_plugin.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/xrt/include/xrt/xrt_plugin.h).
-Loaded at `xrCreateInstance` time by the runtime's registry-driven
-plug-in discovery (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
+Three platform arms, all implementing the `xrt_plugin_iface` ABI from
+[`displayxr-runtime/src/xrt/include/xrt/xrt_plugin.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/xrt/include/xrt/xrt_plugin.h):
+
+- **Windows** (`src/drv_leia`) → `DisplayXR-LeiaSR.dll`, SR SDK weavers
+  (D3D11/D3D12/GL/VK). Loaded via registry discovery
+  (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
+- **Android** (`src/drv_leia_android`) → `libdxrp050_leia_cnsdk.so`, CNSDK.
+- **Linux desktop** (`src/drv_leia_linux`) → `DisplayXR-LeiaSR.so`. **Track A
+  scaffold: STUB weaver** (passthrough SBS blit, no SR SDK) behind the
+  weaver-backend seam `leia_sr_linux.h`, whose interface is shaped by the
+  [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED,
+  #81). Track B swaps in the real SDK (`-DDXR_LEIA_LINUX_WEAVER=sdk`).
+  Discovery is JSON-manifest (`XRT_PLUGIN_SEARCH_PATH` / XDG
+  `DisplayProcessors/` roots). The stub probe **declines by default**;
+  `DXR_LEIA_FORCE_PROBE=1` force-binds it for bring-up/CI.
 
 End-user artifact: `DisplayXRLeiaSRSetup-<version>.exe`. Hard prereq:
 the DisplayXR runtime must be installed first; the installer reads
@@ -45,7 +55,10 @@ ABI from the runtime headers it was built against:
 
 - `CMakeLists.txt` pins `DXR_RUNTIME_GIT_TAG` (a `v*` runtime tag, or a runtime
   `main` SHA pre-release when tracking an ABI bump that hasn't tagged yet —
-  re-pin to the tag at the coupled release).
+  re-pin to the tag at the coupled release). **Linux carries its own pin**
+  (`DXR_RUNTIME_GIT_TAG_LINUX`) because the Windows tag can predate runtime
+  Linux support; `build-linux.yml`'s rule-5 self-check keeps it equal to that
+  workflow's `RUNTIME_REF`.
 - That ref's `xrt_plugin.h` defines `XRT_PLUGIN_API_VERSION_CURRENT`.
 - `src/drv_leia/leia_plugin.c::xrtPluginNegotiate` reports that value.
 - The runtime's loader (`target_plugin_loader.c`) **rejects** plug-ins reporting an ABI major different from the runtime's current ABI (ADR-020 rule 3).
@@ -68,6 +81,10 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_sr_*.{cpp,h}` | SR SDK weaver wrappers. The SDK throws `std::runtime_error` as routine internal control flow (~11/frame in some paths) — every call wrapped in try/catch. |
 | `src/drv_leia/leia_bg_capture_win.{cpp,h}` | WGC background capture for compose-under transparency (Leia transparency model). |
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
+| `src/drv_leia_linux/leia_sr_linux.h` | **Linux weaver-backend seam** — interface shaped 1:1 by `docs/leia-linux-sdk-contract.md` (every declaration cites its R-* requirement). Track B implements it against the real SDK. |
+| `src/drv_leia_linux/leia_sr_stub.c` | Track A stub backend: canned panel info + passthrough SBS blit, `TODO(Track B)` at every body. |
+| `src/drv_leia_linux/leia_plugin_linux.c` | Linux `xrtPluginNegotiate` + iface (VK-only factories; env-gated probe). |
+| `src/drv_leia_linux/leia_display_processor_linux.c` | Linux VK DP — 1×1 grid blits, multi-view goes through the seam. Reuses `../drv_leia/leia_device.c`. |
 | `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `$RuntimeInstall\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Path, ProbeOrder}`. |
 | `scripts/build-windows.bat` | Local Windows build entry point. |
 | `docs/` | Leia implementation internals (weaver, transparency, chroma-key, phase snapping, mode switching) — migrated from the runtime's `docs/vendors/leia/`. Start at `docs/README.md`. |
@@ -85,6 +102,16 @@ Requires VS 2022 + Ninja + Vulkan SDK + GitHub CLI (the SR SDK is
 downloaded from a private GH release; `gh auth status` must show
 authenticated). On first run the script pulls the SR SDK at
 `SR_TAG` (set in `CMakeLists.txt`).
+
+### Linux (Track A — stub weaver)
+```bash
+./scripts/build-linux.sh            # build .so + displayxr-cli, stage manifest, selftest
+./scripts/build-linux.sh --no-test  # build + stage only
+```
+Needs a local runtime checkout (default `../displayxr-runtime`, or set
+`DXR_RUNTIME_SOURCE_DIR`). Deps = the apt list in
+`.github/workflows/build-linux.yml`. CI builds on Ubuntu 22.04/24.04/26.04
+containers and asserts single-export + discovery + ABI-green selftest.
 
 ### Local-build override of the runtime pin
 If you're testing against a yet-unreleased runtime ABI:
@@ -134,11 +161,10 @@ Full spec:
   (`sim_display` fallback) but silent — the installer reports
   success. Run a `cube_handle_d3d11_win` smoke test on Leia
   hardware before tagging.
-- **Don't add Vulkan support yet.** The SR SDK's Vulkan weaver
-  (`SimulatedRealityVulkanBeta`) exists but the runtime currently
-  routes VK apps through sim_display anyway pending issue #357.
-  When that lands, this plug-in will gain a `leia_display_processor_vk`
-  parallel to the D3D11/D3D12/GL ones.
+- **The Linux weaver-backend interface tracks a PROPOSED contract.**
+  `docs/leia-linux-sdk-contract.md` is awaiting ratification by the SDK
+  team; if it shifts, realign `src/drv_leia_linux/leia_sr_linux.h` (and the
+  stub) in the same change — the two must never drift.
 - **Registry registration is at install time.** During dev,
   installer not run, the DLL won't load. Use the runtime's
   `XRT_PLUGIN_SEARCH_PATH` env var to point at the dev build's

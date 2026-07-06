@@ -12,7 +12,9 @@ Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_ifac
 
 ## Architecture
 
-- **`src/drv_leia/`** — driver source: device, EDID probe, plug-in entry point (`xrtPluginNegotiate`), per-API display processors (D3D11, D3D12, OpenGL), SR SDK weavers, eye-tracking listener, WGC background capture.
+- **`src/drv_leia/`** — Windows driver source: device, EDID probe, plug-in entry point (`xrtPluginNegotiate`), per-API display processors (D3D11, D3D12, OpenGL, Vulkan), SR SDK weavers, eye-tracking listener, WGC background capture.
+- **`src/drv_leia_android/`** — Android arm (CNSDK): `libdxrp050_leia_cnsdk.so` for the runtime APK.
+- **`src/drv_leia_linux/`** — Linux desktop arm (**Track A scaffold**): `DisplayXR-LeiaSR.so` with a **stub weaver** (passthrough, no SR SDK). The SDK-facing interface is fixed by the [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED); Track B drops the real SDK behind the same seam. Build/validate with `scripts/build-linux.sh`; CI covers Ubuntu 22.04/24.04/26.04.
 - **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `$RuntimeInstall\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`.
 
 ## Documentation
@@ -26,6 +28,7 @@ Implementation internals live in [`docs/`](docs/) (migrated from the runtime's `
 - [Window phase snapping](docs/window-phase-snapping.md) — SR weaver WndProc subclassing for lenticular phase alignment
 - [Display mode switching](docs/display-mode-switching.md) — 2D/3D via `SwitchableLensHint` / backlight
 - [CNSDK Android calibration](docs/cnsdk-android-calibration.md) — face axes / tile-to-eye / UV-flip validation procedure for Lume Pad
+- [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) — what the Linux SDK must expose (PROPOSED, #81); `src/drv_leia_linux/leia_sr_linux.h` mirrors it
 
 The vendor-neutral contract (what any plug-in must implement) stays in the runtime repo: `docs/specs/vendor/`, `docs/specs/runtime/plugin-discovery.md`, `docs/guides/vendor-plugin-onboarding.md`.
 
