@@ -1,0 +1,14 @@
+/*
+ * Single-export discipline for the Linux plug-in .so (runtime issue #496 /
+ * ADR-019): only xrtPluginNegotiate is visible. Without this, the statically
+ * linked aux_* symbols default to global visibility and interpose the
+ * runtime's own copies when the .so is dlopened, corrupting logging/state
+ * mid-xrCreateInstance. Verbatim copy of the runtime's
+ * src/xrt/drivers/plugin_exports.version.
+ */
+{
+    global:
+        xrtPluginNegotiate;
+    local:
+        *;
+};
