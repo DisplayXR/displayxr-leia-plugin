@@ -1,0 +1,153 @@
+# Linux CI for the Leia plug-in's Track A arm (src/drv_leia_linux, stub weaver).
+#
+# Tri-LTS coverage: the contract's launch target is Ubuntu 26.04 (GCC 15),
+# the interim dev box is 22.04, and 24.04 is what the runtime's own Linux CI
+# runs on — so all three build in containers and all three are required.
+#
+# What each leg proves:
+#   1. DisplayXR-LeiaSR.so builds against the pinned runtime (ABI headers +
+#      static aux) on that LTS toolchain.
+#   2. Single-export discipline: the .so exports exactly xrtPluginNegotiate
+#      (nm twin of build-windows.yml's dumpbin assertion, ADR-019 / #496).
+#   3. Discovery + ABI gate + display info: displayxr-cli selftest goes green
+#      with the leia-sr plug-in active (JSON-manifest discovery via
+#      XRT_PLUGIN_SEARCH_PATH; the loader rejects ABI-mismatched plug-ins, so
+#      a green selftest IS the ABI check).
+#   4. Probe default-decline: without DXR_LEIA_FORCE_PROBE=1 the plug-in
+#      declines and selftest fails (no active DP) — the stub must never
+#      hijack a machine it wasn't forced onto.
+#
+# Triggers: pull_request + manual dispatch only (repo policy: no CI on push
+# to main). No versions-bump dispatch here — that stays tag-driven in
+# build-windows.yml.
+
+name: Build Linux
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Runtime ref the Linux arm builds against. MUST equal the CMake
+  # DXR_RUNTIME_GIT_TAG_LINUX default (rule-5 self-check below, same policy
+  # as build-windows.yml's RUNTIME_REF check) — v1.28.0 is the first runtime
+  # tag with complete Linux support (#708/#709).
+  RUNTIME_REF: v1.28.0
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    container: ubuntu:${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04', '26.04']
+    steps:
+      # Bare container, running as root (no sudo). git + ca-certificates must
+      # land BEFORE actions/checkout, or it silently falls back to the tarball
+      # API and `git describe` (the plug-in's iface .version, #47) degrades.
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git ca-certificates jq \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+
+      - name: Checkout plug-in
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for git describe
+
+      # Rule-5 (ADR-020): the CMake Linux pin and this workflow's runtime
+      # checkout must be the same ref, or the plug-in builds against
+      # different ABI headers than CI validates.
+      - name: Rule-5 Linux pin self-check
+        run: |
+          tag=$(grep -oP 'set\(DXR_RUNTIME_GIT_TAG_LINUX\s+"\K[^"]+' CMakeLists.txt | head -1)
+          if [ "$tag" != "$RUNTIME_REF" ]; then
+            echo "::error::Linux runtime pin drift: CMakeLists.txt has '$tag', workflow has '$RUNTIME_REF'"
+            exit 1
+          fi
+          echo "Pin OK: $tag"
+
+      - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: DisplayXR/displayxr-runtime
+          ref: ${{ env.RUNTIME_REF }}
+          path: displayxr-runtime
+          fetch-depth: 1
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime"
+
+      - name: Build plug-in
+        run: cmake --build build
+
+      # displayxr-cli is a runtime target inside the same build tree
+      # (EXCLUDE_FROM_ALL only skips it from the default target).
+      - name: Build displayxr-cli
+        run: cmake --build build --target cli
+
+      - name: Assert single export (ADR-019 / #496)
+        run: |
+          SO=build/src/drv_leia_linux/DisplayXR-LeiaSR.so
+          test -f "$SO" || { echo "::error::$SO not built"; exit 1; }
+          syms=$(nm -D --defined-only "$SO" | awk '{print $NF}')
+          if [ "$syms" != "xrtPluginNegotiate" ]; then
+            echo "::error::unexpected exports from $SO:"
+            nm -D --defined-only "$SO"
+            exit 1
+          fi
+          echo "OK: only xrtPluginNegotiate exported"
+
+      - name: Selftest (discovery + ABI + display info)
+        run: |
+          CLI=$(find build/runtime-build/src/xrt/targets/cli -maxdepth 1 -name displayxr-cli -type f | head -1)
+          test -n "$CLI" || { echo "::error::displayxr-cli not found"; exit 1; }
+
+          mkdir -p build/_plugins
+          cp build/src/drv_leia_linux/DisplayXR-LeiaSR.so build/_plugins/
+          cat > build/_plugins/050-leia-sr.json <<EOF
+          {
+              "file_format_version": "1.0",
+              "plugin": {
+                  "id":           "leia-sr",
+                  "display_name": "DisplayXR Leia SR (Linux, stub weaver)",
+                  "vendor":       "Leia Inc.",
+                  "version":      "ci",
+                  "binary_path":  "$PWD/build/_plugins/DisplayXR-LeiaSR.so",
+                  "probe_order":  50
+              }
+          }
+          EOF
+          export XRT_PLUGIN_SEARCH_PATH="$PWD/build/_plugins"
+
+          echo "--- default-decline sanity: probe must decline without the env gate"
+          if "$CLI" selftest; then
+            echo "::error::selftest passed WITHOUT DXR_LEIA_FORCE_PROBE=1 — the stub probe must decline by default"
+            exit 1
+          fi
+          echo "OK: declined by default"
+
+          echo "--- forced probe: full selftest"
+          DXR_LEIA_FORCE_PROBE=1 "$CLI" info || true
+          DXR_LEIA_FORCE_PROBE=1 "$CLI" selftest --json | tee selftest.json
+
+          echo "--- assert the active plug-in is leia-sr"
+          jq -e '.plugin.id == "leia-sr"' selftest.json > /dev/null
+          echo "OK: leia-sr active, ABI green"
