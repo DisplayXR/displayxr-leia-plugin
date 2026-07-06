@@ -13,15 +13,22 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Two targets: Windows / Leia SR (drv_leia) and Android / Leia CNSDK
-# (drv_leia_android). The Android arm was accidentally dropped by the
-# v1.17.0 re-pin (29fabc7) — restored here.
-if(NOT WIN32 AND NOT ANDROID)
+# Three targets: Windows / Leia SR (drv_leia), Android / Leia CNSDK
+# (drv_leia_android), and Linux desktop / stub weaver (drv_leia_linux,
+# Track A of the Linux port — SDK backend lands with Track B, see
+# docs/leia-linux-sdk-contract.md). The Android arm was accidentally
+# dropped by the v1.17.0 re-pin (29fabc7) — restored here.
+set(DXR_LINUX_DESKTOP FALSE)
+if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT WIN32)
+    set(DXR_LINUX_DESKTOP TRUE) # CMake-side twin of the XRT_OS_LINUX && !XRT_OS_ANDROID code gate
+endif()
+if(NOT WIN32 AND NOT ANDROID AND NOT DXR_LINUX_DESKTOP)
     message(FATAL_ERROR
-        "The Leia plug-in supports two targets:\n"
+        "The Leia plug-in supports three targets:\n"
         "  - Windows / Leia SR (DisplayXR-LeiaSR.dll, drv_leia)\n"
         "  - Android / Leia CNSDK (libdxrp050_leia_cnsdk.so, drv_leia_android)\n"
-        "Configured platform is neither WIN32 nor ANDROID.")
+        "  - Linux desktop / stub weaver (DisplayXR-LeiaSR.so, drv_leia_linux)\n"
+        "Configured platform is none of these (macOS is not supported).")
 endif()
 
 if(NOT DEFINED BUILD_NUM)
@@ -63,6 +70,26 @@ message(STATUS "Plug-in version (iface .version): ${DXR_PLUGIN_GIT_DESC}")
 # there's no conflict to gate against here — the runtime always builds
 # vendor-source-clean.
 
+if(DXR_LINUX_DESKTOP)
+    # Headless-Linux runtime defaults — the exact set the runtime's own
+    # scripts/build_linux.sh passes, as cache defaults so any invocation
+    # (CI container, dev box, bare cmake) configures the runtime subdir
+    # identically. CLI stays ON: displayxr-cli selftest is the Track A
+    # validation vehicle.
+    set(XRT_MODULE_CLI ON CACHE BOOL "displayxr-cli selftest vehicle (leia-plugin Linux default)")
+    foreach(_dxr_off
+            XRT_FEATURE_SERVICE
+            XRT_BUILD_DRIVER_QWERTY
+            XRT_FEATURE_DEBUG_GUI
+            XRT_FEATURE_WINDOW_PEEK
+            XRT_HAVE_SDL2
+            XRT_HAVE_OPENCV
+            XRT_HAVE_LIBUSB
+            XRT_BUILD_DRIVER_EUROC)
+        set(${_dxr_off} OFF CACHE BOOL "headless Linux default (leia-plugin)")
+    endforeach()
+endif()
+
 if(DXR_RUNTIME_SOURCE_DIR)
     message(STATUS "Using local runtime checkout: ${DXR_RUNTIME_SOURCE_DIR}")
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
@@ -81,11 +108,29 @@ else()
     # runtime checkout ref so the two can't drift.
     set(DXR_RUNTIME_GIT_TAG "v1.24.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
-    message(STATUS "Fetching runtime via FetchContent @ ${DXR_RUNTIME_GIT_TAG}")
+    # Linux carries its own pin: the Windows/Android tag predates runtime
+    # Linux support entirely (scripts/build_linux.sh first shipped in
+    # v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
+    # in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
+    # equals its RUNTIME_REF so the two can't drift.
+    set(DXR_RUNTIME_GIT_TAG_LINUX "v1.28.0" CACHE STRING
+        "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
+    if(DXR_LINUX_DESKTOP)
+        set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_LINUX}")
+        if(_dxr_runtime_ref MATCHES "^v1\\.([0-9]|1[0-9]|2[0-7])\\.")
+            message(FATAL_ERROR
+                "Runtime ${_dxr_runtime_ref} predates usable Linux support (first complete in v1.28.0). "
+                "Set DXR_RUNTIME_GIT_TAG_LINUX to a Linux-capable ref, or point DXR_RUNTIME_SOURCE_DIR "
+                "at a local runtime checkout.")
+        endif()
+    else()
+        set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG}")
+    endif()
+    message(STATUS "Fetching runtime via FetchContent @ ${_dxr_runtime_ref}")
     FetchContent_Declare(
         displayxr_runtime
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-runtime.git
-        GIT_TAG "${DXR_RUNTIME_GIT_TAG}"
+        GIT_TAG "${_dxr_runtime_ref}"
     )
     FetchContent_MakeAvailable(displayxr_runtime)
 endif()
@@ -112,4 +157,12 @@ elseif(ANDROID)
     # which the build environment supplies. No NSIS installer on
     # Android; the .so ships in the runtime APK's jniLibs/<ABI>/.
     add_subdirectory(src/drv_leia_android)
+elseif(DXR_LINUX_DESKTOP)
+    # --- Linux desktop (Track A: stub weaver, no SR SDK) ----------------
+    # Interface = docs/leia-linux-sdk-contract.md (PROPOSED, #81);
+    # implementation = stub passthrough until the SR Linux SDK ships
+    # (Track B swaps the backend via DXR_LEIA_LINUX_WEAVER=sdk). No
+    # find_package, no installer — the .so is discovered via a JSON
+    # manifest (XRT_PLUGIN_SEARCH_PATH / XDG DisplayProcessors roots).
+    add_subdirectory(src/drv_leia_linux)
 endif()
