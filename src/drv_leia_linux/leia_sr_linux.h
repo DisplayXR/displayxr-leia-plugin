@@ -36,6 +36,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// Platform defines (VK_USE_PLATFORM_XCB_KHR) MUST precede vulkan.h so that
+// TUs which also include vk/vk_helpers.h see the XCB PFN types regardless of
+// include order — same pattern as the Windows arm's leia_sr.h.
+#include "xrt/xrt_config_vulkan.h"
 #include <vulkan/vulkan.h>
 
 #ifdef __cplusplus
