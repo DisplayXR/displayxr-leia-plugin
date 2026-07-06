@@ -145,9 +145,12 @@ jobs:
           echo "OK: declined by default"
 
           echo "--- forced probe: full selftest"
-          DXR_LEIA_FORCE_PROBE=1 "$CLI" info || true
           DXR_LEIA_FORCE_PROBE=1 "$CLI" selftest --json | tee selftest.json
 
           echo "--- assert the active plug-in is leia-sr"
-          jq -e '.plugin.id == "leia-sr"' selftest.json > /dev/null
+          # selftest --json emits a checks[] array; the plugin identity object
+          # lives in `info --json` — assert on both.
+          jq -e '.checks[] | select(.name=="active_plugin") | .ok' selftest.json > /dev/null
+          DXR_LEIA_FORCE_PROBE=1 "$CLI" info --json > info.json
+          jq -e '.plugin.id == "leia-sr"' info.json > /dev/null
           echo "OK: leia-sr active, ABI green"
