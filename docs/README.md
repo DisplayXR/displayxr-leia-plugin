@@ -25,6 +25,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 - **[Display mode switching (2D/3D)](display-mode-switching.md)** — how the plug-in maps the neutral mode-request API onto `SwitchableLensHint` (Windows) / `leia_core_set_backlight` (Android).
 - **[CNSDK Android calibration](cnsdk-android-calibration.md)** — symptom→fix procedure for the three CNSDK convention assumptions (face axes, tile-to-eye mapping, UV flip); pending Lume Pad hardware validation.
 - **[Android weaving, orientation, zones & transparency](android-weaving-and-transparency.md)** — the Android CNSDK weave model (per-subpixel phase, predicted center eye), the three-orientation reconciliation, sub-rect/display-zone weaving (the two viewport knobs + the portrait==natural test gotcha), and why per-pixel-alpha transparency is fundamentally limited on Android (+ the background-capture privilege landscape on NP02J).
+- **[LeiaSR Linux SDK contract](leia-linux-sdk-contract.md)** — PROPOSED interface contract the LeiaSR Linux SDK must expose (Vulkan weaver, eye tracking, display/calibration) so the Linux backend (#81) and the SDK can be built in parallel.
 
 ## Build flags
 
