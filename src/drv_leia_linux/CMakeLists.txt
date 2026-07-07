@@ -15,6 +15,13 @@
 
 find_package(Vulkan REQUIRED) # loader lib for the stub's raw vkCmd* calls
 
+# xcb + xcb-randr for the transient panel-position query (#91 / runtime#715):
+# leia_edid_probe_linux.c matches the frozen EDID table against RandR outputs
+# to place the panel in the desktop. Already an apt dep of the CI image (the
+# runtime's own build needs libxcb-randr0-dev).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PLUGIN_XCB REQUIRED IMPORTED_TARGET xcb xcb-randr)
+
 # --- Weaver backend seam — the Track B switch point ----------------------
 set(DXR_LEIA_LINUX_WEAVER "stub" CACHE STRING
     "Linux weaver backend: 'stub' (no SR SDK, passthrough SBS) or 'sdk' (Track B)")
@@ -94,6 +101,7 @@ target_link_libraries(DisplayXR-LeiaSR PRIVATE
     aux_vk
     drv_includes
     Vulkan::Vulkan
+    PkgConfig::PLUGIN_XCB
 )
 
 # One-symbol export discipline (#496): hidden visibility + version script
