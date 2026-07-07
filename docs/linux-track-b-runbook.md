@@ -89,7 +89,9 @@ XR_RUNTIME_JSON=../displayxr-runtime/build/openxr_displayxr-dev.json \
 
 Formerly-open behavior questions (render-pass shape, input width semantics,
 recommended-texture-size units, windowless weaving, image layouts) were settled by
-reading the SDK source — see `docs/leia-linux-sdk-contract.md` §8.
+reading the SDK source and then **vendor-confirmed on LeiaSR#53** (fb=0 = the same
+path Leia's Unity plugin uses; input dims = per-view) — see
+`docs/leia-linux-sdk-contract.md` §8.
 
 ## 5. What to report back (LeiaInc/LeiaSR#53 + displayxr-leia-plugin#81)
 

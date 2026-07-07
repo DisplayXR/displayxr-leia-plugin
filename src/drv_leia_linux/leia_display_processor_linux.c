@@ -365,7 +365,10 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	}
 	ldp->sr = sr;
 
-	U_LOG_I("leia_lnx_dp: Linux VK display processor created (backend: %s)",
+	// WARN not INFO: one-off lifecycle line (docs/reference/debug-logging.md)
+	// — aux INFO is dropped from the hot path, which is exactly how this line
+	// went missing in George's on-hardware trace (#81 smoke-test note).
+	U_LOG_W("leia_lnx_dp: Linux VK display processor created (backend: %s)",
 	        leiasr_lnx_get_render_pass(sr) == VK_NULL_HANDLE ? "stub passthrough" : "weaver");
 
 	*out_xdp = &ldp->base.base;
