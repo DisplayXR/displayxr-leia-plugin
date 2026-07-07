@@ -1,6 +1,6 @@
 # LeiaSR Linux SDK ↔ DisplayXR Leia plug-in — interface contract
 
-**Status: RECONCILED against the srSDK 1.0.0 prototype** (2026-07-06) — the real C99 API exists and has been diffed against this contract requirement-by-requirement (§8); final ratification awaits the merged `sr-sdk-v*` tag (LeiaInc/LeiaSR#53).
+**Status: RECONCILED against the srSDK 1.0.0 prototype** (2026-07-06) — the real C99 API exists and has been diffed against this contract requirement-by-requirement (§8); final ratification awaits the merged `sr-sdk-v*` tag. **Landing target: [LeiaInc/LeiaSR#75](https://github.com/LeiaInc/LeiaSR/pull/75)** (`ST-5532`, "Supersedes #53" — the original C99-API PR #53 is closed). Re-pin Track B off the prototype BuildID onto #75's merged tag once it lands.
 Tracking: [#81](https://github.com/DisplayXR/displayxr-leia-plugin/issues/81) (this repo) · [displayxr-runtime#660](https://github.com/DisplayXR/displayxr-runtime/issues/660) (Linux platform, M8).
 
 **Reconciled against:** `leiasr-prototype-sdk.zip` (George, 2026-07-06) — srSDK API version **1.0.0** (`SR_CURRENT_API_VERSION`), `libLeiaSR_runtime.so` BuildID `fcf21021eeb277bac06fdb0e484bd4a8f31ad36b`. The SDK is commercial-licensed; its headers/libs are **never** committed to this repo — Track B builds against a local unpack (`SRSDK_ROOT`).
@@ -170,7 +170,7 @@ The screen-position query matters doubly on Linux: it anchors lenticular phase (
 
 Requirement-by-requirement verdict against the prototype headers (`include/sr/`). ✅ =
 honored as asked; ◐ = satisfiable with a documented workaround; ❌ = gap, carried as an
-ask on LeiaInc/LeiaSR#53.
+ask on the C99-API PR (send new asks to **LeiaInc/LeiaSR#75**, which supersedes the now-closed #53; the "vendor-confirmed on #53" rows below cite where Cyrus answered on the original thread).
 
 | Req | Verdict | srSDK 1.0.0 reality |
 |---|---|---|

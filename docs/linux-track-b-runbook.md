@@ -93,7 +93,9 @@ reading the SDK source and then **vendor-confirmed on LeiaSR#53** (fb=0 = the sa
 path Leia's Unity plugin uses; input dims = per-view) — see
 `docs/leia-linux-sdk-contract.md` §8.
 
-## 5. What to report back (LeiaInc/LeiaSR#53 + displayxr-leia-plugin#81)
+## 5. What to report back (LeiaInc/LeiaSR#75 + displayxr-leia-plugin#81)
+
+> Note: the C99 srSDK PR **#53 is closed → superseded by [#75](https://github.com/LeiaInc/LeiaSR/pull/75)** (`ST-5532`). Direct new asks / weave-quality reports to #75; #53's thread only holds the already-answered render-pass + input-extent confirmations.
 
 1. Does it weave, and does head movement steer the sweet spot? (The remaining
    unknowns are behavioral quality, not API mechanics.)
