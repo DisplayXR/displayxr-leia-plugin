@@ -23,11 +23,27 @@ if(DXR_LEIA_LINUX_WEAVER STREQUAL "stub")
     target_sources(leia_weaver_backend INTERFACE
         ${CMAKE_CURRENT_SOURCE_DIR}/leia_sr_stub.c)
 elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
-    # TODO(Track B): leia_sr_linux_sdk.c + the LeiaSR Linux SDK
-    # find_package/link, satisfying the same leia_sr_linux.h signatures.
-    message(FATAL_ERROR
-        "DXR_LEIA_LINUX_WEAVER=sdk is Track B — the LeiaSR Linux SDK backend "
-        "is not implemented yet (contract: docs/leia-linux-sdk-contract.md).")
+    # Track B: the real LeiaSR srSDK (SPIKE — pinned to the prototype package,
+    # srSDK API 1.0.0). The SDK is commercial-licensed and never vendored:
+    # point SRSDK_ROOT (or CMAKE_PREFIX_PATH) at a local unpack. Absent SDK is
+    # a hard error by design — a silent stub fallback would let someone
+    # hardware-validate the wrong backend, the exact confusion this seam
+    # exists to prevent. CI never enters this branch (default = stub).
+    if(DEFINED ENV{SRSDK_ROOT})
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{SRSDK_ROOT}")
+    endif()
+    find_package(srSDK 1.0 CONFIG REQUIRED) # exports srSDK::loader (static; dlopens libLeiaSR_runtime.so)
+    target_sources(leia_weaver_backend INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/leia_sr_linux_sdk.c)
+    target_link_libraries(leia_weaver_backend INTERFACE srSDK::loader)
+    # Bake the SDK lib dir as DT_RUNPATH so the static loader's
+    # dlopen("libLeiaSR_runtime.so") resolves with zero environment setup
+    # (glibc honors the CALLING object's runpath — that's this plug-in .so).
+    # SR_RUNTIME_PATH env / /etc/leia/sr/1/active_runtime.json override it.
+    get_target_property(_srsdk_inc srSDK::loader_dynamic INTERFACE_INCLUDE_DIRECTORIES)
+    get_filename_component(_srsdk_lib "${_srsdk_inc}/../lib" ABSOLUTE)
+    target_link_options(leia_weaver_backend INTERFACE "LINKER:-rpath,${_srsdk_lib}")
+    message(STATUS "DisplayXR-LeiaSR: Track B srSDK weaver backend (SDK at ${_srsdk_lib})")
 else()
     message(FATAL_ERROR "Unknown DXR_LEIA_LINUX_WEAVER='${DXR_LEIA_LINUX_WEAVER}' (stub|sdk)")
 endif()
