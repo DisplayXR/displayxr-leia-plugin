@@ -30,6 +30,24 @@ extern "C" {
 bool
 leia_lnx_edid_panel_present(uint16_t *out_manufacturer_id, uint16_t *out_product_id);
 
+/*!
+ * Resolve the Leia panel's desktop position (top-left, root-window pixels) by
+ * matching the frozen EDID table against the X server's RandR outputs' EDID
+ * property and reading the active CRTC's x/y (runtime#715, #91). Matching by
+ * EDID rather than connector name sidesteps DRM-vs-RandR naming drift
+ * ("HDMI-A-1" vs "HDMI-1" vs NVIDIA's "HDMI-0").
+ *
+ * Transient query — connects to the X server, resolves, disconnects. Callers
+ * should cache the result. Fails gracefully headless (no DISPLAY / no RandR /
+ * no match), e.g. the CI selftest.
+ *
+ * @param[out] out_left  Panel left edge in root-window pixels — may be NULL.
+ * @param[out] out_top   Panel top edge in root-window pixels — may be NULL.
+ * @return true when a known Leia panel was found on an active RandR output.
+ */
+bool
+leia_lnx_edid_panel_desktop_position(int32_t *out_left, int32_t *out_top);
+
 #ifdef __cplusplus
 }
 #endif

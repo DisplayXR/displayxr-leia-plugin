@@ -146,6 +146,30 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	out_info->display_screen_left = info.screen_left;
 	out_info->display_screen_top = info.screen_top;
 
+	// Neither backend has a real desktop position on Linux — the stub cans
+	// (0, 0) and srDisplayGetLocation's Linux getScreenRect returns (0, 0)
+	// — so resolve the panel's actual position from RandR (EDID-matched,
+	// #91 / runtime#715) and prefer it. Resolved once; headless (no X /
+	// no match) keeps the backend value, so the CI selftest is unaffected.
+	{
+		static bool resolved = false;
+		static bool randr_found = false;
+		static int32_t randr_left = 0;
+		static int32_t randr_top = 0;
+		if (!resolved) {
+			randr_found = leia_lnx_edid_panel_desktop_position(&randr_left, &randr_top);
+			if (randr_found && (randr_left != info.screen_left || randr_top != info.screen_top)) {
+				U_LOG_W("leia_lnx_plugin: RandR panel position (%d, %d) overrides backend (%d, %d)",
+				        randr_left, randr_top, info.screen_left, info.screen_top);
+			}
+			resolved = true;
+		}
+		if (randr_found) {
+			out_info->display_screen_left = randr_left;
+			out_info->display_screen_top = randr_top;
+		}
+	}
+
 	/* MANAGED-only for v1, Windows parity (contract R-T4; R-T5 MANUAL is a
 	 * SHOULD the stub also honors as a no-op). */
 	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
