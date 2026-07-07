@@ -38,6 +38,7 @@
 #include "leia_interface.h"
 #include "leia_sr_linux.h"
 #include "leia_display_processor_linux.h"
+#include "leia_edid_probe_linux.h"
 
 #include <stddef.h>
 
@@ -54,23 +55,34 @@ static xrt_result_t
 leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 {
 	/*
-	 * TODO(Track B): real hardware probe (SR service + DRM/EDID panel
-	 * match), declining cleanly when absent. Track A: env-gated — the
-	 * stub would otherwise hijack every Linux box it's registered on.
+	 * Bind order (mirrors the Windows arm's EDID fast path):
+	 *   1. DXR_LEIA_FORCE_PROBE=1 — unconditional override (bring-up/CI).
+	 *   2. DRM/EDID match against the frozen Leia panel table — a real
+	 *      panel auto-binds, no env var needed.
+	 *   3. Decline — the plug-in must not hijack a Linux box with no Leia
+	 *      panel just because it is registered.
 	 */
-	if (!debug_get_bool_option_leia_force_probe()) {
-		U_LOG_I("leia_lnx_plugin: probe declined — Track A stub has no hardware probe; "
+	const bool forced = debug_get_bool_option_leia_force_probe();
+	uint16_t edid_man = 0, edid_prod = 0;
+	const bool panel = forced ? false : leia_lnx_edid_panel_present(&edid_man, &edid_prod);
+	if (!forced && !panel) {
+		U_LOG_I("leia_lnx_plugin: probe declined — no Leia panel in /sys/class/drm EDID scan; "
 		        "set DXR_LEIA_FORCE_PROBE=1 to force-bind for bring-up/CI");
 		*out_inst = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
 
-	// Seed the canned probe cache so leia_device.c (leia_hmd_create) and
-	// get_display_info report consistent values.
+	// Seed the backend probe cache so leia_device.c (leia_hmd_create) and
+	// get_display_info report consistent values (canned in the stub, real
+	// SR display queries in the sdk backend).
 	(void)leiasr_probe_display(0.0);
 
-	U_LOG_W("leia_lnx_plugin: probe FORCED (DXR_LEIA_FORCE_PROBE=1) — stub weaver, "
-	        "passthrough output, no interlacing");
+	if (forced) {
+		U_LOG_W("leia_lnx_plugin: probe FORCED (DXR_LEIA_FORCE_PROBE=1)");
+	} else {
+		U_LOG_W("leia_lnx_plugin: Leia panel detected via DRM/EDID (manufacturer %u, product %u) — binding",
+		        edid_man, edid_prod);
+	}
 
 	/* No per-instance state — hardware state lives in file-scope statics
 	 * inside the plug-in .so, mirroring the Windows/Android arms. */
