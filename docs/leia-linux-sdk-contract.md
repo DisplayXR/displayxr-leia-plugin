@@ -1,7 +1,9 @@
 # LeiaSR Linux SDK ↔ DisplayXR Leia plug-in — interface contract
 
-**Status: PROPOSED** — awaiting ratification by the LeiaSR Linux SDK team (George / Suki, `#sw-runtime-linux`).
+**Status: RECONCILED against the srSDK 1.0.0 prototype** (2026-07-06) — the real C99 API exists and has been diffed against this contract requirement-by-requirement (§8); final ratification awaits the merged `sr-sdk-v*` tag (LeiaInc/LeiaSR#53).
 Tracking: [#81](https://github.com/DisplayXR/displayxr-leia-plugin/issues/81) (this repo) · [displayxr-runtime#660](https://github.com/DisplayXR/displayxr-runtime/issues/660) (Linux platform, M8).
+
+**Reconciled against:** `leiasr-prototype-sdk.zip` (George, 2026-07-06) — srSDK API version **1.0.0** (`SR_CURRENT_API_VERSION`), `libLeiaSR_runtime.so` BuildID `fcf21021eeb277bac06fdb0e484bd4a8f31ad36b`. The SDK is commercial-licensed; its headers/libs are **never** committed to this repo — Track B builds against a local unpack (`SRSDK_ROOT`).
 
 ## 1. Purpose
 
@@ -9,7 +11,7 @@ The DisplayXR runtime now builds and runs on desktop Linux (phases 0/1a/2a/3a of
 
 This document defines **what the LeiaSR Linux SDK must expose** so that the SDK and the plug-in can be developed **in parallel**: the plug-in scaffolds against this contract with a stub weaver today, and swaps in the real SDK the day it ships.
 
-It is a **capability contract, SR-shaped**: each requirement says *what the SDK must provide*; the reference signatures are modeled on the existing Windows SR Vulkan surface (`SR::CreateVulkanWeaver` / `SR::IVulkanWeaver1`), so a straight SR-to-Linux port satisfies the contract with near-zero delta — but a CNSDK-derived SDK can satisfy it equally (the Android backend proves both shapes drive the same runtime interface). Requirement keywords **MUST / SHOULD / MAY** are RFC-2119.
+It is a **capability contract**: each requirement says *what the SDK must provide*. Originally the reference signatures were modeled on the Windows SR Vulkan surface (`SR::CreateVulkanWeaver` / `SR::IVulkanWeaver1`); as of the 2026-07-06 reconciliation (§8) they are the **real srSDK 1.0.0 C99 API** shipped in the prototype package. Requirement keywords **MUST / SHOULD / MAY** are RFC-2119.
 
 ## 2. Where the SDK sits
 
@@ -42,25 +44,52 @@ These are set by the runtime's Linux architecture and shape everything below; th
 
 ## 4. Surface (a) — Vulkan weaver
 
-### Reference shape (Windows SR, works today)
+### Reference shape (srSDK 1.0.0 prototype — the REAL C API)
 
-```cpp
-// context / display
-SR::SRContext::create();                       // throws SR::ServerNotAvailableException
-SR::GetDisplayManagerInstance(ctx).getPrimaryActiveSRDisplay();
-SR::SwitchableLensHint::create(ctx);
-// weaver
-SR::CreateVulkanWeaver(ctx, VkDevice, VkPhysicalDevice, VkQueue /*graphics*/,
-                       VkCommandPool, <native window>, IVulkanWeaver1 **out);
-// per frame
-weaver->setViewport(rect); weaver->setScissorRect(rect);
-weaver->setCommandBuffer(cmd);
-weaver->setInputViewTexture(viewL, viewR, w, h, fmt);   // SBS atlas as L, R = NULL
-weaver->setOutputFrameBuffer(fb, w, h, fmt);
-weaver->setLatency(us);
-weaver->weave();                                        // records into cmd
-weaver->getPredictedEyePositions(l[3], r[3]);           // millimeters
-weaver->destroy();
+This replaces the pre-reconciliation Windows-SR C++ reference (that shape lives on in
+`docs/weaver.md`). The consumer links the SDK's **static loader** (`srSDK::loader`, via
+`find_package(srSDK CONFIG)`), which `dlopen`s `libLeiaSR_runtime.so` on first call and
+dispatches through an append-only function table; `srGetLastLoaderError()` diagnoses
+load failures.
+
+```c
+#include <sr/sr.h>      /* umbrella: instance/display/eye_tracker/system/weaver/lens */
+#include <sr/sr_vk.h>   /* Vulkan weaver extension (no Vulkan headers; opaque aliases) */
+
+/* --- context: senses + callbacks MUST be registered BEFORE srInitialize --- */
+SrInstance inst;
+srCreateInstance(&(SrInstanceCreateInfo){ .sType = SR_TYPE_INSTANCE_CREATE_INFO,
+        .apiVersion = SR_CURRENT_API_VERSION,
+        .networkMode = SR_NETWORK_MODE_STANDALONE,
+        .applicationName = "DisplayXR-LeiaSR" }, &inst);   /* SR_ERROR_RUNTIME_UNAVAILABLE = R-W1 signal */
+srCreateEyeTracker(inst, &(SrEyeTrackerCreateInfo){ .enablePrediction = SR_TRUE }, &tracker);
+srCreateSystemMonitor(inst, &monitor_ci, &monitor);
+srSystemMonitorAddCallback(monitor, on_event, user);       /* USER_FOUND/USER_LOST, DEVICE_*, LENS_* */
+srInitialize(inst);
+
+srCreateDisplay(inst, &(SrDisplayCreateInfo){ .window = 0 }, &display);  /* 0 = primary SR display */
+srCreateLens(inst, &lens_ci, &lens);                       /* 2D/3D switch (R-D2) */
+
+/* --- weaver (check srGetRuntimeCapabilities: SR_WEAVER_BACKEND_VULKAN_BIT) --- */
+srCreateWeaverVulkan(inst, &(SrWeaverCreateInfoVulkan){
+        .device = dev, .physicalDevice = phys, .graphicsQueue = q, .commandPool = pool,
+        .window = x11_window /* X11 Window XID, or 0 = windowless/display-scoped */ }, &weaver);
+srWeaverSetLatency(weaver, latency_us);                    /* absolute µs — functional (R-W9) */
+
+/* --- per frame --- */
+srWeaverSetCommandBufferVulkan(weaver, cmd);               /* recording state; caller submits (R-W6) */
+srWeaverSetInputTextureVulkan(weaver, sbs_view, w, h, vk_format);   /* ONE SBS VkImageView (R-W4) */
+srWeaverSetOutputFrameBufferVulkan(weaver, fb, w, h, fmt); /* or fb=0 if a render pass is already begun */
+srWeaverSetViewportVulkan(weaver, l, t, r, b);
+srWeaverSetScissorRectVulkan(weaver, l, t, r, b);
+srWeaverWeave(weaver);                                     /* records the interlace pass into cmd */
+srWeaverGetPredictedEyePositions(weaver, &l_mm, &r_mm);    /* SrPoint3f, millimeters (R-T1) */
+
+/* --- teardown --- */
+srDestroyWeaver(weaver);
+srDestroyLens(lens); srDestroyDisplay(display);
+srDestroySystemMonitor(monitor); srDestroyEyeTracker(tracker);
+srDestroyInstance(inst);                                   /* blocks until SDK threads join */
 ```
 
 ### Requirements
@@ -137,18 +166,51 @@ The screen-position query matters doubly on Linux: it anchors lenticular phase (
 - **Runtime-optional loading.** The plug-in must remain loadable (and cleanly declining in `probe()`) on machines without the SDK/service installed. Either the SDK core is dlopen-able behind a thin always-present loader stub (CNSDK loader model), or the plug-in will dlopen the SDK itself (Windows uses `/DELAYLOAD` for the same effect). Loader-stub model preferred.
 - **Service lifecycle:** document install (packages?), start (systemd user unit / D-Bus activation), camera permissions (udev), and crash/restart semantics (R-W1).
 
-## 8. Open questions for ratification
+## 8. Reconciliation vs srSDK 1.0.0 (prototype, 2026-07-06)
 
-1. **Ubuntu 26.04 / GCC 15 / Mesa ANV (Intel Arc Xe-3)** — in the SDK support matrix? Any known blockers? (Carried over from the Slack thread — still unanswered.)
-2. **Lineage** — is the Linux SDK an SR (SimulatedReality) port or CNSDK-derived? (Contract accepts either; affects which reference signatures are literal.)
-3. **Tracking service model on Linux** — separate daemon (SR-service analog) vs in-process? Camera stack (V4L2? RealSense-style?) and permission story?
-4. **Phase origin API (R-W7)** — confirm the Linux SDK will expose the decoupled viewport + screen-position-phase pair (CNSDK shape) rather than the Windows SR viewport-only shape.
-5. **Latency API (R-W9)** — confirm absolute-µs prediction horizon works on Linux (the Windows VK `setLatencyInFrames` no-op made us build adaptive-latency workarounds we'd like to delete, #71).
-6. **N-view roadmap** — should the input API carry the tile grid now (R-W4 SHOULD), or is 2×1 stereo locked for the Linux panel generation?
-7. **C vs C++ ABI** (§7) — preference?
-8. **Wayland** — any SDK-side dependency on X11 beyond what the plug-in passes in (R-W3)? The runtime is X11-first; Wayland is deferred, but SDK X11 assumptions would be good to know.
+Requirement-by-requirement verdict against the prototype headers (`include/sr/`). ✅ =
+honored as asked; ◐ = satisfiable with a documented workaround; ❌ = gap, carried as an
+ask on LeiaInc/LeiaSR#53.
 
-## 9. Appendix — how the SDK gets driven, per frame
+| Req | Verdict | srSDK 1.0.0 reality |
+|---|---|---|
+| R-W1 context connect | ✅ | `srCreateInstance` returns `SR_ERROR_RUNTIME_UNAVAILABLE`, distinguishable; retry loop is caller-side (no budget param — fine). Service model still undocumented (→ Q3). |
+| R-W2 existing VK objects | ◐ | `SrWeaverCreateInfoVulkan{device, physicalDevice, graphicsQueue, commandPool}` ✅; no queue-family param (pool implies it) ✅; **no pre-device-creation enumeration of required device extensions/features** ❌ ask. |
+| R-W3 optional window | ✅ | `.window = 0` = windowless/display-scoped, documented "texture-in / weave-out". X11 `Window` XID only — no `Display*`/xcb param (SDK opens its own connection). |
+| R-W4 single tiled atlas | ◐ | ONE SBS `VkImageView` ✅; **no tile-grid param** (2×1 locked, no N-view) ❌; **no UV-flip toggle** ❌; "width/height of the texture" wording ambiguous (full SBS vs per-view) — needs one doc line ❌. Input layout undocumented ❌. |
+| R-W5 caller output target | ◐ | Caller `VkFramebuffer` + w/h/format accepted, **or `framebuffer = 0` with a render pass already begun on the command buffer** — that second path is how the plug-in keeps loadOp/layout control. **The weave's internal render-pass assumptions (attachment count/samples/depth) are not exposed or documented** — render-pass compatibility is a gamble validated only by layers ❌ ask: expose the pass or document its shape. Output layout on completion undocumented ❌. |
+| R-W6 record, don't submit | ✅ | `srWeaverSetCommandBufferVulkan` + "caller owns the swapchain, command buffer submission, and synchronisation" (sr_vk.h header note). |
+| R-W7 viewport + phase origin | ❌ | `SetViewportVulkan`/`SetScissorRectVulkan` only. **No phase/screen-position-origin API** — the exact Windows gap (runtime#85) reproduced; display-zones and per-window weaving remain inexpressible. Top ask. |
+| R-W8 target recreation | ◐ | All `srWeaverSet*` bindings are per-frame settable ✅; **no explicit invalidation call**, and whether the SDK caches on handle values (Vulkan recycles them) is undocumented ❌. |
+| R-W9 latency in µs | ✅ | `srWeaverSetLatency(weaver, latencyUs)` — the contract ask, honored. (`SetLatencyInFrames` convenience also exists.) |
+| R-W10 deterministic teardown | ◐ | `srDestroyWeaver`/`srDestroyInstance` documented, no event-loop pumping ✅; but `srDestroyInstance` "blocks until all internal threads have been joined" with **no timeout** — unbounded if the service dies ❌ (forces a process-lifetime context in the plug-in). |
+| R-W11 no exceptions | ✅ | Pure C99 API. `SrResult` everywhere, `srResultToString` for diagnostics. |
+| R-T1 predicted pull | ✅ | `srWeaverGetPredictedEyePositions` (mm, display-centre, the pair the weave consumes) + `srEyeTrackerPredict(latencyUs)`; **no timestamp out-param on the weaver pull** ◐. |
+| R-T2 never zeros | ◐ | Not documented; `SR_ERROR_DEVICE_NOT_AVAILABLE` when no data yet — plug-in guards with `srDisplayGetDefaultViewingPosition` fallback. |
+| R-T3 explicit tracking state | ◐ | **No pollable per-sample flag.** State is event-edge-driven: `srSystemMonitor` + `SR_EVENT_TYPE_USER_FOUND/USER_LOST` (plus `DEVICE_READY/DISCONNECTED`, `SR_UNAVAILABLE/RESTORED`). Workable — plug-in latches events into an atomic — but a different shape than asked; callbacks must be registered **before `srInitialize`** (no late sense attach). |
+| R-T4 MANAGED | ◐ | Prediction + late-latching + lens events exist, but grace-period/collapse/auto-2D semantics are undocumented; no grace-period state is observable, so `is_tracking` flips at raw `USER_LOST`, earlier than R-T4 prefers ❌ doc ask. |
+| R-T5 MANUAL | ❌ | No stand-down toggle. MANAGED-only (acceptable for v1 per contract). |
+| R-T6 threading | ✅ | `srEyeTrackerPredict` documented safe from any thread incl. render thread; callbacks on SDK thread. |
+| R-D1 display enumeration | ◐ | `srCreateDisplay({window:0})` + `GetPhysicalSize(cm)/GetPhysicalResolution/GetLocation/GetRecommendedTextureSize/GetDefaultViewingPosition(mm)/GetIdentifier` map 1:1 ✅, readable pre-weaver ✅; **no refresh-rate getter** ❌ (weaver knows it internally for `SetLatencyInFrames`); `GetRecommendedTextureSize` per-view vs full-SBS undocumented ❌. |
+| R-D2 2D/3D switch | ✅ | `sr_lens.h`: `srLensEnable/Disable/IsEnabled` (+ `lensPreference` at instance create, `SR_EVENT_TYPE_LENS_ON/OFF` events). |
+| R-D3 calibration internal | ✅ | No interlace parameters exposed anywhere. |
+| R-D4 headless-tolerant | ✅ | `srCreateDisplay` succeeds with no panel; getters return `SR_ERROR_DISPLAY_NOT_FOUND`; `srDisplayIsValid` is the probe primitive. |
+| §7 packaging | ✅ | C API ✅; `find_package(srSDK CONFIG)` package, relocatable ✅; loader-stub dlopen model ✅ (static `libsrSDK_loader.a` → `libLeiaSR_runtime.so`, search order: `/etc/leia/sr/1/active_runtime.json` → `SR_RUNTIME_PATH` → plain dlopen). Support matrix (26.04/Mesa ANV) unconfirmed (→ Q1). |
+
+## 9. Open questions for ratification
+
+Post-reconciliation status per question — answered ones kept for the record:
+
+1. **Ubuntu 26.04 / GCC 15 / Mesa ANV (Intel Arc Xe-3)** — **still open.** The prototype ships x86_64 Linux binaries but the support matrix is unconfirmed.
+2. **Lineage** — **answered:** new C99 srSDK (LeiaInc/LeiaSR#53 loader/runtime split), neither a straight SR C++ port nor CNSDK; SR-derived semantics with a Vulkan-style extensible-struct C API.
+3. **Tracking service model on Linux** — **still open.** `SrNetworkMode` (STANDALONE/CLIENT/…) exists in the API but the intended Linux deployment (in-process runtime vs daemon), camera stack, and udev/permission story are undocumented.
+4. **Phase origin API (R-W7)** — **answered: NOT in 1.0.0.** Viewport/scissor only; the decoupled screen-position-phase knob is the top carried ask (runtime#85 class).
+5. **Latency API (R-W9)** — **answered: yes.** `srWeaverSetLatency(µs)` is a first-class dispatch-table entry.
+6. **N-view roadmap** — **answered: 2×1 locked in 1.0.0.** `srWeaverSetInputTextureVulkan` carries no tile grid; N-view stays a contract SHOULD for a later API rev.
+7. **C vs C++ ABI** — **answered: C99**, with an append-only dispatch-table ABI (frozen slot layout for major version 1).
+8. **Wayland** — **effectively answered:** `SrNativeWindowHandle` is an X11 `Window` (`unsigned long`) on Linux; the SDK opens its own X connection. Wayland unaddressed in 1.0.0.
+
+## 10. Appendix — how the SDK gets driven, per frame
 
 The plug-in's Linux DP implements the runtime's `xrt_display_processor_vk` vtable (`src/xrt/include/xrt/xrt_display_processor_vk.h`, ABI v4). Trace:
 
