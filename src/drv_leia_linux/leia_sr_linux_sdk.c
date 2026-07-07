@@ -41,11 +41,11 @@
  *    collapses below 1 mm separation (vkweaver.cpp weave(): isTracking =
  *    eyeSeparation > 1) — the MANAGED loss lifecycle in action.
  *
- *  - srWeaverSetInputTextureVulkan's width/height are STORED BUT NEVER READ
- *    by the SDK implementation (viewTextureWidth/Height have no consumer in
- *    vkweaver.cpp) — the shader samples the SBS view with computed UVs. We
- *    pass the full side-by-side extent for forward-compat documentation
- *    value; any value works against 1.0.0.
+ *  - srWeaverSetInputTextureVulkan's width/height are PER-VIEW — vendor-
+ *    confirmed on LeiaSR#53 ("The size is for a single view, not SBS").
+ *    The 1.0.0 implementation stores and never reads them (shader samples
+ *    the SBS view with computed UVs), so this is contract hygiene for
+ *    future SDK versions, not a behavior change.
  *
  *  - Windowless (window = 0) weaving is real: the legacy constructor maps
  *    window==NULL to constructedWithoutWindow=true, whose canWeaveInternal
@@ -821,11 +821,11 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 		return;
 	}
 
-	/* Full side-by-side extent. The 1.0.0 implementation stores these dims
-	 * and never reads them (shader samples the SBS view with computed UVs —
-	 * verified in vkweaver.cpp), so this is documentation for future SDKs. */
-	const int32_t in_w = (int32_t)(input->view_width * input->tile_columns);
-	const int32_t in_h = (int32_t)(input->view_height * input->tile_rows);
+	/* PER-VIEW dims — vendor-confirmed contract (LeiaSR#53: "single view,
+	 * not SBS"). Unread by the 1.0.0 implementation (verified in
+	 * vkweaver.cpp), so contract hygiene for future SDKs. */
+	const int32_t in_w = (int32_t)input->view_width;
+	const int32_t in_h = (int32_t)input->view_height;
 	res = srWeaverSetInputTextureVulkan(lnx->weaver, (SrVkImageView)input->atlas_view, in_w, in_h,
 	                                    (SrVkFormat)input->view_format);
 	if (SR_FAILED(res)) {
