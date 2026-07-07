@@ -36,14 +36,30 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     target_sources(leia_weaver_backend INTERFACE
         ${CMAKE_CURRENT_SOURCE_DIR}/leia_sr_linux_sdk.c)
     target_link_libraries(leia_weaver_backend INTERFACE srSDK::loader)
-    # Bake the SDK lib dir as DT_RUNPATH so the static loader's
-    # dlopen("libLeiaSR_runtime.so") resolves with zero environment setup
-    # (glibc honors the CALLING object's runpath — that's this plug-in .so).
-    # SR_RUNTIME_PATH env / /etc/leia/sr/1/active_runtime.json override it.
-    get_target_property(_srsdk_inc srSDK::loader_dynamic INTERFACE_INCLUDE_DIRECTORIES)
-    get_filename_component(_srsdk_lib "${_srsdk_inc}/../lib" ABSOLUTE)
-    target_link_options(leia_weaver_backend INTERFACE "LINKER:-rpath,${_srsdk_lib}")
-    message(STATUS "DisplayXR-LeiaSR: Track B srSDK weaver backend (SDK at ${_srsdk_lib})")
+
+    # DEV-ONLY convenience: bake the SDK lib dir as DT_RUNPATH so the static
+    # loader's dlopen("libLeiaSR_runtime.so") resolves with zero environment
+    # setup on a spike/bring-up box (glibc honors the CALLING object's
+    # runpath — that's this plug-in .so).
+    #
+    # RELEASE builds MUST turn this OFF (-DDXR_LEIA_SDK_DEV_RPATH=OFF): the
+    # deployment model is Windows parity — Leia's own Linux runtime installer
+    # lays down the SR stack and registers it at
+    # /etc/leia/sr/1/active_runtime.json (the loader's first search path,
+    # with the SR_RUNTIME_PATH env as the manual override). A shipped plug-in
+    # must resolve the runtime through that registration, never through a
+    # build-machine path baked into the ELF.
+    option(DXR_LEIA_SDK_DEV_RPATH
+        "Bake the srSDK lib dir as DT_RUNPATH (dev/bring-up only; OFF for release builds)" ON)
+    if(DXR_LEIA_SDK_DEV_RPATH)
+        get_target_property(_srsdk_inc srSDK::loader_dynamic INTERFACE_INCLUDE_DIRECTORIES)
+        get_filename_component(_srsdk_lib "${_srsdk_inc}/../lib" ABSOLUTE)
+        target_link_options(leia_weaver_backend INTERFACE "LINKER:-rpath,${_srsdk_lib}")
+        message(STATUS "DisplayXR-LeiaSR: Track B srSDK weaver backend (DEV rpath -> ${_srsdk_lib})")
+    else()
+        message(STATUS "DisplayXR-LeiaSR: Track B srSDK weaver backend (release: runtime via "
+                       "/etc/leia/sr/1/active_runtime.json, no baked rpath)")
+    endif()
 else()
     message(FATAL_ERROR "Unknown DXR_LEIA_LINUX_WEAVER='${DXR_LEIA_LINUX_WEAVER}' (stub|sdk)")
 endif()

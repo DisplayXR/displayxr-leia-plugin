@@ -34,6 +34,11 @@ Configure must print `Track B srSDK weaver backend (SDK at …/lib)`. If it fail
 into the plug-in's DT_RUNPATH at configure time. If you move the SDK afterwards, either
 reconfigure or `export SR_RUNTIME_PATH=/new/path/libLeiaSR_runtime.so`.
 
+That baked rpath is a **dev-only convenience** (`DXR_LEIA_SDK_DEV_RPATH`, default ON).
+Release builds pass `-DDXR_LEIA_SDK_DEV_RPATH=OFF` and resolve the runtime the
+deployment way: Leia's Linux runtime installer registers it at
+`/etc/leia/sr/1/active_runtime.json` (the loader's first search path).
+
 ## 2. Smoke-test headless (no window, no GPU work)
 
 ```bash
