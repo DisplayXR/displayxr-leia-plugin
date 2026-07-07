@@ -309,8 +309,6 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
                        int32_t target_format,
                        struct xrt_display_processor **out_xdp)
 {
-	(void)target_format; // no render pass to seed — the stub blits (Track B may use it)
-
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle;
 	if (vk == NULL || out_xdp == NULL) {
 		return XRT_ERROR_ALLOCATION;
@@ -355,6 +353,7 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	    .x11_window = window_handle,
 	    .x11_connection = NULL,
 	    .retry_budget_s = 5.0, // Windows-parity connect budget (R-W1)
+	    .target_format = (VkFormat)target_format,
 	};
 	struct leiasr_lnx *sr = NULL;
 	enum leiasr_lnx_result res = leiasr_lnx_create(&info, &sr);

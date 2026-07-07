@@ -102,6 +102,14 @@ struct leiasr_lnx_create_info
 	 * Windows plug-in uses ~5 s at DP creation; 0 means a single attempt.
 	 */
 	double retry_budget_s;
+
+	/*!
+	 * Format of the compositor's weave target (R-W5), so a backend that
+	 * renders through a render pass can build one compatible with the
+	 * caller's framebuffers up front. VK_FORMAT_UNDEFINED ⟹ the contract
+	 * baseline VK_FORMAT_B8G8R8A8_UNORM. The stub (blit path) ignores it.
+	 */
+	VkFormat target_format;
 };
 
 /*!
