@@ -25,18 +25,34 @@
  *    already begun" path: we own a single-color-attachment VkRenderPass
  *    (returned from leiasr_lnx_get_render_pass), begin it with the caller's
  *    framebuffer (or an internally cached one), and let srWeaverWeave record
- *    its draw inside. Render-pass compatibility (formats/samples/subpass
- *    structure) is the assumption — bring up with validation layers. Escape
- *    hatch: DXR_LEIA_SR_FB_SDK=1 hands the caller framebuffer to the SDK
- *    instead (the SDK then begins its own pass).
+ *    its draw inside. Render-pass compatibility VERIFIED against the SDK
+ *    source (LeiaSR v2-vulkan-weaver, vkweaver.cpp RenderPassCache): its
+ *    pipeline pass is single color attachment @ outputFormat, samples 1,
+ *    loadOp LOAD, COLOR_ATTACHMENT_OPTIMAL in/out, no depth, one subpass —
+ *    identical shape to ours, so the passes are compatible by Vulkan §8.2.
+ *    In fb=0 mode the weaver skips its own Begin/EndRenderPass entirely and
+ *    just binds pipeline + draws. Escape hatch kept: DXR_LEIA_SR_FB_SDK=1
+ *    hands the caller framebuffer to the SDK (it then begins its own pass).
  *
  *  - Tracking state is event-edge only in srSDK 1.0.0 (USER_FOUND/USER_LOST
  *    via the system monitor) — latched into atomics; is_tracking flips at
- *    raw face-loss (earlier than R-T4's grace-period preference).
+ *    raw face-loss (earlier than R-T4's grace-period preference). The weaver
+ *    itself independently drops to a blit when its predicted eye pair
+ *    collapses below 1 mm separation (vkweaver.cpp weave(): isTracking =
+ *    eyeSeparation > 1) — the MANAGED loss lifecycle in action.
  *
- *  - srWeaverSetInputTextureVulkan's "width of the texture" is assumed to be
- *    the FULL side-by-side width; DXR_LEIA_SR_INPUT_PER_VIEW=1 flips to
- *    per-view during bring-up (doc ambiguity, contract §8 R-W4).
+ *  - srWeaverSetInputTextureVulkan's width/height are STORED BUT NEVER READ
+ *    by the SDK implementation (viewTextureWidth/Height have no consumer in
+ *    vkweaver.cpp) — the shader samples the SBS view with computed UVs. We
+ *    pass the full side-by-side extent for forward-compat documentation
+ *    value; any value works against 1.0.0.
+ *
+ *  - Windowless (window = 0) weaving is real: the legacy constructor maps
+ *    window==NULL to constructedWithoutWindow=true, whose canWeaveInternal
+ *    path ALWAYS weaves (given correction textures). On Linux the window
+ *    screen-rect helper returns (0,0) unconditionally, so the lens phase
+ *    anchors at the viewport offset in panel coordinates — exactly the
+ *    display-scoped convention the DP feeds us.
  *
  * Also implements the two probe entry points from ../drv_leia/leia_interface.h
  * (`leiasr_probe_display` / `leiasr_get_probe_results`) that the shared
@@ -64,7 +80,6 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(sr_fb_sdk, "DXR_LEIA_SR_FB_SDK", false)
-DEBUG_GET_ONCE_BOOL_OPTION(sr_input_per_view, "DXR_LEIA_SR_INPUT_PER_VIEW", false)
 
 #define SDK_HALF_IPD_MM 31.5f /* nominal 63 mm IPD — R-T2 fallback pair */
 
@@ -348,8 +363,9 @@ sr_ctx_refresh_display_info_locked(void)
 	info.pixel_height = (uint32_t)px_h;
 	info.screen_left = (int32_t)rect.left;
 	info.screen_top = (int32_t)rect.top;
-	/* Assumed per-view (undocumented in srSDK 1.0.0 — contract §8 R-D1);
-	 * raw values logged once so bring-up can falsify the assumption. */
+	/* Per-view: srDisplayGetRecommendedTextureSize wraps the same legacy
+	 * getRecommendedViewsTextureWidth/Height getter the Windows arm already
+	 * consumes and logs as "per eye" (leia_sr_d3d11.cpp) — settled. */
 	info.recommended_view_width = (uint32_t)rec_w;
 	info.recommended_view_height = (uint32_t)rec_h;
 	/* No refresh getter in srSDK 1.0.0 (contract §8 R-D1 carried ask). */
@@ -361,7 +377,7 @@ sr_ctx_refresh_display_info_locked(void)
 	static bool logged;
 	if (!logged) {
 		U_LOG_I("leia_sr_sdk: display %dx%d px, %.1fx%.1f cm, at (%d,%d), recommended %dx%d "
-		        "(per-view assumed), nominal viewer Z %.0f mm, refresh HARDCODED 60 Hz",
+		        "per view, nominal viewer Z %.0f mm, refresh HARDCODED 60 Hz",
 		        px_w, px_h, w_cm, h_cm, (int)rect.left, (int)rect.top, rec_w, rec_h, nz);
 		logged = true;
 	}
@@ -785,8 +801,10 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	}
 
 	/* No phase-origin API in srSDK 1.0.0 (runtime#85 gap, contract §8
-	 * R-W7). Display-scoped weaving is implicitly correct because the DP
-	 * anchors phase at the viewport offset; anything else can't weave. */
+	 * R-W7). Display-scoped weaving is correct BY CONSTRUCTION: verified in
+	 * the SDK source that on Linux the windowless screen-rect is (0,0), so
+	 * the weave's phase offset = our viewport offset in panel coordinates.
+	 * Anything else (window-scoped) can't weave with 1.0.0. */
 	if (phase_origin.x != viewport.offset.x || phase_origin.y != viewport.offset.y) {
 		static bool logged;
 		if (!logged) {
@@ -803,15 +821,11 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 		return;
 	}
 
-	/* "Width/height of the texture" (sr_vk.h) read as the FULL side-by-side
-	 * extent; DXR_LEIA_SR_INPUT_PER_VIEW=1 flips the reading (contract §8
-	 * R-W4 ambiguity, to be settled during bring-up). */
-	int32_t in_w = (int32_t)(input->view_width * input->tile_columns);
-	int32_t in_h = (int32_t)(input->view_height * input->tile_rows);
-	if (debug_get_bool_option_sr_input_per_view()) {
-		in_w = (int32_t)input->view_width;
-		in_h = (int32_t)input->view_height;
-	}
+	/* Full side-by-side extent. The 1.0.0 implementation stores these dims
+	 * and never reads them (shader samples the SBS view with computed UVs —
+	 * verified in vkweaver.cpp), so this is documentation for future SDKs. */
+	const int32_t in_w = (int32_t)(input->view_width * input->tile_columns);
+	const int32_t in_h = (int32_t)(input->view_height * input->tile_rows);
 	res = srWeaverSetInputTextureVulkan(lnx->weaver, (SrVkImageView)input->atlas_view, in_w, in_h,
 	                                    (SrVkFormat)input->view_format);
 	if (SR_FAILED(res)) {

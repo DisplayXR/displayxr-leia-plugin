@@ -67,28 +67,31 @@ XR_RUNTIME_JSON=../displayxr-runtime/build/openxr_displayxr-dev.json \
   eye tracking runs (`is_tracking` flips on `USER_FOUND` events, visible as
   `leia_sr_sdk: system event 16/17` log lines).
 - **First run with validation layers** (`VK_LOADER_LAYERS_ENABLE=*validation*` or
-  vkconfig): the weave executes the SDK's pipeline inside a plug-in-owned render pass
-  (the SDK's "framebuffer = 0, render pass already begun" mode). Any
-  `VUID-vkCmdDraw-renderPass-*` error means the SDK's internal pass is NOT compatible
-  with a bare single-color-attachment pass — report it (that's friction item #1) and
-  retry with `DXR_LEIA_SR_FB_SDK=1`, which hands the framebuffer to the SDK instead.
+  vkconfig) — belt and braces. Render-pass compatibility has since been **verified
+  against the SDK source** (v2-vulkan-weaver `vkweaver.cpp`: single color attachment,
+  1 sample, no depth, loadOp LOAD, `COLOR_ATTACHMENT_OPTIMAL` in/out — same shape as
+  the plug-in's pass, and fb=0 mode skips the weaver's own Begin/EndRenderPass), so
+  no VUID errors are expected. If one fires anyway, `DXR_LEIA_SR_FB_SDK=1` hands the
+  framebuffer to the SDK instead.
 
 ## 4. Bring-up toggles (env vars)
 
 | Var | Meaning |
 |---|---|
-| `DXR_LEIA_FORCE_PROBE=1` | Bypass the plugin probe's default-decline (required, Track A behavior). |
-| `DXR_LEIA_SR_FB_SDK=1` | Hand the caller framebuffer to the SDK (its own render pass) instead of the default plug-in-owned pass + fb=0 mode. |
-| `DXR_LEIA_SR_INPUT_PER_VIEW=1` | Feed `srWeaverSetInputTextureVulkan` per-view width/height instead of the full SBS extent (settles the sr_vk.h doc ambiguity: if the weave samples only the left half of the panel image with this OFF, per-view is the right reading — report which). |
+| `DXR_LEIA_FORCE_PROBE=1` | Bypass the plugin probe (only needed when no Leia panel is connected — a real panel now auto-binds via DRM/EDID). |
+| `DXR_LEIA_SR_FB_SDK=1` | Hand the caller framebuffer to the SDK (its own render pass) instead of the default plug-in-owned pass + fb=0 mode. Fallback only; not expected to be needed. |
 | `SR_RUNTIME_PATH` | Explicit path to `libLeiaSR_runtime.so` (overrides the baked rpath). |
+
+Formerly-open behavior questions (render-pass shape, input width semantics,
+recommended-texture-size units, windowless weaving, image layouts) were settled by
+reading the SDK source — see `docs/leia-linux-sdk-contract.md` §8.
 
 ## 5. What to report back (LeiaInc/LeiaSR#53 + displayxr-leia-plugin#81)
 
-1. Did the fb=0/pre-begun-render-pass mode weave cleanly with validation layers on?
-2. Which input width/height reading is correct (full SBS vs per-view)?
-3. `srDisplayGetRecommendedTextureSize` — per-view or full render target?
-4. Eye tracking: latency feel, `USER_FOUND/USER_LOST` cadence, whether the MANAGED
-   loss animation is visible in `srWeaverGetPredictedEyePositions` output.
-5. Anything from the reconciliation gap list that bit in practice
+1. Does it weave, and does head movement steer the sweet spot? (The remaining
+   unknowns are behavioral quality, not API mechanics.)
+2. Eye tracking: latency feel, `USER_FOUND/USER_LOST` cadence, whether the MANAGED
+   collapse (weaver auto-blits below 1 mm eye separation) looks right.
+3. Anything from the reconciliation gap list that bites in practice
    (`docs/leia-linux-sdk-contract.md` §8): no phase origin, no refresh getter,
-   teardown time on `srDestroyInstance`, layout expectations.
+   teardown time on `srDestroyInstance`.
