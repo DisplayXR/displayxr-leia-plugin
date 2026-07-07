@@ -54,6 +54,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_plugin_linux.c
     leia_display_processor_linux.c
     leia_display_processor_linux.h
+    leia_edid_probe_linux.c
+    leia_edid_probe_linux.h
     leia_sr_linux.h
     # Shared, platform-portable device implementation from the Windows arm.
     ../drv_leia/leia_device.c
