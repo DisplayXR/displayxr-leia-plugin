@@ -6,18 +6,21 @@
  *         LeiaSR Linux SDK interface contract.
  *
  * Every declaration in this header is shaped 1:1 by
- * `docs/leia-linux-sdk-contract.md` (status: PROPOSED, issue #81) and cites
- * the contract requirement (R-W* / R-T* / R-D*) it realizes. The contract may
- * still shift on ratification — expect a small realignment pass here when it
- * does.
+ * `docs/leia-linux-sdk-contract.md` (status: RECONCILED vs srSDK 1.0.0,
+ * issue #81) and cites the contract requirement (R-W* / R-T* / R-D*) it
+ * realizes. Where the real srSDK 1.0.0 prototype diverges from a contract
+ * ask, the member/function doc says so ("no srSDK 1.0.0 counterpart") — those
+ * fields stay as carried asks (contract §8 verdict table), not dead weight.
  *
  * Two implementations plug in behind this seam (selected by the CMake cache
  * var `DXR_LEIA_LINUX_WEAVER`):
  *   - `leia_sr_stub.c` (Track A, this repo today): no SR SDK — canned display
  *     info + passthrough SBS blit, so the .so builds/discovers/selftests on
  *     machines and CI with no Leia hardware or SDK.
- *   - TODO(Track B): `leia_sr_linux_sdk.c` wrapping the real LeiaSR Linux SDK
- *     the day it ships, satisfying the same signatures.
+ *   - TODO(Track B): `leia_sr_linux_sdk.c` wrapping the real srSDK
+ *     (`sr.h`/`sr_vk.h`, static-loader model), satisfying the same
+ *     signatures. Pinned to the prototype: srSDK API 1.0.0,
+ *     libLeiaSR_runtime.so BuildID fcf21021eeb277bac06fdb0e484bd4a8f31ad36b.
  *
  * Linux-desktop only — see the platform gate below.
  *
@@ -84,6 +87,12 @@ struct leiasr_lnx_create_info
 	 * Passed as opaque pointers so this header needs no Xlib/xcb includes:
 	 * `x11_window` carries the X11 `Window` XID, `x11_connection` the
 	 * `Display*` / `xcb_connection_t*` (backend's preference).
+	 *
+	 * srSDK 1.0.0: `SrWeaverCreateInfoVulkan.window` takes the XID (0 =
+	 * windowless, honored). `x11_connection` has NO srSDK counterpart (the
+	 * SDK opens its own X connection) — the sdk backend ignores it.
+	 * `graphics_queue_family` likewise has no counterpart (the command pool
+	 * implies the family); kept because the stub and future backends want it.
 	 */
 	void *x11_window;
 	void *x11_connection;
@@ -101,6 +110,11 @@ struct leiasr_lnx_create_info
  * grid fields keep >2-view panels expressible. Layout at call time is
  * VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL unless the backend documents
  * otherwise (the Track A stub manages its own transitions internally).
+ *
+ * srSDK 1.0.0: maps to `srWeaverSetInputTextureVulkan(view, w, h, format)` —
+ * single SBS view honored, but NO tile-grid parameter (2×1 only; the sdk
+ * backend falls back to a passthrough blit for any other grid) and NO y_flip
+ * toggle (ignored + logged). Both stay as carried asks (contract §8, R-W4).
  */
 struct leiasr_lnx_weave_input
 {
@@ -132,6 +146,10 @@ struct leiasr_lnx_weave_output
  * Absolute panel coordinate the lenticular interlacing pattern is computed
  * against (contract R-W7) — decoupled from the viewport so weaving into a
  * sub-rectangle keeps correct lens phase (display-zones, per-window weaving).
+ *
+ * srSDK 1.0.0: NO counterpart — the runtime#85 gap reproduced (top carried
+ * ask, contract §8). Display-scoped weaving is unaffected because the DP sets
+ * phase_origin == viewport offset today; the sdk backend logs if they diverge.
  */
 struct leiasr_lnx_phase_origin
 {
@@ -166,7 +184,7 @@ struct leiasr_lnx_display_info
 	int32_t screen_top;
 	uint32_t recommended_view_width; //!< recommended per-view render size
 	uint32_t recommended_view_height;
-	uint32_t refresh_mhz; //!< refresh rate in milli-Hz (60000 = 60 Hz)
+	uint32_t refresh_mhz; //!< refresh rate in milli-Hz (60000 = 60 Hz); srSDK 1.0.0 has NO getter — sdk backend reports 60000 (carried ask)
 	float nominal_viewer_x_m; //!< recommended viewing position, display-center meters
 	float nominal_viewer_y_m;
 	float nominal_viewer_z_m;
@@ -193,6 +211,13 @@ enum leiasr_lnx_tracking_mode
  * Create the backend: SR-service connect (R-W1, bounded by
  * `info->retry_budget_s`) + weaver creation on the compositor's Vulkan
  * objects (R-W2/R-W3).
+ *
+ * srSDK 1.0.0 note: senses/callbacks must be registered before
+ * `srInitialize` and `leiasr_lnx_query_display_info` is callable pre-create,
+ * so the sdk backend keeps ONE process-lifetime SR context (instance +
+ * tracker + monitor + display + lens); this call creates only the weaver
+ * against it. `srDestroyInstance` joins SDK threads unboundedly — another
+ * reason the context outlives DP create/destroy cycles (contract §8, R-W10).
  *
  * @return LEIASR_LNX_SUCCESS, or LEIASR_LNX_ERROR_SERVICE_UNAVAILABLE when
  *         the SR service is unreachable (distinguishable per R-W1).
@@ -226,6 +251,11 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
  * The render pass the weave renders through, so the caller can pre-build
  * compatible framebuffers (R-W5) — VK_NULL_HANDLE when the backend needs no
  * render pass (the Track A stub blits).
+ *
+ * srSDK 1.0.0 exposes no render pass; the sdk backend returns its OWN
+ * single-color-attachment pass and drives the weave through the SDK's
+ * "framebuffer = 0, render pass already begun" path, relying on Vulkan
+ * render-pass compatibility (contract §8, R-W5 — validated with layers).
  */
 VkRenderPass
 leiasr_lnx_get_render_pass(struct leiasr_lnx *lnx);
@@ -242,6 +272,7 @@ leiasr_lnx_output_invalidated(struct leiasr_lnx *lnx);
  * Prediction horizon for the internal eye-pose consumer, absolute
  * microseconds (R-W9 — the µs path is the contract; it MUST be functional,
  * unlike the Windows VK setLatencyInFrames no-op that spawned issue #71).
+ * srSDK 1.0.0: `srWeaverSetLatency(weaver, latencyUs)` — honored as asked.
  */
 void
 leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us);
@@ -259,6 +290,12 @@ leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us);
  * always return a plausible pair — never zeros (R-T2): tracked positions
  * while tracking, animated/frozen fallback otherwise.
  *
+ * srSDK 1.0.0: pair from `srWeaverGetPredictedEyePositions` (mm, the pair
+ * the weave consumes — R-T1 honored). Tracking state has NO pollable flag;
+ * the sdk backend latches `srSystemMonitor` events (USER_FOUND/USER_LOST +
+ * DEVICE_READY/DISCONNECTED) into atomics — so is_tracking flips at raw
+ * face-loss, earlier than R-T4's grace-period preference (contract §8).
+ *
  * @param[out] out_pair          Millimeters, display-center (see struct doc).
  * @param[out] out_is_tracking   Explicit tracking state (R-T3) — may be NULL.
  * @param[out] out_timestamp_ns  Sample time, monotonic ns — may be NULL.
@@ -273,7 +310,8 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 /*!
  * Select MANAGED vs MANUAL (R-T4/R-T5). @return false when the backend
  * doesn't support the requested mode (MANAGED-only backends are acceptable
- * for v1 — Windows parity).
+ * for v1 — Windows parity). srSDK 1.0.0 has no stand-down toggle, so the sdk
+ * backend is MANAGED-only (contract §8, R-T5 carried ask).
  */
 bool
 leiasr_lnx_set_eye_tracking_mode(struct leiasr_lnx *lnx, enum leiasr_lnx_tracking_mode mode);
@@ -299,6 +337,7 @@ leiasr_lnx_query_display_info(struct leiasr_lnx_display_info *out_info);
 /*!
  * Lens/backlight 2D⇄3D switch, independent of weaving (R-D2). Backs the
  * runtime's `request_display_mode` DP slot and MANAGED auto-drop (R-T4).
+ * srSDK 1.0.0: `srLensEnable/Disable` — honored as asked.
  */
 bool
 leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d);
