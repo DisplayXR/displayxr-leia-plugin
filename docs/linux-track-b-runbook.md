@@ -4,17 +4,46 @@
 (George's 22.04/NVIDIA machine today). **Goal:** see the *real* interlaced weave from the
 srSDK Vulkan weaver instead of the Track A passthrough SBS blit, and report friction.
 
-**Pin:** this spike is built against `leiasr-prototype-sdk.zip` (2026-07-06) — srSDK API
-**1.0.0**, `libLeiaSR_runtime.so` BuildID `fcf21021eeb277bac06fdb0e484bd4a8f31ad36b`.
-A different SDK drop may work (the loader ABI is append-only) but is unpinned territory.
-Do NOT commit the SDK anywhere — it is commercial-licensed.
+**Status (2026-07-08):** the real weave is **validated end-to-end on an Acer SpatialLabs
+DS1** (George, 22.04/RTX 3080, displayxr-leia-plugin#81) — the srSDK Vulkan weaver engages
+behind the seam (`backend: weaver`, not stub) and the DS1's lenticular lens physically
+switches to 3D (`system event 14: Lens has been enabled`). The core integration question is
+answered YES. Two open items remain: eye-tracking isn't running (Blink SDK not wired) and one
+display-geometry getter fails on Linux — see §0 and §5.
+
+**Pin:** build against a freshly-built **LeiaSR ST-5525** SDK install (SR Service ≥ 1.37.0,
+srSDK API **1.0.0**), matching the running SR runtime. **The old `leiasr-prototype-sdk.zip`
+(2026-07-06) is now stale** — it predates `SR_WEAVER_BACKEND_VULKAN_BIT`, so the plug-in no
+longer compiles against it (`SR_WEAVER_BACKEND_VULKAN_BIT undeclared`) as of #92. A different
+SDK drop may work (the loader ABI is append-only) but is unpinned territory. Do NOT commit the
+SDK anywhere — it is commercial-licensed.
+
+## 0. SR runtime prerequisites (the box, not the plug-in)
+
+The plug-in binds to an already-running SR runtime/service; three SRService build-time
+settings gate whether the lens actually turns on and whether tracking runs (learned on the
+2026-07-08 DS1 run):
+
+- **Real FPC keys are required.** A default SRService build compiles dummy zero-keys
+  (`FPC_AUTHENTICATION_PATH` unset → `mutualAuthenticateFPC = false`) and the lens stays off.
+  Build with `FPC_AUTHENTICATION_PATH=<keys>` for real auth (calibration cached, lens
+  available). Do **not** reach for the `DISABLE_FPC_AUTHENTICATION` bypass — it wasn't needed.
+- **Leave `LEIASR_FPC_PORT` unset.** Auto-detect follows the FPC's `bootApplication`
+  re-enumeration; pinning the port breaks the reconnect after the firmware re-enumerates.
+- **Eye tracking needs the Blink SDK wired.** A default `build.py … generate eyetracker`
+  links Blink but doesn't wire `BLINK_SDK_DIR`→`Blink_DIR` / `Detector_UseFaceLockBlinkSDK`
+  / license+models, so `SREyeTracker` dies at `BlinkEye contextFaceTracker creation failed`
+  and the weave runs at a **fixed default eye position** (no `USER_FOUND/LOST`, no steering).
+  A Blink-configured eyetracker rebuild (possibly `BLINK_UN`/`BLINK_PW`) is needed for the
+  head-steering test.
 
 ## 1. Build
 
 ```bash
-# Unpack the SDK anywhere (never into the repo):
-unzip leiasr-prototype-sdk.zip -d ~/sdk
-export SRSDK_ROOT=~/sdk/leiasr-prototype-sdk
+# Point SRSDK_ROOT at a freshly-built ST-5525 SDK install (dir containing lib/cmake/srSDK/) —
+# NOT the stale prototype zip, which predates SR_WEAVER_BACKEND_VULKAN_BIT and won't compile
+# against #92. Never unpack into the repo (commercial-licensed):
+export SRSDK_ROOT=~/sdk/leiasr-st5525-install
 
 # Sibling runtime checkout (>= v1.28.0), as for the Track A build:
 git clone https://github.com/DisplayXR/displayxr-runtime ../displayxr-runtime
@@ -104,3 +133,20 @@ path Leia's Unity plugin uses; input dims = per-view) — see
 3. Anything from the reconciliation gap list that bites in practice
    (`docs/leia-linux-sdk-contract.md` §8): no phase origin, no refresh getter,
    teardown time on `srDestroyInstance`.
+
+### Results so far (2026-07-08 DS1 run — displayxr-leia-plugin#81)
+
+1. **Weaves: YES** — lens enables on the DS1, `backend: weaver`, weaver comes up
+   display-scoped/windowless (`window=0x0`). **Head-steering: NOT yet** — the eye tracker
+   isn't running (Blink SDK not wired; see §0), so the weave is at a fixed default eye
+   position. This is the main open item.
+2. **Display-geometry gap (contract §8 R-D1):** headless `selftest` fails `display_info`
+   /`display_dims` — one of `srDisplayGet{PhysicalSize,PhysicalResolution,Location,
+   RecommendedTextureSize,DefaultViewingPosition}` returns `SR_FAILED` on Linux (the default
+   display object isn't backed by real geometry; plausibly tied to DisplayManager/eyetracker
+   not being up). Does **not** block the weave — legacy `cube_handle_vk_linux` doesn't enable
+   `XR_EXT_display_info` and the weaver runs display-scoped. Next debug step: per-getter
+   logging in `sr_ctx_refresh_display_info_locked` to name which getter fails.
+3. **Teardown clean** — no `srDestroyInstance` crash. NB: the srSDK loader pulls glog, which
+   installs a `FailureSignalHandler`, so a plain SIGTERM to the host app prints a benign glog
+   stack trace — don't misread it as a weaver crash.
