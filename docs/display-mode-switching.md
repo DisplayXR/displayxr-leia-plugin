@@ -1,8 +1,8 @@
 # Leia SR — Display Mode Switching (2D/3D)
 
-How the Leia plug-in implements the neutral `xrRequestDisplayRenderingModeEXT` /
-`xrRequestDisplayModeEXT` contract from
-[`XR_EXT_display_info`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_EXT_display_info.md). The extension spec stays
+How the Leia plug-in implements the neutral `xrRequestDisplayRenderingModeDXR` /
+`xrRequestDisplayModeDXR` contract from
+[`XR_DXR_display_info`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_DXR_display_info.md). The extension spec stays
 vendor-neutral: the runtime translates a mode request into the display processor's `set_property`
 call, and the vendor SDK implements it as either a preference-based request (aggregated across
 applications) or direct hardware control. This page documents the concrete Leia mechanism.
@@ -28,7 +28,7 @@ else. The DP's atlas processing — weave vs flat-blit, and the mono eye-positio
 follows the **per-frame atlas grid** the runtime hands to `process_atlas`
 (`tile_columns × tile_rows > 1` ⇒ weave, `1×1` ⇒ flat blit), tracked as `ldp->view_count`.
 
-The two channels are deliberately independent: the repurposed `xrRequestDisplayModeEXT`
+The two channels are deliberately independent: the repurposed `xrRequestDisplayModeDXR`
 (spec v15) overrides the hardware state for the current mode without changing it, so a
 hardware-2D override over an active 3D mode keeps the weave running with the lens off — the
 panel shows the woven atlas flat, and an app fading its parallax to zero converges back to a

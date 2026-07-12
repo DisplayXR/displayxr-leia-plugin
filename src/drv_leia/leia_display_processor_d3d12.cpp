@@ -312,7 +312,7 @@ struct leia_display_processor_d3d12_impl
 	//! @}
 
 	//! @name #224 / ADR-027 local 2D/3D zones — 1×1 leg (D3D12 port of D3D11)
-	//! The runtime publishes the XR_EXT_local_3d_zone wish mask per frame; on this
+	//! The runtime publishes the XR_DXR_local_3d_zone wish mask per frame; on this
 	//! single-zone panel the OR-collapse is "any non-zero mask pixel ⟹ this client
 	//! hints 3D", driven onto the per-client SR lens hint
 	//! (leiasr_d3d12_request_display_mode). Content is evaluated once per mask
@@ -2095,7 +2095,7 @@ leia_dp_d3d12_request_display_mode(struct xrt_display_processor_d3d12 *xdp, bool
 	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
 	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
 	// tracks the per-frame atlas grid in process_atlas, so a hardware
-	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// override (xrRequestDisplayModeDXR) leaves the weave running and the
 	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 	return leiasr_d3d12_request_display_mode(ldp->leiasr, enable_3d);

@@ -2,7 +2,7 @@
 
 Vendor-specific behavior of the Leia SR weaver around window positioning on Windows. This is
 **one vendor's optional optimization** of the neutral phase-alignment problem described in
-[`XR_EXT_win32_window_binding` §2.4](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_EXT_win32_window_binding.md#24-the-phase-alignment-problem)
+[`XR_DXR_win32_window_binding` §2.4](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_DXR_win32_window_binding.md#24-the-phase-alignment-problem)
 — other vendor display processors may handle it differently or not at all.
 
 ## The problem (recap)

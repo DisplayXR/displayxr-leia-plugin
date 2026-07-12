@@ -39,7 +39,7 @@ env:
   # DXR_RUNTIME_GIT_TAG_LINUX default (rule-5 self-check below, same policy
   # as build-windows.yml's RUNTIME_REF check) — v1.28.0 is the first runtime
   # tag with complete Linux support (#708/#709).
-  RUNTIME_REF: v1.28.0
+  RUNTIME_REF: 7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6
 
 jobs:
   Build:

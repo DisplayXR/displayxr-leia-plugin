@@ -82,10 +82,10 @@ To get transparency on D3D11 / D3D12 / Vulkan apps with a Leia 3D display:
 
 1. **Window style.** Standard top-level window with `WS_EX_NOREDIRECTIONBITMAP`, null background brush. (DComp owns the redirection bitmap; a non-null brush would paint over the composition swap chain.)
 2. **Clear to `RGBA(0,0,0,0)`** in the app's render target. The compose pass turns the cleared regions into the captured desktop.
-3. **Opt-in via `XR_EXT_win32_window_binding`:**
+3. **Opt-in via `XR_DXR_win32_window_binding`:**
    ```c
-   XrWin32WindowBindingCreateInfoEXT bind = {
-       .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT,
+   XrWin32WindowBindingCreateInfoDXR bind = {
+       .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR,
        .windowHandle = hwnd,
        .transparentBackgroundEnabled = XR_TRUE,
        .chromaKeyColor = 0,   // 0 = DP picks default (used only on fallback)
@@ -129,7 +129,7 @@ Leia D3D11 DP: transparency = chroma-key (key=0x00ff00ff — DP default)
 
 ## References
 
-- `XR_EXT_win32_window_binding` spec_version 5 — [`src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h) (runtime repo; auto-synced to [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions))
+- `XR_DXR_win32_window_binding` spec_version 5 — [`src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h) (runtime repo; auto-synced to [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions))
 - [`chroma-key-transparent-overlay.md`](chroma-key-overlay.md) — the legacy fallback path, kept as reference for the GL DP and as historical context.
 - [Windows Graphics Capture (WGC)](https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/screen-capture)
 - [`VK_KHR_external_memory_win32`](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_external_memory_win32.html)

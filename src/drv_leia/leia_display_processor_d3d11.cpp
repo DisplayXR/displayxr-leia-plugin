@@ -286,7 +286,7 @@ struct leia_display_processor_d3d11_impl
 	enum xrt_atlas_encoding atlas_encoding;
 
 	//! @name #224 local 2D/3D zones — 1×1 leg
-	//! The runtime publishes the XR_EXT_local_3d_zone mask per frame; on this
+	//! The runtime publishes the XR_DXR_local_3d_zone mask per frame; on this
 	//! single-zone panel the OR-collapse is "mask has any non-zero pixel ⟹
 	//! this client hints 3D", mapped onto the per-client SR lens hint
 	//! (leiasr_d3d11_request_display_mode — the SR service arbitrates hints
@@ -1476,7 +1476,7 @@ leia_dp_d3d11_request_display_mode(struct xrt_display_processor_d3d11 *xdp, bool
 	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
 	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
 	// tracks the per-frame atlas grid in process_atlas, so a hardware
-	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// override (xrRequestDisplayModeDXR) leaves the weave running and the
 	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	return leiasr_d3d11_request_display_mode(ldp->leiasr, enable_3d);
@@ -1588,7 +1588,7 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 			td.Height = mask_height;
 			td.MipLevels = 1;
 			td.ArraySize = 1;
-			td.Format = DXGI_FORMAT_R8_UNORM; // the XR_EXT_local_3d_zone mask format
+			td.Format = DXGI_FORMAT_R8_UNORM; // the XR_DXR_local_3d_zone mask format
 			td.SampleDesc.Count = 1;
 			td.Usage = D3D11_USAGE_STAGING;
 			td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;

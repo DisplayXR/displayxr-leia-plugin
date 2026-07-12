@@ -1186,7 +1186,7 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	    cnsdk->interlacer, (int32_t)atlas_width, (int32_t)atlas_height,
 	    /*isHorizontalViews=*/true);
 
-	// XR_EXT_display_zones (#568): confine the interlace to the canvas sub-rect
+	// XR_DXR_display_zones (#568): confine the interlace to the canvas sub-rect
 	// (e.g. the avatar's bottom-75% band). CNSDK splits placement and phase into
 	// TWO decoupled knobs:
 	//   * set_viewport(posX,posY,w,h)         — where the output lands in the

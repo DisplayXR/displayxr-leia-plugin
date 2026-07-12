@@ -106,14 +106,14 @@ else()
     # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
     # The rule-5 CI self-check below asserts this value equals the workflow's
     # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v1.24.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     # Linux carries its own pin: the Windows/Android tag predates runtime
     # Linux support entirely (scripts/build_linux.sh first shipped in
     # v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
     # in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
     # equals its RUNTIME_REF so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG_LINUX "v1.28.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG_LINUX "7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6" CACHE STRING
         "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
     if(DXR_LINUX_DESKTOP)
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_LINUX}")

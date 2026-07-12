@@ -690,7 +690,7 @@ alpha_gate_ensure_pipeline(leia_dp_cnsdk *impl, VkFormat target_format)
 	}
 
 	// Pipeline layout: 32-byte push constant (uvec2 tile_count + uint has_backdrop
-	// + uint mode + vec4 canvas — the canvas sub-rect for XR_EXT_display_zones, #568).
+	// + uint mode + vec4 canvas — the canvas sub-rect for XR_DXR_display_zones, #568).
 	{
 		VkPushConstantRange pc = {};
 		pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1176,7 +1176,7 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = 0u;            // no Local2D under-layer on Android yet (#491)
 	push.mode = alpha_gate_mode();     // #568: 1=woven view-select (de-occlusion fix), 0=legacy
-	// XR_EXT_display_zones (#568): the canvas sub-rect the weave occupies, in
+	// XR_DXR_display_zones (#568): the canvas sub-rect the weave occupies, in
 	// normalized target coords. A zero/empty rect means the content fills the
 	// target → (0,0,1,1), the identity that reproduces the pre-zone behavior.
 	if (canvas_width > 0u && canvas_height > 0u && w > 0u && h > 0u) {
@@ -1249,7 +1249,7 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	(void)view_format;
 	(void)target_fb;      // self-submit: compositor has no CNSDK-compatible FB; we build our own
 
-	// XR_EXT_display_zones (#568): a zone layer confines the woven output to a
+	// XR_DXR_display_zones (#568): a zone layer confines the woven output to a
 	// canvas sub-rect (e.g. the avatar's bottom-75% tiger band). A zero/empty
 	// rect means "fill the target" — collapse it to the full target so the weave
 	// viewport + alpha-gate canvas are uniform downstream.

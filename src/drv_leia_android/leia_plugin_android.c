@@ -277,7 +277,7 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	// injection (docs/specs/vendor/eye-tracking-modes.md). CNSDK can do both on
 	// Android: MANAGED = NoFaceMode on (vendor runs grace + auto-2D + comfort
 	// animation); MANUAL = NoFaceMode off + immediate isTracking (the app drives
-	// 2D⇄3D via xrRequestDisplayRenderingModeEXT). Advertise both; default MANAGED.
+	// 2D⇄3D via xrRequestDisplayRenderingModeDXR). Advertise both; default MANAGED.
 	out_info->supported_eye_tracking_modes = 3u; // MANAGED_BIT | MANUAL_BIT
 	out_info->default_eye_tracking_mode = 0u;    // MANAGED
 

@@ -128,7 +128,7 @@ Runtime contract this must satisfy: `docs/specs/vendor/eye-tracking-modes.md` in
 
 **R-T2 — Never zeros.** The pose read MUST always return a plausible pair: real tracked positions while tracking, the SDK's animated/collapsed positions during a MANAGED grace period, and frozen last-known (or nominal) after loss. All-zero output is a contract violation (the runtime treats positions as always-valid).
 
-**R-T3 — Explicit tracking state.** The SDK MUST expose tracking state explicitly — a poll (`bool is_tracking` + timestamp) or a state-change callback. The Windows plug-in currently *infers* loss from the eye pair collapsing below ~1 mm separation (the SDK animates the pair to a single point when dropping to 2D); that heuristic is the anti-pattern this requirement retires. The state feeds `XrEventDataEyeTrackingStateChangedEXT` to apps.
+**R-T3 — Explicit tracking state.** The SDK MUST expose tracking state explicitly — a poll (`bool is_tracking` + timestamp) or a state-change callback. The Windows plug-in currently *infers* loss from the eye pair collapsing below ~1 mm separation (the SDK animates the pair to a single point when dropping to 2D); that heuristic is the anti-pattern this requirement retires. The state feeds `XrEventDataEyeTrackingStateChangedDXR` to apps.
 
 **R-T4 — MANAGED mode (required).** In MANAGED mode the SDK owns the loss lifecycle: grace period (~0.5–2 s), animated collapse toward nominal, automatic 3D→2D hardware drop, revival animation on reacquisition. `is_tracking` SHOULD stay `true` through the grace period and flip `false` at the actual 2D switch. This is the Windows SR behavior today and the plug-in's advertised default.
 
