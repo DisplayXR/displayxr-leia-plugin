@@ -95,10 +95,10 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v1.24.0 — the tag that ships the appended
-    # D3D11 DP `snap_window_rect` slot 18 (#625 window-drag phase lock,
-    # ADR-020 append-only, no major bump). This plug-in implements that slot
-    # (the probe-window SnapToPhase), so it needs headers that declare it.
+    # Pinned to displayxr-runtime v2.0.0 (a8f6e74f) — the release that ships
+    # the XR_EXT_* → XR_DXR_* extension rename (#734), which this plug-in's
+    # own rename commit builds against. Replaces the TEMPORARY pre-squash
+    # rename-branch pin (its displayxr_mcp branch SHA is no longer fetchable).
     # The DP vtables carry a struct_size header; the runtime's loader rejects
     # any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
     # This plug-in MUST be built against headers that ship the matching major,
@@ -106,14 +106,14 @@ else()
     # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
     # The rule-5 CI self-check below asserts this value equals the workflow's
     # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "a8f6e74fdfbd26d54bcce859ca5f60bb66963828" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     # Linux carries its own pin: the Windows/Android tag predates runtime
     # Linux support entirely (scripts/build_linux.sh first shipped in
     # v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
     # in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
     # equals its RUNTIME_REF so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG_LINUX "7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG_LINUX "a8f6e74fdfbd26d54bcce859ca5f60bb66963828" CACHE STRING
         "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
     if(DXR_LINUX_DESKTOP)
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_LINUX}")

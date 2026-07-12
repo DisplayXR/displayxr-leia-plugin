@@ -53,10 +53,9 @@ jobs:
       # equals this value so the FetchContent pin and the workflow checkout
       # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
       # regression originally).
-      # #625: runtime v1.24.0 ships the appended snap_window_rect DP vtable
-      # slot 18 (xrWeaveSnapWindowRectDXR window-drag phase lock; ADR-020
-      # append-only — no major bump).
-      RUNTIME_REF: 7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6
+      # #734: runtime v2.0.0 (a8f6e74f) ships the XR_EXT_* → XR_DXR_*
+      # extension rename this plug-in's headers now use (ABI unchanged, v4).
+      RUNTIME_REF: a8f6e74fdfbd26d54bcce859ca5f60bb66963828
     steps:
       - name: Checkout
         uses: actions/checkout@v4
