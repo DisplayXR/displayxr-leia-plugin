@@ -55,7 +55,7 @@ jobs:
       # regression originally).
       # #734: runtime v2.0.0 (a8f6e74f) ships the XR_EXT_* → XR_DXR_*
       # extension rename this plug-in's headers now use (ABI unchanged, v4).
-      RUNTIME_REF: a8f6e74fdfbd26d54bcce859ca5f60bb66963828
+      RUNTIME_REF: v2.0.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
