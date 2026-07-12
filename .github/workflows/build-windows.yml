@@ -54,9 +54,9 @@ jobs:
       # can't drift apart (which is what spawned the v1.4.1↔v1.5.2 weave
       # regression originally).
       # #625: runtime v1.24.0 ships the appended snap_window_rect DP vtable
-      # slot 18 (xrWeaveSnapWindowRectEXT window-drag phase lock; ADR-020
+      # slot 18 (xrWeaveSnapWindowRectDXR window-drag phase lock; ADR-020
       # append-only — no major bump).
-      RUNTIME_REF: v1.24.0
+      RUNTIME_REF: 7bd2dccc8bf4d6446e2402a3a7c75718ec7e22f6
     steps:
       - name: Checkout
         uses: actions/checkout@v4

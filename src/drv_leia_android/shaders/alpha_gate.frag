@@ -15,7 +15,7 @@
 // (debug.dxr.alphagate).
 //
 // Screen UV equals tile-local UV when the woven content fills the target
-// (canvas == (0,0,1,1)). With XR_EXT_display_zones (#568) the content may
+// (canvas == (0,0,1,1)). With XR_DXR_display_zones (#568) the content may
 // instead occupy a canvas sub-rect (e.g. the avatar's bottom-75% tiger band);
 // the band-local remap below handles both cases (identity when canvas fills).
 
@@ -33,7 +33,7 @@ layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // always 0 on Android
 	uint  mode;           // 0 = legacy all-or-nothing, 1 = woven view-select (#568 de-occlusion fix)
-	// XR_EXT_display_zones (#568): the woven content occupies only this canvas
+	// XR_DXR_display_zones (#568): the woven content occupies only this canvas
 	// sub-rect of the target (normalized: xy = offset, zw = extent). For a
 	// full-canvas avatar this is (0,0,1,1) and every branch below is identity.
 	// For a zone (the bottom-75% tiger band) the gate runs over the WHOLE target

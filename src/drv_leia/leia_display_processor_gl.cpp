@@ -1529,7 +1529,7 @@ leia_dp_gl_request_display_mode(struct xrt_display_processor_gl *xdp, bool enabl
 	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
 	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
 	// tracks the per-frame atlas grid in process_atlas, so a hardware
-	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// override (xrRequestDisplayModeDXR) leaves the weave running and the
 	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 	return leiasr_gl_request_display_mode(ldp->leiasr, enable_3d);

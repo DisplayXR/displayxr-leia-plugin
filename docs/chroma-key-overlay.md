@@ -8,7 +8,7 @@ This is the design that shipped via #191. It supersedes an earlier `WS_EX_LAYERE
 
 ## What the runtime does
 
-When an app sets `XrWin32WindowBindingCreateInfoEXT::transparentBackgroundEnabled = XR_TRUE` (spec_version 5), the D3D11 / D3D12 native compositor switches the bound HWND's presentation path:
+When an app sets `XrWin32WindowBindingCreateInfoDXR::transparentBackgroundEnabled = XR_TRUE` (spec_version 5), the D3D11 / D3D12 native compositor switches the bound HWND's presentation path:
 
 1. **Composition swapchain.** `CreateSwapChainForComposition` with `DXGI_FORMAT_R8G8B8A8_UNORM` and `DXGI_ALPHA_MODE_PREMULTIPLIED` (instead of the default opaque `CreateSwapChainForHwnd` + `ALPHA_MODE_IGNORE` from #163).
 2. **DirectComposition binding.** `IDCompositionDevice` → `IDCompositionTarget` on the HWND → `IDCompositionVisual::SetContent(swapchain)`. DComp owns the redirection; the HWND itself is just the target geometry.
@@ -34,7 +34,7 @@ When the display processor preserves alpha — the long-term goal tracked as a L
 ## API surface
 
 ```c
-typedef struct XrWin32WindowBindingCreateInfoEXT {
+typedef struct XrWin32WindowBindingCreateInfoDXR {
     XrStructureType             type;
     const void* XR_MAY_ALIAS    next;
     void*                       windowHandle;          // HWND
@@ -43,7 +43,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     void*                       sharedTextureHandle;
     XrBool32                    transparentBackgroundEnabled;  // (spec_v4) opt in
     uint32_t                    chromaKeyColor;                // (spec_v5) 0x00BBGGRR; 0 disables post-weave pass
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 ```
 
 `chromaKeyColor` is a Win32 `COLORREF` (`0x00BBGGRR`). The default-suggested value is `0x00FF00FF` (magenta). Apps must clear both eye views to the same color in regions that should be transparent — `L == R` ensures the weaver passes the color through unchanged. `chromaKeyColor = 0` disables the post-weave pass and is intended for forward compatibility with alpha-respecting display processors.
@@ -56,8 +56,8 @@ The flag is honored only when `windowHandle != NULL` and the session is standalo
 2. Request the runtime's transparent path at session create:
 
    ```c
-   XrWin32WindowBindingCreateInfoEXT bind = {
-       .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT,
+   XrWin32WindowBindingCreateInfoDXR bind = {
+       .type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR,
        .windowHandle = hwnd,
        .transparentBackgroundEnabled = XR_TRUE,
        .chromaKeyColor = 0x00FF00FF,
@@ -118,7 +118,7 @@ If you see the first line but not the second, `chromaKeyColor` was zero — the 
 
 ## References
 
-- `XR_EXT_win32_window_binding` spec_version 5 — [`src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h) (runtime repo; auto-synced to [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions))
+- `XR_DXR_win32_window_binding` spec_version 5 — [`src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/external/openxr_includes/openxr/XR_DXR_win32_window_binding.h) (runtime repo; auto-synced to [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions))
 - Issue #191 — root-cause investigation and the runtime fix
 - Issue #163 — context for the default opaque present
 - Issue #190 — vendor request for an alpha-respecting weaver mode (long-term replacement for the post-weave pass)

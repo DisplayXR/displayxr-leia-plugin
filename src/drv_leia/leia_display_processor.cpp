@@ -495,7 +495,7 @@ ck_get_strip_fb(struct leia_display_processor *ldp,
 
 	if (ldp->ck_strip_fbs_count >= kMaxStripFramebuffers) {
 		// LRU eviction. This recurs when the present target is recreated as a
-		// content-fit zone (P6 XR_EXT_display_zones, e.g. the avatar tracking
+		// content-fit zone (P6 XR_DXR_display_zones, e.g. the avatar tracking
 		// its silhouette) renegotiates size every few frames: each fresh present
 		// image adds an entry keyed by image, so the bounded cache cycles. The
 		// eviction is correct and harmless — only the per-occurrence WARN is
@@ -1656,7 +1656,7 @@ leia_dp_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
 	// runtime#542: HARDWARE only — drive the SR lens hint and nothing else.
 	// Atlas processing (weave vs flat blit) follows the CONTENT: view_count
 	// tracks the per-frame atlas grid in process_atlas, so a hardware
-	// override (xrRequestDisplayModeEXT) leaves the weave running and the
+	// override (xrRequestDisplayModeDXR) leaves the weave running and the
 	// panel shows the woven atlas flat — the app-authored transition state.
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	return leiasr_request_display_mode(ldp->leiasr, enable_3d);

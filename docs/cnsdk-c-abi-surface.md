@@ -101,8 +101,8 @@ Returns a heap-allocated config that **must be released** via
 | Field | Type | Units | Used for |
 |---|---|---|---|
 | `cameraCenterX/Y/Z` | float | mm (camera frame) | Face position translation to display-relative meters |
-| `displaySizeInMm[2]` | int | mm | XR_EXT_display_info physical dimensions |
-| `panelResolution[2]` | int | px | XR_EXT_display_info pixel dimensions |
+| `displaySizeInMm[2]` | int | mm | XR_DXR_display_info physical dimensions |
+| `panelResolution[2]` | int | px | XR_DXR_display_info pixel dimensions |
 
 Thread safety undocumented. Serialized to the worker thread.
 

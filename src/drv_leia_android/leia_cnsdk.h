@@ -238,7 +238,7 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
  * @param vp_w          Weave viewport width  (0 → full target = w).
  * @param vp_h          Weave viewport height (0 → full target = h).
  *
- * The viewport params (XR_EXT_display_zones, #568) confine the interlace to a
+ * The viewport params (XR_DXR_display_zones, #568) confine the interlace to a
  * sub-rect of the target — the CNSDK weaver folds vpX/vpY into its phase math
  * so the lenticular alignment stays correct for an offset band. Pass 0,0,0,0
  * to fill the whole target (the pre-zone behavior).

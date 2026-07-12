@@ -83,7 +83,7 @@ done in the natural orientation space"*). The runtime rotates everything else to
 ## 3. Sub-rect / display-zone weaving (the two-knob model)
 
 When 3D content is confined to a **canvas sub-rect** (e.g. the avatar's bottom-75% band via
-`XR_EXT_display_zones`), you are weaving into part of the panel. CNSDK exposes **two decoupled
+`XR_DXR_display_zones`), you are weaving into part of the panel. CNSDK exposes **two decoupled
 knobs**, and you must set **both**:
 
 | API | Feeds | Effect |

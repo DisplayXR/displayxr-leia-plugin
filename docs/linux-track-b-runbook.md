@@ -145,7 +145,7 @@ path Leia's Unity plugin uses; input dims = per-view) — see
    RecommendedTextureSize,DefaultViewingPosition}` returns `SR_FAILED` on Linux (the default
    display object isn't backed by real geometry; plausibly tied to DisplayManager/eyetracker
    not being up). Does **not** block the weave — legacy `cube_handle_vk_linux` doesn't enable
-   `XR_EXT_display_info` and the weaver runs display-scoped. Next debug step: per-getter
+   `XR_DXR_display_info` and the weaver runs display-scoped. Next debug step: per-getter
    logging in `sr_ctx_refresh_display_info_locked` to name which getter fails.
 3. **Teardown clean** — no `srDestroyInstance` crash. NB: the srSDK loader pulls glog, which
    installs a `FailureSignalHandler`, so a plain SIGTERM to the host app prints a benign glog
