@@ -1675,11 +1675,51 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		                               view_width, view_height, format);
 	}
 
-	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect. leiasr_d3d12_weave
-	// applies them via RSSetViewports/RSSetScissorRects on the cmd list —
-	// the weaver's setViewport/setScissorRect alone do NOT scope the draw.
-	// See gotcha at leiasr_d3d12_weave().
-	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
+	// #740: correct the interlace phase when the SR weaver anchors
+	// window_WeavingX to a window other than the one the content is displayed
+	// under. In texture/shared-texture mode the SR SDK resolves its weaving
+	// window from the app's top-level window (GA_ROOT / the device's DXGI-
+	// associated window). When the weave HWND is a WS_CHILD embedded in a
+	// FOREIGN container — e.g. a Unity editor docked Game-view pane inside the
+	// editor container — that top-level container sits offset from the pane the
+	// content occupies, so the phase (window_WeavingX + vpX) is off by that
+	// horizontal delta. Add the pane-vs-container client-origin X delta to the
+	// PHASE only (the RENDER position stays at vp_x/vp_y).
+	//
+	// X only: the interlace reference is horizontal. A pane-vs-container Y
+	// delta (menu/toolbar band) does not shift the interlace, and applying it
+	// re-introduces a residual (HW-verified: maximized is correct at vpY=0).
+	//
+	// Strict no-op unless the bound HWND is a WS_CHILD embedded in a foreign
+	// top-level. Own-top-level windows — native handle/cube apps, and undocked/
+	// floating Game views (bound in present mode) — have GA_ROOT == self →
+	// delta 0, and the SR weaving window already IS the content window.
+	int32_t phase_off_x = 0, phase_off_y = 0;
+	if (ldp->hwnd != nullptr) {
+		const LONG style = GetWindowLong(ldp->hwnd, GWL_STYLE);
+		HWND root = GetAncestor(ldp->hwnd, GA_ROOT);
+		if ((style & WS_CHILD) != 0 && root != nullptr && root != ldp->hwnd) {
+			POINT pane = {0, 0}, cont = {0, 0};
+			if (ClientToScreen(ldp->hwnd, &pane) && ClientToScreen(root, &cont)) {
+				phase_off_x = pane.x - cont.x; // X only (#740)
+				static bool s_have_last = false;
+				static int32_t s_last_x = 0;
+				if (!s_have_last || phase_off_x != s_last_x) {
+					s_have_last = true;
+					s_last_x = phase_off_x;
+					U_LOG_W("#740 weave phase: WS_CHILD pane offset x=%d corrected "
+					        "(hwnd=%p root=%p)",
+					        phase_off_x, (void *)ldp->hwnd, (void *)root);
+				}
+			}
+		}
+	}
+
+	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect (RENDER position, applied
+	// via RSSetViewports/RSSetScissorRects); phase_off_x/y shift the weaver's
+	// PHASE viewport only. See gotcha + #740 note at leiasr_d3d12_weave().
+	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h,
+	                   phase_off_x, phase_off_y);
 
 	// Post-weave transparency pass:
 	//   - compose path: alpha-gate samples the ORIGINAL atlas (not the
