@@ -30,22 +30,6 @@
 #include <cstring>
 
 
-// #740 A/B lever ONLY: LEIA_WEAVE_PHASE_OFF_LEGACY=1 restores the v2.0.1
-// pane-vs-container phase correction, which measurement showed to be spurious
-// (see the long note at the weave call site). Default off — the SR weaver
-// phases from the bound HWND, so no correction is warranted. Remove once the
-// removal is eye-confirmed on hardware.
-static bool
-leia_weave_phase_off_legacy(void)
-{
-	static int cached = -1;
-	if (cached < 0) {
-		const char *v = std::getenv("LEIA_WEAVE_PHASE_OFF_LEGACY");
-		cached = (v != nullptr && v[0] != '\0' && v[0] != '0') ? 1 : 0;
-	}
-	return cached != 0;
-}
-
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
 static const char *blit_vs_source = R"(
 struct VS_OUTPUT {
@@ -1733,30 +1717,7 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	// maximized one (a different offset) looked correct.
 	//
 	// Deliberately NOT a calibration: no pitch, slant, or panel constant enters
-	// here, so this holds on any panel. LEIA_WEAVE_PHASE_OFF_LEGACY=1 restores
-	// the v2.0.1 behaviour for A/B only.
-	int32_t phase_off_x = 0, phase_off_y = 0;
-	if (leia_weave_phase_off_legacy() && ldp->hwnd != nullptr) {
-		const LONG style = GetWindowLong(ldp->hwnd, GWL_STYLE);
-		HWND root = GetAncestor(ldp->hwnd, GA_ROOT);
-		if ((style & WS_CHILD) != 0 && root != nullptr && root != ldp->hwnd) {
-			POINT pane = {0, 0}, cont = {0, 0};
-			if (ClientToScreen(ldp->hwnd, &pane) && ClientToScreen(root, &cont)) {
-				// X-only here only to reproduce v2.0.1 byte-for-byte for the
-				// A/B; the X/Y split was never principled (see above).
-				phase_off_x = pane.x - cont.x;
-				static bool s_have_last = false;
-				static int32_t s_last_x = 0;
-				if (!s_have_last || phase_off_x != s_last_x) {
-					s_have_last = true;
-					s_last_x = phase_off_x;
-					U_LOG_W("#740 weave phase: LEGACY correction ACTIVE — WS_CHILD pane "
-					        "offset x=%d applied (hwnd=%p root=%p)",
-					        phase_off_x, (void *)ldp->hwnd, (void *)root);
-				}
-			}
-		}
-	}
+	// here, so this holds on any panel.
 
 	// #740 diagnostic: dump the rect the DP actually reads for the bound HWND at
 	// weave time, so it can be diffed against the app's declared geometry. Two
@@ -1824,11 +1785,10 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		}
 	}
 
-	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect (RENDER position, applied
-	// via RSSetViewports/RSSetScissorRects); phase_off_x/y shift the weaver's
-	// PHASE viewport only. See gotcha + #740 note at leiasr_d3d12_weave().
-	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h,
-	                   phase_off_x, phase_off_y);
+	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect, which feeds both the RENDER
+	// position and the weaver's phase term — they coincide because the offset is
+	// window-global. See the gotcha + #740 note at leiasr_d3d12_weave().
+	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
 
 	// Post-weave transparency pass:
 	//   - compose path: alpha-gate samples the ORIGINAL atlas (not the

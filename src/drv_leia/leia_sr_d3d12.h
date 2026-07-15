@@ -100,14 +100,20 @@ leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
  *   xOffset = window_WeavingX + viewport_x
  *   yOffset = window_WeavingY + viewport_y
  *
- * #740: phase_off_x/y decouple the interlace PHASE from the RENDER position.
- * The RENDER (RSSetViewports/scissor on the cmd list) stays at viewport_x/y —
- * where the woven pixels actually land in the target — while the weaver's own
- * setViewport (which feeds ONLY the phase term above) is shifted by the extra
- * phase offset. This corrects the case where the SR SDK anchors window_Weaving
- * to a window other than the one the content is displayed under (e.g. a Unity
- * editor container ~576px left of a docked Game-view pane). Pass 0/0 for the
- * common case where the weaving window IS the content window (no-op).
+ * #740: viewport_x/y are WINDOW-GLOBAL and in practice always (0,0). This DP
+ * weaves ONCE per frame over the whole bound window, so the only offset the
+ * term can carry is the content's origin within that window — which a
+ * full-window weave anchored at that window's client origin puts at (0,0) by
+ * construction. Zone rects position content in the composited atlas and drive
+ * the wish mask; they never enter the weave geometry (ADR-027).
+ *
+ * There is deliberately NO phase-only offset parameter. v2.0.1 added one (#95)
+ * to add back a WS_CHILD pane's offset within a foreign container, on the
+ * premise that SR anchors window_WeavingX to the app's top-level container.
+ * That premise is refuted — SR phases from the HWND handed to
+ * CreateDX12Weaver, and the D3D11 DP, which never had the correction, shows
+ * the same docked behaviour. The offset only ever contributed an error of
+ * (pane_offset mod lens pitch): a uniform random phase per dock layout.
  *
  * @param leiasr The D3D12 weaver instance.
  * @param command_list The command list (ID3D12GraphicsCommandList*).
@@ -115,8 +121,6 @@ leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
  * @param viewport_y Top edge of the viewport sub-rect within the render target.
  * @param viewport_width Width of the viewport sub-rect.
  * @param viewport_height Height of the viewport sub-rect.
- * @param phase_off_x Extra X added to the weaver's phase viewport ONLY (not render).
- * @param phase_off_y Extra Y added to the weaver's phase viewport ONLY (not render).
  *
  * @ingroup drv_leia
  */
@@ -126,9 +130,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    int32_t viewport_x,
                    int32_t viewport_y,
                    uint32_t viewport_width,
-                   uint32_t viewport_height,
-                   int32_t phase_off_x,
-                   int32_t phase_off_y);
+                   uint32_t viewport_height);
 
 /*!
  * Get predicted eye positions from the weaver's LookaroundFilter.
