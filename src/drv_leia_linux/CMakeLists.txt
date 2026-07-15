@@ -15,6 +15,18 @@
 
 find_package(Vulkan REQUIRED) # loader lib for the stub's raw vkCmd* calls
 
+# Compose-under-bg transparency shaders (runtime#757) → SPIR-V byte-array
+# headers. The runtime tree owns the spirv_shaders macro (available because the
+# runtime is added as a subdirectory above). Shaders are per-backend copies
+# (same pattern as drv_leia_android/shaders), sourced from ../drv_leia/shaders.
+spirv_shaders(
+    LEIA_LINUX_SHADER_HEADERS
+    SPIRV_VERSION 1.0
+    SOURCES
+        shaders/fullscreen_tri.vert
+        shaders/compose_under_bg.frag
+)
+
 # xcb + xcb-randr for the transient panel-position query (#91 / runtime#715):
 # leia_edid_probe_linux.c matches the frozen EDID table against RandR outputs
 # to place the panel in the desktop. Already an apt dep of the CI image (the
@@ -82,6 +94,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_sr_linux.h
     # Shared, platform-portable device implementation from the Windows arm.
     ../drv_leia/leia_device.c
+    # Generated SPIR-V headers for the compose-under-bg pass (runtime#757).
+    ${LEIA_LINUX_SHADER_HEADERS}
 )
 
 # Surface the plug-in build identity through xrt_plugin_iface::version (#47).
@@ -90,6 +104,7 @@ target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_PLUGIN_GIT_DESC="${DXR_P
 target_include_directories(DisplayXR-LeiaSR PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia # leia_interface.h / leia_types.h
+    ${CMAKE_CURRENT_BINARY_DIR}             # generated shaders/*.h (runtime#757)
 )
 
 target_link_libraries(DisplayXR-LeiaSR PRIVATE

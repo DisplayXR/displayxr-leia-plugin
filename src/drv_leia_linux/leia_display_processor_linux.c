@@ -26,6 +26,11 @@
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
 
+// SPIR-V for the compose-under-bg pass (shaders/ copied from ../drv_leia,
+// compiled by spirv_shaders in CMakeLists → shaders_<name> byte arrays).
+#include "shaders/fullscreen_tri.vert.h"
+#include "shaders/compose_under_bg.frag.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,12 +41,469 @@ struct leia_dp_linux
 	struct vk_bundle *vk;                 //!< compositor's bundle — not owned
 	struct leiasr_lnx *sr;                //!< weaver backend — owned
 	uint32_t view_count;                  //!< from the last process_atlas grid
+
+	// --- Transparency: pre-weave compose-under-bg (runtime#757) ---------
+	// The srSDK weaver flattens alpha (contract R-W12), so — exactly like the
+	// Windows DP — transparency is reconstructed DP-side: composite the app
+	// content OVER a background into an opaque intermediate the weaver then
+	// interlaces. On Linux the background is sampled directly (shared VkDevice,
+	// no import): today the runtime's flattened 2D-under backdrop (set_background_2d);
+	// WS1 (portal/PipeWire desktop capture) plugs the live desktop into the same
+	// bg2d_view seam. Reuses ../drv_leia/shaders/compose_under_bg.frag.
+	bool transparent_enabled;   //!< set_transparent_background, in-process path
+	VkImageView bg2d_view;      //!< background to compose under (or VK_NULL_HANDLE)
+	uint32_t bg2d_w, bg2d_h;    //!< background dims (informational)
+
+	// Compose pipeline (lazy, built on the first transparent multi-view frame).
+	VkRenderPass compose_rp;              //!< R8G8B8A8_UNORM intermediate pass
+	VkImage compose_fill_image;           //!< atlas-sized opaque intermediate
+	VkImageView compose_fill_view;        //!< sampled by the weaver as its input
+	VkDeviceMemory compose_fill_mem;
+	VkFramebuffer compose_fill_fb;
+	uint32_t compose_fill_w, compose_fill_h;
+	VkSampler compose_sampler;
+	VkDescriptorSetLayout compose_desc_layout;
+	VkDescriptorPool compose_desc_pool;
+	VkDescriptorSet compose_set;
+	VkPipelineLayout compose_pipeline_layout;
+	VkPipeline compose_pipeline;
+	bool compose_inited;
 };
 
 static inline struct leia_dp_linux *
 leia_dp_linux(struct xrt_display_processor *xdp)
 {
 	return (struct leia_dp_linux *)xdp;
+}
+
+
+/*
+ *
+ * Transparency: pre-weave compose-under-bg (runtime#757).
+ *
+ * Ported from the Windows VK DP (../drv_leia/leia_display_processor.cpp), minus
+ * the Windows-only pieces: no WGC capture / NT-handle import (that is WS1's
+ * portal/PipeWire → dma-buf producer), no chroma-key fallback, no post-weave
+ * alpha-gate. The background arrives already in the compositor's VkDevice via
+ * set_background_2d, so it is sampled directly. Runs only for transparent
+ * multi-view frames that have a background bound.
+ *
+ */
+
+static void
+compose_release(struct leia_dp_linux *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (vk == NULL) {
+		return;
+	}
+	if (ldp->compose_pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, ldp->compose_pipeline, NULL);
+	}
+	if (ldp->compose_pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, ldp->compose_pipeline_layout, NULL);
+	}
+	if (ldp->compose_desc_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorPool(vk->device, ldp->compose_desc_pool, NULL);
+	}
+	if (ldp->compose_desc_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, ldp->compose_desc_layout, NULL);
+	}
+	if (ldp->compose_sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, ldp->compose_sampler, NULL);
+	}
+	if (ldp->compose_fill_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, ldp->compose_fill_fb, NULL);
+	}
+	if (ldp->compose_fill_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, ldp->compose_fill_view, NULL);
+	}
+	if (ldp->compose_fill_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->compose_fill_image, NULL);
+	}
+	if (ldp->compose_fill_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->compose_fill_mem, NULL);
+	}
+	if (ldp->compose_rp != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, ldp->compose_rp, NULL);
+	}
+	ldp->compose_pipeline = VK_NULL_HANDLE;
+	ldp->compose_pipeline_layout = VK_NULL_HANDLE;
+	ldp->compose_desc_pool = VK_NULL_HANDLE;
+	ldp->compose_desc_layout = VK_NULL_HANDLE;
+	ldp->compose_sampler = VK_NULL_HANDLE;
+	ldp->compose_fill_fb = VK_NULL_HANDLE;
+	ldp->compose_fill_view = VK_NULL_HANDLE;
+	ldp->compose_fill_image = VK_NULL_HANDLE;
+	ldp->compose_fill_mem = VK_NULL_HANDLE;
+	ldp->compose_rp = VK_NULL_HANDLE;
+	ldp->compose_fill_w = 0;
+	ldp->compose_fill_h = 0;
+	ldp->compose_inited = false;
+}
+
+// Create (or resize) the atlas-sized R8G8B8A8_UNORM intermediate the compose
+// pass renders into and the weaver then samples.
+static bool
+compose_ensure_fill(struct leia_dp_linux *ldp, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (ldp->compose_fill_image != VK_NULL_HANDLE && ldp->compose_fill_w == w && ldp->compose_fill_h == h) {
+		return true;
+	}
+
+	if (ldp->compose_fill_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, ldp->compose_fill_fb, NULL);
+		ldp->compose_fill_fb = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_fill_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, ldp->compose_fill_view, NULL);
+		ldp->compose_fill_view = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_fill_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->compose_fill_image, NULL);
+		ldp->compose_fill_image = VK_NULL_HANDLE;
+	}
+	if (ldp->compose_fill_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->compose_fill_mem, NULL);
+		ldp->compose_fill_mem = VK_NULL_HANDLE;
+	}
+
+	VkExtent2D ext = {w, h};
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	VkResult res =
+	    vk_create_image_simple(vk, ext, VK_FORMAT_R8G8B8A8_UNORM, usage, &ldp->compose_fill_mem, &ldp->compose_fill_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose fill image create failed: %d", res);
+		return false;
+	}
+	VkImageSubresourceRange sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	res = vk_create_view(vk, ldp->compose_fill_image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, sub,
+	                     &ldp->compose_fill_view);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose fill view create failed: %d", res);
+		return false;
+	}
+	VkFramebufferCreateInfo fbi = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = ldp->compose_rp,
+	    .attachmentCount = 1,
+	    .pAttachments = &ldp->compose_fill_view,
+	    .width = w,
+	    .height = h,
+	    .layers = 1,
+	};
+	res = vk->vkCreateFramebuffer(vk->device, &fbi, NULL, &ldp->compose_fill_fb);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose fill fb create failed: %d", res);
+		return false;
+	}
+	ldp->compose_fill_w = w;
+	ldp->compose_fill_h = h;
+	return true;
+}
+
+// Build the render pass + pipeline + descriptor plumbing once. Idempotent.
+static bool
+compose_ensure_pipeline(struct leia_dp_linux *ldp)
+{
+	if (ldp->compose_inited) {
+		return true;
+	}
+	struct vk_bundle *vk = ldp->vk;
+	VkResult res;
+
+	// Render pass: opaque R8G8B8A8_UNORM intermediate, no presentation.
+	{
+		VkAttachmentDescription att = {
+		    .format = VK_FORMAT_R8G8B8A8_UNORM,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+		VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+		VkSubpassDescription sub = {
+		    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		    .colorAttachmentCount = 1,
+		    .pColorAttachments = &ref,
+		};
+		VkRenderPassCreateInfo rpi = {
+		    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		    .attachmentCount = 1,
+		    .pAttachments = &att,
+		    .subpassCount = 1,
+		    .pSubpasses = &sub,
+		};
+		res = vk->vkCreateRenderPass(vk->device, &rpi, NULL, &ldp->compose_rp);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: compose render pass failed: %d", res);
+			return false;
+		}
+	}
+
+	// 3-binding descriptor set: atlas (0) + bg/desktop (1) + 2D-under backdrop (2).
+	{
+		VkDescriptorSetLayoutBinding bs[3] = {
+		    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		     .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		     .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		    {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		     .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+		};
+		VkDescriptorSetLayoutCreateInfo ci = {
+		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = bs};
+		res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->compose_desc_layout);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: compose desc layout failed: %d", res);
+			return false;
+		}
+	}
+
+	// Push constants: 2*vec2 + uvec2 + uvec2 = 32 bytes (matches compose_under_bg.frag).
+	{
+		VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 32};
+		VkPipelineLayoutCreateInfo pli = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		    .setLayoutCount = 1,
+		    .pSetLayouts = &ldp->compose_desc_layout,
+		    .pushConstantRangeCount = 1,
+		    .pPushConstantRanges = &pc,
+		};
+		res = vk->vkCreatePipelineLayout(vk->device, &pli, NULL, &ldp->compose_pipeline_layout);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: compose pipeline layout failed: %d", res);
+			return false;
+		}
+	}
+
+	res = vk_create_sampler(vk, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, &ldp->compose_sampler);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose sampler failed: %d", res);
+		return false;
+	}
+
+	{
+		VkDescriptorPoolSize size = {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3};
+		VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		                                  .maxSets = 1,
+		                                  .poolSizeCount = 1,
+		                                  .pPoolSizes = &size};
+		res = vk->vkCreateDescriptorPool(vk->device, &dpi, NULL, &ldp->compose_desc_pool);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: compose desc pool failed: %d", res);
+			return false;
+		}
+		VkDescriptorSetAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		    .descriptorPool = ldp->compose_desc_pool,
+		    .descriptorSetCount = 1,
+		    .pSetLayouts = &ldp->compose_desc_layout,
+		};
+		res = vk->vkAllocateDescriptorSets(vk->device, &ai, &ldp->compose_set);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: compose desc set alloc failed: %d", res);
+			return false;
+		}
+	}
+
+	// Pipeline (fullscreen triangle + compose_under_bg, against compose_rp).
+	VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo vsi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	                                .codeSize = sizeof(shaders_fullscreen_tri_vert),
+	                                .pCode = shaders_fullscreen_tri_vert};
+	res = vk->vkCreateShaderModule(vk->device, &vsi, NULL, &vs);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose vs create failed: %d", res);
+		return false;
+	}
+	VkShaderModuleCreateInfo fsi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	                                .codeSize = sizeof(shaders_compose_under_bg_frag),
+	                                .pCode = shaders_compose_under_bg_frag};
+	res = vk->vkCreateShaderModule(vk->device, &fsi, NULL, &fs);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose fs create failed: %d", res);
+		vk->vkDestroyShaderModule(vk->device, vs, NULL);
+		return false;
+	}
+
+	VkPipelineVertexInputStateCreateInfo vi = {.sType =
+	                                               VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+	VkPipelineInputAssemblyStateCreateInfo ia = {.sType =
+	                                                 VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+	                                             .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+	VkPipelineViewportStateCreateInfo vps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+	                                         .viewportCount = 1,
+	                                         .scissorCount = 1};
+	VkPipelineRasterizationStateCreateInfo rs = {.sType =
+	                                                 VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+	                                             .polygonMode = VK_POLYGON_MODE_FILL,
+	                                             .cullMode = VK_CULL_MODE_NONE,
+	                                             .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+	                                             .lineWidth = 1.0f};
+	VkPipelineMultisampleStateCreateInfo ms = {.sType =
+	                                               VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+	                                           .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+	VkPipelineColorBlendAttachmentState ba = {.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+	                                                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+	VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+	                                          .attachmentCount = 1,
+	                                          .pAttachments = &ba};
+	VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+	VkPipelineDynamicStateCreateInfo dynstate = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+	                                             .dynamicStateCount = 2,
+	                                             .pDynamicStates = dyn};
+	VkPipelineShaderStageCreateInfo stages[2] = {
+	    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	     .stage = VK_SHADER_STAGE_VERTEX_BIT,
+	     .module = vs,
+	     .pName = "main"},
+	    {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+	     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+	     .module = fs,
+	     .pName = "main"},
+	};
+	VkGraphicsPipelineCreateInfo pi = {
+	    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+	    .stageCount = 2,
+	    .pStages = stages,
+	    .pVertexInputState = &vi,
+	    .pInputAssemblyState = &ia,
+	    .pViewportState = &vps,
+	    .pRasterizationState = &rs,
+	    .pMultisampleState = &ms,
+	    .pColorBlendState = &cb,
+	    .pDynamicState = &dynstate,
+	    .layout = ldp->compose_pipeline_layout,
+	    .renderPass = ldp->compose_rp,
+	    .subpass = 0,
+	};
+	res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pi, NULL, &ldp->compose_pipeline);
+	vk->vkDestroyShaderModule(vk->device, fs, NULL);
+	vk->vkDestroyShaderModule(vk->device, vs, NULL);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: compose pipeline create failed: %d", res);
+		return false;
+	}
+
+	ldp->compose_inited = true;
+	U_LOG_W("leia_lnx_dp: transparency compose-under-bg pipeline initialized");
+	return true;
+}
+
+// Composite the tiled atlas OVER the bound background into the opaque
+// intermediate, and return the intermediate view for the weaver to interlace.
+// Returns VK_NULL_HANDLE (→ caller weaves the raw atlas) when disabled, when no
+// background is bound, or on any setup failure.
+static VkImageView
+compose_pre_weave(struct leia_dp_linux *ldp,
+                  VkCommandBuffer cmd,
+                  VkImageView atlas_view,
+                  uint32_t atlas_w,
+                  uint32_t atlas_h,
+                  uint32_t tile_columns,
+                  uint32_t tile_rows)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (!ldp->transparent_enabled || ldp->bg2d_view == VK_NULL_HANDLE) {
+		return VK_NULL_HANDLE;
+	}
+	if (!compose_ensure_pipeline(ldp) || !compose_ensure_fill(ldp, atlas_w, atlas_h)) {
+		return VK_NULL_HANDLE;
+	}
+
+	// Bind atlas (0) + background (1). Slot 2 (2D-under backdrop) is bound to the
+	// same background as a valid dummy and gated off via has_backdrop=0 — WS1
+	// will split desktop (slot 1) from the 2D-under backdrop (slot 2). The atlas
+	// and background both arrive in SHADER_READ_ONLY_OPTIMAL (compositor +
+	// set_background_2d contract), so no input transition is needed here.
+	VkDescriptorImageInfo atlas_info = {.sampler = ldp->compose_sampler,
+	                                    .imageView = atlas_view,
+	                                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	VkDescriptorImageInfo bg_info = {.sampler = ldp->compose_sampler,
+	                                 .imageView = ldp->bg2d_view,
+	                                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	VkWriteDescriptorSet writes[3] = {
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 0,
+	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &atlas_info},
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 1,
+	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &bg_info},
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 2,
+	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &bg_info},
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 3, writes, 0, NULL);
+
+	// Intermediate UNDEFINED → COLOR_ATTACHMENT (contents fully overwritten).
+	VkImageMemoryBarrier pre = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = ldp->compose_fill_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+	                         0, NULL, 0, NULL, 1, &pre);
+
+	VkRenderPassBeginInfo rpbi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = ldp->compose_rp,
+	    .framebuffer = ldp->compose_fill_fb,
+	    .renderArea = {{0, 0}, {atlas_w, atlas_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->compose_pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->compose_pipeline_layout, 0, 1,
+	                            &ldp->compose_set, 0, NULL);
+
+	struct
+	{
+		float bg_uv_origin[2];
+		float bg_uv_extent[2];
+		uint32_t tile_count[2];
+		uint32_t has_backdrop;
+		uint32_t pad;
+	} push = {0};
+	// The 2D-under background is already in the canvas/window pixel space, so it
+	// maps 1:1 onto each tile (origin 0, extent 1); WS1's monitor-space desktop
+	// capture supplies a real sub-rect here instead.
+	push.bg_uv_extent[0] = 1.0f;
+	push.bg_uv_extent[1] = 1.0f;
+	push.tile_count[0] = tile_columns;
+	push.tile_count[1] = tile_rows;
+	push.has_backdrop = 0u;
+	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+
+	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
+	VkRect2D sc = {{0, 0}, {atlas_w, atlas_h}};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+
+	// Intermediate COLOR_ATTACHMENT → SHADER_READ for the weaver.
+	VkImageMemoryBarrier post = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = ldp->compose_fill_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                         0, 0, NULL, 0, NULL, 1, &post);
+
+	return ldp->compose_fill_view;
 }
 
 
@@ -150,15 +612,31 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 		return;
 	}
 
+	// Transparency (runtime#757): the weaver flattens alpha, so composite the
+	// atlas OVER the bound background into an opaque intermediate FIRST and weave
+	// that. No-op (returns NULL) unless transparency is enabled and a background
+	// is bound — then the raw atlas is woven as before. The intermediate is
+	// R8G8B8A8_UNORM, so the weave input format is overridden to match.
+	VkImage weave_atlas_image = (VkImage)atlas_image;
+	VkImageView weave_atlas_view = (VkImageView)atlas_view;
+	VkFormat weave_view_format = (VkFormat)view_format;
+	VkImageView composed = compose_pre_weave(ldp, cmd_buffer, (VkImageView)atlas_view, view_width * tile_columns,
+	                                         view_height * tile_rows, tile_columns, tile_rows);
+	if (composed != VK_NULL_HANDLE) {
+		weave_atlas_image = ldp->compose_fill_image;
+		weave_atlas_view = composed;
+		weave_view_format = VK_FORMAT_R8G8B8A8_UNORM;
+	}
+
 	// Multi-view: hand the whole tiled atlas to the backend (contract R-W4:
 	// one atlas image + explicit grid). The atlas is guaranteed content-sized
 	// by the compositor's crop-blit (ADR-030).
 	struct leiasr_lnx_weave_input input = {
-	    .atlas_image = (VkImage)atlas_image,
-	    .atlas_view = (VkImageView)atlas_view,
+	    .atlas_image = weave_atlas_image,
+	    .atlas_view = weave_atlas_view,
 	    .view_width = view_width,
 	    .view_height = view_height,
-	    .view_format = (VkFormat)view_format,
+	    .view_format = weave_view_format,
 	    .tile_columns = tile_columns,
 	    .tile_rows = tile_rows,
 	    .y_flip = false,
@@ -287,10 +765,58 @@ leia_lnx_dp_notify_target_recreated(struct xrt_display_processor_vk *xdp_vk, uin
 	leiasr_lnx_output_invalidated(ldp->sr); // R-W8 (idempotent)
 }
 
+static bool
+leia_lnx_dp_is_alpha_native(struct xrt_display_processor *xdp)
+{
+	(void)xdp;
+	// The srSDK Vulkan weaver flattens alpha (contract R-W12); transparency is
+	// reconstructed by the DP-side compose-under-bg pass, not a native-alpha
+	// weave. Matches the Windows/D3D/GL DPs.
+	return false;
+}
+
+static void
+leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp;
+
+	// client_presents: the runtime owns a transparent present and blends the
+	// live desktop into the holes itself, so the DP must NOT compose-under.
+	// (Not used by the desktop vk_native path today — client_presents=false —
+	// but honored for symmetry with the Windows slot.)
+	bool want = enabled && !client_presents;
+	if (ldp->transparent_enabled == want) {
+		return;
+	}
+	ldp->transparent_enabled = want;
+	if (!want) {
+		compose_release(ldp);
+	}
+	U_LOG_W("leia_lnx_dp: transparency %s", want ? "= compose-under-bg" : "disabled");
+}
+
+// Store the runtime's flattened 2D-under backdrop as the background to compose
+// under (#491 part 3). Shared VkDevice, so the view is sampled directly — no
+// import. NULL clears (no background → compose no-ops, weaves the raw atlas).
+// WS1 (portal/PipeWire desktop capture) will feed the live desktop through this
+// same seam.
+static void
+leia_lnx_dp_set_background_2d(struct xrt_display_processor *xdp,
+                             VkImageView background_view,
+                             uint32_t width,
+                             uint32_t height)
+{
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	ldp->bg2d_view = background_view;
+	ldp->bg2d_w = width;
+	ldp->bg2d_h = height;
+}
+
 static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	compose_release(ldp);        // transparency resources (runtime#757)
 	leiasr_lnx_destroy(ldp->sr); // R-W10
 	free(ldp);
 }
@@ -334,10 +860,15 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->base.base.set_eye_tracking_mode = leia_lnx_dp_set_eye_tracking_mode;
 	ldp->base.base.destroy = leia_lnx_dp_destroy;
 	ldp->base.notify_target_recreated = leia_lnx_dp_notify_target_recreated;
-	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the
-	// X11 window position), is_alpha_native / set_background_2d /
-	// set_transparent_background (transparency stack), zone slots
-	// (get_local_zone_caps + publish/clear — needs R-W7 phase weaving).
+	// Transparency stack (runtime#757): compose-under-bg reconstructs the
+	// alpha the weaver flattens (R-W12). set_transparent_background enables it,
+	// set_background_2d supplies the background, is_alpha_native reports false.
+	ldp->base.base.is_alpha_native = leia_lnx_dp_is_alpha_native;
+	ldp->base.base.set_background_2d = leia_lnx_dp_set_background_2d;
+	ldp->base.set_transparent_background = leia_lnx_dp_vk_set_transparent_background;
+	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the X11
+	// window position), zone slots (get_local_zone_caps + publish/clear —
+	// needs R-W7 phase weaving).
 	ldp->vk = vk;
 	ldp->view_count = 2;
 
