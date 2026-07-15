@@ -317,9 +317,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    int32_t viewport_x,
                    int32_t viewport_y,
                    uint32_t viewport_width,
-                   uint32_t viewport_height,
-                   int32_t phase_off_x,
-                   int32_t phase_off_y)
+                   uint32_t viewport_height)
 {
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		U_LOG_W("leiasr_d3d12_weave called with null instance or weaver");
@@ -333,9 +331,8 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	bool weave_log = (weave_counter % 60 == 0);
 	weave_counter++;
 	if (weave_log) {
-		U_LOG_I("SR D3D12 weave: cmd_list=%p, render_vp=(%d,%d %ux%u), phase_off=(%d,%d), input=%p (%ux%u fmt=%u)",
+		U_LOG_I("SR D3D12 weave: cmd_list=%p, vp=(%d,%d %ux%u), input=%p (%ux%u fmt=%u)",
 		        (void *)cmd_list, viewport_x, viewport_y, viewport_width, viewport_height,
-		        phase_off_x, phase_off_y,
 		        (void *)leiasr->input_resource,
 		        leiasr->view_width, leiasr->view_height,
 		        (unsigned)leiasr->input_format);
@@ -344,24 +341,24 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	// Set command list for the weaver to record commands onto
 	leiasr->weaver->setCommandList(cmd_list);
 
-	// #740: the weaver's setViewport feeds ONLY the phase term
+	// #740: the weaver's setViewport feeds BOTH the phase term
 	//   xOffset = window_WeavingX + vpX
-	// so we give the WEAVER a phase viewport shifted by phase_off (which
-	// corrects a window_WeavingX anchored to the wrong window), while the
-	// RENDER viewport/scissor set on the cmd list below stay at viewport_x/y
-	// (where the woven pixels must actually land in the target). When
-	// phase_off is 0 (weaving window == content window) the two coincide and
-	// behaviour is unchanged.
-	D3D12_VIEWPORT phase_viewport = {};
-	phase_viewport.TopLeftX = static_cast<float>(viewport_x + phase_off_x);
-	phase_viewport.TopLeftY = static_cast<float>(viewport_y + phase_off_y);
-	phase_viewport.Width = static_cast<float>(viewport_width);
-	phase_viewport.Height = static_cast<float>(viewport_height);
-	phase_viewport.MinDepth = 0.0f;
-	phase_viewport.MaxDepth = 1.0f;
-	leiasr->weaver->setViewport(phase_viewport);
-
-	// Render viewport + scissor: where the woven pixels land in the target.
+	// and (with the scissor below) where the woven pixels land in the target.
+	// Those two uses coincide because vpX/vpY are window-global: this DP weaves
+	// ONCE per frame over the whole bound window, so the only offset the term
+	// can carry is the content's origin within that window, which is (0,0) by
+	// construction. The runtime agrees from the other side —
+	// d3d12_effective_canvas() returns x=0,y=0,w/h=client for every zones /
+	// mask / Local2D frame.
+	//
+	// Do NOT reintroduce a phase-only offset here. v2.0.1 did (#95), on the
+	// premise that SR anchors window_WeavingX to the app's top-level container
+	// and a WS_CHILD pane therefore needed the pane-vs-container delta added
+	// back. That premise is refuted: SR phases from the HWND handed to
+	// CreateDX12Weaver, and the D3D11 DP — which never had the correction —
+	// exhibits the same docked behaviour. All the offset achieved was an error
+	// of (pane_offset mod lens pitch): a uniform random phase per dock layout,
+	// i.e. a coin flip on eye assignment.
 	D3D12_VIEWPORT viewport = {};
 	viewport.TopLeftX = static_cast<float>(viewport_x);
 	viewport.TopLeftY = static_cast<float>(viewport_y);
@@ -369,6 +366,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	viewport.Height = static_cast<float>(viewport_height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
+	leiasr->weaver->setViewport(viewport);
 
 	// Set scissor rect to match the RENDER viewport sub-rect.
 	D3D12_RECT scissor = {};

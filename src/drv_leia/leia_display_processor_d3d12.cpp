@@ -1675,51 +1675,120 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		                               view_width, view_height, format);
 	}
 
-	// #740: correct the interlace phase when the SR weaver anchors
-	// window_WeavingX to a window other than the one the content is displayed
-	// under. In texture/shared-texture mode the SR SDK resolves its weaving
-	// window from the app's top-level window (GA_ROOT / the device's DXGI-
-	// associated window). When the weave HWND is a WS_CHILD embedded in a
-	// FOREIGN container — e.g. a Unity editor docked Game-view pane inside the
-	// editor container — that top-level container sits offset from the pane the
-	// content occupies, so the phase (window_WeavingX + vpX) is off by that
-	// horizontal delta. Add the pane-vs-container client-origin X delta to the
-	// PHASE only (the RENDER position stays at vp_x/vp_y).
+	// #740: NO phase correction — vpX/vpY are window-global and therefore zero.
 	//
-	// X only: the interlace reference is horizontal. A pane-vs-container Y
-	// delta (menu/toolbar band) does not shift the interlace, and applying it
-	// re-introduces a residual (HW-verified: maximized is correct at vpY=0).
+	// WHY (structural, not empirical): this DP weaves ONCE per frame, over the
+	// whole bound window, in a single pass. Zone rects position CONTENT in the
+	// composited atlas and drive the wish mask (the lens); they never enter the
+	// weave geometry (ADR-027: the zone rect is its canvas for RIG framing, and
+	// the mask drives the lens, never content). So the only offset this term can
+	// carry is the content's origin within the bound window — and one
+	// full-window weave anchored at that window's client origin puts it at
+	// (0,0) by construction. The runtime agrees from the other side:
+	// d3d12_effective_canvas() returns x=0,y=0,w/h=client for every zones /
+	// mask / Local2D frame.
 	//
-	// Strict no-op unless the bound HWND is a WS_CHILD embedded in a foreign
-	// top-level. Own-top-level windows — native handle/cube apps, and undocked/
-	// floating Game views (bound in present mode) — have GA_ROOT == self →
-	// delta 0, and the SR weaving window already IS the content window.
-	int32_t phase_off_x = 0, phase_off_y = 0;
+	// There is NO X/Y asymmetry here. The previous "X only: the interlace
+	// reference is horizontal" rationale was wrong — the lenticular is slanted,
+	// so Y shifts phase as surely as X does. vpY was correct at 0 for the same
+	// reason vpX is: not because Y doesn't matter, but because NO correction is
+	// warranted in either axis. That the Y term "re-introduced a residual" when
+	// applied was the bug reporting itself, and it should have generalised to X.
+	//
+	// The refuted premise: that SR resolves its weaving window from the app's
+	// top-level container (GA_ROOT / the device's DXGI-associated window), so a
+	// WS_CHILD pane needed the pane-vs-container delta added back. It does not —
+	// SR phases from the HWND handed to CreateDX12Weaver, i.e. the bound window.
+	// Measured on the #740 transfer-function harness (container top-level owning
+	// the app's DXGI swapchain + a WS_CHILD pane pinned to a fixed panel pixel
+	// while the container slides; phase read sub-pixel off the woven shared
+	// texture with no face in view, where the SDK's nominal-eye fallback is
+	// bit-exact stable):
+	//
+	//   - pane pinned / container slid by -D  -> phase moved +D exactly
+	//     => the container contributes NOTHING to the phase.
+	//   - phase_off=0 / pane+container slid together
+	//     -> phase tracked window X with gain 1.00058 (rms 0.0002 px)
+	//     => SR honors the bound window, 1:1.
+	//
+	// So the old correction added a pure error of (pane_offset mod lens pitch) —
+	// a uniform random phase per dock layout, i.e. a coin flip on eye
+	// assignment. It is what made a docked Game view show swapped eyes while a
+	// maximized one (a different offset) looked correct.
+	//
+	// Deliberately NOT a calibration: no pitch, slant, or panel constant enters
+	// here, so this holds on any panel.
+
+	// #740 diagnostic: dump the rect the DP actually reads for the bound HWND at
+	// weave time, so it can be diffed against the app's declared geometry. Two
+	// reads of the SAME window: one under the SDK's DPI context
+	// (PER_MONITOR_AWARE_V2 — what CreateDX12Weaver/weave() see when the SDK
+	// queries the HWND), one under whatever the host thread ambiently is. If
+	// those two disagree, the SDK and the app are living in different coordinate
+	// spaces and THAT is the phase error — a mismatch invisible from the app
+	// side, which always reads ambient.
+	//
+	// GA_ROOT is dumped alongside purely as a discriminator: if the phase tracks
+	// the root's numbers rather than the bound window's, the wrong-window premise
+	// is back on the table.
+	//
+	// Change-gated: never per-frame (log bloat).
 	if (ldp->hwnd != nullptr) {
-		const LONG style = GetWindowLong(ldp->hwnd, GWL_STYLE);
+		auto read = [](HWND w, POINT *cli, RECT *cr, RECT *wr) {
+			*cli = {0, 0};
+			ClientToScreen(w, cli);
+			GetClientRect(w, cr);
+			GetWindowRect(w, wr);
+		};
+		POINT bcli_dpi, bcli_amb, rcli_dpi;
+		RECT bcr_dpi, bwr_dpi, bcr_amb, bwr_amb, rcr_dpi, rwr_dpi;
 		HWND root = GetAncestor(ldp->hwnd, GA_ROOT);
-		if ((style & WS_CHILD) != 0 && root != nullptr && root != ldp->hwnd) {
-			POINT pane = {0, 0}, cont = {0, 0};
-			if (ClientToScreen(ldp->hwnd, &pane) && ClientToScreen(root, &cont)) {
-				phase_off_x = pane.x - cont.x; // X only (#740)
-				static bool s_have_last = false;
-				static int32_t s_last_x = 0;
-				if (!s_have_last || phase_off_x != s_last_x) {
-					s_have_last = true;
-					s_last_x = phase_off_x;
-					U_LOG_W("#740 weave phase: WS_CHILD pane offset x=%d corrected "
-					        "(hwnd=%p root=%p)",
-					        phase_off_x, (void *)ldp->hwnd, (void *)root);
-				}
+
+		DPI_AWARENESS_CONTEXT oldCtx =
+		    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		read(ldp->hwnd, &bcli_dpi, &bcr_dpi, &bwr_dpi);
+		if (root != nullptr) {
+			read(root, &rcli_dpi, &rcr_dpi, &rwr_dpi);
+		}
+		if (oldCtx != NULL) {
+			SetThreadDpiAwarenessContext(oldCtx);
+		}
+		read(ldp->hwnd, &bcli_amb, &bcr_amb, &bwr_amb);
+
+		static bool s_have = false;
+		static POINT s_last = {0, 0};
+		static LONG s_last_w = 0;
+		if (!s_have || bcli_dpi.x != s_last.x || bcli_dpi.y != s_last.y ||
+		    bcr_dpi.right != s_last_w) {
+			s_have = true;
+			s_last = bcli_dpi;
+			s_last_w = bcr_dpi.right;
+			U_LOG_W("#740 rect-read: BOUND hwnd=%p  [PER_MONITOR_V2] client_origin=(%ld,%ld) "
+			        "client=%ldx%ld window=(%ld,%ld)  |  [ambient] client_origin=(%ld,%ld) "
+			        "client=%ldx%ld window=(%ld,%ld)%s",
+			        (void *)ldp->hwnd, bcli_dpi.x, bcli_dpi.y, bcr_dpi.right, bcr_dpi.bottom,
+			        bwr_dpi.left, bwr_dpi.top, bcli_amb.x, bcli_amb.y, bcr_amb.right,
+			        bcr_amb.bottom, bwr_amb.left, bwr_amb.top,
+			        (bcli_dpi.x != bcli_amb.x || bcli_dpi.y != bcli_amb.y ||
+			         bcr_dpi.right != bcr_amb.right)
+			            ? "   *** DPI-CONTEXT MISMATCH ***"
+			            : "");
+			if (root != nullptr && root != ldp->hwnd) {
+				U_LOG_W("#740 rect-read: ROOT  hwnd=%p  [PER_MONITOR_V2] client_origin=(%ld,%ld) "
+				        "client=%ldx%ld window=(%ld,%ld)  | border=(%ld,%ld) "
+				        "child_in_root_client=(%ld,%ld)",
+				        (void *)root, rcli_dpi.x, rcli_dpi.y, rcr_dpi.right, rcr_dpi.bottom,
+				        rwr_dpi.left, rwr_dpi.top, rcli_dpi.x - rwr_dpi.left,
+				        rcli_dpi.y - rwr_dpi.top, bcli_dpi.x - rcli_dpi.x,
+				        bcli_dpi.y - rcli_dpi.y);
 			}
 		}
 	}
 
-	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect (RENDER position, applied
-	// via RSSetViewports/RSSetScissorRects); phase_off_x/y shift the weaver's
-	// PHASE viewport only. See gotcha + #740 note at leiasr_d3d12_weave().
-	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h,
-	                   phase_off_x, phase_off_y);
+	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect, which feeds both the RENDER
+	// position and the weaver's phase term — they coincide because the offset is
+	// window-global. See the gotcha + #740 note at leiasr_d3d12_weave().
+	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
 
 	// Post-weave transparency pass:
 	//   - compose path: alpha-gate samples the ORIGINAL atlas (not the
