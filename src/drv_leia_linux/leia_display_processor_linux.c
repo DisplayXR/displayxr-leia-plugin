@@ -19,6 +19,7 @@
 
 #include "leia_display_processor_linux.h"
 #include "leia_sr_linux.h"
+#include "leia_bg_capture_linux.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -51,8 +52,9 @@ struct leia_dp_linux
 	// WS1 (portal/PipeWire desktop capture) plugs the live desktop into the same
 	// bg2d_view seam. Reuses ../drv_leia/shaders/compose_under_bg.frag.
 	bool transparent_enabled;   //!< set_transparent_background, in-process path
-	VkImageView bg2d_view;      //!< background to compose under (or VK_NULL_HANDLE)
-	uint32_t bg2d_w, bg2d_h;    //!< background dims (informational)
+	VkImageView bg2d_view;      //!< runtime's flattened 2D-under backdrop (or NULL)
+	uint32_t bg2d_w, bg2d_h;    //!< backdrop dims (informational)
+	struct leia_bg_capture_linux *bg_capture; //!< WS1 live-desktop capture (or NULL)
 
 	// Compose pipeline (lazy, built on the first transparent multi-view frame).
 	VkRenderPass compose_rp;              //!< R8G8B8A8_UNORM intermediate pass
@@ -409,23 +411,49 @@ compose_pre_weave(struct leia_dp_linux *ldp,
                   uint32_t tile_rows)
 {
 	struct vk_bundle *vk = ldp->vk;
-	if (!ldp->transparent_enabled || ldp->bg2d_view == VK_NULL_HANDLE) {
+	if (!ldp->transparent_enabled) {
 		return VK_NULL_HANDLE;
+	}
+	if (ldp->bg_capture == NULL && ldp->bg2d_view == VK_NULL_HANDLE) {
+		return VK_NULL_HANDLE; // no background source → weave the raw atlas
 	}
 	if (!compose_ensure_pipeline(ldp) || !compose_ensure_fill(ldp, atlas_w, atlas_h)) {
 		return VK_NULL_HANDLE;
 	}
 
-	// Bind atlas (0) + background (1). Slot 2 (2D-under backdrop) is bound to the
-	// same background as a valid dummy and gated off via has_backdrop=0 — WS1
-	// will split desktop (slot 1) from the 2D-under backdrop (slot 2). The atlas
-	// and background both arrive in SHADER_READ_ONLY_OPTIMAL (compositor +
-	// set_background_2d contract), so no input transition is needed here.
+	// Pick the background under the atlas (Windows-parity): the live desktop
+	// (WS1 capture) when a frame is available, else the runtime's flattened
+	// 2D-under backdrop. When BOTH are present the 2D-under composites OVER the
+	// desktop (has_backdrop=1) — a flat 2D plane behind the woven 3D that still
+	// reveals the desktop where it is transparent.
+	float uv_origin[2] = {0.0f, 0.0f};
+	float uv_extent[2] = {1.0f, 1.0f};
+	VkImageView bg = VK_NULL_HANDLE;
+	VkImageView backdrop = VK_NULL_HANDLE;
+	if (ldp->bg_capture != NULL && leia_bg_capture_linux_poll(ldp->bg_capture, cmd, uv_origin, uv_extent)) {
+		bg = leia_bg_capture_linux_get_view(ldp->bg_capture); // captured monitor, poll'd UV sub-rect
+		backdrop = ldp->bg2d_view;                            // may be NULL → gated off below
+	} else if (ldp->bg2d_view != VK_NULL_HANDLE) {
+		bg = ldp->bg2d_view; // 2D-under is the background; already canvas-space (UV 0..1)
+	}
+	if (bg == VK_NULL_HANDLE) {
+		return VK_NULL_HANDLE; // capture not ready and no backdrop this frame
+	}
+	const bool have_backdrop = (backdrop != VK_NULL_HANDLE);
+
+	// Bind atlas (0) + background (1) + backdrop (2). The backdrop slot is bound
+	// to a valid image even when unused (gated by has_backdrop) so the set is
+	// always complete. atlas + backdrop arrive in SHADER_READ_ONLY_OPTIMAL
+	// (compositor + set_background_2d contract); the captured desktop is
+	// transitioned to SHADER_READ inside poll().
 	VkDescriptorImageInfo atlas_info = {.sampler = ldp->compose_sampler,
 	                                    .imageView = atlas_view,
 	                                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 	VkDescriptorImageInfo bg_info = {.sampler = ldp->compose_sampler,
-	                                 .imageView = ldp->bg2d_view,
+	                                 .imageView = bg,
+	                                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+	VkDescriptorImageInfo bd_info = {.sampler = ldp->compose_sampler,
+	                                 .imageView = have_backdrop ? backdrop : bg,
 	                                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 	VkWriteDescriptorSet writes[3] = {
 	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 0,
@@ -433,7 +461,7 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 1,
 	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &bg_info},
 	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ldp->compose_set, .dstBinding = 2,
-	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &bg_info},
+	     .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &bd_info},
 	};
 	vk->vkUpdateDescriptorSets(vk->device, 3, writes, 0, NULL);
 
@@ -471,14 +499,16 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 		uint32_t has_backdrop;
 		uint32_t pad;
 	} push = {0};
-	// The 2D-under background is already in the canvas/window pixel space, so it
-	// maps 1:1 onto each tile (origin 0, extent 1); WS1's monitor-space desktop
-	// capture supplies a real sub-rect here instead.
-	push.bg_uv_extent[0] = 1.0f;
-	push.bg_uv_extent[1] = 1.0f;
+	// UV maps the app-window region onto the background: (0,0)-(1,1) for the
+	// canvas-space 2D-under backdrop, or the poll'd window-on-monitor sub-rect
+	// for the captured desktop.
+	push.bg_uv_origin[0] = uv_origin[0];
+	push.bg_uv_origin[1] = uv_origin[1];
+	push.bg_uv_extent[0] = uv_extent[0];
+	push.bg_uv_extent[1] = uv_extent[1];
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
-	push.has_backdrop = 0u;
+	push.has_backdrop = have_backdrop ? 1u : 0u;
 	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
@@ -789,7 +819,25 @@ leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, 
 		return;
 	}
 	ldp->transparent_enabled = want;
-	if (!want) {
+	if (want) {
+		// Start desktop capture for the live background (WS1). Display-scoped
+		// today: capture the panel monitor via its screen origin. The producer
+		// declines cleanly (NULL) if portal/PipeWire is unavailable, and the
+		// compose pass falls back to the 2D-under backdrop.
+		if (ldp->bg_capture == NULL) {
+			struct leiasr_lnx_display_info info;
+			int32_t sx = 0, sy = 0;
+			if (leiasr_lnx_query_display_info(&info) && info.valid) {
+				sx = info.screen_left;
+				sy = info.screen_top;
+			}
+			ldp->bg_capture = leia_bg_capture_linux_create(ldp->vk, sx, sy);
+		}
+	} else {
+		if (ldp->bg_capture != NULL) {
+			leia_bg_capture_linux_destroy(ldp->bg_capture);
+			ldp->bg_capture = NULL;
+		}
 		compose_release(ldp);
 	}
 	U_LOG_W("leia_lnx_dp: transparency %s", want ? "= compose-under-bg" : "disabled");
@@ -816,6 +864,9 @@ static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (ldp->bg_capture != NULL) {
+		leia_bg_capture_linux_destroy(ldp->bg_capture); // WS1 capture (runtime#757)
+	}
 	compose_release(ldp);        // transparency resources (runtime#757)
 	leiasr_lnx_destroy(ldp->sr); // R-W10
 	free(ldp);
