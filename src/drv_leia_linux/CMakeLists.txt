@@ -25,6 +25,7 @@ spirv_shaders(
     SOURCES
         shaders/fullscreen_tri.vert
         shaders/compose_under_bg.frag
+        shaders/alpha_gate.frag
 )
 
 # xcb + xcb-randr for the transient panel-position query (#91 / runtime#715):
