@@ -207,14 +207,23 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	(void)inst;
 
 	/*
-	 * Per-monitor claims (issue #69 / ADR-015). Thin wrapper over the same
-	 * detection the binary probe() uses — no new logic, just re-shaped:
+	 * Per-monitor claims (issue #69 / ADR-015). Mirrors the binary probe():
 	 *   - Match EACH runtime-supplied descriptor's (mfr, product) against
 	 *     the known-panel EDID table (the runtime already enumerated the
 	 *     monitors, so we don't re-enumerate).
 	 *   - SR SDK + service presence are system-global; check once and apply
 	 *     to every matched monitor. EDID match alone → EDID confidence;
 	 *     EDID + SDK + running service → VERIFIED.
+	 *   - The EDID table is a frozen copy of SR's product-code map and
+	 *     drifts (SR's ProductCodeInstaller registers panels our table can't
+	 *     see). So on a CLEAN table miss we defer to the authoritative
+	 *     source — the SR runtime — exactly like leia_plugin_probe() does,
+	 *     and claim the primary monitor VERIFIED. Without this, an
+	 *     SR-confirmed-but-table-unknown panel yields zero registry claims,
+	 *     so the registry-driven DP selection (the D3D11 service / shell
+	 *     path) loses the monitor to sim_display's FALLBACK claim and weaves
+	 *     with no head tracking — while the scalar in-process path, fed by
+	 *     probe()'s SR deferral, correctly picks Leia.
 	 */
 	struct leia_display_probe_result probe = {0};
 	(void)leia_edid_probe_display(&probe);
@@ -259,6 +268,40 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		        (unsigned long long)displays[i].monitor_id, displays[i].edid_manufacturer,
 		        displays[i].edid_product, verified ? "VERIFIED" : "EDID");
 	}
+
+	/*
+	 * Clean EDID-table miss on a machine that has the SDK + a running
+	 * service: defer to the SR runtime, mirroring leia_plugin_probe(). If SR
+	 * confirms an active display, claim the primary monitor VERIFIED so it
+	 * beats sim_display's FALLBACK(10) in the registry. This is the rare-miss
+	 * path only — same cost profile as probe()'s deferral (one SR-context
+	 * creation), gated behind sdk+service so it never runs on a non-SR box.
+	 * Single-display assumption: the SR runtime confirms *an* active SR
+	 * display but not *which* monitor id, so we pin it to the primary — the
+	 * same monitor the runtime's own back-compat synth-claim would pick.
+	 */
+	if (n == 0 && verified && display_count > 0 && max_claims > 0 &&
+	    leiasr_probe_display(LEIA_PLUGIN_SR_PROBE_TIMEOUT_S)) {
+		uint32_t pick = 0;
+		for (uint32_t i = 0; i < display_count; i++) {
+			if (displays[i].flags & 1u) { /* bit 0 = primary monitor */
+				pick = i;
+				break;
+			}
+		}
+		struct xrt_display_claim *c = &out_claims[n++];
+		c->monitor_id = displays[pick].monitor_id;
+		c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
+		c->supported_apis = apis;
+		c->serial[0] = '\0';
+
+		U_LOG_W("leia_plugin: EDID table miss with SR present — claiming primary monitor "
+		        "0x%016llx (mfr=0x%04X prod=0x%04X) VERIFIED via SR runtime probe "
+		        "(table stale relative to SR's product-code registry)",
+		        (unsigned long long)displays[pick].monitor_id, displays[pick].edid_manufacturer,
+		        displays[pick].edid_product);
+	}
+
 	return n;
 }
 
