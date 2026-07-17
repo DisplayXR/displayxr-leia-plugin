@@ -126,6 +126,11 @@ static const uint16_t leia_edid_table[][2] = {
 	{58633, 2353},    // ONSOR_2K14 (BOE)
 	{58633, 3208},    // ONSOR_2K14_2 (BOE)
 
+	// SR laptop 4K 16" — BOE0B95 3840x2400 (field report 2026-07; the
+	// SR-runtime fallback in probe/probe_displays already covers it, this
+	// is just the fast EDID path)
+	{58633, 2965},    // BOE0B95 (BOE)
+
 	// JPIK 4K 27" AIO (EH, EI)
 	{58633, 1751},    // JPIK_4K27 (BOE)
 	{11612, 9984},    // JPIK_4K27_2 (WAM)
