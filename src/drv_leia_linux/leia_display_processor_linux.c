@@ -98,6 +98,13 @@ struct leia_dp_linux
 		uint32_t w, h;
 	} ag_fbs[4];
 	uint32_t ag_fbs_count;
+
+	//! Windowed weaving (runtime#757 / LeiaSR#85): the app window's client-area
+	//! top-left in panel-relative pixels, pushed each frame by the compositor via
+	//! the set_present_origin slot. (0,0) = full-panel/display-scoped (default).
+	//! Combined with the per-atlas canvas offset at weave time (present + viewport).
+	int32_t present_origin_x;
+	int32_t present_origin_y;
 };
 
 static inline struct leia_dp_linux *
@@ -1216,12 +1223,15 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .extent = {canvas_width != 0 ? canvas_width : target_width,
 	               canvas_height != 0 ? canvas_height : target_height},
 	};
+	// Windowed weaving (runtime#757 / LeiaSR#85): the phase origin is the app
+	// WINDOW's panel-relative top-left (pushed by the compositor via
+	// set_present_origin; 0,0 = display-scoped default). The weave adds the
+	// viewport (canvas) offset on top — phase = present_origin + canvas_offset —
+	// so this must carry the window term ONLY, not the canvas offset (which the
+	// `viewport` above already supplies), or the two would double-count.
 	struct leiasr_lnx_phase_origin phase = {
-	    // TODO(Track B): add the display's screen origin of the runtime
-	    // window so the phase anchors in absolute panel coordinates
-	    // (window-scoped weaving, runtime Phase 3b). Display-scoped today.
-	    .x = canvas_offset_x,
-	    .y = canvas_offset_y,
+	    .x = ldp->present_origin_x,
+	    .y = ldp->present_origin_y,
 	};
 
 	leiasr_lnx_weave(ldp->sr, cmd_buffer, &input, &output, viewport, phase);
@@ -1401,6 +1411,20 @@ leia_lnx_dp_set_background_2d(struct xrt_display_processor *xdp,
 	ldp->bg2d_h = height;
 }
 
+#ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
+// Windowed weaving (runtime#757 / LeiaSR#85): store the app window's panel-relative
+// origin; process_atlas forwards it as the weave phase origin. Guarded so the
+// plug-in still compiles against a runtime that predates the slot (the vtable
+// assignment below is then skipped and the DP weaves display-scoped).
+static void
+leia_lnx_dp_set_present_origin(struct xrt_display_processor_vk *xdp_vk, int32_t panel_x, int32_t panel_y)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp_vk;
+	ldp->present_origin_x = panel_x;
+	ldp->present_origin_y = panel_y;
+}
+#endif
+
 static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -1459,9 +1483,14 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->base.base.is_alpha_native = leia_lnx_dp_is_alpha_native;
 	ldp->base.base.set_background_2d = leia_lnx_dp_set_background_2d;
 	ldp->base.set_transparent_background = leia_lnx_dp_vk_set_transparent_background;
-	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the X11
-	// window position), zone slots (get_local_zone_caps + publish/clear —
-	// needs R-W7 phase weaving).
+#ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
+	// Windowed weaving (runtime#757 / LeiaSR#85) — the R-W7 window-scoped phase.
+	// Only wired when built against a runtime whose xrt_display_processor_vk
+	// carries the slot; sizeof(base) (→ struct_size above) grows with it, so the
+	// runtime's presence gate matches.
+	ldp->base.set_present_origin = leia_lnx_dp_set_present_origin;
+#endif
+	// TODO(Track B): zone slots (get_local_zone_caps + publish/clear).
 	ldp->vk = vk;
 	ldp->view_count = 2;
 
