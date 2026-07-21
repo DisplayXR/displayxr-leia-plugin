@@ -1490,7 +1490,20 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	// runtime's presence gate matches.
 	ldp->base.set_present_origin = leia_lnx_dp_set_present_origin;
 #endif
-	// TODO(Track B): zone slots (get_local_zone_caps + publish/clear).
+	// Zone slots (get_local_zone_caps + publish/clear) are intentionally LEFT
+	// UNWIRED — hardware per-zone lens switching is SDK-BLOCKED on Linux (#778).
+	// Real per-zone hardware needs srSDK Linux per-zone interlacing phase (a
+	// per-zone weave or a decoupled phase-origin), which srSDK 1.0.0 does NOT
+	// expose (see leia_sr_linux_sdk.c — single global weave over a viewport, no
+	// phase-origin API; the LeiaSR#85 gap). A 1×1 global-collapse port (the
+	// shape the Windows DPs use, drv_leia/leia_display_processor_{d3d11,gl}.cpp)
+	// would only toggle the WHOLE panel 2D/3D whenever any zone exists — wrong
+	// for mixed 2D-in-3D content and redundant with the runtime's platform-
+	// agnostic software composite (vk_composite_local_2d), which already renders
+	// 2D-in-3D Local2D zones on Linux. So the DP reports no zone caps here and
+	// 2D-in-3D is handled entirely runtime-side. Revisit (Track B) IFF the srSDK
+	// Linux weaver gains a per-zone phase surface (open question for George, tied
+	// to the #85 v2 weaver present-origin/phase work).
 	ldp->vk = vk;
 	ldp->view_count = 2;
 
