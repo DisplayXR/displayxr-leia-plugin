@@ -151,13 +151,18 @@ struct leiasr_lnx_weave_output
 };
 
 /*!
- * Absolute panel coordinate the lenticular interlacing pattern is computed
- * against (contract R-W7) — decoupled from the viewport so weaving into a
- * sub-rectangle keeps correct lens phase (display-zones, per-window weaving).
+ * The app WINDOW's client-area top-left in panel-relative pixels — the term the
+ * lenticular interlacing phase anchors against (contract R-W7), decoupled from
+ * the draw viewport so a moved/sub-panel window keeps correct lens phase
+ * (per-window weaving, display-zones). The DP fills this from the compositor's
+ * set_present_origin slot; (0,0) = display-scoped (full-panel window at the
+ * panel top-left) = the default.
  *
- * srSDK 1.0.0: NO counterpart — the runtime#85 gap reproduced (top carried
- * ask, contract §8). Display-scoped weaving is unaffected because the DP sets
- * phase_origin == viewport offset today; the sdk backend logs if they diverge.
+ * srSDK maps this to `srWeaverSetPresentOrigin` (LeiaSR#85): the SDK combines it
+ * with the viewport — phase = present_origin + viewport_offset — so this carries
+ * the window term and the `viewport` arg carries the canvas offset. A running SR
+ * runtime that predates the #85 slot returns SR_ERROR_FUNCTION_UNSUPPORTED and
+ * the sdk backend weaves display-scoped (logged once).
  */
 struct leiasr_lnx_phase_origin
 {
