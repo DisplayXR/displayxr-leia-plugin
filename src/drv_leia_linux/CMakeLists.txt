@@ -15,12 +15,39 @@
 
 find_package(Vulkan REQUIRED) # loader lib for the stub's raw vkCmd* calls
 
+# Compose-under-bg transparency shaders (runtime#757) → SPIR-V byte-array
+# headers. The runtime tree owns the spirv_shaders macro (available because the
+# runtime is added as a subdirectory above). Shaders are per-backend copies
+# (same pattern as drv_leia_android/shaders), sourced from ../drv_leia/shaders.
+spirv_shaders(
+    LEIA_LINUX_SHADER_HEADERS
+    SPIRV_VERSION 1.0
+    SOURCES
+        shaders/fullscreen_tri.vert
+        shaders/compose_under_bg.frag
+        shaders/alpha_gate.frag
+)
+
 # xcb + xcb-randr for the transient panel-position query (#91 / runtime#715):
 # leia_edid_probe_linux.c matches the frozen EDID table against RandR outputs
 # to place the panel in the desktop. Already an apt dep of the CI image (the
 # runtime's own build needs libxcb-randr0-dev).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PLUGIN_XCB REQUIRED IMPORTED_TARGET xcb xcb-randr)
+
+# Desktop background capture for transparency (runtime#757 WS1): xdg-desktop-
+# portal ScreenCast (D-Bus) → PipeWire → dma-buf. OPTIONAL — not REQUIRED — so a
+# CI image without these -dev packages still builds the graceful-decline path and
+# stays green (portal/PipeWire cannot run in CI anyway). When present, the real
+# producer compiles behind DXR_LEIA_HAVE_PIPEWIRE.
+pkg_check_modules(PLUGIN_PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
+pkg_check_modules(PLUGIN_DBUS IMPORTED_TARGET dbus-1)
+if(PLUGIN_PIPEWIRE_FOUND AND PLUGIN_DBUS_FOUND)
+    message(STATUS "DisplayXR-LeiaSR: desktop capture enabled (libpipewire-0.3 + dbus-1)")
+else()
+    message(STATUS "DisplayXR-LeiaSR: desktop capture unavailable (no libpipewire-0.3/dbus-1) "
+                   "— transparency falls back to the 2D-under backdrop")
+endif()
 
 # --- Weaver backend seam — the Track B switch point ----------------------
 set(DXR_LEIA_LINUX_WEAVER "stub" CACHE STRING
@@ -79,9 +106,13 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_display_processor_linux.h
     leia_edid_probe_linux.c
     leia_edid_probe_linux.h
+    leia_bg_capture_linux.c
+    leia_bg_capture_linux.h
     leia_sr_linux.h
     # Shared, platform-portable device implementation from the Windows arm.
     ../drv_leia/leia_device.c
+    # Generated SPIR-V headers for the compose-under-bg pass (runtime#757).
+    ${LEIA_LINUX_SHADER_HEADERS}
 )
 
 # Surface the plug-in build identity through xrt_plugin_iface::version (#47).
@@ -90,6 +121,7 @@ target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_PLUGIN_GIT_DESC="${DXR_P
 target_include_directories(DisplayXR-LeiaSR PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia # leia_interface.h / leia_types.h
+    ${CMAKE_CURRENT_BINARY_DIR}             # generated shaders/*.h (runtime#757)
 )
 
 target_link_libraries(DisplayXR-LeiaSR PRIVATE
@@ -103,6 +135,13 @@ target_link_libraries(DisplayXR-LeiaSR PRIVATE
     Vulkan::Vulkan
     PkgConfig::PLUGIN_XCB
 )
+
+# Desktop-capture producer (runtime#757 WS1): link + enable the real path only
+# when both libs are present; otherwise the graceful-decline path is compiled.
+if(PLUGIN_PIPEWIRE_FOUND AND PLUGIN_DBUS_FOUND)
+    target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAVE_PIPEWIRE)
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE PkgConfig::PLUGIN_PIPEWIRE PkgConfig::PLUGIN_DBUS)
+endif()
 
 # One-symbol export discipline (#496): hidden visibility + version script
 # keeping only xrtPluginNegotiate global; --exclude-libs,ALL is belt-and-

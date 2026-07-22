@@ -62,7 +62,13 @@ jobs:
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
+            libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev \
+            libpipewire-0.3-dev libdbus-1-dev
+          # ^ pipewire + dbus: compile-check the portal/PipeWire desktop-capture
+          #   producer (runtime#757 WS1, behind DXR_LEIA_HAVE_PIPEWIRE). CI cannot
+          #   RUN a portal/PipeWire session (no compositor), but with the -dev libs
+          #   present CMake defines DXR_LEIA_HAVE_PIPEWIRE so the real body is
+          #   compiled — otherwise this large producer only ever built on the box.
 
       - name: Checkout plug-in
         uses: actions/checkout@v4

@@ -737,10 +737,27 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 
-	/* The compositor manages gamma; the weave must not double-convert. */
-	srWeaverSetShaderSRGBConversion(lnx->weaver, SR_FALSE, SR_FALSE);
+	/* Gamma (runtime#778): the vk_native compositor composes in LINEAR — it
+	 * blits the app's sRGB swapchain into a *_UNORM atlas (HW sRGB-decode on
+	 * read → linear atlas) and the compose-under/alpha-gate intermediates are
+	 * likewise linear UNORM with no gamma math. The XCB present surface is
+	 * *_UNORM with an sRGB (nonlinear) colorspace, so the display expects
+	 * sRGB-ENCODED bytes. The weave must therefore ENCODE linear→sRGB on output
+	 * (write=TRUE) — matching what the Windows D3D11 DP computes for the same
+	 * linear atlas (write = atlas_is_linear, ADR-021). The old (FALSE,FALSE)
+	 * skipped the encode → linear bytes hit an sRGB display → crushed dark, and
+	 * the ~1.2:1-blue near-neutral clear read as BLUE instead of light GREY.
+	 * read=FALSE: the atlas is already linear, nothing to decode on input.
+	 * NOTE: vk_native's atlas is unconditionally linear on this path, so the
+	 * encode is hardcoded here. The fully-general negotiated path (runtime
+	 * declaring the encoding per-frame via set_atlas_encoding, like the D3D11
+	 * service) is the ADR-021 follow-up. */
+	srWeaverSetShaderSRGBConversion(lnx->weaver, SR_FALSE, SR_TRUE);
 
-	U_LOG_I("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d)",
+	// WARN (one-off lifecycle): this line tells us at a glance whether the weaver
+	// got a real window (→ getDrawRegions + eye-tracked steering) or fell to the
+	// windowless/display-scoped default (#778 view-swap fingerprint).
+	U_LOG_W("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d)",
 	        (unsigned long)(uintptr_t)info->x11_window,
 	        info->x11_window == NULL ? " = windowless/display-scoped" : "", rp_format);
 	*out_lnx = lnx;
@@ -796,21 +813,6 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 		static bool logged;
 		if (!logged) {
 			U_LOG_W("leia_sr_sdk: y_flip requested but srSDK 1.0.0 has no flip toggle — ignored");
-			logged = true;
-		}
-	}
-
-	/* No phase-origin API in srSDK 1.0.0 (runtime#85 gap, contract §8
-	 * R-W7). Display-scoped weaving is correct BY CONSTRUCTION: verified in
-	 * the SDK source that on Linux the windowless screen-rect is (0,0), so
-	 * the weave's phase offset = our viewport offset in panel coordinates.
-	 * Anything else (window-scoped) can't weave with 1.0.0. */
-	if (phase_origin.x != viewport.offset.x || phase_origin.y != viewport.offset.y) {
-		static bool logged;
-		if (!logged) {
-			U_LOG_W("leia_sr_sdk: phase origin (%d,%d) != viewport offset (%d,%d) — srSDK 1.0.0 "
-			        "cannot express decoupled phase; weaving with viewport phase",
-			        phase_origin.x, phase_origin.y, viewport.offset.x, viewport.offset.y);
 			logged = true;
 		}
 	}
@@ -880,6 +882,18 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	const int32_t b = viewport.offset.y + (int32_t)viewport.extent.height;
 	srWeaverSetViewportVulkan(lnx->weaver, l, t, r, b);
 	srWeaverSetScissorRectVulkan(lnx->weaver, l, t, r, b);
+
+	/* Windowed weaving (runtime#757 / LeiaSR#85): anchor the interlacing phase to
+	 * the app WINDOW's panel-relative origin. The SDK combines it with the
+	 * viewport above (phase = presentOrigin + viewportOffset), so we pass the
+	 * window term only — the DP already put the canvas offset in the viewport.
+	 * (0,0) = display-scoped, exactly the pre-#85 windowless behavior. A runtime
+	 * predating this slot returns SR_ERROR_FUNCTION_UNSUPPORTED → we log once and
+	 * weave display-scoped. */
+	res = srWeaverSetPresentOrigin(lnx->weaver, phase_origin.x, phase_origin.y);
+	if (SR_FAILED(res)) {
+		LOG_SR_ONCE("srWeaverSetPresentOrigin", res);
+	}
 
 	res = srWeaverWeave(lnx->weaver);
 	if (SR_FAILED(res)) {
