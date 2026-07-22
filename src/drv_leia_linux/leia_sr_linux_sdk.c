@@ -754,7 +754,10 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	 * service) is the ADR-021 follow-up. */
 	srWeaverSetShaderSRGBConversion(lnx->weaver, SR_FALSE, SR_TRUE);
 
-	U_LOG_I("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d)",
+	// WARN (one-off lifecycle): this line tells us at a glance whether the weaver
+	// got a real window (→ getDrawRegions + eye-tracked steering) or fell to the
+	// windowless/display-scoped default (#778 view-swap fingerprint).
+	U_LOG_W("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d)",
 	        (unsigned long)(uintptr_t)info->x11_window,
 	        info->x11_window == NULL ? " = windowless/display-scoped" : "", rp_format);
 	*out_lnx = lnx;
