@@ -17,22 +17,33 @@
 #      declines and selftest fails (no active DP) — the stub must never
 #      hijack a machine it wasn't forced onto.
 #
-# Triggers: pull_request + manual dispatch only (repo policy: no CI on push
-# to main). No versions-bump dispatch here — that stays tag-driven in
-# build-windows.yml.
+# Triggers: pull_request + manual dispatch, plus v* release tags (for the Deb
+# job's release-asset attach) — never plain pushes to main. No versions-bump
+# dispatch here — that stays tag-driven in build-windows.yml.
+#
+# Deb job (runtime #781 Phase 3): builds the REAL Track B srSDK plug-in .deb
+# (Linux SDK pulled from the sr-sdk-v* release) and, on a v* tag, attaches
+# displayxr-leia-sr_<ver>_amd64.deb to the Release for the Linux meta-bundle.
+# Soft-skips until the Linux SDK asset is uploaded to that release (see @George).
 
 name: Build Linux
 
 on:
   pull_request:
   workflow_dispatch:
+  # Release tags: the Deb job attaches displayxr-leia-sr_<ver>_amd64.deb to the
+  # GitHub Release (the Linux meta-bundle fetches it — runtime #781 Phase 3).
+  # Tags only, never plain pushes to main.
+  push:
+    tags:
+      - "v*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write # the Deb job attaches release assets on tags
 
 env:
   # Runtime ref the Linux arm builds against. MUST equal the CMake
@@ -154,3 +165,104 @@ jobs:
           DXR_LEIA_FORCE_PROBE=1 "$CLI" info --json > info.json
           jq -e '.plugin.id == "leia-sr"' info.json > /dev/null
           echo "OK: leia-sr active, ABI green"
+
+  # Track B (real srSDK) .deb for the Linux meta-bundle (runtime #781 Phase 3).
+  # Builds the REAL plug-in .deb using the Linux SR SDK pulled from the
+  # sr-sdk-v* release — the same release the Windows build pulls the win64 SDK
+  # from — and on a v* tag attaches displayxr-leia-sr_<ver>_amd64.deb to the
+  # GitHub Release. Single artifact on one base (not the tri-LTS matrix), on a
+  # VM (not a container) so sudo apt + softprops/action-gh-release work simply.
+  #
+  # GATED ON THE LINUX SDK ASSET EXISTING: until a LeiaSR-SDK-<SR_TAG>-linux64.*
+  # is uploaded to the sr-sdk-v<SR_TAG> release (produced by the LeiaSR Linux
+  # build — see runtime #781 / @George), the download soft-skips and this job is
+  # a green no-op. It never blocks a PR.
+  Deb:
+    runs-on: ubuntu-latest
+    env:
+      # SDK release tag — keep in sync with build-windows.yml's SR_TAG (both
+      # pull from the same sr-sdk-v<SR_TAG> release, just different-OS assets).
+      SR_TAG: 1.35.0.2011
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config glslang-tools jq \
+            libvulkan-dev libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            dpkg-dev fakeroot patchelf
+
+      - name: Checkout plug-in
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe for the .deb version
+
+      - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: DisplayXR/displayxr-runtime
+          ref: ${{ env.RUNTIME_REF }}
+          path: displayxr-runtime
+          fetch-depth: 1
+
+      - name: Download the Linux SR SDK from the sr-sdk release
+        id: sdk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # Try common tarball extensions; the LeiaSR Linux build decides the
+          # exact name. Absent asset => soft-skip (the .deb path isn't live yet).
+          got=""
+          for ext in tar.gz tgz tar.xz zip; do
+            if gh release download "sr-sdk-v$SR_TAG" -R DisplayXR/displayxr-leia-plugin \
+                 -p "LeiaSR-SDK-$SR_TAG-linux64.$ext" -D . 2>/dev/null; then
+              got="LeiaSR-SDK-$SR_TAG-linux64.$ext"; break
+            fi
+          done
+          if [ -z "$got" ]; then
+            echo "::warning::No LeiaSR-SDK-$SR_TAG-linux64.* on the sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
+            echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          mkdir -p _srsdk
+          case "$got" in
+            *.zip) unzip -q "$got" -d _srsdk ;;
+            *)     tar -xf "$got" -C _srsdk ;;
+          esac
+          # SRSDK_ROOT = the prefix that holds lib/cmake/srSDK/ (what
+          # find_package(srSDK CONFIG) searches). Derive it from the config file
+          # so the tarball's top-dir name doesn't matter.
+          cfg=$(find _srsdk \( -name 'srSDKConfig.cmake' -o -name 'srSDK-config.cmake' \) | head -1)
+          if [ -z "$cfg" ]; then
+            echo "::error::LeiaSR Linux SDK unpacked but no srSDK CMake config found — check the tarball layout."
+            exit 1
+          fi
+          root=$(cd "$(dirname "$cfg")/../.." && pwd)   # up from lib/cmake/srSDK
+          echo "SRSDK_ROOT=$root" >> "$GITHUB_ENV"
+          echo "have_sdk=yes" >> "$GITHUB_OUTPUT"
+          echo "SRSDK_ROOT=$root"
+
+      - name: Build Track B .deb
+        if: steps.sdk.outputs.have_sdk == 'yes'
+        env:
+          DXR_RUNTIME_SOURCE_DIR: ${{ github.workspace }}/displayxr-runtime
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/package_deb_leia.sh
+          ls -lh dist/displayxr-leia-sr_*_amd64.deb
+
+      - name: Upload .deb artifact
+        if: steps.sdk.outputs.have_sdk == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-leia-sr-deb
+          path: dist/displayxr-leia-sr_*_amd64.deb
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release (tags only)
+        if: steps.sdk.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/displayxr-leia-sr_*_amd64.deb
+          fail_on_unmatched_files: true
