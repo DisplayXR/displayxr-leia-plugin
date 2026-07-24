@@ -64,6 +64,7 @@
  */
 
 #include "leia_sr_linux.h"
+#include "leia_edid_probe_linux.h"
 
 #include "leia_interface.h"
 
@@ -374,6 +375,46 @@ sr_ctx_refresh_display_info_locked(void)
 	info.nominal_viewer_y_m = ny / 1000.0f;
 	info.nominal_viewer_z_m = nz / 1000.0f;
 
+	/* SRService-Linux does not yet populate per-panel display geometry: on an
+	 * unconfigured panel it reports its built-in default (344.2 x 193.6 mm
+	 * 15.6" quad — the same constants the Windows probe uses as a last-resort
+	 * fallback, leia_sr_probe.cpp) plus a nominal viewer derived from that
+	 * default. Accepting it verbatim shrinks the runtime's Kooima screen quad
+	 * ~1.7x on a 27" panel — wrong frusta, wrong convergence plane ("cube out
+	 * of focus"). Detect the canned default and override the physical size
+	 * from the panel's own EDID; re-derive the nominal viewer from the real
+	 * height (design position ~ centre, ~1.9x width in front is SR's own
+	 * ratio, but plain (0, 0, max(nz_scaled, 0.45)) matches the Windows
+	 * fallback semantics and keeps the axis on panel-centre). */
+	const bool sr_default_geometry = (w_cm > 34.3f && w_cm < 34.6f && h_cm > 19.2f && h_cm < 19.5f);
+	if (sr_default_geometry) {
+		float edid_w = 0.0f, edid_h = 0.0f;
+		if (leia_lnx_edid_panel_physical_size(&edid_w, &edid_h)) {
+			const float scale = edid_w / info.width_m;
+			U_LOG_W("leia_sr_sdk: SR reported its DEFAULT display geometry (%.1fx%.1f cm) — "
+			        "overriding physical size from EDID: %.3fx%.3f m (nominal viewer scaled %.2fx)",
+			        w_cm, h_cm, edid_w, edid_h, scale);
+			info.width_m = edid_w;
+			info.height_m = edid_h;
+			/* The default-derived nominal is for the wrong quad; scale its Z
+			 * with the size ratio and drop the bogus Y offset. */
+			info.nominal_viewer_x_m = 0.0f;
+			info.nominal_viewer_y_m = 0.0f;
+			info.nominal_viewer_z_m = info.nominal_viewer_z_m * scale;
+		} else {
+			U_LOG_W("leia_sr_sdk: SR reported its DEFAULT display geometry (%.1fx%.1f cm) and "
+			        "no EDID size available — projection geometry will be wrong on large panels",
+			        w_cm, h_cm);
+		}
+	}
+
+	/* NB: recommended per-view size is passed through as-is (e.g. 0.5x0.5 of
+	 * the panel for the 2-view mode — half-size views, tiled 2x1 from the
+	 * atlas origin). The weave path hands the srSDK weaver the CONTENT rect
+	 * (view_width*cols x view_height*rows) via the crop/flip intermediate in
+	 * leiasr_lnx_weave — never the whole worst-case atlas — per the runtime's
+	 * crop-before-the-DP rule (ADR-030). */
+
 	static bool logged;
 	if (!logged) {
 		U_LOG_I("leia_sr_sdk: display %dx%d px, %.1fx%.1f cm, at (%d,%d), recommended %dx%d "
@@ -465,9 +506,183 @@ struct leiasr_lnx
 	struct sdk_fb_cache_entry fb_cache[FB_CACHE_SIZE];
 	uint32_t fb_cache_next;
 
+	/* Y-flip intermediate: srSDK 1.0.0's Vulkan weaver has no input-flip
+	 * toggle and samples the SBS input with the opposite V convention from
+	 * the Windows SR VK weaver, so a Vulkan-rendered (Y-down) atlas weaves
+	 * upside-down. When input->y_flip is set we flip-blit the atlas into
+	 * this backend-owned intermediate and hand ITS view to the weaver.
+	 * Lazily (re)created on size/format change; freed with the backend. */
+	VkImage flip_image;
+	VkDeviceMemory flip_memory;
+	VkImageView flip_view;
+	uint32_t flip_w, flip_h;
+	VkFormat flip_format;
+
 	struct leiasr_lnx_eye_pair_mm last_good_pair;
 	bool have_last_good;
 };
+
+static void
+sdk_flip_cache_flush(struct leiasr_lnx *lnx)
+{
+	if (lnx->flip_view != VK_NULL_HANDLE) {
+		vkDestroyImageView(lnx->info.device, lnx->flip_view, NULL);
+	}
+	if (lnx->flip_image != VK_NULL_HANDLE) {
+		vkDestroyImage(lnx->info.device, lnx->flip_image, NULL);
+	}
+	if (lnx->flip_memory != VK_NULL_HANDLE) {
+		vkFreeMemory(lnx->info.device, lnx->flip_memory, NULL);
+	}
+	lnx->flip_view = VK_NULL_HANDLE;
+	lnx->flip_image = VK_NULL_HANDLE;
+	lnx->flip_memory = VK_NULL_HANDLE;
+	lnx->flip_w = lnx->flip_h = 0;
+	lnx->flip_format = VK_FORMAT_UNDEFINED;
+}
+
+/*! Lazily (re)create the flip intermediate for the given atlas dims/format.
+ * Returns the sampleable view, or VK_NULL_HANDLE on failure (caller weaves
+ * unflipped rather than dropping the frame). */
+static VkImageView
+sdk_flip_get_view(struct leiasr_lnx *lnx, uint32_t w, uint32_t h, VkFormat format)
+{
+	if (lnx->flip_view != VK_NULL_HANDLE && lnx->flip_w == w && lnx->flip_h == h &&
+	    lnx->flip_format == format) {
+		return lnx->flip_view;
+	}
+	sdk_flip_cache_flush(lnx);
+
+	VkImageCreateInfo img_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = format,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	if (vkCreateImage(lnx->info.device, &img_info, NULL, &lnx->flip_image) != VK_SUCCESS) {
+		return VK_NULL_HANDLE;
+	}
+
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(lnx->info.device, lnx->flip_image, &req);
+	VkPhysicalDeviceMemoryProperties props;
+	vkGetPhysicalDeviceMemoryProperties(lnx->info.physical_device, &props);
+	uint32_t type = UINT32_MAX;
+	for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+		if ((req.memoryTypeBits & (1u << i)) &&
+		    (props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+			type = i;
+			break;
+		}
+	}
+	VkMemoryAllocateInfo alloc = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = req.size,
+	    .memoryTypeIndex = type,
+	};
+	if (type == UINT32_MAX ||
+	    vkAllocateMemory(lnx->info.device, &alloc, NULL, &lnx->flip_memory) != VK_SUCCESS ||
+	    vkBindImageMemory(lnx->info.device, lnx->flip_image, lnx->flip_memory, 0) != VK_SUCCESS) {
+		sdk_flip_cache_flush(lnx);
+		return VK_NULL_HANDLE;
+	}
+
+	VkImageViewCreateInfo view_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = lnx->flip_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = format,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	if (vkCreateImageView(lnx->info.device, &view_info, NULL, &lnx->flip_view) != VK_SUCCESS) {
+		sdk_flip_cache_flush(lnx);
+		return VK_NULL_HANDLE;
+	}
+	lnx->flip_w = w;
+	lnx->flip_h = h;
+	lnx->flip_format = format;
+	U_LOG_I("leia_sr_sdk: created y-flip intermediate %ux%u (srSDK weaver has no input flip)", w, h);
+	return lnx->flip_view;
+}
+
+/*! Record the flip blit: atlas (SHADER_READ) -> intermediate (-> SHADER_READ),
+ * vertically mirrored. Whole-image overwrite, so the intermediate's oldLayout
+ * is UNDEFINED every frame (legal + skips a redundant transition). */
+static void
+sdk_record_flip_blit(struct leiasr_lnx *lnx, VkCommandBuffer cmd_buffer,
+                     const struct leiasr_lnx_weave_input *input, uint32_t w, uint32_t h)
+{
+	VkImageMemoryBarrier pre[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = input->atlas_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = 0,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = lnx->flip_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vkCmdPipelineBarrier(cmd_buffer,
+	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, (int32_t)h, 0}, {(int32_t)w, 0, 1}}, // mirrored V
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+	};
+	vkCmdBlitImage(cmd_buffer, input->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	               lnx->flip_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+	               VK_FILTER_NEAREST);
+
+	VkImageMemoryBarrier post[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = input->atlas_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = lnx->flip_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, post);
+}
 
 static VkResult
 sdk_create_render_pass(struct leiasr_lnx *lnx, VkFormat format)
@@ -759,6 +974,7 @@ leiasr_lnx_destroy(struct leiasr_lnx *lnx)
 		srDestroyWeaver(lnx->weaver);
 	}
 	sdk_fb_cache_flush(lnx);
+	sdk_flip_cache_flush(lnx);
 	if (lnx->render_pass != VK_NULL_HANDLE) {
 		vkDestroyRenderPass(lnx->info.device, lnx->render_pass, NULL);
 	}
@@ -792,11 +1008,27 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 		return;
 	}
 
+	/* srSDK 1.0.0 has no input-flip toggle and its Linux VK weaver samples the
+	 * SBS input with the opposite V convention from the Windows SR VK weaver
+	 * (which consumes the runtime's top-down atlas directly — see
+	 * drv_leia/leia_display_processor.cpp). So when the compositor asks for a
+	 * flip, blit the atlas vertically mirrored into a backend-owned
+	 * intermediate and weave from THAT. On any allocation failure, weave
+	 * unflipped (upside-down beats a dropped frame). */
+	VkImageView weave_view = input->atlas_view;
 	if (input->y_flip) {
-		static bool logged;
-		if (!logged) {
-			U_LOG_W("leia_sr_sdk: y_flip requested but srSDK 1.0.0 has no flip toggle — ignored");
-			logged = true;
+		const uint32_t atlas_w = input->view_width * input->tile_columns;
+		const uint32_t atlas_h = input->view_height * input->tile_rows;
+		VkImageView fv = sdk_flip_get_view(lnx, atlas_w, atlas_h, input->view_format);
+		if (fv != VK_NULL_HANDLE) {
+			sdk_record_flip_blit(lnx, cmd_buffer, input, atlas_w, atlas_h);
+			weave_view = fv;
+		} else {
+			static bool logged;
+			if (!logged) {
+				U_LOG_W("leia_sr_sdk: y_flip intermediate unavailable — weaving unflipped");
+				logged = true;
+			}
 		}
 	}
 
@@ -826,7 +1058,7 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	 * vkweaver.cpp), so contract hygiene for future SDKs. */
 	const int32_t in_w = (int32_t)input->view_width;
 	const int32_t in_h = (int32_t)input->view_height;
-	res = srWeaverSetInputTextureVulkan(lnx->weaver, (SrVkImageView)input->atlas_view, in_w, in_h,
+	res = srWeaverSetInputTextureVulkan(lnx->weaver, (SrVkImageView)weave_view, in_w, in_h,
 	                                    (SrVkFormat)input->view_format);
 	if (SR_FAILED(res)) {
 		LOG_SR_ONCE("srWeaverSetInputTextureVulkan", res);
@@ -907,6 +1139,7 @@ leiasr_lnx_output_invalidated(struct leiasr_lnx *lnx)
 	 * exists (contract §8 R-W8) — we re-bind every Set* per frame and flush
 	 * only our own view/fb cache. */
 	sdk_fb_cache_flush(lnx);
+	sdk_flip_cache_flush(lnx);
 }
 
 void

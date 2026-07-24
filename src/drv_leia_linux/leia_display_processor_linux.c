@@ -19,6 +19,7 @@
 
 #include "leia_display_processor_linux.h"
 #include "leia_sr_linux.h"
+#include "leia_edid_probe_linux.h" // RandR panel desktop position (screen_left/top override)
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -161,6 +162,12 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .view_format = (VkFormat)view_format,
 	    .tile_columns = tile_columns,
 	    .tile_rows = tile_rows,
+	    /* The handle app already renders a right-side-up atlas into the swapchain
+	     * (GL-Y-up projection + Vulkan negative-height viewport), and the srSDK
+	     * weaver samples it in the same convention — so NO extra weave-side flip.
+	     * (An earlier y_flip=true here double-flipped: the scene showed the floor
+	     * above the cube. If a future producer supplies a bottom-up atlas, gate
+	     * this per-input rather than hardcoding.) */
 	    .y_flip = false,
 	};
 	struct leiasr_lnx_weave_output output = {
@@ -246,8 +253,29 @@ leia_lnx_dp_get_display_pixel_info(struct xrt_display_processor *xdp,
 	}
 	*out_pixel_width = info.pixel_width;
 	*out_pixel_height = info.pixel_height;
-	*out_screen_left = info.screen_left;
-	*out_screen_top = info.screen_top;
+	// MUST match get_display_info's coordinate frame: the SR backend reports
+	// screen (0,0) on Linux, but the app opens its window at the panel's real
+	// desktop position (RandR). The runtime's window-metrics computes the eye
+	// offset as (window_screen_left - display_screen_left); if this returns 0
+	// while the window is at desktop 3072, a huge phantom lateral eye offset
+	// shoves the content off-screen. Apply the SAME RandR override the plugin's
+	// get_display_info uses (leia_plugin_linux.c), cached once.
+	int32_t sl = info.screen_left, st = info.screen_top;
+	{
+		static bool resolved = false;
+		static bool randr_found = false;
+		static int32_t randr_left = 0, randr_top = 0;
+		if (!resolved) {
+			randr_found = leia_lnx_edid_panel_desktop_position(&randr_left, &randr_top);
+			resolved = true;
+		}
+		if (randr_found) {
+			sl = randr_left;
+			st = randr_top;
+		}
+	}
+	*out_screen_left = sl;
+	*out_screen_top = st;
 	return true;
 }
 
