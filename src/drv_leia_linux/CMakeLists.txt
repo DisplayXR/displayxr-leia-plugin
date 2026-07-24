@@ -43,6 +43,10 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     target_sources(leia_weaver_backend INTERFACE
         ${CMAKE_CURRENT_SOURCE_DIR}/leia_sr_linux_sdk.c)
     target_link_libraries(leia_weaver_backend INTERFACE srSDK::loader)
+    # Lets the plug-in iface's display_name reflect the real (Track B) backend
+    # instead of the stub label (#100 review / cube-hw finding D). INTERFACE →
+    # propagates to leia_plugin_linux.c compiled into DisplayXR-LeiaSR.
+    target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_WEAVER_SDK=1)
 
     # DEV-ONLY convenience: bake the SDK lib dir as DT_RUNPATH so the static
     # loader's dlopen("libLeiaSR_runtime.so") resolves with zero environment

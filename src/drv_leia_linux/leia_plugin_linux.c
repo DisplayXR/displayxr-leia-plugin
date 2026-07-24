@@ -202,7 +202,11 @@ static struct xrt_plugin_iface g_leia_lnx_iface = {
     .reserved_0 = 0,
 
     .id = "leia-sr",
+#ifdef DXR_LEIA_WEAVER_SDK
+    .display_name = "DisplayXR Leia SR (Linux)",
+#else
     .display_name = "DisplayXR Leia SR (Linux, stub weaver)",
+#endif
     .vendor = "Leia Inc.",
     .version = DXR_PLUGIN_GIT_DESC,
 

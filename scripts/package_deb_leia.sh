@@ -158,8 +158,15 @@ compute_lib_depends() {
     local sonames so pkg pkgs=""
     sonames="$(objdump -p "$SO" 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u)"
     for so in $sonames; do
+        # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
+        # /usr/lib, incl. multiarch/lib64). This is the cube-hw finding (B): the
+        # Leia SR runtime bundles copies of common .so's under /opt/leiasr/lib,
+        # so a bare `dpkg -S <soname>` can otherwise attribute a system lib to
+        # `leiasr-runtime` and wrongly make it a hard Depend (it must stay a
+        # Recommends). Excluding /opt paths + leiasr-runtime keeps auto-Depends
+        # to real system packages.
         pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '{n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); print p; exit}}')"
+               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
         [ -n "$pkg" ] && pkgs="$pkgs $pkg"
     done
     echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'
@@ -209,3 +216,7 @@ dpkg-deb --info "$DEB" | sed 's/^/    /'
 echo "    --- contents ---"
 dpkg-deb --contents "$DEB" | sed 's/^/    /'
 [ "$WEAVER" = "stub" ] && echo "" && echo "NOTE: --stub build — this .deb is for packaging-mechanics validation only, NOT a shippable artifact."
+
+# Explicit success: the trailing test above returns 1 on an sdk build, which
+# would otherwise become the script's exit code (cube-hw finding E).
+exit 0
