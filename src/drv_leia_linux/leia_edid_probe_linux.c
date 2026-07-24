@@ -87,6 +87,109 @@ leia_lnx_edid_panel_present(uint16_t *out_manufacturer_id, uint16_t *out_product
 	return found;
 }
 
+/*! Parse physical size (metres) out of one 128-byte EDID block. Preferred:
+ * detailed timing descriptor #1 image size in mm (bytes 66,67 low 8 bits;
+ * byte 68 = H-upper-nibble<<4 | V-upper-nibble). Fallback: bytes 21/22, cm.
+ * Returns false when both encodings are absent/implausible. */
+static bool
+edid_physical_size_m(const uint8_t *edid, float *out_w_m, float *out_h_m)
+{
+	// Detailed timing #1 at byte 54; a pixel-clock of 0 means it is a
+	// display descriptor, not a timing — mm fields would be garbage.
+	const uint16_t pixel_clock = (uint16_t)(edid[54] | (edid[55] << 8));
+	if (pixel_clock != 0) {
+		const uint32_t w_mm = (uint32_t)edid[66] | ((uint32_t)(edid[68] & 0xF0) << 4);
+		const uint32_t h_mm = (uint32_t)edid[67] | ((uint32_t)(edid[68] & 0x0F) << 8);
+		if (w_mm > 50 && h_mm > 50) {
+			*out_w_m = (float)w_mm / 1000.0f;
+			*out_h_m = (float)h_mm / 1000.0f;
+			return true;
+		}
+	}
+	// Basic max image size, cm (0 = undefined/aspect-ratio encoding).
+	if (edid[21] > 5 && edid[22] > 5) {
+		*out_w_m = (float)edid[21] / 100.0f;
+		*out_h_m = (float)edid[22] / 100.0f;
+		return true;
+	}
+	return false;
+}
+
+bool
+leia_lnx_edid_panel_physical_size(float *out_width_m, float *out_height_m)
+{
+	DIR *drm = opendir("/sys/class/drm");
+	if (drm == NULL) {
+		return false;
+	}
+
+	float table_w = 0, table_h = 0;     // frozen-table-matched panel (preferred)
+	float ext_w = 0, ext_h = 0;         // first connected external connector
+	struct dirent *entry;
+	while ((entry = readdir(drm)) != NULL) {
+		if (strncmp(entry->d_name, "card", 4) != 0 || strchr(entry->d_name, '-') == NULL) {
+			continue;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "/sys/class/drm/%s/edid", entry->d_name);
+		FILE *f = fopen(path, "rb");
+		if (f == NULL) {
+			continue;
+		}
+		uint8_t edid[128];
+		size_t n = fread(edid, 1, sizeof(edid), f);
+		fclose(f);
+		if (n < sizeof(edid) || memcmp(edid, EDID_MAGIC, sizeof(EDID_MAGIC)) != 0) {
+			continue;
+		}
+
+		float w = 0, h = 0;
+		if (!edid_physical_size_m(edid, &w, &h) || w < 0.05f || h < 0.05f) {
+			continue;
+		}
+
+		const uint16_t man = (uint16_t)(edid[8] | (edid[9] << 8));
+		const uint16_t prod = (uint16_t)(edid[10] | (edid[11] << 8));
+		bool in_table = false;
+		for (size_t i = 0; i < LEIA_EDID_TABLE_LEN; i++) {
+			if (leia_edid_table[i][0] == man && leia_edid_table[i][1] == prod) {
+				in_table = true;
+				break;
+			}
+		}
+		// Internal-panel connectors (eDP/LVDS/DSI) are never the 3D display.
+		const bool internal = strstr(entry->d_name, "eDP") != NULL ||
+		                      strstr(entry->d_name, "LVDS") != NULL ||
+		                      strstr(entry->d_name, "DSI") != NULL;
+
+		if (in_table && table_w == 0) {
+			table_w = w;
+			table_h = h;
+			U_LOG_I("leia_lnx_edid: table-matched panel %s physical size %.3fx%.3f m",
+			        entry->d_name, w, h);
+		} else if (!internal && ext_w == 0) {
+			ext_w = w;
+			ext_h = h;
+			U_LOG_I("leia_lnx_edid: external connector %s physical size %.3fx%.3f m",
+			        entry->d_name, w, h);
+		}
+	}
+	closedir(drm);
+
+	const float w = table_w > 0 ? table_w : ext_w;
+	const float h = table_h > 0 ? table_h : ext_h;
+	if (w <= 0 || h <= 0) {
+		return false;
+	}
+	if (out_width_m != NULL) {
+		*out_width_m = w;
+	}
+	if (out_height_m != NULL) {
+		*out_height_m = h;
+	}
+	return true;
+}
+
 /*! Match one RandR output's EDID property against the frozen panel table. */
 static bool
 randr_output_is_leia_panel(xcb_connection_t *conn, xcb_randr_output_t output, xcb_atom_t edid_atom)

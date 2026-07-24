@@ -48,6 +48,23 @@ leia_lnx_edid_panel_present(uint16_t *out_manufacturer_id, uint16_t *out_product
 bool
 leia_lnx_edid_panel_desktop_position(int32_t *out_left, int32_t *out_top);
 
+/*!
+ * Read the panel's physical size from its EDID (metres). Preferred source:
+ * detailed timing descriptor #1's mm image-size fields (bytes 66-68); fallback:
+ * the cm max-image-size fields (bytes 21/22). Connector choice: a frozen-table
+ * match wins; otherwise the first connected non-internal (non-eDP/LVDS)
+ * connector — covers panels whose EDID IDs are not (yet) in the table, e.g. the
+ * Samsung Odyssey 3D. Used to override the SR runtime's display geometry when
+ * it reports its built-in default (344.2x193.6 mm) instead of the real panel —
+ * on Linux SRService display geometry is not yet populated per-panel, and a
+ * wrong physical size skews the runtime's whole projection (wrong convergence).
+ * @param[out] out_width_m   Panel width in metres — may be NULL.
+ * @param[out] out_height_m  Panel height in metres — may be NULL.
+ * @return true when a plausible size (> 0.05 m each axis) was read.
+ */
+bool
+leia_lnx_edid_panel_physical_size(float *out_width_m, float *out_height_m);
+
 #ifdef __cplusplus
 }
 #endif
