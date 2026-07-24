@@ -36,8 +36,18 @@ path.**
 
 ## Open items before release
 
-- **Confirm the SR runtime Debian package name** for `Recommends:` (currently
-  the `SR_RUNTIME_PKG` default `leiasr-runtime` — override via the env var).
+- ✅ **SR runtime package name = `leiasr-runtime`** — confirmed against LeiaSR
+  `packaging/linux/deb/control.in` (ST-5525-linux-support branch; installs under
+  `/opt/leiasr`). `Recommends: leiasr-runtime`.
+- ⚠️ **SR-side integration gap:** the `leiasr-runtime` .deb bundles
+  `libLeiaSR_runtime.so` under `/opt/leiasr/lib` but does **not** register
+  `/etc/leia/sr/1/active_runtime.json`, add an `ld.so.conf.d` entry, or
+  `ldconfig` that dir — so the srSDK loader's default resolution finds nothing
+  as-is. The correct fix is on the SR side (register the active_runtime path in
+  its `postinst`). Until then a deployed plug-in needs `SR_RUNTIME_PATH`
+  (env) or a baked rpath to the stable `/opt/leiasr/lib` (a fixed *install*
+  path, distinct from the dev/build-machine rpath the release model rejects).
+  **Raise with George before shipping** — don't paper over it in the plug-in.
 - **Track B build + hardware acceptance** run on an SR box (Suzhou / George).
 - The `-DDXR_LEIA_SDK_DEV_RPATH=OFF` build option lands with the
   `linux-sdk-rpath-dev-only` branch; until it merges, the `patchelf` strip in the

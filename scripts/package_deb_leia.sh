@@ -56,9 +56,23 @@ BUILD_DIR="${BUILD_DIR:-$ROOT/build-deb}"
 DIST_DIR="${DIST_DIR:-$ROOT/dist}"
 RUNTIME_DIR="${DXR_RUNTIME_SOURCE_DIR:-$(cd "$ROOT/.." && pwd)/displayxr-runtime}"
 
-# The SR runtime Debian package name for `Recommends:`. CONFIRM with the SR
-# runtime .deb George ships — override with SR_RUNTIME_PKG=<name> until then.
+# The SR runtime Debian package name for `Recommends:`. CONFIRMED against the
+# LeiaSR repo (packaging/linux/deb/control.in on the ST-5525-linux-support
+# branch: `Package: leiasr-runtime`; installs under /opt/leiasr). Override with
+# SR_RUNTIME_PKG=<name> if the release package name changes.
 SR_RUNTIME_PKG="${SR_RUNTIME_PKG:-leiasr-runtime}"
+
+# INTEGRATION GAP (as of the ST-5525-linux-support branch): the leiasr-runtime
+# .deb bundles libLeiaSR_runtime.so under /opt/leiasr/lib but does NOT register
+# /etc/leia/sr/1/active_runtime.json, add an ld.so.conf.d entry for
+# /opt/leiasr/lib, or ldconfig it. So the srSDK loader's default resolution
+# (/etc/leia/sr/1/active_runtime.json -> $SR_RUNTIME_PATH -> plain dlopen) finds
+# nothing as-is. Until the SR .deb registers that path (the correct owner), a
+# deployed plug-in needs one of: SR_RUNTIME_PATH=/opt/leiasr/lib/libLeiaSR_runtime.so
+# (env, re-introduces config), or a baked rpath to the STABLE install dir
+# /opt/leiasr/lib (a fixed deployment path, not a build-machine path — distinct
+# from the dev-rpath the release model rejects). Tracked as an SR-side ask; do
+# NOT paper over it here without George's call.
 
 WEAVER="sdk"       # Track B (real srSDK). --stub switches to Track A.
 NO_BUILD=0
