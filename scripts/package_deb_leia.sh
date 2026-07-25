@@ -114,7 +114,10 @@ SO="$(find_so)"
 [ -n "$SO" ] || { echo "error: DisplayXR-LeiaSR.so not found after build." >&2; exit 1; }
 
 # Version: git describe → Debian-legal upstream version (same rule as the runtime).
-RAW="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo 0.0.0)"
+# --match 'v[0-9]*' so the plug-in version derives ONLY from canonical release
+# tags — the sr-sdk-v<...> SDK-pin tags share this repo and would otherwise be
+# picked up by `git describe` as the nearest tag (they are the newest tags).
+RAW="$(git -C "$ROOT" describe --tags --always --dirty --match 'v[0-9]*' 2>/dev/null || echo 0.0.0)"
 VERSION="$(echo "$RAW" | sed -e 's/^v//' -e 's/-dirty$/+dirty/' -e 's/-\([0-9]\+\)-g/+\1.g/')"
 case "$VERSION" in [0-9]*) : ;; *) VERSION="0.0.0+g$VERSION" ;; esac
 ARCH="$(dpkg --print-architecture)"
@@ -159,14 +162,17 @@ compute_lib_depends() {
     sonames="$(objdump -p "$SO" 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u)"
     for so in $sonames; do
         # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
-        # /usr/lib, incl. multiarch/lib64). This is the cube-hw finding (B): the
-        # Leia SR runtime bundles copies of common .so's under /opt/leiasr/lib,
-        # so a bare `dpkg -S <soname>` can otherwise attribute a system lib to
-        # `leiasr-runtime` and wrongly make it a hard Depend (it must stay a
-        # Recommends). Excluding /opt paths + leiasr-runtime keeps auto-Depends
-        # to real system packages.
+        # /usr/lib, incl. multiarch/lib64), EXCLUDING the wrong-arch 32-bit
+        # multiarch trees (i386/lib32/libx32). Two reasons:
+        #   - cube-hw finding (B): the Leia SR runtime bundles copies of common
+        #     .so's under /opt/leiasr/lib, so a bare `dpkg -S <soname>` can
+        #     attribute a system lib to `leiasr-runtime` and wrongly make it a
+        #     hard Depend (it must stay a Recommends).
+        #   - amd64 runners carry i386 multiarch, so `dpkg -S libc.so.6` also
+        #     matches /usr/lib/i386-linux-gnu/libc.so.6 (libc6-i386); picking
+        #     that would add a bogus 32-bit Depend to an amd64 package.
         pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
+               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// && $2 !~ /(i386-linux-gnu|\/lib32\/|\/libx32\/)/ {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
         [ -n "$pkg" ] && pkgs="$pkgs $pkg"
     done
     echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'
