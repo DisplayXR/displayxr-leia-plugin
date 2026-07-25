@@ -239,7 +239,11 @@ jobs:
             echo "::error::LeiaSR Linux SDK unpacked but no srSDK CMake config found — check the tarball layout."
             exit 1
           fi
-          root=$(cd "$(dirname "$cfg")/../.." && pwd)   # up from lib/cmake/srSDK
+          # PREFIX (holds lib/cmake/srSDK/) = 3 levels up from the config's dir:
+          # srSDK -> cmake -> lib -> PREFIX. find_package(srSDK CONFIG) then
+          # resolves <PREFIX>/lib/cmake/srSDK. (Two levels landed on .../lib and
+          # find_package missed it.)
+          root=$(cd "$(dirname "$cfg")/../../.." && pwd)
           echo "SRSDK_ROOT=$root" >> "$GITHUB_ENV"
           echo "have_sdk=yes" >> "$GITHUB_OUTPUT"
           echo "SRSDK_ROOT=$root"
