@@ -37,6 +37,19 @@ struct leia_dp_linux
 	struct vk_bundle *vk;                 //!< compositor's bundle — not owned
 	struct leiasr_lnx *sr;                //!< weaver backend — owned
 	uint32_t view_count;                  //!< from the last process_atlas grid
+
+	//! XR_DXR_display_zones (ADR-027). Zones need NO special weaver support on
+	//! Linux: the runtime composites every zone into the ONE content atlas and
+	//! the standard process_atlas weave (0,0 offset) presents it — the same
+	//! aggregate-into-a-single-pass model as the Windows DP. The published
+	//! wish-mask drives the panel's global 2D/3D lens wish (single-zone panel:
+	//! the union collapses to on/off, zone_grid 1x1). These fields cache the
+	//! last-published geometry for change-gated logging.
+	bool zone_active;
+	int32_t zone_last_x, zone_last_y;
+	uint32_t zone_last_w, zone_last_h;
+	uint32_t zone_last_mask_w, zone_last_mask_h;
+	uint64_t zone_last_seq;
 };
 
 static inline struct leia_dp_linux *
@@ -326,6 +339,100 @@ leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 
 /*
  *
+ * XR_DXR_display_zones (ADR-027).
+ *
+ * Zones need NO special weaver support: the runtime composites every zone into
+ * the ONE content atlas and the standard process_atlas weave (0,0 offset,
+ * already implemented above) presents it — identical to the Windows DP's
+ * aggregate-into-a-single-pass model. So the DP only has to (1) advertise the
+ * capability and (2) accept the published wish-mask (which drives the panel's
+ * global 2D/3D lens wish). The Odyssey is a single-zone panel, so the wish
+ * union collapses to a global on/off, exactly like the Windows leia DPs
+ * (zone_grid 1x1). Mirrors leia_dp_d3d11_get_local_zone_caps + the
+ * sim_display record-and-return publish.
+ *
+ */
+
+static bool
+leia_lnx_dp_get_local_zone_caps(struct xrt_display_processor *xdp, struct xrt_dp_local_zone_caps *out_caps)
+{
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (out_caps == NULL || out_caps->struct_size < XRT_DP_LOCAL_ZONE_CAPS_SIZE_V1) {
+		// V1 floor only — see the D3D11 variant for the append rationale.
+		return false;
+	}
+	// Zones ride the same SR lens the mode switch drives; require the backend.
+	if (ldp->sr == NULL) {
+		return false;
+	}
+	out_caps->supported = 1;
+	out_caps->zone_grid_width = 1;  // single-zone panel: union collapses to global on/off
+	out_caps->zone_grid_height = 1;
+	out_caps->max_mask_width = 0;  // no preference — content is reduced to one bit
+	out_caps->max_mask_height = 0;
+	out_caps->max_update_hz = 0;  // edge-triggered internally (verdict changes only)
+	if (out_caps->struct_size >= sizeof(struct xrt_dp_local_zone_caps)) {
+		// SR weaver drives a binary panel state — the wish is consumed by the
+		// conformant any-nonzero quantization, not driven fractionally.
+		out_caps->wish_fractional = 0;
+		out_caps->switch_granularity = (uint32_t)XRT_DP_SWITCH_GRANULARITY_UNKNOWN;
+		memset(out_caps->reserved, 0, sizeof(out_caps->reserved));
+	}
+	return true;
+}
+
+static bool
+leia_lnx_dp_publish_local_zone_mask(struct xrt_display_processor *xdp,
+                                    VkImageView mask_view,
+                                    uint32_t mask_width,
+                                    uint32_t mask_height,
+                                    int32_t screen_x,
+                                    int32_t screen_y,
+                                    uint32_t screen_w,
+                                    uint32_t screen_h,
+                                    uint64_t seq)
+{
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (mask_view == VK_NULL_HANDLE || mask_width == 0 || mask_height == 0) {
+		return false;
+	}
+	// Change-gated geometry log (seq ticks every frame — not a change). The
+	// zone content itself is already composited into the atlas the weaver
+	// samples; the mask is the panel's global 2D/3D lens wish (single-zone
+	// panel → any-nonzero collapses to global 3D, which the active display
+	// mode already reflects). Record for logging + future per-region lens.
+	bool geo_changed = !ldp->zone_active || screen_x != ldp->zone_last_x || screen_y != ldp->zone_last_y ||
+	                   screen_w != ldp->zone_last_w || screen_h != ldp->zone_last_h ||
+	                   mask_width != ldp->zone_last_mask_w || mask_height != ldp->zone_last_mask_h;
+	if (geo_changed) {
+		U_LOG_W("leia_lnx_dp: zone publish mask=%ux%u screen=(%d,%d %ux%u) seq=%llu", mask_width, mask_height,
+		        screen_x, screen_y, screen_w, screen_h, (unsigned long long)seq);
+	}
+	ldp->zone_active = true;
+	ldp->zone_last_x = screen_x;
+	ldp->zone_last_y = screen_y;
+	ldp->zone_last_w = screen_w;
+	ldp->zone_last_h = screen_h;
+	ldp->zone_last_mask_w = mask_width;
+	ldp->zone_last_mask_h = mask_height;
+	ldp->zone_last_seq = seq;
+	return true;
+}
+
+static bool
+leia_lnx_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
+{
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (ldp->zone_active) {
+		U_LOG_W("leia_lnx_dp: zone cleared");
+	}
+	ldp->zone_active = false;
+	return true;
+}
+
+
+/*
+ *
  * Factory.
  *
  */
@@ -362,10 +469,15 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->base.base.set_eye_tracking_mode = leia_lnx_dp_set_eye_tracking_mode;
 	ldp->base.base.destroy = leia_lnx_dp_destroy;
 	ldp->base.notify_target_recreated = leia_lnx_dp_notify_target_recreated;
+	// XR_DXR_display_zones (ADR-027): zones aggregate into the one content
+	// atlas + standard 0,0 weave (process_atlas), so no special weaver support
+	// is needed — just advertise caps + accept the wish-mask (Windows parity).
+	ldp->base.base.get_local_zone_caps = leia_lnx_dp_get_local_zone_caps;
+	ldp->base.base.publish_local_zone_mask = leia_lnx_dp_publish_local_zone_mask;
+	ldp->base.base.clear_local_zone_mask = leia_lnx_dp_clear_local_zone_mask;
 	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the
 	// X11 window position), is_alpha_native / set_background_2d /
-	// set_transparent_background (transparency stack), zone slots
-	// (get_local_zone_caps + publish/clear — needs R-W7 phase weaving).
+	// set_transparent_background (transparency stack).
 	ldp->vk = vk;
 	ldp->view_count = 2;
 
