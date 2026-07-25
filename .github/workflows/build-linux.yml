@@ -180,9 +180,10 @@ jobs:
   Deb:
     runs-on: ubuntu-latest
     env:
-      # SDK release tag — keep in sync with build-windows.yml's SR_TAG (both
-      # pull from the same sr-sdk-v<SR_TAG> release, just different-OS assets).
-      SR_TAG: 1.35.0.2011
+      # Linux srSDK release tag. Independent of build-windows.yml's SR_TAG — the
+      # Linux srSDK is versioned like the SR runtime (1.37.0.x) and lives in its
+      # own sr-sdk-v<SR_TAG> release with the LeiaSR-SDK-<SR_TAG>-linux64.* asset.
+      SR_TAG: 1.37.0.41935
     steps:
       - name: Install dependencies
         run: |
