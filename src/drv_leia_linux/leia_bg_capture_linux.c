@@ -388,23 +388,37 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 		return false;
 	}
 
-	// Map the MemFd ourselves when the producer didn't hand us a pointer.
+	// Three shm sub-cases:
+	//   MemFd with fd      → mmap it ourselves (producer-allocated).
+	//   MemPtr with data   → producer-provided pointer.
+	//   MemPtr, no data/fd → CLIENT-ALLOCATES mode (what Mutter's Xorg
+	//                        screencast actually negotiates, #109): WE must
+	//                        provide the storage. We point d->data straight at
+	//                        the slot's persistently-mapped staging buffer, so
+	//                        the producer writes frames directly into the
+	//                        upload source — no extra copy.
 	void *map = NULL;
 	size_t map_size = 0;
+	bool client_alloc = false;
 	if (d->data == NULL) {
-		if (d->fd < 0) {
-			U_LOG_W("leia_bg_capture_linux: shm buffer has neither data nor fd");
-			return false;
-		}
-		map_size = (size_t)d->maxsize + (size_t)d->mapoffset;
-		map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, (int)d->fd, 0);
-		if (map == MAP_FAILED) {
-			U_LOG_W("leia_bg_capture_linux: mmap(MemFd) failed");
-			return false;
+		if (d->fd >= 0) {
+			map_size = (size_t)d->maxsize + (size_t)d->mapoffset;
+			map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, (int)d->fd, 0);
+			if (map == MAP_FAILED) {
+				U_LOG_W("leia_bg_capture_linux: mmap(MemFd) failed");
+				return false;
+			}
+		} else {
+			client_alloc = true;
 		}
 	}
 
-	const VkDeviceSize staging_size = (VkDeviceSize)c->width * c->height * 4;
+	// Size the staging for the producer's declared maxsize when it's the
+	// backing store (client-alloc), never below one tight frame.
+	VkDeviceSize staging_size = (VkDeviceSize)c->width * c->height * 4;
+	if (client_alloc && (VkDeviceSize)d->maxsize > staging_size) {
+		staging_size = (VkDeviceSize)d->maxsize;
+	}
 
 	VkBuffer staging = VK_NULL_HANDLE;
 	VkDeviceMemory staging_mem = VK_NULL_HANDLE;
@@ -519,9 +533,17 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 	c->buffers[slot].image_initialized = false;
 	c->buffers[slot].imported = true;
 
+	if (client_alloc) {
+		// Hand the producer our staging buffer as the frame storage.
+		d->data = staging_ptr;
+		d->maxsize = (uint32_t)staging_size;
+		d->mapoffset = 0;
+	}
+
 	// WARN so it survives field logs: proves the shm path activated.
 	U_LOG_W("leia_bg_capture_linux: shm slot %u ready (%ux%u, %s)", slot, c->width,
-	        c->height, map != NULL ? "MemFd mmap" : "MemPtr");
+	        c->height,
+	        client_alloc ? "MemPtr client-alloc → staging" : (map != NULL ? "MemFd mmap" : "MemPtr"));
 	return true;
 
 fail:
@@ -1356,7 +1378,18 @@ on_process(void *data)
 					}
 				}
 				src += off;
-				if (src_stride == (int32_t)dst_stride) {
+				if (src == (const uint8_t *)bb->staging_ptr) {
+					// Client-alloc mode: the producer wrote straight into our
+					// staging buffer. Only compact rows if its stride is
+					// padded (forward per-row memmove is safe: dst < src).
+					if (src_stride != (int32_t)dst_stride) {
+						uint8_t *base = bb->staging_ptr;
+						for (uint32_t y = 1; y < c->height; y++) {
+							memmove(base + (size_t)y * dst_stride,
+							        base + (size_t)y * src_stride, dst_stride);
+						}
+					}
+				} else if (src_stride == (int32_t)dst_stride) {
 					memcpy(bb->staging_ptr, src, (size_t)dst_stride * c->height);
 				} else {
 					uint8_t *dst = bb->staging_ptr;
