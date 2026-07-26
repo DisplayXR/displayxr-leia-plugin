@@ -1539,9 +1539,15 @@ pipewire_start(struct leia_bg_capture_linux *c)
 		goto unlock;
 	}
 
-	// dma-buf: do NOT map buffers (we import); AUTOCONNECT to the node.
+	// ALLOC_BUFFERS: when the negotiation lands on a CPU type (MemFd), PipeWire
+	// allocates the shareable memfd storage on our behalf — without it the
+	// spa_data arrives with neither data nor fd and the producer can never
+	// write a frame (#109). MAP_BUFFERS maps those into d->data for the copy
+	// path. The dma-buf import path ignores both (it consumes d->fd directly).
 	int r = pw_stream_connect(c->stream, PW_DIRECTION_INPUT, c->node_id,
-	                          PW_STREAM_FLAG_AUTOCONNECT, params, (uint32_t)n_params);
+	                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_ALLOC_BUFFERS |
+	                              PW_STREAM_FLAG_MAP_BUFFERS,
+	                          params, (uint32_t)n_params);
 	if (r < 0) {
 		U_LOG_W("leia_bg_capture_linux: pw_stream_connect failed (%d)", r);
 		goto unlock;
