@@ -1439,12 +1439,13 @@ on_process(void *data)
 		// after requeue.
 		atomic_store(&c->current_buffer, (int)slot);
 
-		// Frame-flow diagnostics (#109 follow-up): first frame + every 600.
+		// Frame-flow diagnostics (#109 follow-up): FIRST frame only (WARN is
+		// for one-off lifecycle events; recurring counts stay in dbg_frames).
 		uint32_t n = atomic_fetch_add(&c->dbg_frames, 1) + 1;
-		if (!c->dbg_first_frame_logged || (n % 600) == 0) {
+		if (!c->dbg_first_frame_logged) {
 			c->dbg_first_frame_logged = true;
-			U_LOG_W("leia_bg_capture_linux: frame %u published (slot %u, %s)", n, slot,
-			        c->buffers[slot].is_shm ? "shm" : "dma-buf");
+			U_LOG_W("leia_bg_capture_linux: frame %u published (slot %u, %s) — capture is live", n,
+			        slot, c->buffers[slot].is_shm ? "shm" : "dma-buf");
 		}
 	}
 	pw_stream_queue_buffer(c->stream, newest);
@@ -1754,9 +1755,10 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 			bb->image_initialized = true;
 
 			uint32_t u = atomic_fetch_add(&c->dbg_uploads, 1) + 1;
-			if (!c->dbg_first_upload_logged || (u % 600) == 0) {
+			if (!c->dbg_first_upload_logged) {
 				c->dbg_first_upload_logged = true;
-				U_LOG_W("leia_bg_capture_linux: shm upload %u recorded (slot %d)", u, idx);
+				U_LOG_W("leia_bg_capture_linux: shm upload %u recorded (slot %d) — compose is fed", u,
+				        idx);
 			}
 		}
 		// Not dirty + initialized: image already SHADER_READ_ONLY with the
