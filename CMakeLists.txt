@@ -95,10 +95,9 @@ if(DXR_RUNTIME_SOURCE_DIR)
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v2.0.0 (a8f6e74f) — the release that ships
-    # the XR_EXT_* → XR_DXR_* extension rename (#734), which this plug-in's
-    # own rename commit builds against. Replaces the TEMPORARY pre-squash
-    # rename-branch pin (its displayxr_mcp branch SHA is no longer fetchable).
+    # Pinned to displayxr-runtime v2.2.0 — the release that ships plugin ABI
+    # v5 (vk_bundle ABI-parity layout + the Linux dma-buf device-extension
+    # guarantee, runtime#802) which this plug-in's bg-capture producer needs.
     # The DP vtables carry a struct_size header; the runtime's loader rejects
     # any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
     # This plug-in MUST be built against headers that ship the matching major,
@@ -106,14 +105,14 @@ else()
     # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
     # The rule-5 CI self-check below asserts this value equals the workflow's
     # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v2.0.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "v2.2.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     # Linux carries its own pin: the Windows/Android tag predates runtime
     # Linux support entirely (scripts/build_linux.sh first shipped in
     # v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
     # in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
     # equals its RUNTIME_REF so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG_LINUX "v2.0.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
         "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
     if(DXR_LINUX_DESKTOP)
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_LINUX}")
