@@ -1249,12 +1249,15 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	uint8_t buf[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof buf);
 	const struct spa_pod *params[1];
+	// dma-buf or MemFd ONLY — never MemPtr: a raw pointer is meaningless across
+	// the process boundary, so offering it makes PipeWire pick client-alloc
+	// MemPtr (spa_data with neither data nor fd) and the producer can never
+	// fill the frames — uploads run but the texture stays black (#109).
 	params[0] = spa_pod_builder_add_object(
 	    &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 	    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, DXR_MAX_BUFFERS),
 	    SPA_PARAM_BUFFERS_dataType,
-	    SPA_POD_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) |
-	                (1 << SPA_DATA_MemPtr)));
+	    SPA_POD_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd)));
 
 	pw_stream_update_params(c->stream, params, 1);
 }
