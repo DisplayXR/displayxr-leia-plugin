@@ -66,6 +66,7 @@ struct dxr_bg_buffer {
 	bool is_shm;               //!< slot is CPU-staged, not a dma-buf import
 	void *map;                 //!< our mmap of the MemFd (NULL for MemPtr)
 	size_t map_size;           //!< mmap length (0 when map == NULL)
+	int memfd;                 //!< client-allocated memfd (-1 when producer-owned)
 	VkBuffer staging;          //!< host-visible upload source
 	VkDeviceMemory staging_mem; //!< staging allocation (persistently mapped)
 	void *staging_ptr;         //!< persistent map of staging_mem
@@ -391,14 +392,15 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 	// Three shm sub-cases:
 	//   MemFd with fd      → mmap it ourselves (producer-allocated).
 	//   MemPtr with data   → producer-provided pointer.
-	//   MemPtr, no data/fd → CLIENT-ALLOCATES mode (what Mutter's Xorg
-	//                        screencast actually negotiates, #109): WE must
-	//                        provide the storage. We point d->data straight at
-	//                        the slot's persistently-mapped staging buffer, so
-	//                        the producer writes frames directly into the
-	//                        upload source — no extra copy.
+	//   no data, no fd     → CLIENT-ALLOCATES mode (PW_STREAM_FLAG_ALLOC_BUFFERS,
+	//                        what this stack negotiates, #109): WE must provide
+	//                        SHAREABLE storage. A raw pointer can't cross the
+	//                        process boundary, so allocate a memfd, map it, and
+	//                        hand PipeWire the fd — it marshals the fd to the
+	//                        producer, which writes frames into it.
 	void *map = NULL;
 	size_t map_size = 0;
+	int memfd = -1;
 	bool client_alloc = false;
 	if (d->data == NULL) {
 		if (d->fd >= 0) {
@@ -410,15 +412,25 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 			}
 		} else {
 			client_alloc = true;
+			map_size = (size_t)c->width * c->height * 4;
+			memfd = memfd_create("dxr-bgcap", MFD_CLOEXEC);
+			if (memfd < 0 || ftruncate(memfd, (off_t)map_size) != 0) {
+				U_LOG_W("leia_bg_capture_linux: memfd_create/ftruncate failed");
+				if (memfd >= 0) {
+					close(memfd);
+				}
+				return false;
+			}
+			map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+			if (map == MAP_FAILED) {
+				U_LOG_W("leia_bg_capture_linux: mmap(client memfd) failed");
+				close(memfd);
+				return false;
+			}
 		}
 	}
 
-	// Size the staging for the producer's declared maxsize when it's the
-	// backing store (client-alloc), never below one tight frame.
-	VkDeviceSize staging_size = (VkDeviceSize)c->width * c->height * 4;
-	if (client_alloc && (VkDeviceSize)d->maxsize > staging_size) {
-		staging_size = (VkDeviceSize)d->maxsize;
-	}
+	const VkDeviceSize staging_size = (VkDeviceSize)c->width * c->height * 4;
 
 	VkBuffer staging = VK_NULL_HANDLE;
 	VkDeviceMemory staging_mem = VK_NULL_HANDLE;
@@ -533,17 +545,21 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 	c->buffers[slot].image_initialized = false;
 	c->buffers[slot].imported = true;
 
+	c->buffers[slot].memfd = memfd;
 	if (client_alloc) {
-		// Hand the producer our staging buffer as the frame storage.
-		d->data = staging_ptr;
-		d->maxsize = (uint32_t)staging_size;
+		// Fill the spa_data so PipeWire marshals our memfd to the producer.
+		d->type = SPA_DATA_MemFd;
+		d->fd = memfd;
+		d->flags = SPA_DATA_FLAG_READWRITE;
 		d->mapoffset = 0;
+		d->maxsize = (uint32_t)map_size;
+		d->data = map;
 	}
 
 	// WARN so it survives field logs: proves the shm path activated.
 	U_LOG_W("leia_bg_capture_linux: shm slot %u ready (%ux%u, %s)", slot, c->width,
 	        c->height,
-	        client_alloc ? "MemPtr client-alloc → staging" : (map != NULL ? "MemFd mmap" : "MemPtr"));
+	        client_alloc ? "client memfd" : (map != NULL ? "MemFd mmap" : "MemPtr"));
 	return true;
 
 fail:
@@ -565,6 +581,9 @@ fail:
 	}
 	if (map != NULL) {
 		munmap(map, map_size);
+	}
+	if (memfd >= 0) {
+		close(memfd);
 	}
 	return false;
 }
@@ -594,6 +613,9 @@ destroy_buffer_slot(struct leia_bg_capture_linux *c, uint32_t slot)
 	}
 	if (c->buffers[slot].map != NULL) {
 		munmap(c->buffers[slot].map, c->buffers[slot].map_size);
+	}
+	if (c->buffers[slot].memfd > 0) {
+		close(c->buffers[slot].memfd);
 	}
 	memset(&c->buffers[slot], 0, sizeof(c->buffers[slot]));
 }
