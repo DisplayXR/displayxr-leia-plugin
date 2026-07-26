@@ -6,6 +6,8 @@
 #include "util/u_logging.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 #ifdef DXR_LEIA_HAVE_PIPEWIRE
 
@@ -418,6 +420,86 @@ append_bool_variant(DBusMessageIter *dict, const char *key, dbus_bool_t value)
 	dbus_message_iter_close_container(dict, &entry);
 }
 
+/*
+ * ── ScreenCast restore-token persistence ──────────────────────────────────
+ *
+ * The portal Start() call pops an interactive "Share your screen" consent
+ * dialog — unacceptable on every launch for an unattended box. ScreenCast v4+
+ * supports `persist_mode`/`restore_token` in SelectSources(): with a valid
+ * saved token the portal restores the prior grant silently (no dialog), and
+ * every Start() response carries a fresh token to persist for the next run.
+ * Portals ignore unknown options, so pre-v4 portals just keep showing the
+ * dialog — a graceful degrade, no version probe needed.
+ *
+ * Token lives per-user in $XDG_STATE_HOME/displayxr/screencast_restore_token
+ * (fallback ~/.local/state/...). It is a capability grant scoped to this
+ * user+app, not a credential.
+ */
+
+static void
+restore_token_path(char *out, size_t out_len)
+{
+	const char *state = getenv("XDG_STATE_HOME");
+	if (state != NULL && state[0] != '\0') {
+		snprintf(out, out_len, "%s/displayxr", state);
+	} else {
+		const char *home = getenv("HOME");
+		snprintf(out, out_len, "%s/.local/state/displayxr", home != NULL ? home : "/tmp");
+	}
+}
+
+//! Returns a malloc'd saved token, or NULL if none.
+static char *
+load_restore_token(void)
+{
+	char dir[512];
+	char path[600];
+	restore_token_path(dir, sizeof dir);
+	snprintf(path, sizeof path, "%s/screencast_restore_token", dir);
+
+	FILE *f = fopen(path, "r");
+	if (f == NULL) {
+		return NULL;
+	}
+	char buf[512] = {0};
+	size_t n = fread(buf, 1, sizeof buf - 1, f);
+	fclose(f);
+	// Trim trailing whitespace/newline.
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) {
+		buf[--n] = '\0';
+	}
+	return n > 0 ? strdup(buf) : NULL;
+}
+
+static void
+save_restore_token(const char *token)
+{
+	if (token == NULL || token[0] == '\0') {
+		return;
+	}
+	char dir[512];
+	char path[600];
+	restore_token_path(dir, sizeof dir);
+	// Best-effort two-level mkdir (~/.local/state may not exist on minimal setups).
+	char parent[512];
+	snprintf(parent, sizeof parent, "%s", dir);
+	char *slash = strrchr(parent, '/');
+	if (slash != NULL) {
+		*slash = '\0';
+		mkdir(parent, 0700);
+	}
+	mkdir(dir, 0700);
+	snprintf(path, sizeof path, "%s/screencast_restore_token", dir);
+
+	FILE *f = fopen(path, "w");
+	if (f == NULL) {
+		U_LOG_W("leia_bg_capture_linux: cannot persist restore token to %s", path);
+		return;
+	}
+	fprintf(f, "%s\n", token);
+	fclose(f);
+}
+
 /*!
  * Build the expected `/org/freedesktop/portal/desktop/request/<sender>/<token>`
  * object path for a given handle token. Caller frees.
@@ -754,6 +836,15 @@ portal_handshake(struct leia_bg_capture_linux *c)
 		append_uint32_variant(&dict, "types", 1u);      // MONITOR
 		append_bool_variant(&dict, "multiple", FALSE);
 		append_uint32_variant(&dict, "cursor_mode", 2u); // embedded
+		// Silent re-grant across launches (ScreenCast v4+; ignored by older
+		// portals): 2 = persist until explicitly revoked.
+		append_uint32_variant(&dict, "persist_mode", 2u);
+		char *saved_token = load_restore_token();
+		if (saved_token != NULL) {
+			append_string_variant(&dict, "restore_token", saved_token);
+			U_LOG_I("leia_bg_capture_linux: restoring prior screencast grant");
+			free(saved_token);
+		}
 		dbus_message_iter_close_container(&args, &dict);
 
 		DBusMessage *resp = finish_portal_call(c, call, htok);
@@ -790,6 +881,13 @@ portal_handshake(struct leia_bg_capture_linux *c)
 			U_LOG_W("leia_bg_capture_linux: Start: no results");
 			dbus_message_unref(resp);
 			return false;
+		}
+		// Persist the (re)issued restore token so the next launch skips the
+		// consent dialog. Every Start() response carries a fresh one.
+		char *new_token = dict_get_string(results, "restore_token");
+		if (new_token != NULL) {
+			save_restore_token(new_token);
+			free(new_token);
 		}
 		bool ok = parse_streams(c, results);
 		dbus_message_unref(resp);

@@ -198,7 +198,13 @@ jobs:
             build-essential cmake ninja-build pkg-config glslang-tools jq \
             libvulkan-dev libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            libpipewire-0.3-dev libdbus-1-dev \
             dpkg-dev fakeroot patchelf
+          # ^ pipewire + dbus: the shipped .deb must carry the portal/PipeWire
+          #   desktop-capture producer (compose-under-bg live background,
+          #   runtime#757) — v2.0.4 shipped without it because only the
+          #   compile-check job had these. The deb's Depends picks up
+          #   libpipewire-0.3-0/libdbus-1-3 automatically via DT_NEEDED.
 
       - name: Checkout plug-in
         uses: actions/checkout@v4
