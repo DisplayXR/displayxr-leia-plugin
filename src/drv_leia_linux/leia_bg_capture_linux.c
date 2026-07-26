@@ -1472,30 +1472,15 @@ build_format_params(struct spa_pod_builder *b, const struct spa_pod **params,
 	struct spa_fraction rate_min = SPA_FRACTION(0, 1);
 	struct spa_fraction rate_max = SPA_FRACTION(240, 1);
 
-	// Canonical variadic object build (stable across SPA 0.2). First cut FORCES
-	// DRM_FORMAT_MOD_LINEAR so the dma-buf import is correct-by-construction
-	// (LINEAR always imports right; the compositor blits if its native buffer is
-	// tiled). TODO(hardware bring-up): negotiate the driver-tiled modifier set
-	// via the DONT_FIXATE two-pass dance to drop that blit on the Arc box.
-	if (n < max_params) {
-		params[n++] = spa_pod_builder_add_object(
-		    b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,          //
-		    SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),   //
-		    SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), //
-		    SPA_FORMAT_VIDEO_format,
-		    SPA_POD_CHOICE_ENUM_Id(5, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA,
-		                           SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_BGRx,
-		                           SPA_VIDEO_FORMAT_RGBx),
-		    SPA_FORMAT_VIDEO_modifier, SPA_POD_Long(DRM_FORMAT_MOD_LINEAR), //
-		    SPA_FORMAT_VIDEO_size,
-		    SPA_POD_CHOICE_RANGE_Rectangle(&size_def, &size_min, &size_max), //
-		    SPA_FORMAT_VIDEO_framerate,
-		    SPA_POD_CHOICE_RANGE_Fraction(&rate_def, &rate_min, &rate_max));
-	}
-
-	// Plain (MemFd/MemPtr) fallback — no modifier property. Used when the
-	// compositor won't produce a LINEAR dma-buf; add_buffer log-and-skips these
-	// until an mmap upload path exists (bring-up requires dma-buf).
+	// SYSMEM-ONLY offer (#109): a format pod carrying a modifier property makes
+	// Mutter's Xorg screen-cast fixate the dma-buf format, but its X11 path
+	// then never actually allocates/delivers dma-buf frames — the stream runs
+	// with a limbo buffer negotiation and the consumer sees empty spa_data
+	// forever (verified live via pw-dump: Format fixated with modifier=0,
+	// Buffers=null). The plain no-modifier format takes Mutter's classic
+	// sysmem producer path (the one OBS has consumed for years). dma-buf
+	// zero-copy is a hardware-bring-up follow-up: it needs the DONT_FIXATE
+	// modifier-choice dance AND a compositor that honors it on X11.
 	if (n < max_params) {
 		params[n++] = spa_pod_builder_add_object(
 		    b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,          //
