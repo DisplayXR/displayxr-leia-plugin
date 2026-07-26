@@ -1665,15 +1665,17 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 		return false; // no frame yet — caller passes the raw atlas through
 	}
 
-	// Window rect in desktop coords: win_x/win_y are relative to the display
-	// origin passed at create() (the DP's present_origin).
-	const int32_t wx = c->window_screen_left + win_x;
-	const int32_t wy = c->window_screen_top + win_y;
-
-	// If the window is not on the captured monitor, decline (raw pass-through).
-	if (c->mon_w > 0 && c->mon_h > 0) {
-		if (wx < c->mon_x || wy < c->mon_y || wx >= c->mon_x + c->mon_w ||
-		    wy >= c->mon_y + c->mon_h) {
+	// win_x/win_y (the DP's present_origin) are PANEL-relative, and the portal
+	// session captures exactly the panel monitor — so the window rect is
+	// already in captured-monitor space. Do NOT try to reconcile absolute
+	// desktop coords here: the SR display-info origin (create-time) and the
+	// portal's stream position live in different frames on this stack (the
+	// RandR position override only applies at the plugin get_display_info
+	// layer), and mixing them silently declined every frame (#109).
+	if (c->mon_w > 0 && c->mon_h > 0 && win_w > 0 && win_h > 0) {
+		// Window fully off the captured monitor → decline (raw pass-through).
+		if (win_x >= c->mon_w || win_y >= c->mon_h ||
+		    win_x + (int32_t)win_w <= 0 || win_y + (int32_t)win_h <= 0) {
 			return false;
 		}
 	}
@@ -1773,8 +1775,8 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	// win_w/win_h == 0 (display-scoped present) maps the full monitor.
 	float uox = 0.0f, uoy = 0.0f, uex = 1.0f, uey = 1.0f;
 	if (c->mon_w > 0 && c->mon_h > 0 && win_w > 0 && win_h > 0) {
-		uox = (float)(wx - c->mon_x) / (float)c->mon_w;
-		uoy = (float)(wy - c->mon_y) / (float)c->mon_h;
+		uox = (float)win_x / (float)c->mon_w;
+		uoy = (float)win_y / (float)c->mon_h;
 		uex = (float)win_w / (float)c->mon_w;
 		uey = (float)win_h / (float)c->mon_h;
 	}
