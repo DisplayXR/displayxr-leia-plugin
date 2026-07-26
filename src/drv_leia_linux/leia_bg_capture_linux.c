@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 #ifdef DXR_LEIA_HAVE_PIPEWIRE
 
@@ -52,12 +53,24 @@
 
 #define DXR_MAX_BUFFERS 16
 
-/*! One imported PipeWire dma-buf, cached as a Vulkan-sampleable image. */
+/*! One PipeWire buffer slot, cached as a Vulkan-sampleable image. Two kinds:
+ *  dma-buf (zero-copy import) or shm (MemFd/MemPtr staged through a host-visible
+ *  buffer — what Mutter's Xorg screencast actually delivers, #109/#110). */
 struct dxr_bg_buffer {
 	bool imported;             //!< slot holds a live VkImage
-	VkImage image;             //!< imported dma-buf backing image
-	VkDeviceMemory memory;     //!< memory imported from the dup'd fd
+	VkImage image;             //!< backing image (imported dma-buf, or device-local for shm)
+	VkDeviceMemory memory;     //!< image memory
 	VkImageView view;          //!< SHADER_READ_ONLY view
+
+	// shm (MemFd/MemPtr) staging path.
+	bool is_shm;               //!< slot is CPU-staged, not a dma-buf import
+	void *map;                 //!< our mmap of the MemFd (NULL for MemPtr)
+	size_t map_size;           //!< mmap length (0 when map == NULL)
+	VkBuffer staging;          //!< host-visible upload source
+	VkDeviceMemory staging_mem; //!< staging allocation (persistently mapped)
+	void *staging_ptr;         //!< persistent map of staging_mem
+	_Atomic bool dirty;        //!< staging holds a frame the GPU hasn't copied yet
+	bool image_initialized;    //!< image has left UNDEFINED (layout tracking)
 };
 
 /*! Linux desktop background-capture context. */
@@ -349,6 +362,182 @@ import_dmabuf(struct leia_bg_capture_linux *c, uint32_t slot, int spa_fd,
 	return true;
 }
 
+/*!
+ * Create a CPU-staged slot for a MemFd/MemPtr PipeWire buffer: a host-visible
+ * staging VkBuffer (persistently mapped; on_process memcpy's frames into it)
+ * plus a device-local sampled image poll() uploads into on the compose command
+ * buffer. This is the path Mutter's Xorg screencast actually takes — it
+ * declines our dma-buf format offer and delivers MemFd frames (#109/#110).
+ */
+static bool
+create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data *d)
+{
+	struct vk_bundle *vk = c->vk;
+	VkResult res;
+
+	if (c->vk_format == VK_FORMAT_UNDEFINED || !c->have_format) {
+		U_LOG_W("leia_bg_capture_linux: shm slot before format negotiated");
+		return false;
+	}
+
+	// Map the MemFd ourselves when the producer didn't hand us a pointer.
+	void *map = NULL;
+	size_t map_size = 0;
+	if (d->data == NULL) {
+		if (d->fd < 0) {
+			U_LOG_W("leia_bg_capture_linux: shm buffer has neither data nor fd");
+			return false;
+		}
+		map_size = (size_t)d->maxsize + (size_t)d->mapoffset;
+		map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, (int)d->fd, 0);
+		if (map == MAP_FAILED) {
+			U_LOG_W("leia_bg_capture_linux: mmap(MemFd) failed");
+			return false;
+		}
+	}
+
+	const VkDeviceSize staging_size = (VkDeviceSize)c->width * c->height * 4;
+
+	VkBuffer staging = VK_NULL_HANDLE;
+	VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+	void *staging_ptr = NULL;
+	VkImage image = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	VkImageView view = VK_NULL_HANDLE;
+
+	VkBufferCreateInfo bci = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = staging_size,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	res = vk->vkCreateBuffer(vk->device, &bci, NULL, &staging);
+	if (res != VK_SUCCESS) {
+		goto fail;
+	}
+
+	VkMemoryRequirements breq;
+	vk->vkGetBufferMemoryRequirements(vk->device, staging, &breq);
+	uint32_t host_type = UINT32_MAX;
+	const VkMemoryPropertyFlags want =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	for (uint32_t i = 0; i < vk->device_memory_props.memoryTypeCount; i++) {
+		if ((breq.memoryTypeBits & (1u << i)) &&
+		    (vk->device_memory_props.memoryTypes[i].propertyFlags & want) == want) {
+			host_type = i;
+			break;
+		}
+	}
+	if (host_type == UINT32_MAX) {
+		goto fail;
+	}
+	VkMemoryAllocateInfo bai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = breq.size,
+	    .memoryTypeIndex = host_type,
+	};
+	res = vk->vkAllocateMemory(vk->device, &bai, NULL, &staging_mem);
+	if (res != VK_SUCCESS) {
+		goto fail;
+	}
+	if (vk->vkBindBufferMemory(vk->device, staging, staging_mem, 0) != VK_SUCCESS ||
+	    vk->vkMapMemory(vk->device, staging_mem, 0, VK_WHOLE_SIZE, 0, &staging_ptr) != VK_SUCCESS) {
+		goto fail;
+	}
+
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = c->vk_format,
+	    .extent = {c->width, c->height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	res = vk->vkCreateImage(vk->device, &ici, NULL, &image);
+	if (res != VK_SUCCESS) {
+		goto fail;
+	}
+	VkMemoryRequirements ireq;
+	vk->vkGetImageMemoryRequirements(vk->device, image, &ireq);
+	uint32_t dev_type = UINT32_MAX;
+	for (uint32_t i = 0; i < vk->device_memory_props.memoryTypeCount; i++) {
+		if ((ireq.memoryTypeBits & (1u << i)) &&
+		    (vk->device_memory_props.memoryTypes[i].propertyFlags &
+		     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+			dev_type = i;
+			break;
+		}
+	}
+	if (dev_type == UINT32_MAX) {
+		dev_type = __builtin_ctz(ireq.memoryTypeBits); // any supported type
+	}
+	VkMemoryAllocateInfo iai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = ireq.size,
+	    .memoryTypeIndex = dev_type,
+	};
+	res = vk->vkAllocateMemory(vk->device, &iai, NULL, &memory);
+	if (res != VK_SUCCESS || vk->vkBindImageMemory(vk->device, image, memory, 0) != VK_SUCCESS) {
+		goto fail;
+	}
+
+	VkImageViewCreateInfo vci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = c->vk_format,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &vci, NULL, &view);
+	if (res != VK_SUCCESS) {
+		goto fail;
+	}
+
+	c->buffers[slot].image = image;
+	c->buffers[slot].memory = memory;
+	c->buffers[slot].view = view;
+	c->buffers[slot].is_shm = true;
+	c->buffers[slot].map = map;
+	c->buffers[slot].map_size = map_size;
+	c->buffers[slot].staging = staging;
+	c->buffers[slot].staging_mem = staging_mem;
+	c->buffers[slot].staging_ptr = staging_ptr;
+	atomic_store(&c->buffers[slot].dirty, false);
+	c->buffers[slot].image_initialized = false;
+	c->buffers[slot].imported = true;
+
+	U_LOG_I("leia_bg_capture_linux: shm slot %u ready (%ux%u, %s)", slot, c->width,
+	        c->height, map != NULL ? "MemFd mmap" : "MemPtr");
+	return true;
+
+fail:
+	U_LOG_W("leia_bg_capture_linux: shm slot %u setup failed", slot);
+	if (view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, view, NULL);
+	}
+	if (image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, image, NULL);
+	}
+	if (memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, memory, NULL);
+	}
+	if (staging != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, staging, NULL);
+	}
+	if (staging_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+	}
+	if (map != NULL) {
+		munmap(map, map_size);
+	}
+	return false;
+}
+
 static void
 destroy_buffer_slot(struct leia_bg_capture_linux *c, uint32_t slot)
 {
@@ -364,6 +553,16 @@ destroy_buffer_slot(struct leia_bg_capture_linux *c, uint32_t slot)
 	}
 	if (c->buffers[slot].memory != VK_NULL_HANDLE) {
 		vk->vkFreeMemory(vk->device, c->buffers[slot].memory, NULL);
+	}
+	if (c->buffers[slot].staging != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, c->buffers[slot].staging, NULL);
+	}
+	if (c->buffers[slot].staging_mem != VK_NULL_HANDLE) {
+		// Persistent map dies with the allocation.
+		vk->vkFreeMemory(vk->device, c->buffers[slot].staging_mem, NULL);
+	}
+	if (c->buffers[slot].map != NULL) {
+		munmap(c->buffers[slot].map, c->buffers[slot].map_size);
 	}
 	memset(&c->buffers[slot], 0, sizeof(c->buffers[slot]));
 }
@@ -1053,12 +1252,13 @@ on_add_buffer(void *data, struct pw_buffer *buffer)
 	buffer->user_data = (void *)(uintptr_t)slot;
 
 	if (d->type != SPA_DATA_DmaBuf) {
-		// Fallback data types are not imported into Vulkan; log & skip.
-		// TODO: mmap MemFd/MemPtr into a staging upload if a compositor ever
-		// refuses dma-buf. For bring-up we require dma-buf.
-		U_LOG_W("leia_bg_capture_linux: buffer type %u is not dma-buf; skipping",
-		        d->type);
-		buffer->user_data = (void *)(uintptr_t)DXR_MAX_BUFFERS;
+		// MemFd/MemPtr delivery (what Mutter's Xorg screencast actually
+		// gives us after declining the dma-buf format offer, #109/#110):
+		// stage through a host-visible buffer; poll() uploads on the
+		// compose command buffer.
+		if (!create_shm_slot(c, slot, d)) {
+			buffer->user_data = (void *)(uintptr_t)DXR_MAX_BUFFERS;
+		}
 		return;
 	}
 
@@ -1126,8 +1326,41 @@ on_process(void *data)
 
 	uint32_t slot = slot_for_buffer(newest);
 	if (slot < DXR_MAX_BUFFERS && c->buffers[slot].imported) {
-		// Publish the stable slot index; the VkImage import is fixed for the
-		// buffer's lifetime, so the render thread can sample it after requeue.
+		struct dxr_bg_buffer *bb = &c->buffers[slot];
+		if (bb->is_shm) {
+			// Copy the frame out BEFORE requeueing (the producer may
+			// rewrite the buffer as soon as it's back in the pool).
+			struct spa_data *d = &newest->buffer->datas[0];
+			const uint8_t *src = d->data != NULL
+			                         ? (const uint8_t *)d->data
+			                         : (const uint8_t *)bb->map + d->mapoffset;
+			if (src != NULL && bb->staging_ptr != NULL) {
+				const uint32_t dst_stride = c->width * 4;
+				int32_t src_stride = (int32_t)dst_stride;
+				uint32_t off = 0;
+				if (d->chunk != NULL) {
+					off = d->chunk->offset;
+					if (d->chunk->stride > 0) {
+						src_stride = d->chunk->stride;
+					}
+				}
+				src += off;
+				if (src_stride == (int32_t)dst_stride) {
+					memcpy(bb->staging_ptr, src, (size_t)dst_stride * c->height);
+				} else {
+					uint8_t *dst = bb->staging_ptr;
+					for (uint32_t y = 0; y < c->height; y++) {
+						memcpy(dst + (size_t)y * dst_stride,
+						       src + (size_t)y * src_stride, dst_stride);
+					}
+				}
+				atomic_store(&bb->dirty, true);
+			}
+		}
+		// Publish the stable slot index; for dma-buf the VkImage import is
+		// fixed for the buffer's lifetime, for shm the frame now sits in the
+		// slot's staging buffer — either way the render thread can proceed
+		// after requeue.
 		atomic_store(&c->current_buffer, (int)slot);
 	}
 	pw_stream_queue_buffer(c->stream, newest);
@@ -1386,31 +1619,86 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 
 	c->current_view = c->buffers[idx].view;
 
-	// ACQUIRE barrier: the dma-buf is written out-of-band by the compositor, so
-	// we take ownership from the FOREIGN queue and transition UNDEFINED ->
-	// SHADER_READ_ONLY_OPTIMAL for sampling in the fragment shader.
-	VkImageMemoryBarrier acquire = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .pNext = NULL,
-	    .srcAccessMask = 0,
-	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
-	    .dstQueueFamilyIndex = c->vk->main_queue->family_index,
-	    .image = c->buffers[idx].image,
-	    .subresourceRange =
-	        {
-	            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	            .baseMipLevel = 0,
-	            .levelCount = 1,
-	            .baseArrayLayer = 0,
-	            .layerCount = 1,
-	        },
-	};
-	c->vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
-	                            NULL, 1, &acquire);
+	struct dxr_bg_buffer *bb = &c->buffers[idx];
+	if (bb->is_shm) {
+		// CPU-staged slot: upload the latest frame from the staging buffer
+		// on the compose command buffer, then transition for sampling.
+		bool expected = true;
+		const bool do_upload = atomic_compare_exchange_strong(&bb->dirty, &expected, false);
+		if (!do_upload && !bb->image_initialized) {
+			return false; // no frame ever uploaded — nothing valid to sample
+		}
+		if (do_upload) {
+			VkImageMemoryBarrier to_dst = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = bb->image_initialized ? VK_ACCESS_SHADER_READ_BIT : 0,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .oldLayout = bb->image_initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+			                                       : VK_IMAGE_LAYOUT_UNDEFINED,
+			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .image = bb->image,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			c->vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+			                            NULL, 1, &to_dst);
+			VkBufferImageCopy region = {
+			    .bufferOffset = 0,
+			    .bufferRowLength = 0, // tightly packed by on_process
+			    .bufferImageHeight = 0,
+			    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .imageOffset = {0, 0, 0},
+			    .imageExtent = {c->width, c->height, 1},
+			};
+			c->vk->vkCmdCopyBufferToImage(cmd, bb->staging, bb->image,
+			                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+			VkImageMemoryBarrier to_read = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .image = bb->image,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			c->vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+			                            NULL, 0, NULL, 1, &to_read);
+			bb->image_initialized = true;
+		}
+		// Not dirty + initialized: image already SHADER_READ_ONLY with the
+		// last frame — sample as-is, no barrier needed.
+	} else {
+		// ACQUIRE barrier: the dma-buf is written out-of-band by the compositor,
+		// so we take ownership from the FOREIGN queue and transition UNDEFINED ->
+		// SHADER_READ_ONLY_OPTIMAL for sampling in the fragment shader.
+		VkImageMemoryBarrier acquire = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .pNext = NULL,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+		    .dstQueueFamilyIndex = c->vk->main_queue->family_index,
+		    .image = bb->image,
+		    .subresourceRange =
+		        {
+		            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		            .baseMipLevel = 0,
+		            .levelCount = 1,
+		            .baseArrayLayer = 0,
+		            .layerCount = 1,
+		        },
+		};
+		c->vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
+		                            NULL, 1, &acquire);
+	}
 
 	// TODO: compute the per-window background sub-rect once the window size is
 	// threaded into this module. The correct mapping is:
