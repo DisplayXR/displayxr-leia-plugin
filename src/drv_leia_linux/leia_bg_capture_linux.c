@@ -1271,15 +1271,22 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	uint8_t buf[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof buf);
 	const struct spa_pod *params[1];
-	// dma-buf or MemFd ONLY — never MemPtr: a raw pointer is meaningless across
-	// the process boundary, so offering it makes PipeWire pick client-alloc
-	// MemPtr (spa_data with neither data nor fd) and the producer can never
-	// fill the frames — uploads run but the texture stays black (#109).
+	// Producer-allocated buffers, standard consumer recipe (what OBS uses
+	// against Mutter). blocks/size/stride/align are REQUIRED for the
+	// producer's allocator to size the pool — without them Mutter falls into
+	// a degenerate client-alloc negotiation that never delivers frames (#109).
+	const uint32_t frame_stride = c->width * 4;
+	const uint32_t frame_size = frame_stride * c->height;
 	params[0] = spa_pod_builder_add_object(
 	    &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 	    SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, DXR_MAX_BUFFERS),
+	    SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+	    SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)frame_size),
+	    SPA_PARAM_BUFFERS_stride, SPA_POD_Int((int)frame_stride),
+	    SPA_PARAM_BUFFERS_align, SPA_POD_Int(16),
 	    SPA_PARAM_BUFFERS_dataType,
-	    SPA_POD_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd)));
+	    SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_DmaBuf) | (1 << SPA_DATA_MemFd) |
+	                             (1 << SPA_DATA_MemPtr)));
 
 	pw_stream_update_params(c->stream, params, 1);
 }
@@ -1561,14 +1568,11 @@ pipewire_start(struct leia_bg_capture_linux *c)
 		goto unlock;
 	}
 
-	// ALLOC_BUFFERS: when the negotiation lands on a CPU type (MemFd), PipeWire
-	// allocates the shareable memfd storage on our behalf — without it the
-	// spa_data arrives with neither data nor fd and the producer can never
-	// write a frame (#109). MAP_BUFFERS maps those into d->data for the copy
-	// path. The dma-buf import path ignores both (it consumes d->fd directly).
+	// Standard consumer recipe: producer allocates (NO ALLOC_BUFFERS — that
+	// flag means the CLIENT allocates); MAP_BUFFERS maps CPU buffers into
+	// d->data for the copy path. The dma-buf import path uses d->fd directly.
 	int r = pw_stream_connect(c->stream, PW_DIRECTION_INPUT, c->node_id,
-	                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_ALLOC_BUFFERS |
-	                              PW_STREAM_FLAG_MAP_BUFFERS,
+	                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS,
 	                          params, (uint32_t)n_params);
 	if (r < 0) {
 		U_LOG_W("leia_bg_capture_linux: pw_stream_connect failed (%d)", r);
