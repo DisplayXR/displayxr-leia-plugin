@@ -42,6 +42,14 @@ void main()
 	vec2 bg_uv = pc.bg_uv_origin + tile_local * pc.bg_uv_extent;
 	vec3 b = textureLod(bg, bg_uv, 0.0).rgb;
 
+	// DXR_LEIA_BG_DEBUG=1 (pc.pad==1): output the background ONLY across the
+	// whole tile — makes "is the captured desktop actually arriving?" a
+	// one-glance visual check on the panel.
+	if (pc.pad == 1u) {
+		out_color = vec4(b, 1.0);
+		return;
+	}
+
 	// #491 part 3 — the backdrop is a flat z=0 layer covering the window client
 	// area, so sample it at the same per-tile window-local UV as the desktop.
 	// Premultiplied "over": b' = backdrop.rgb + (1 - backdrop.a) * desktop.

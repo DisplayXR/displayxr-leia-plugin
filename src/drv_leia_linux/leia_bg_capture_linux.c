@@ -119,6 +119,14 @@ struct leia_bg_capture_linux {
 	// Latest ready buffer index; written by pw thread, read by render thread.
 	_Atomic int current_buffer; //!< -1 == none
 	VkImageView current_view;   //!< last view poll() selected (render thread only)
+
+	// Frame-flow diagnostics (#109 follow-up). WARN-level, heavily throttled —
+	// the whole point is that INFO is dropped from app logs in the field.
+	_Atomic uint32_t dbg_frames;  //!< frames copied/published by on_process
+	_Atomic uint32_t dbg_uploads; //!< shm uploads recorded by poll()
+	bool dbg_first_frame_logged;
+	bool dbg_first_upload_logged;
+	bool dbg_no_frame_logged;
 };
 
 static bool s_pw_inited = false; //!< pw_init() guard (only global mutable state)
@@ -511,7 +519,8 @@ create_shm_slot(struct leia_bg_capture_linux *c, uint32_t slot, struct spa_data 
 	c->buffers[slot].image_initialized = false;
 	c->buffers[slot].imported = true;
 
-	U_LOG_I("leia_bg_capture_linux: shm slot %u ready (%ux%u, %s)", slot, c->width,
+	// WARN so it survives field logs: proves the shm path activated.
+	U_LOG_W("leia_bg_capture_linux: shm slot %u ready (%ux%u, %s)", slot, c->width,
 	        c->height, map != NULL ? "MemFd mmap" : "MemPtr");
 	return true;
 
@@ -1208,7 +1217,9 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	}
 
 	c->have_format = true;
-	U_LOG_I("leia_bg_capture_linux: format %ux%u vkfmt=%d mod=0x%llx",
+	// WARN so it survives field logs (INFO is dropped) — fires once per
+	// (re)negotiation, which is rare and is exactly what we want to see.
+	U_LOG_W("leia_bg_capture_linux: format negotiated %ux%u vkfmt=%d mod=0x%llx",
 	        c->width, c->height, (int)c->vk_format,
 	        (unsigned long long)c->modifier);
 
@@ -1362,6 +1373,14 @@ on_process(void *data)
 		// slot's staging buffer — either way the render thread can proceed
 		// after requeue.
 		atomic_store(&c->current_buffer, (int)slot);
+
+		// Frame-flow diagnostics (#109 follow-up): first frame + every 600.
+		uint32_t n = atomic_fetch_add(&c->dbg_frames, 1) + 1;
+		if (!c->dbg_first_frame_logged || (n % 600) == 0) {
+			c->dbg_first_frame_logged = true;
+			U_LOG_W("leia_bg_capture_linux: frame %u published (slot %u, %s)", n, slot,
+			        c->buffers[slot].is_shm ? "shm" : "dma-buf");
+		}
 	}
 	pw_stream_queue_buffer(c->stream, newest);
 }
@@ -1596,6 +1615,7 @@ leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *out_wi
 
 bool
 leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
+                           int32_t win_x, int32_t win_y, uint32_t win_w, uint32_t win_h,
                            float out_bg_uv_origin[2], float out_bg_uv_extent[2])
 {
 	if (c == NULL) {
@@ -1604,15 +1624,23 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 
 	int idx = atomic_load(&c->current_buffer);
 	if (idx < 0 || idx >= DXR_MAX_BUFFERS || !c->buffers[idx].imported) {
+		if (!c->dbg_no_frame_logged) {
+			c->dbg_no_frame_logged = true;
+			U_LOG_W("leia_bg_capture_linux: poll before any frame arrived "
+			        "(stream up but no buffers yet — will report when frames flow)");
+		}
 		return false; // no frame yet — caller passes the raw atlas through
 	}
 
+	// Window rect in desktop coords: win_x/win_y are relative to the display
+	// origin passed at create() (the DP's present_origin).
+	const int32_t wx = c->window_screen_left + win_x;
+	const int32_t wy = c->window_screen_top + win_y;
+
 	// If the window is not on the captured monitor, decline (raw pass-through).
 	if (c->mon_w > 0 && c->mon_h > 0) {
-		if (c->window_screen_left < c->mon_x ||
-		    c->window_screen_top < c->mon_y ||
-		    c->window_screen_left >= c->mon_x + c->mon_w ||
-		    c->window_screen_top >= c->mon_y + c->mon_h) {
+		if (wx < c->mon_x || wy < c->mon_y || wx >= c->mon_x + c->mon_w ||
+		    wy >= c->mon_y + c->mon_h) {
 			return false;
 		}
 	}
@@ -1669,6 +1697,12 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 			                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 			                            NULL, 0, NULL, 1, &to_read);
 			bb->image_initialized = true;
+
+			uint32_t u = atomic_fetch_add(&c->dbg_uploads, 1) + 1;
+			if (!c->dbg_first_upload_logged || (u % 600) == 0) {
+				c->dbg_first_upload_logged = true;
+				U_LOG_W("leia_bg_capture_linux: shm upload %u recorded (slot %d)", u, idx);
+			}
 		}
 		// Not dirty + initialized: image already SHADER_READ_ONLY with the
 		// last frame — sample as-is, no barrier needed.
@@ -1700,18 +1734,24 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 		                            NULL, 1, &acquire);
 	}
 
-	// TODO: compute the per-window background sub-rect once the window size is
-	// threaded into this module. The correct mapping is:
-	//   origin = ((win_left - mon_x)/mon_w, (win_top - mon_y)/mon_h)
-	//   extent = (win_w/mon_w, win_h/mon_h)
-	// For now we map the full captured monitor (window size unknown here).
+	// Per-window background sub-rect: the compose shader samples the desktop
+	// region directly UNDER the window, so each tile's transparent pixels line
+	// up with what a user would see through a glass window at that position.
+	// win_w/win_h == 0 (display-scoped present) maps the full monitor.
+	float uox = 0.0f, uoy = 0.0f, uex = 1.0f, uey = 1.0f;
+	if (c->mon_w > 0 && c->mon_h > 0 && win_w > 0 && win_h > 0) {
+		uox = (float)(wx - c->mon_x) / (float)c->mon_w;
+		uoy = (float)(wy - c->mon_y) / (float)c->mon_h;
+		uex = (float)win_w / (float)c->mon_w;
+		uey = (float)win_h / (float)c->mon_h;
+	}
 	if (out_bg_uv_origin) {
-		out_bg_uv_origin[0] = 0.0f;
-		out_bg_uv_origin[1] = 0.0f;
+		out_bg_uv_origin[0] = uox;
+		out_bg_uv_origin[1] = uoy;
 	}
 	if (out_bg_uv_extent) {
-		out_bg_uv_extent[0] = 1.0f;
-		out_bg_uv_extent[1] = 1.0f;
+		out_bg_uv_extent[0] = uex;
+		out_bg_uv_extent[1] = uey;
 	}
 	return true;
 }
@@ -1791,8 +1831,9 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left, i
 VkImageView leia_bg_capture_linux_get_view(struct leia_bg_capture_linux *c) { (void)c; return VK_NULL_HANDLE; }
 void leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *out_width, uint32_t *out_height)
 { (void)c; if (out_width) *out_width = 0; if (out_height) *out_height = 0; }
-bool leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd, float o[2], float e[2])
-{ (void)c; (void)cmd; (void)o; (void)e; return false; }
+bool leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd, int32_t win_x, int32_t win_y,
+                                uint32_t win_w, uint32_t win_h, float o[2], float e[2])
+{ (void)c; (void)cmd; (void)win_x; (void)win_y; (void)win_w; (void)win_h; (void)o; (void)e; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 
 #endif // DXR_LEIA_HAVE_PIPEWIRE

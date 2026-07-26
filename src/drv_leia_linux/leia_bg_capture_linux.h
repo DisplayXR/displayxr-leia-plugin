@@ -88,6 +88,12 @@ leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *out_wi
  * the Windows leia_bg_capture_poll contract so the compose shader's per-tile
  * bg_uv math is identical.
  *
+ * @param win_x,win_y  Window top-left relative to the display origin passed at
+ *                     create() (the DP's present_origin — (0,0) when
+ *                     display-scoped/fullscreen).
+ * @param win_w,win_h  Window (present target) size in pixels. 0 ⟹ treat the
+ *                     window as covering the whole captured monitor.
+ *
  * @return true if a frame is available and the window is on the captured monitor;
  *         false if no frame yet or the window left the monitor (caller skips the
  *         compose for this frame — passes the raw atlas through).
@@ -95,6 +101,10 @@ leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *out_wi
 bool
 leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c,
                            VkCommandBuffer cmd,
+                           int32_t win_x,
+                           int32_t win_y,
+                           uint32_t win_w,
+                           uint32_t win_h,
                            float out_bg_uv_origin[2],
                            float out_bg_uv_extent[2]);
 
