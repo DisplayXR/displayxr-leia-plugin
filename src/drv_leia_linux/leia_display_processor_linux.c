@@ -446,6 +446,20 @@ compose_ensure_pipeline(struct leia_dp_linux *ldp)
 	return true;
 }
 
+// DXR_LEIA_BG_DEBUG=1: compose outputs the captured background ONLY across the
+// whole window and the post-weave alpha-gate is skipped — turns "is the
+// captured desktop actually arriving (vs black)?" into a one-glance panel check.
+static bool
+dxr_leia_bg_debug(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_LEIA_BG_DEBUG");
+		cached = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 // Composite the tiled atlas OVER the bound background into the opaque
 // intermediate, and return the intermediate view for the weaver to interlace.
 // Returns VK_NULL_HANDLE (→ caller weaves the raw atlas) when disabled, when no
@@ -457,7 +471,9 @@ compose_pre_weave(struct leia_dp_linux *ldp,
                   uint32_t atlas_w,
                   uint32_t atlas_h,
                   uint32_t tile_columns,
-                  uint32_t tile_rows)
+                  uint32_t tile_rows,
+                  uint32_t win_w,
+                  uint32_t win_h)
 {
 	struct vk_bundle *vk = ldp->vk;
 	if (!ldp->transparent_enabled) {
@@ -479,7 +495,9 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	float uv_extent[2] = {1.0f, 1.0f};
 	VkImageView bg = VK_NULL_HANDLE;
 	VkImageView backdrop = VK_NULL_HANDLE;
-	if (ldp->bg_capture != NULL && leia_bg_capture_linux_poll(ldp->bg_capture, cmd, uv_origin, uv_extent)) {
+	if (ldp->bg_capture != NULL &&
+	    leia_bg_capture_linux_poll(ldp->bg_capture, cmd, ldp->present_origin_x, ldp->present_origin_y,
+	                               win_w, win_h, uv_origin, uv_extent)) {
 		bg = leia_bg_capture_linux_get_view(ldp->bg_capture); // captured monitor, poll'd UV sub-rect
 		backdrop = ldp->bg2d_view;                            // may be NULL → gated off below
 	} else if (ldp->bg2d_view != VK_NULL_HANDLE) {
@@ -558,6 +576,9 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u;
+	// DXR_LEIA_BG_DEBUG=1: shader outputs the background ONLY (one-glance
+	// "is the capture black?" check); the caller also skips the alpha-gate.
+	push.pad = dxr_leia_bg_debug() ? 1u : 0u;
 	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
@@ -1201,7 +1222,8 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	VkImageView weave_atlas_view = (VkImageView)atlas_view;
 	VkFormat weave_view_format = (VkFormat)view_format;
 	VkImageView composed = compose_pre_weave(ldp, cmd_buffer, (VkImageView)atlas_view, view_width * tile_columns,
-	                                         view_height * tile_rows, tile_columns, tile_rows);
+	                                         view_height * tile_rows, tile_columns, tile_rows,
+	                                         target_width, target_height);
 	if (composed != VK_NULL_HANDLE) {
 		weave_atlas_image = ldp->compose_fill_image;
 		weave_atlas_view = composed;
@@ -1262,7 +1284,7 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	// views opaque) was already baked opaque by compose_pre_weave above, so it
 	// stays. Pass the ORIGINAL atlas_view (pre-compose) — that carries the app's
 	// per-view alpha the gate keys on.
-	if (ldp->transparent_enabled && target_image != (VkImage_XDP)0) {
+	if (ldp->transparent_enabled && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
 		alpha_gate_run(ldp, cmd_buffer, (VkImage)target_image, (VkImageView)atlas_view,
 		               (VkFormat)target_format, target_width, target_height, tile_columns, tile_rows);
 	}
