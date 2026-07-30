@@ -119,20 +119,27 @@ if not exist "%SR_SDK_MARKER%" (
     gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
     gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.dll" -D "%LEIASR_SDKROOT%\bin"
 
-    :: Stamp-aware weaver — REQUIRED for SR 1.36.x, which emits the pixel stamp
-    :: but ships no Vulkan weaver of its own. Without it a 1.36 machine renders
-    :: a coloured replica of the scene. (SR >= 1.37 installs its own weaver on
-    :: PATH and neither bundled DLL is used.) The .lib is not linked — it is
-    :: fetched only so CMake's Vulkan gate sees the newer SDK layout.
-    echo === Downloading stamp-aware Vulkan weaver (%SR_VKSTAMP_TAG%) ===
+    echo SR SDK ready.
+)
+
+:: Stamp-aware weaver — REQUIRED for SR 1.36.x, which emits the pixel stamp but
+:: ships no Vulkan weaver of its own. Without it a 1.36 machine renders a
+:: coloured replica of the scene. (SR >= 1.37 installs its own weaver on PATH
+:: and neither bundled DLL is used.) The .lib is not linked — it is fetched only
+:: so CMake's Vulkan gate sees the newer SDK layout.
+::
+:: Fetched OUTSIDE the SDK-extract guard above, and keyed on its own file, so a
+:: dev tree that already has an older SR SDK unpacked still self-heals instead
+:: of silently skipping it and tripping the installer's FATAL_ERROR.
+if not exist "%LEIASR_SDKROOT%\bin\SimulatedRealityVulkan.dll" (
+    echo === Downloading stamp-aware Vulkan weaver ^(%SR_VKSTAMP_TAG%^) ===
     gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "%LEIASR_SDKROOT%\bin"
-    if %ERRORLEVEL% NEQ 0 (
+    if !ERRORLEVEL! NEQ 0 (
         echo ERROR: Failed to download the stamp-aware weaver ^(%SR_VKSTAMP_TAG%^).
         echo        SR 1.36.x machines would ship broken. Aborting.
         exit /b 1
     )
     gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "%LEIASR_SDKROOT%\lib"
-    echo SR SDK ready.
 )
 
 echo.

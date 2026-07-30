@@ -40,13 +40,14 @@ namespace {
 
 //! Signature of the resolved `CreateVulkanWeaver`. Typed against *this* build's
 //! `SR::IVulkanWeaver1`, which is what makes the two builds differ.
-using create_vulkan_weaver_fn = SR::WeaverErrorCode (*)(SR::SRContext &context,
-                                                        VkDevice device,
-                                                        VkPhysicalDevice physicalDevice,
-                                                        VkQueue graphicsQueue,
-                                                        VkCommandPool commandPool,
-                                                        HWND window,
-                                                        SR::IVulkanWeaver1 **weaver);
+//! `WeaverErrorCode` is a global enum from `WeaverTypes.h`, not `SR`-scoped.
+using create_vulkan_weaver_fn = ::WeaverErrorCode (*)(SR::SRContext &context,
+                                                      VkDevice device,
+                                                      VkPhysicalDevice physicalDevice,
+                                                      VkQueue graphicsQueue,
+                                                      VkCommandPool commandPool,
+                                                      HWND window,
+                                                      SR::IVulkanWeaver1 **weaver);
 
 inline SR::IVulkanWeaver1 *
 as_weaver(void *raw)
@@ -69,7 +70,7 @@ impl_create(void *create_fn,
 	}
 
 	SR::IVulkanWeaver1 *weaver = nullptr;
-	SR::WeaverErrorCode rc;
+	::WeaverErrorCode rc;
 
 	// The SR SDK throws from construction paths on some failures rather than
 	// returning an error code; never let that cross the plug-in's C ABI.
@@ -87,7 +88,7 @@ impl_create(void *create_fn,
 	if (out_err != nullptr) {
 		*out_err = static_cast<int>(rc);
 	}
-	if (rc != SR::WeaverErrorCode::WeaverSuccess) {
+	if (rc != ::WeaverErrorCode::WeaverSuccess) {
 		return nullptr;
 	}
 	return weaver;
