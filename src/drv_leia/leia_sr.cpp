@@ -11,7 +11,12 @@
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
-#include <sr/weaver/vkweaver.h>
+// NOTE: <sr/weaver/vkweaver.h> is deliberately NOT included here. That interface
+// is not binary-stable across LeiaSR versions, so every weaver call goes through
+// the ABI-neutral shim, whose backing DLL and vtable are chosen at runtime.
+// See leia_vk_weaver.h for the full explanation.
+#include "leia_vk_weaver.h"
+
 #include <sr/world/display/display.h>
 #include <sr/sense/display/switchablehint.h>
 #include <sr/utility/exception.h>
@@ -38,7 +43,11 @@ struct leiasr
 
 	// SR SDK objects
 	SR::SRContext *context = nullptr;
-	SR::IVulkanWeaver1 *weaver = nullptr;
+	//! Opaque SR::IVulkanWeaver1*, only ever dereferenced through `weaver_ops`
+	//! (its vtable layout depends on which weaver DLL was loaded).
+	void *weaver = nullptr;
+	//! Dispatch table matching the loaded weaver's ABI; null iff `weaver` is null.
+	const struct leia_vk_weaver_ops *weaver_ops = nullptr;
 	SR::SwitchableLensHint *lens_hint = nullptr;
 
 	// Display dimensions in meters (for Kooima FOV calculation)
@@ -229,13 +238,23 @@ CreateSRWeaver(SR::SRContext *context,
                HWND hWnd,
                leiasr *out)
 {
-	// Create weaver.
-	WeaverErrorCode createWeaverResult =
-	    SR::CreateVulkanWeaver(*context, device, physicalDevice, graphicsQueue, commandPool, hWnd, &out->weaver);
-	if (createWeaverResult != WeaverErrorCode::WeaverSuccess) {
-		U_LOG_E("Failed to create SR Vulkan weaver: %d", (int)createWeaverResult);
+	// Resolve which weaver DLL this machine needs (SR >= 1.37 machine weaver,
+	// bundled stamp-aware weaver for 1.36.x, or the bundled legacy weaver for a
+	// pre-stamp core) and bind the matching vtable. Cached after the first call.
+	const struct leia_vk_weaver_backend *backend = leia_vk_weaver_select_backend();
+	if (backend == nullptr) {
+		U_LOG_E("Failed to create SR Vulkan weaver: no usable weaver DLL on this machine");
 		return false;
 	}
+
+	int err = 0;
+	out->weaver = backend->ops->create(backend->create_fn, context, device, physicalDevice, graphicsQueue,
+	                                   commandPool, hWnd, &err);
+	if (out->weaver == nullptr) {
+		U_LOG_E("Failed to create SR Vulkan weaver: %d (weaver '%ls')", err, backend->dll_path);
+		return false;
+	}
+	out->weaver_ops = backend->ops;
 
 	return true;
 }
@@ -285,7 +304,7 @@ ConfigureAdaptiveLatency(leiasr *sr)
 	sr->display_term_us = getu("LEIA_VK_LATENCY_DISPLAY_US", disp_default);
 
 	if (sr->latency_fixed_us > 0) {
-		sr->weaver->setLatency(sr->latency_fixed_us);
+		sr->weaver_ops->set_latency(sr->weaver, sr->latency_fixed_us);
 		sr->last_set_latency_us = sr->latency_fixed_us;
 		U_LOG_W("Leia VK weave latency: FIXED %llu us (adaptive disabled)",
 		        (unsigned long long)sr->latency_fixed_us);
@@ -406,8 +425,9 @@ leiasr_destroy(struct leiasr *leiasr)
 	// before the object memory is freed, reducing the race window further.
 	if (leiasr->weaver != nullptr) {
 		U_LOG_I("leiasr_destroy: explicitly destroying weaver");
-		leiasr->weaver->destroy();
+		leiasr->weaver_ops->destroy(leiasr->weaver);
 		leiasr->weaver = nullptr;
+		leiasr->weaver_ops = nullptr;
 		U_LOG_I("leiasr_destroy: weaver destroyed");
 
 		// Pump messages again after weaver destroy, since restoreOriginalWindowProc
@@ -468,22 +488,24 @@ leiasr_weave(struct leiasr *leiasr,
 	rect.right = rect.left + viewport.extent.width;
 	rect.bottom = rect.top + viewport.extent.height;
 
-	leiasr->weaver->setViewport(rect);
-	leiasr->weaver->setScissorRect(rect);
+	leiasr->weaver_ops->set_viewport(leiasr->weaver, rect);
+	leiasr->weaver_ops->set_scissor_rect(leiasr->weaver, rect);
 	// If caller provides a command buffer, use it; otherwise use the
 	// pre-allocated one from leiasr_create(). The weaver always needs a
 	// valid command buffer — passing VK_NULL_HANDLE causes black screen.
 	VkCommandBuffer cmd = (commandBuffer != VK_NULL_HANDLE)
 	                          ? commandBuffer
 	                          : leiasr->commandBuffer;
-	leiasr->weaver->setCommandBuffer(cmd);
-	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
+	leiasr->weaver_ops->set_command_buffer(leiasr->weaver, cmd);
+	leiasr->weaver_ops->set_input_view_texture(leiasr->weaver, leftImageView, rightImageView, imageWidth,
+	                                           imageHeight, imageFormat);
 	// Set the output framebuffer for weaving. The weaver renders to the
 	// application-provided framebuffer — it does not manage its own swapchain.
 	// VK_NULL_HANDLE is only valid if setOutputFrameBuffer was called on a
 	// prior frame and the framebuffer hasn't changed.
 	if (framebuffer != VK_NULL_HANDLE) {
-		leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
+		leiasr->weaver_ops->set_output_framebuffer(leiasr->weaver, framebuffer, framebufferWidth,
+		                                           framebufferHeight, framebufferFormat);
 	}
 
 	// Adaptive weave latency: estimate the motion-to-photon horizon from the
@@ -526,7 +548,7 @@ leiasr_weave(struct leiasr *leiasr,
 			const uint64_t prev = leiasr->last_set_latency_us;
 			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
 			if (prev == 0 || diff >= 250) {
-				leiasr->weaver->setLatency(latency_us);
+				leiasr->weaver_ops->set_latency(leiasr->weaver, latency_us);
 				// Throttle log to ~2 ms steps (not per frame; see debug-logging.md).
 				if (prev == 0 || (latency_us > prev ? latency_us - prev : prev - latency_us) >= 2000) {
 					U_LOG_I("Leia VK adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
@@ -541,7 +563,7 @@ leiasr_weave(struct leiasr *leiasr,
 		}
 	}
 
-	leiasr->weaver->weave();
+	leiasr->weaver_ops->weave(leiasr->weaver);
 }
 
 bool
@@ -562,9 +584,7 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	// internal control flow. Catch at the DP boundary so it never
 	// crosses the C ABI. See [[feedback_leia_eye_pos_throws_intrinsic]].
 	float leftEye[3], rightEye[3];
-	try {
-		leiasr->weaver->getPredictedEyePositions(leftEye, rightEye);
-	} catch (...) {
+	if (!leiasr->weaver_ops->get_predicted_eye_positions(leiasr->weaver, leftEye, rightEye)) {
 		out_eye_pos->valid = false;
 		return false;
 	}

@@ -33,6 +33,9 @@ setlocal enabledelayedexpansion
 set SCRIPT_DIR=%~dp0
 set REPO=%SCRIPT_DIR%..\
 set SR_TAG=1.35.0.2011
+:: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
+:: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
+set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
@@ -110,9 +113,25 @@ if not exist "%SR_SDK_MARKER%" (
     del "%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip" 2>nul
 
     echo === Downloading Vulkan weaver extras ===
+    :: Legacy (pre-stamp) weaver — shipped for SR <= 1.34.x, which predates the
+    :: ST-5318 subpixel pixel-stamp and needs the old vtable.
     gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
     gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
     gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.dll" -D "%LEIASR_SDKROOT%\bin"
+
+    :: Stamp-aware weaver — REQUIRED for SR 1.36.x, which emits the pixel stamp
+    :: but ships no Vulkan weaver of its own. Without it a 1.36 machine renders
+    :: a coloured replica of the scene. (SR >= 1.37 installs its own weaver on
+    :: PATH and neither bundled DLL is used.) The .lib is not linked — it is
+    :: fetched only so CMake's Vulkan gate sees the newer SDK layout.
+    echo === Downloading stamp-aware Vulkan weaver (%SR_VKSTAMP_TAG%) ===
+    gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "%LEIASR_SDKROOT%\bin"
+    if %ERRORLEVEL% NEQ 0 (
+        echo ERROR: Failed to download the stamp-aware weaver ^(%SR_VKSTAMP_TAG%^).
+        echo        SR 1.36.x machines would ship broken. Aborting.
+        exit /b 1
+    )
+    gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "%LEIASR_SDKROOT%\lib"
     echo SR SDK ready.
 )
 

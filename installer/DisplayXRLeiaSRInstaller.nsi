@@ -172,22 +172,27 @@ Section "Leia SR Plug-in" SecPlugin
 	; Install the plug-in DLL.
 	File "${BIN_DIR}\plugins\DisplayXR-LeiaSR.dll"
 
-	; Bundle the SR SDK's Vulkan Beta DLL alongside the plug-in DLL
-	; so the plug-in's /DELAYLOAD:SimulatedRealityVulkanBeta.dll
-	; resolves via LOAD_WITH_ALTERED_SEARCH_PATH (the runtime's loader
-	; uses this flag, putting the plug-in DLL's own directory first in
-	; the search). Apps on boxes that have only the D3D11 weaver never
-	; trigger the delay-load — the bundle just covers the VK path.
-	;
-	; SR Platform's own installer may also provide
-	; SimulatedRealityVulkanBeta.dll on machine PATH; either resolution
-	; works.
+	; Bundle the SR Vulkan weavers alongside the plug-in DLL. These are no
+	; longer delay-loaded imports resolved by base name — the plug-in picks one
+	; at runtime and LoadLibrary's it by absolute path from this directory
+	; (leia_vk_weaver_select.cpp), because the weaver's vtable is not stable
+	; across LeiaSR versions and the choice depends on the installed core.
+	; Apps on boxes that only use the D3D11 weaver never load either DLL.
 	;
 	; Source the copy that build staging placed in BIN_DIR\plugins (the
 	; tree the signing step covers) rather than the raw SDK dir, so the
 	; bundled DLL ships code-signed — SAC checks it at delay-load time.
 	; (${SR_VK_BETA_DLL} is the unsigned SDK dir; kept defined but unused.)
+	;
+	; TWO weavers ship, and the plug-in picks between them at runtime
+	; (leia_vk_weaver_select.cpp):
+	;   SimulatedRealityVulkanBeta.dll  pre-stamp vtable, for SR <= 1.34.x
+	;   SimulatedRealityVulkan.dll      stamp-aware (ST-5318), for SR 1.36.x
+	; SR >= 1.37 installs its own SimulatedRealityVulkan.dll on PATH and neither
+	; of these is loaded. Shipping only the pre-stamp one is what made 1.36/1.37
+	; machines render a coloured replica of the scene.
 	File "${BIN_DIR}\plugins\SimulatedRealityVulkanBeta.dll"
+	File "${BIN_DIR}\plugins\SimulatedRealityVulkan.dll"
 
 	; -----------------------------------------------------------------
 	; Register at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr per
@@ -292,6 +297,7 @@ Section "Uninstall"
 	; Remove our files.
 	Delete "$INSTDIR\DisplayXR-LeiaSR.dll"
 	Delete "$INSTDIR\SimulatedRealityVulkanBeta.dll"
+	Delete "$INSTDIR\SimulatedRealityVulkan.dll"
 	Delete "$INSTDIR\Uninstall.exe"
 
 	; Remove install dir.

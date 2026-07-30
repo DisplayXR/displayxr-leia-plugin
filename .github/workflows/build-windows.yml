@@ -47,6 +47,10 @@ jobs:
     runs-on: windows-2022
     env:
       SR_TAG: 1.35.0.2011
+      # Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. A separate tag because
+      # it is grafted from a different SR branch than SR_TAG's SDK — v1.36.4 tree
+      # with v1.37.1's modules/srVulkan. See that release's notes.
+      SR_VKSTAMP_TAG: sr-sdk-v1.36.4.17537-vkstamp
       GH_TOKEN: ${{ github.token }}
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
@@ -108,6 +112,13 @@ jobs:
           gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "vkweaver.h" -D "LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver"
           New-Item -ItemType Directory -Force "LeiaSR-SDK-$env:SR_TAG-win64/bin" | Out-Null
           gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
+          # Stamp-aware (ST-5318) weaver, REQUIRED for SR 1.36.x: that core emits
+          # the subpixel pixel-stamp but ships no Vulkan weaver, so the pre-stamp
+          # DLL above renders a coloured replica there. Hard-fail rather than
+          # silently packaging a build that is broken on 1.36 machines.
+          gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download stamp-aware weaver ($env:SR_VKSTAMP_TAG)" }
+          gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
 
       # The plug-in CMake adds the runtime as a subdirectory, so we need
       # all the runtime's own build prereqs (vcpkg, Vulkan SDK, OpenXR

@@ -42,23 +42,33 @@ set(DXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 # silently leaving the embedded uninstaller unsigned (#664 validation).
 set(SIGN_CMD "$ENV{SIGN_CMD}" CACHE STRING "Code-signing command for installer/uninstaller (empty = unsigned)" FORCE)
 
-# SR Vulkan Beta runtime DLL — fetched into ${SR_PATH}/bin by
-# scripts/build-windows.bat from the sr-sdk-v* release. REQUIRED, not
-# optional: the plug-in delay-loads SimulatedRealityVulkanBeta.dll and must
-# ship it next to the plug-in DLL, else VK apps fail to weave / crash at
-# xrCreateSession on boxes that don't already have it on PATH (issue #314).
-# The NSI `File "${SR_VK_BETA_DLL}"` line is NOT conditional — an empty value
-# would make NSIS error out anyway — so fail loudly and legibly here rather
-# than silently producing a #314-prone installer.
+# SR Vulkan weaver DLLs — fetched into ${SR_PATH}/bin by
+# scripts/build-windows.bat from the sr-sdk-v* releases. BOTH are REQUIRED:
+# the plug-in loads one by absolute path from its own directory depending on
+# the installed LeiaSR core (leia_vk_weaver_select.cpp).
+#   SimulatedRealityVulkanBeta.dll  pre-stamp vtable, for SR <= 1.34.x
+#   SimulatedRealityVulkan.dll      stamp-aware (ST-5318), for SR 1.36.x
+# Missing the legacy DLL crashes VK apps at xrCreateSession on boxes without it
+# on PATH (issue #314). Missing the stamp-aware DLL is quieter and worse: SR
+# 1.36.x machines fall back to the pre-stamp weaver and render a coloured
+# replica of the scene with a completely clean log. Fail loudly for both.
 if(EXISTS "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
     set(SR_VK_BETA_DLL "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
     file(TO_NATIVE_PATH "${SR_VK_BETA_DLL}" SR_VK_BETA_DLL)
-    message(STATUS "Bundling SR VK Beta DLL: ${SR_VK_BETA_DLL}")
+    message(STATUS "Bundling SR VK legacy (pre-stamp) DLL: ${SR_VK_BETA_DLL}")
+    if(NOT EXISTS "${SR_PATH}/bin/SimulatedRealityVulkan.dll")
+        message(FATAL_ERROR
+            "SimulatedRealityVulkan.dll (stamp-aware weaver) not found at "
+            "${SR_PATH}/bin. Without it, SR 1.36.x machines render a coloured "
+            "replica of the scene and nothing in the logs reports a fault. Run "
+            "scripts/build-windows.bat first — it fetches the DLL from the "
+            "sr-sdk-v*-vkstamp release into the SR SDK's bin/ dir.")
+    endif()
 else()
     message(FATAL_ERROR
         "SimulatedRealityVulkanBeta.dll not found at ${SR_PATH}/bin. The "
-        "plug-in delay-loads it and the installer must bundle it (issue "
-        "#314); a missing DLL ships an installer whose VK apps crash at "
+        "plug-in loads it for pre-stamp cores and the installer must bundle it "
+        "(issue #314); a missing DLL ships an installer whose VK apps crash at "
         "xrCreateSession. Run scripts/build-windows.bat first — it fetches "
         "the DLL from the sr-sdk-v* release into the SR SDK's bin/ dir.")
 endif()
