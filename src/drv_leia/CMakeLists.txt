@@ -17,13 +17,17 @@ set(LEIA_SOURCES
     leia_plugin.c
 )
 
-# Vulkan weaver path — SimulatedRealityVulkanBeta.lib is fetched into
-# ${SR_PATH}/lib by scripts/build-windows.bat (or CI). Optional.
+# Vulkan weaver path. The weaver DLL is resolved and loaded at RUNTIME (see
+# leia_vk_weaver_select.cpp), so no SR Vulkan import library is linked and the
+# gate below only asks "were Vulkan weaver bits fetched at all". Either name
+# satisfies it: SimulatedRealityVulkanBeta.lib (SR <= 1.36 SDKs) or
+# SimulatedRealityVulkan.lib (>= 1.37, and the 1.36 stamp-aware rescue SDK).
 set(LEIA_SR_VULKAN_AVAILABLE FALSE)
-if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
-    message(STATUS "Found SimulatedRealityVulkanBeta.lib - enabling Vulkan weaver")
+if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib" OR EXISTS "${SR_PATH}/lib/SimulatedRealityVulkan.lib")
+    message(STATUS "Found SR Vulkan SDK bits - enabling Vulkan weaver (runtime-selected DLL)")
     list(APPEND LEIA_SOURCES
         leia_sr.cpp leia_sr.h
+        leia_vk_weaver.h leia_vk_weaver_select.cpp
         leia_display_processor.cpp leia_display_processor.h)
 
     # Chroma-key + compose-under-bg shaders compiled to SPIR-V headers.
@@ -39,8 +43,37 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
     )
     list(APPEND LEIA_SOURCES ${LEIA_SHADER_HEADERS})
     set(LEIA_SR_VULKAN_AVAILABLE TRUE)
+
+    # --- Per-ABI weaver dispatch tables ------------------------------------
+    #
+    # SR::IVulkanWeaver1 is NOT binary-stable: 1.37.1 (ST-5318) inserted a mono
+    # setInputViewTexture overload ahead of the stereo one, and MSVC orders
+    # contiguous same-name virtual overloads in REVERSE, so every method after
+    # that group shifts down a slot. A binary built against the old header calls
+    # setOutputFrameBuffer and lands on mono setInputViewTexture.
+    #
+    # So leia_vk_weaver_impl.cpp is compiled ONCE PER ABI, each build seeing a
+    # different vendored vkweaver.h and exporting a differently-named ops getter.
+    # The vendored headers live in sr_vk_abi/ rather than being taken from
+    # ${SR_PATH} so the ABI pair is deterministic regardless of which SR SDK
+    # happens to have been fetched into the build tree.
+    foreach(_abi legacy stamp)
+        add_library(leia_vk_abi_${_abi} OBJECT leia_vk_weaver_impl.cpp)
+        target_include_directories(leia_vk_abi_${_abi} BEFORE PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/sr_vk_abi/${_abi}")
+        target_include_directories(leia_vk_abi_${_abi} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            ${SR_PATH}/include
+            ${SR_PATH}/third_party/OpenCV/include)
+        target_link_libraries(leia_vk_abi_${_abi} PRIVATE xrt-interfaces aux_util)
+        target_compile_definitions(leia_vk_abi_${_abi} PRIVATE
+            LEIA_VK_OPS_SYMBOL=leia_vk_weaver_ops_${_abi})
+        set_target_properties(leia_vk_abi_${_abi} PROPERTIES
+            CXX_VISIBILITY_PRESET hidden
+            POSITION_INDEPENDENT_CODE ON)
+    endforeach()
 else()
-    message(STATUS "SimulatedRealityVulkanBeta.lib not found - Vulkan weaver disabled")
+    message(STATUS "SR Vulkan SDK bits not found - Vulkan weaver disabled")
 endif()
 
 # D3D11 / D3D12 / GL weavers (SimulatedRealityDirectX.lib covers both DX paths).
@@ -124,15 +157,25 @@ target_link_libraries(DisplayXR-LeiaSR
 add_dependencies(DisplayXR-LeiaSR ${RUNTIME_TARGET})
 
 if(LEIA_SR_VULKAN_AVAILABLE)
-    target_link_libraries(DisplayXR-LeiaSR PRIVATE ${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib)
+    # Both ABI dispatch tables are linked in; which one is used is decided at
+    # runtime by leia_vk_weaver_select_backend().
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE
+        leia_vk_abi_legacy
+        leia_vk_abi_stamp
+        # GetFileVersionInfo* — reads DimencoWeaving.dll's version to decide
+        # whether the installed core emits the subpixel stamp.
+        version)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_HAVE_LEIA_SR_VULKAN)
-    # SR Vulkan beta + the Vulkan loader aren't on every machine.
-    # Delay-loading keeps the plug-in loadable; the D3D11/D3D12 paths
-    # never hit the Vulkan weaver code.
-    target_link_options(DisplayXR-LeiaSR PRIVATE
-        "/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
-        "/DELAYLOAD:vulkan-1.dll"
-    )
+    # NOTE: no SR Vulkan import library and no /DELAYLOAD for it. The weaver is
+    # LoadLibrary'd by absolute path and CreateVulkanWeaver resolved via
+    # GetProcAddress. That is required, not merely tidy: the mangled export name
+    # is identical across versions, so linking both SimulatedRealityVulkanBeta.lib
+    # and SimulatedRealityVulkan.lib would collide on a single symbol and there
+    # would be no way to bind two weavers in one process.
+    #
+    # The Vulkan loader itself is still delay-loaded — it is genuinely absent on
+    # some machines, and the D3D11/D3D12/GL paths must stay loadable there.
+    target_link_options(DisplayXR-LeiaSR PRIVATE "/DELAYLOAD:vulkan-1.dll")
     target_link_libraries(DisplayXR-LeiaSR PRIVATE delayimp)
 endif()
 
@@ -179,12 +222,27 @@ install(
     LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
 )
 
-# Stage the SR Vulkan Beta DLL alongside the plug-in in _package/bin/plugins so
-# the installer packs it from the *signed* tree (the raw SDK-dir copy bypasses
-# the code-signing pass that covers _package/bin, so it would ship unsigned and
-# trip Smart App Control at delay-load time). app-local deps do not reliably
-# stage this delay-loaded DLL on CI, so copy it explicitly.
+# Stage the bundled SR Vulkan weavers alongside the plug-in in _package/bin/plugins
+# so the installer packs them from the *signed* tree (the raw SDK-dir copy bypasses
+# the code-signing pass that covers _package/bin, so they would ship unsigned and
+# trip Smart App Control at load time). These are loaded explicitly by absolute
+# path, so CI's app-local dependency staging never picks them up — copy them.
+#
+# Two weavers ship, and the runtime picks between them:
+#   SimulatedRealityVulkanBeta.dll  pre-stamp vtable, for SR <= 1.34.x
+#   SimulatedRealityVulkan.dll      stamp-aware, for SR 1.36.x (which ships none)
+# SR >= 1.37 installs its own SimulatedRealityVulkan.dll on PATH and neither of
+# these is used — the machine weaver always wins.
 if(LEIA_SR_VULKAN_AVAILABLE AND EXISTS "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll")
     install(FILES "${SR_PATH}/bin/SimulatedRealityVulkanBeta.dll"
         DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime)
+endif()
+if(LEIA_SR_VULKAN_AVAILABLE AND EXISTS "${SR_PATH}/bin/SimulatedRealityVulkan.dll")
+    install(FILES "${SR_PATH}/bin/SimulatedRealityVulkan.dll"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime)
+else()
+    message(WARNING
+        "Stamp-aware SimulatedRealityVulkan.dll not found in ${SR_PATH}/bin - "
+        "SR 1.36.x machines will fall back to the pre-stamp weaver and show the "
+        "coloured-replica artefact. Fetch it from the sr-sdk-v*-vkstamp release.")
 endif()
