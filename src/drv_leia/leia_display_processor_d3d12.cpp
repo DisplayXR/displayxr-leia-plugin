@@ -2283,7 +2283,15 @@ leia_dp_d3d12_set_transparent_background(struct xrt_display_processor_d3d12 *xdp
 
 	// In-process path: WGC desktop capture + per-tile compose-under-bg.
 	if (enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
-		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
+		// Producer device must be on the consumer's adapter — shared textures
+		// do not cross adapters, and the default D3D11 device follows the
+		// process GpuPreference instead of ldp->device (#819).
+		uint64_t luid = 0;
+		if (ldp->device != nullptr) {
+			LUID l = ldp->device->GetAdapterLuid();
+			luid = ((uint64_t)(uint32_t)l.HighPart << 32) | (uint64_t)(uint32_t)l.LowPart;
+		}
+		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd, luid);
 		if (ldp->bg_capture != nullptr && ldp->device != nullptr) {
 			HRESULT hr = leia_bg_capture_open_d3d12(
 			    ldp->bg_capture, ldp->device, &ldp->bg_shared_tex);

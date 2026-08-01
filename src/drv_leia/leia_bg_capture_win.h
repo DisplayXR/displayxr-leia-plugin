@@ -47,9 +47,23 @@ struct leia_bg_capture;
  * Create a WGC capture session targeting the monitor containing @p hwnd.
  * Returns NULL on any failure — caller falls back to chroma-key.
  *
+ * @p adapter_luid selects the DXGI adapter for the internal producer D3D11
+ * device (packed LUID, HighPart<<32 | LowPart; 0 = system default). Pass the
+ * LUID of the adapter the CONSUMER device lives on: a D3D11 shared texture
+ * cannot be opened across adapters, and on some drivers (Intel UHD
+ * 30.0.100.x) a cross-adapter Vulkan import crashes inside the ICD instead
+ * of failing (#819). With 0 the device follows the process GpuPreference,
+ * which is unrelated to where the consumer lives.
+ *
  * Side-effect on success: SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).
  */
-struct leia_bg_capture *leia_bg_capture_create(HWND hwnd);
+struct leia_bg_capture *leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid);
+
+/*!
+ * Packed LUID of the adapter the producer D3D11 device actually landed on
+ * (authoritative — queried from the created device). 0 if unknown.
+ */
+uint64_t leia_bg_capture_get_adapter_luid(struct leia_bg_capture *c);
 
 /*!
  * Open the shared staging texture on the caller's D3D11 device + create an SRV.

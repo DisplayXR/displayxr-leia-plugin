@@ -1740,16 +1740,46 @@ leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool
 #ifdef _WIN32
 	// In-process path: WGC desktop capture + per-tile compose-under-bg.
 	if (enabled && !ldp->bg_compose_enabled && ldp->hwnd_opaque != nullptr) {
-		ldp->bg_capture = leia_bg_capture_create((HWND)ldp->hwnd_opaque);
+		// The capture's producer D3D11 device must be on the SAME adapter as
+		// this VkDevice: the shared texture cannot cross adapters, and the
+		// Intel UHD 30.0.100.x ICD crashes (rather than erroring) on a
+		// cross-adapter import (#819). Left to itself the D3D11 device
+		// follows the process GpuPreference, which is set independently.
+		struct vk_bundle *vk = ldp->vk;
+		uint64_t vk_luid = 0;
+		if (vk->vkGetPhysicalDeviceProperties2 != NULL) {
+			VkPhysicalDeviceIDProperties id_props = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+			};
+			VkPhysicalDeviceProperties2 props2 = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			    .pNext = &id_props,
+			};
+			vk->vkGetPhysicalDeviceProperties2(vk->physical_device, &props2);
+			if (id_props.deviceLUIDValid) {
+				memcpy(&vk_luid, id_props.deviceLUID, sizeof(vk_luid));
+			}
+		}
+		ldp->bg_capture = leia_bg_capture_create((HWND)ldp->hwnd_opaque, vk_luid);
 		if (ldp->bg_capture != nullptr) {
-			if (compose_import_bg_image(ldp)) {
+			uint64_t cap_luid = leia_bg_capture_get_adapter_luid(ldp->bg_capture);
+			if (vk_luid != 0 && cap_luid != 0 && cap_luid != vk_luid) {
+				// Never hand a foreign-adapter handle to the ICD.
+				U_LOG_W("Leia VK DP: bg capture landed on adapter 0x%016llx but VkDevice is "
+				        "0x%016llx — skipping import, staying opaque",
+				        (unsigned long long)cap_luid, (unsigned long long)vk_luid);
+				leia_bg_capture_destroy(ldp->bg_capture);
+				ldp->bg_capture = nullptr;
+			} else if (compose_import_bg_image(ldp)) {
 				ldp->bg_compose_enabled = true;
 				U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
 				return;
 			}
-			U_LOG_W("Leia VK DP: bg image import failed — staying opaque");
-			leia_bg_capture_destroy(ldp->bg_capture);
-			ldp->bg_capture = nullptr;
+			if (ldp->bg_capture != nullptr) {
+				U_LOG_W("Leia VK DP: bg image import failed — staying opaque");
+				leia_bg_capture_destroy(ldp->bg_capture);
+				ldp->bg_capture = nullptr;
+			}
 		}
 	}
 #else

@@ -1748,7 +1748,26 @@ leia_dp_d3d11_enable_transparency(struct leia_display_processor_d3d11_impl *ldp,
 	}
 
 	if (transparent_bg_enabled && !ldp->bg_compose_enabled && ldp->hwnd != nullptr) {
-		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
+		// Producer device must be on the consumer's adapter — shared textures
+		// do not cross adapters, and the default D3D11 device follows the
+		// process GpuPreference instead of ldp->device (#819).
+		uint64_t luid = 0;
+		if (ldp->device != nullptr) {
+			IDXGIDevice *dxgi_device = nullptr;
+			if (SUCCEEDED(ldp->device->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+				IDXGIAdapter *adapter = nullptr;
+				if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
+					DXGI_ADAPTER_DESC desc;
+					if (SUCCEEDED(adapter->GetDesc(&desc))) {
+						luid = ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32) |
+						       (uint64_t)(uint32_t)desc.AdapterLuid.LowPart;
+					}
+					adapter->Release();
+				}
+				dxgi_device->Release();
+			}
+		}
+		ldp->bg_capture = leia_bg_capture_create(ldp->hwnd, luid);
 		if (ldp->bg_capture != nullptr && ldp->device != nullptr) {
 			HRESULT hr = leia_bg_capture_open_d3d11(
 			    ldp->bg_capture, ldp->device, &ldp->bg_shared_tex, &ldp->bg_shared_srv);
