@@ -812,7 +812,25 @@ compose_try_init_gl(struct leia_display_processor_gl_impl *ldp)
 	}
 
 	// WGC capture (honors LEIA_DP_DISABLE_BG_CAPTURE; NULL ⟹ chroma-key).
-	ldp->bg_capture = leia_bg_capture_create(ldp->hwnd);
+	// Producer must be on dx_device's adapter — shared textures do not cross
+	// adapters and the default D3D11 device follows GpuPreference (#819).
+	uint64_t bg_luid = 0;
+	{
+		IDXGIDevice *dxgi_device = nullptr;
+		if (SUCCEEDED(ldp->dx_device->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+			IDXGIAdapter *adapter = nullptr;
+			if (SUCCEEDED(dxgi_device->GetAdapter(&adapter))) {
+				DXGI_ADAPTER_DESC desc;
+				if (SUCCEEDED(adapter->GetDesc(&desc))) {
+					bg_luid = ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32) |
+					          (uint64_t)(uint32_t)desc.AdapterLuid.LowPart;
+				}
+				adapter->Release();
+			}
+			dxgi_device->Release();
+		}
+	}
+	ldp->bg_capture = leia_bg_capture_create(ldp->hwnd, bg_luid);
 	if (ldp->bg_capture == nullptr) {
 		U_LOG_W("Leia GL DP: WGC capture unavailable — transparency = chroma-key");
 		compose_release_resources_gl(ldp);

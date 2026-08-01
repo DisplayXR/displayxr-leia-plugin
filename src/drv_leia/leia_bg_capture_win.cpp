@@ -67,6 +67,8 @@ struct leia_bg_capture
 	ComPtr<ID3D11Texture2D> staging_tex;
 	HANDLE staging_shared_handle;
 
+	uint64_t adapter_luid; //!< Packed LUID the producer device landed on (0 = unknown).
+
 	// Cross-API GPU sync — D3D11 shared fence. Producer signals after each
 	// CopyResource; consumers (D3D11 or D3D12) Wait before sampling.
 	ComPtr<ID3D11Fence> shared_fence;
@@ -107,14 +109,69 @@ os_supports_wda_exclude_from_capture()
 	return vi.dwBuildNumber >= 19041;
 }
 
+static uint64_t
+pack_luid(LUID l)
+{
+	return ((uint64_t)(uint32_t)l.HighPart << 32) | (uint64_t)(uint32_t)l.LowPart;
+}
+
 static HRESULT
-create_internal_d3d11(ID3D11Device **out_dev, ID3D11DeviceContext **out_ctx)
+create_internal_d3d11(uint64_t adapter_luid, ID3D11Device **out_dev, ID3D11DeviceContext **out_ctx)
 {
 	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 	D3D_FEATURE_LEVEL fl;
 	const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+
+	// The producer device must live on the SAME adapter as the consumer
+	// device that will open the shared staging texture: D3D11 shared
+	// textures do not cross adapters, and on Intel UHD 30.0.100.x a
+	// cross-adapter VK import crashes inside the ICD (#819). The default
+	// (NULL-adapter) path follows the process GpuPreference, which says
+	// nothing about the consumer, so a LUID is matched explicitly.
+	if (adapter_luid != 0) {
+		ComPtr<IDXGIFactory1> factory;
+		HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+		if (SUCCEEDED(hr)) {
+			for (UINT i = 0;; i++) {
+				ComPtr<IDXGIAdapter1> adapter;
+				if (factory->EnumAdapters1(i, adapter.GetAddressOf()) == DXGI_ERROR_NOT_FOUND) {
+					break;
+				}
+				DXGI_ADAPTER_DESC1 desc;
+				if (FAILED(adapter->GetDesc1(&desc)) || pack_luid(desc.AdapterLuid) != adapter_luid) {
+					continue;
+				}
+				return D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+				                         levels, 2, D3D11_SDK_VERSION, out_dev, &fl, out_ctx);
+			}
+		}
+		// A requested adapter that cannot be found must NOT silently fall
+		// back to the default one — that reintroduces the cross-adapter
+		// import. Fail; the DP falls back to chroma-key.
+		U_LOG_W("leia_bg_capture: no DXGI adapter with LUID 0x%016llx — falling back to chroma-key",
+		        (unsigned long long)adapter_luid);
+		return E_FAIL;
+	}
 	return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2,
 	                         D3D11_SDK_VERSION, out_dev, &fl, out_ctx);
+}
+
+static uint64_t
+query_device_adapter_luid(ID3D11Device *dev)
+{
+	ComPtr<IDXGIDevice> dxgi_device;
+	if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+		return 0;
+	}
+	ComPtr<IDXGIAdapter> adapter;
+	if (FAILED(dxgi_device->GetAdapter(adapter.GetAddressOf()))) {
+		return 0;
+	}
+	DXGI_ADAPTER_DESC desc;
+	if (FAILED(adapter->GetDesc(&desc))) {
+		return 0;
+	}
+	return pack_luid(desc.AdapterLuid);
 }
 
 static HRESULT
@@ -182,7 +239,7 @@ create_shared_fence(ID3D11Device *dev, ID3D11Fence **out_fence, HANDLE *out_hand
 // ---------- public API -----------------------------------------------------
 
 extern "C" struct leia_bg_capture *
-leia_bg_capture_create(HWND hwnd)
+leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 {
 	if (env_disable()) {
 		U_LOG_W("leia_bg_capture: disabled via LEIA_DP_DISABLE_BG_CAPTURE — falling back to chroma-key");
@@ -250,7 +307,7 @@ leia_bg_capture_create(HWND hwnd)
 
 	ComPtr<ID3D11Device> d3d11_device;
 	ComPtr<ID3D11DeviceContext> d3d11_context;
-	hr = create_internal_d3d11(d3d11_device.GetAddressOf(), d3d11_context.GetAddressOf());
+	hr = create_internal_d3d11(adapter_luid, d3d11_device.GetAddressOf(), d3d11_context.GetAddressOf());
 	if (FAILED(hr)) {
 		U_LOG_W("leia_bg_capture: D3D11CreateDevice failed: 0x%08x", (unsigned)hr);
 		reset_affinity();
@@ -395,13 +452,21 @@ leia_bg_capture_create(HWND hwnd)
 	c->capture_session = capture_session;
 	c->staging_tex = staging_tex;
 	c->staging_shared_handle = staging_handle;
+	c->adapter_luid = query_device_adapter_luid(d3d11_device.Get());
 	c->shared_fence = shared_fence;
 	c->shared_fence_handle = shared_fence_handle;
 	c->signaled_value = 0;
 	c->has_frame = false;
 
-	U_LOG_W("leia_bg_capture: ready (monitor=%ux%u, hwnd=0x%p)", monitor_w, monitor_h, hwnd);
+	U_LOG_W("leia_bg_capture: ready (monitor=%ux%u, hwnd=0x%p, adapter_luid=0x%016llx)", monitor_w, monitor_h,
+	        hwnd, (unsigned long long)c->adapter_luid);
 	return c;
+}
+
+extern "C" uint64_t
+leia_bg_capture_get_adapter_luid(struct leia_bg_capture *c)
+{
+	return c != nullptr ? c->adapter_luid : 0;
 }
 
 extern "C" long
