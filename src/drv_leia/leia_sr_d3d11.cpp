@@ -22,6 +22,7 @@
 #include <sysinfoapi.h>
 
 #include <cmath>
+#include <cstdlib>
 
 /*!
  * D3D11 SR weaver instance.
@@ -82,6 +83,27 @@ struct leiasr_d3d11
 	SR::IDX11Weaver1 *snap_probe_weaver = nullptr;
 	DWORD snap_probe_thread = 0;    //!< Thread that created/owns snap_probe_hwnd.
 	bool snap_probe_failed = false; //!< Lazy-init tried and failed — don't retry.
+
+	// --- Adaptive weave-latency estimation (D3D11), microseconds ------------
+	// Same additive motion-to-photon model as the VK arm (leia_sr.cpp):
+	//     horizon = N_buffered * frame_interval + T_display
+	// pushed via setLatency() each frame. The SDK's own frames-based heuristic
+	// (setLatencyInFrames) uses the identical shape with N pinned by the app —
+	// the point of the per-frame push is the N_BUFFERED KNOB: under the
+	// runtime's late-weave scheduling (DXR_LATE_WEAVE=1) the weave runs ~one
+	// refresh before scanout, so LEIA_D3D11_LATENCY_FRAMES=0 aligns the
+	// predictor with the measured horizon instead of over-predicting ~2x.
+	// Defaults reproduce today's numbers (N=1 + one refresh).
+	bool     adaptive_latency_enabled = true;
+	float    latency_frames_factor = 1.0f;   // N_buffered (frames in flight)
+	uint64_t display_term_us = 16667;        // T_display, constant (~1 panel refresh @60Hz)
+	uint64_t latency_min_us = 5000;          // clamp floor
+	uint64_t latency_max_us = 60000;         // clamp ceiling
+	uint64_t latency_fixed_us = 0;           // >0 => bypass adaptive, set once
+	double   latency_ema_alpha = 0.15;       // EMA smoothing for frame interval
+	uint64_t prev_weave_ns = 0;              // timestamp of previous weave()
+	double   ema_interval_ns = 0.0;          // smoothed weave interval (ns)
+	uint64_t last_set_latency_us = 0;        // last value pushed to setLatency()
 };
 
 namespace {
@@ -257,8 +279,59 @@ leiasr_d3d11_create(double max_time,
 	// initialize() starts the senses.
 	sr->context->initialize();
 
-	// Set default latency (1 frame)
+	// Set default latency (1 frame). Kept as the fallback for
+	// LEIA_D3D11_ADAPTIVE_LATENCY=0; the adaptive per-frame setLatency()
+	// below overrides it (setLatency disables the SDK's frames mode).
 	sr->weaver->setLatencyInFrames(1);
+
+	// Adaptive-latency knobs, mirroring the VK arm's LEIA_VK_* set:
+	//   LEIA_D3D11_ADAPTIVE_LATENCY=0   disable (keep SDK frames-based default)
+	//   LEIA_D3D11_LATENCY_FIXED_US=N   bypass adaptive, pin setLatency(N) once
+	//   LEIA_D3D11_LATENCY_FRAMES=f     N_buffered (default 1.0; 0 under late-weave)
+	//   LEIA_D3D11_PANEL_HZ=hz          panel refresh for display term (default 60)
+	//   LEIA_D3D11_LATENCY_DISPLAY_US=N override display term outright
+	//   LEIA_D3D11_LATENCY_MIN_US/_MAX_US/_EMA_ALPHA  clamps + smoothing
+	{
+		auto getf = [](const char *n, float def) -> float {
+			const char *v = std::getenv(n);
+			return (v == nullptr || v[0] == '\0') ? def : (float)atof(v);
+		};
+		auto getu = [](const char *n, uint64_t def) -> uint64_t {
+			const char *v = std::getenv(n);
+			if (v == nullptr || v[0] == '\0') return def;
+			long long x = atoll(v);
+			return x < 0 ? def : (uint64_t)x;
+		};
+
+		const char *en = std::getenv("LEIA_D3D11_ADAPTIVE_LATENCY");
+		sr->adaptive_latency_enabled = !(en != nullptr && en[0] == '0');
+		sr->latency_frames_factor = getf("LEIA_D3D11_LATENCY_FRAMES", 1.0f);
+		sr->latency_min_us = getu("LEIA_D3D11_LATENCY_MIN_US", 5000);
+		sr->latency_max_us = getu("LEIA_D3D11_LATENCY_MAX_US", 60000);
+		sr->latency_fixed_us = getu("LEIA_D3D11_LATENCY_FIXED_US", 0);
+		float a = getf("LEIA_D3D11_LATENCY_EMA_ALPHA", 0.15f);
+		sr->latency_ema_alpha = a < 0.01f ? 0.01f : (a > 1.0f ? 1.0f : a);
+
+		float panel_hz = getf("LEIA_D3D11_PANEL_HZ", 60.0f);
+		uint64_t disp_default = (panel_hz > 1.0f) ? (uint64_t)(1.0e6 / panel_hz + 0.5) : 16667;
+		sr->display_term_us = getu("LEIA_D3D11_LATENCY_DISPLAY_US", disp_default);
+
+		if (sr->latency_fixed_us > 0) {
+			sr->weaver->setLatency(sr->latency_fixed_us);
+			sr->last_set_latency_us = sr->latency_fixed_us;
+			sr->adaptive_latency_enabled = false;
+			U_LOG_W("Leia D3D11 weave latency: FIXED %llu us (adaptive disabled)",
+			        (unsigned long long)sr->latency_fixed_us);
+		} else if (sr->adaptive_latency_enabled) {
+			U_LOG_W("Leia D3D11 weave latency: ADAPTIVE (horizon = %.2f x frame_interval + %llu us display, clamp %llu..%llu us, alpha %.2f)",
+			        (double)sr->latency_frames_factor,
+			        (unsigned long long)sr->display_term_us,
+			        (unsigned long long)sr->latency_min_us,
+			        (unsigned long long)sr->latency_max_us, sr->latency_ema_alpha);
+		} else {
+			U_LOG_W("Leia D3D11 weave latency: SDK frames-based default (adaptive off)");
+		}
+	}
 
 	*out = sr;
 
@@ -349,6 +422,55 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		U_LOG_W("leiasr_d3d11_weave called with null instance or weaver");
 		return;
+	}
+
+	// Adaptive weave latency: estimate the motion-to-photon horizon from the
+	// achieved weave() interval and feed it to the predictor via setLatency()
+	// BEFORE weave() so this frame's eye prediction uses it. Same model and
+	// deadband as the VK arm (leia_sr.cpp).
+	if (leiasr->adaptive_latency_enabled && leiasr->latency_fixed_us == 0) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (leiasr->prev_weave_ns != 0) {
+			const uint64_t dt_ns = now_ns - leiasr->prev_weave_ns;
+			// Ignore hitches / first-frame gaps (>250 ms).
+			if (dt_ns < 250ULL * 1000 * 1000) {
+				if (leiasr->ema_interval_ns <= 0.0) {
+					leiasr->ema_interval_ns = (double)dt_ns;
+				} else {
+					const double a = leiasr->latency_ema_alpha;
+					leiasr->ema_interval_ns =
+					    a * (double)dt_ns + (1.0 - a) * leiasr->ema_interval_ns;
+				}
+			}
+		}
+		leiasr->prev_weave_ns = now_ns;
+
+		if (leiasr->ema_interval_ns > 0.0) {
+			double horizon_us = (double)leiasr->latency_frames_factor *
+			                        leiasr->ema_interval_ns / 1000.0 +
+			                    (double)leiasr->display_term_us;
+			if (horizon_us < (double)leiasr->latency_min_us)
+				horizon_us = (double)leiasr->latency_min_us;
+			if (horizon_us > (double)leiasr->latency_max_us)
+				horizon_us = (double)leiasr->latency_max_us;
+			const uint64_t latency_us = (uint64_t)(horizon_us + 0.5);
+
+			// Deadband: only re-push on a meaningful change (>=250 us).
+			const uint64_t prev = leiasr->last_set_latency_us;
+			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
+			if (prev == 0 || diff >= 250) {
+				leiasr->weaver->setLatency(latency_us);
+				if (prev == 0 || diff >= 2000) {
+					U_LOG_I("Leia D3D11 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
+					        (unsigned long long)latency_us,
+					        leiasr->ema_interval_ns / 1e6,
+					        1e9 / leiasr->ema_interval_ns,
+					        (double)leiasr->latency_frames_factor,
+					        (unsigned long long)leiasr->display_term_us);
+				}
+				leiasr->last_set_latency_us = latency_us;
+			}
+		}
 	}
 
 	// The weaver writes to the currently bound render target.
