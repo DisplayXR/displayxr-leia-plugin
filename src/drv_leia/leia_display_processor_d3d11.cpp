@@ -212,13 +212,19 @@ Texture2D<float4> atlas      : register(t1);
 // backdrop premultiplied with its own alpha (DWM composites it over the LIVE
 // desktop) instead of punching to full transparency.
 Texture2D<float4> backdrop   : register(t2);
+// #116 — captured desktop, for the flatten path (opaque present, runtime #833):
+// when the runtime presents opaque DWM completes no blends, so every partial-
+// alpha output must be flattened against the baked bg here instead.
+Texture2D<float4> bg         : register(t3);
 SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
 	uint2 tile_count;
 	uint  has_backdrop;       // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
-	uint  pad0;
+	uint  flatten;            // #116 — 1 ⟹ complete all blends here (opaque present)
 	float2 canvas_uv_origin;  // canvas sub-rect origin on the window, normalized
 	float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
+	float2 bg_uv_origin;      // #116 — window TL on monitor, normalized
+	float2 bg_uv_extent;      // #116 — window size on monitor, normalized
 };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 float4 main(VSOut i) : SV_Target {
@@ -242,20 +248,48 @@ float4 main(VSOut i) : SV_Target {
 	}
 	// #491 part 3 — atlas transparent: emit the backdrop premultiplied with its
 	// own alpha (DWM adds the live desktop) instead of punching fully through.
+	// #116 — flatten (opaque present): DWM adds nothing, so complete the blend
+	// against the captured desktop and output alpha 1.
 	if (has_backdrop != 0) {
 		float4 bd = backdrop.Sample(samp, bb_uv);
+		if (flatten != 0) {
+			float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
+			return float4(bd.rgb + (1.0 - bd.a) * b, 1.0);
+		}
 		return float4(bd.rgb, bd.a);
+	}
+	if (flatten != 0) {
+		float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
+		return float4(b, 1.0); // baked desktop instead of live punch-through
 	}
 	return float4(0.0, 0.0, 0.0, 0.0); // live desktop
 }
 )";
 
+
+// #116 — the runtime presents opaque (DXR_PRESENT_OPAQUE, runtime #833): DWM
+// completes no blends, so the alpha-gate must flatten everything itself. Same
+// process env, read once.
+static bool
+env_present_opaque(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char buf[8];
+		DWORD n = GetEnvironmentVariableA("DXR_PRESENT_OPAQUE", buf, sizeof(buf));
+		cached = (n > 0 && n < sizeof(buf) && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T')) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 struct AlphaGateConstants {
 	uint32_t tile_count[2];
 	uint32_t has_backdrop;
-	uint32_t pad0;
+	uint32_t flatten;          // #116 — opaque-present flatten
 	float    canvas_uv_origin[2];
 	float    canvas_uv_extent[2];
+	float    bg_uv_origin[2];  // #116
+	float    bg_uv_extent[2];  // #116
 };
 
 
@@ -364,6 +398,7 @@ struct leia_display_processor_d3d11_impl
 	bool client_present_mode;
 	ID3D11Texture2D *bg_shared_tex;     //!< Opened from bg_capture's shared NT handle.
 	ID3D11ShaderResourceView *bg_shared_srv;
+	float bg_uv_last[4]; //!< #116 — this frame's window-on-monitor UV rect (origin, extent).
 	ID3D11Fence *bg_fence;              //!< Opened from bg_capture's shared fence handle.
 	ID3D11PixelShader *compose_ps;
 	ID3D11SamplerState *compose_sampler; //!< Linear sampler (atlas + bg both filtered).
@@ -946,6 +981,10 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
 	cb->bg_uv_origin[1] = bg_origin[1];
 	cb->bg_uv_extent[0] = bg_extent[0];
 	cb->bg_uv_extent[1] = bg_extent[1];
+	ldp->bg_uv_last[0] = bg_origin[0]; // #116 — reused by the alpha-gate flatten
+	ldp->bg_uv_last[1] = bg_origin[1];
+	ldp->bg_uv_last[2] = bg_extent[0];
+	ldp->bg_uv_last[3] = bg_extent[1];
 	cb->tile_count[0] = tile_columns;
 	cb->tile_count[1] = tile_rows;
 	cb->has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u; // #491 part 3
@@ -1112,11 +1151,15 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		cb->tile_count[0] = tile_columns;
 		cb->tile_count[1] = tile_rows;
 		cb->has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u; // #491 part 3
-		cb->pad0 = 0;
+		cb->flatten = (env_present_opaque() && ldp->bg_shared_srv != nullptr) ? 1u : 0u; // #116
 		cb->canvas_uv_origin[0] = cu_ox;
 		cb->canvas_uv_origin[1] = cu_oy;
 		cb->canvas_uv_extent[0] = cu_ex;
 		cb->canvas_uv_extent[1] = cu_ey;
+		cb->bg_uv_origin[0] = ldp->bg_uv_last[0]; // #116
+		cb->bg_uv_origin[1] = ldp->bg_uv_last[1];
+		cb->bg_uv_extent[0] = ldp->bg_uv_last[2];
+		cb->bg_uv_extent[1] = ldp->bg_uv_last[3];
 		ctx->Unmap(ldp->alpha_gate_constants, 0);
 	}
 
@@ -1149,14 +1192,18 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	// gated by has_backdrop).
 	ID3D11ShaderResourceView *ag_backdrop =
 	    (ldp->backdrop_srv != nullptr) ? ldp->backdrop_srv : ldp->ck_strip_srv;
-	ID3D11ShaderResourceView *srvs[3] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop};
-	ctx->PSSetShaderResources(0, 3, srvs);
+	// #116 — t3 = captured desktop for the flatten path (dummy = strip copy
+	// when compose-under-bg is off; gated by the flatten constant).
+	ID3D11ShaderResourceView *ag_bg =
+	    (ldp->bg_shared_srv != nullptr) ? ldp->bg_shared_srv : ldp->ck_strip_srv;
+	ID3D11ShaderResourceView *srvs[4] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop, ag_bg};
+	ctx->PSSetShaderResources(0, 4, srvs);
 	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
 	ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
 	ctx->Draw(4, 0);
 
-	ID3D11ShaderResourceView *null_srvs[3] = {nullptr, nullptr, nullptr};
-	ctx->PSSetShaderResources(0, 3, null_srvs);
+	ID3D11ShaderResourceView *null_srvs[4] = {nullptr, nullptr, nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 4, null_srvs);
 
 	back_buffer->Release();
 	rtv_res->Release();
