@@ -289,7 +289,14 @@ ConfigureAdaptiveLatency(leiasr *sr)
 
 	const char *en = std::getenv("LEIA_VK_ADAPTIVE_LATENCY");
 	sr->adaptive_latency_enabled = !(en != nullptr && en[0] == '0');
-	sr->latency_frames_factor = getf("LEIA_VK_LATENCY_FRAMES", 1.0f);
+	// N_buffered default follows the runtime's late-weave gate (same
+	// process, same env): under late-weave the weave runs ~1 refresh
+	// before scanout, so the buffered-frames term is 0. DXR_LATE_WEAVE=0
+	// (opt-out) restores the classic 1-frame default. Interim coupling
+	// until the runtime passes measured timing across the DP vtable.
+	const char *lw = std::getenv("DXR_LATE_WEAVE");
+	const float frames_def = (lw != nullptr && lw[0] == '0') ? 1.0f : 0.0f;
+	sr->latency_frames_factor = getf("LEIA_VK_LATENCY_FRAMES", frames_def);
 	sr->latency_min_us = getu("LEIA_VK_LATENCY_MIN_US", 5000);
 	sr->latency_max_us = getu("LEIA_VK_LATENCY_MAX_US", 60000);
 	sr->latency_fixed_us = getu("LEIA_VK_LATENCY_FIXED_US", 0);
