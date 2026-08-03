@@ -22,6 +22,7 @@
 #include <sysinfoapi.h>
 
 #include <cmath>
+#include <cstdlib>
 
 /*!
  * D3D12 SR weaver instance.
@@ -54,6 +55,24 @@ struct leiasr_d3d12
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	bool display_pixel_dims_valid = false;
+
+	// --- Adaptive weave-latency estimation (D3D12), microseconds ------------
+	// Same additive model + env knobs as the D3D11 arm (leia_sr_d3d11.cpp) and
+	// VK arm (leia_sr.cpp): horizon = N_buffered * frame_interval + T_display,
+	// pushed via setLatency() each weave. LEIA_D3D12_LATENCY_FRAMES=0 aligns
+	// the predictor with the runtime's late-weave scheduling (DXR_LATE_WEAVE=1,
+	// measured R = 16.65 ms on the D3D12 in-process path). Defaults reproduce
+	// the SDK frames-heuristic values.
+	bool     adaptive_latency_enabled = true;
+	float    latency_frames_factor = 1.0f;
+	uint64_t display_term_us = 16667;
+	uint64_t latency_min_us = 5000;
+	uint64_t latency_max_us = 60000;
+	uint64_t latency_fixed_us = 0;
+	double   latency_ema_alpha = 0.15;
+	uint64_t prev_weave_ns = 0;
+	double   ema_interval_ns = 0.0;
+	uint64_t last_set_latency_us = 0;
 };
 
 namespace {
@@ -214,8 +233,59 @@ leiasr_d3d12_create(double max_time,
 	// Initialize the context after creating the weaver.
 	sr->context->initialize();
 
-	// Set default latency (1 frame)
+	// Set default latency (1 frame). Fallback for
+	// LEIA_D3D12_ADAPTIVE_LATENCY=0; the adaptive per-frame setLatency()
+	// below overrides it (setLatency disables the SDK's frames mode).
 	sr->weaver->setLatencyInFrames(1);
+
+	// Adaptive-latency knobs, mirroring LEIA_D3D11_* / LEIA_VK_*.
+	{
+		auto getf = [](const char *n, float def) -> float {
+			const char *v = std::getenv(n);
+			return (v == nullptr || v[0] == '\0') ? def : (float)atof(v);
+		};
+		auto getu = [](const char *n, uint64_t def) -> uint64_t {
+			const char *v = std::getenv(n);
+			if (v == nullptr || v[0] == '\0') return def;
+			long long x = atoll(v);
+			return x < 0 ? def : (uint64_t)x;
+		};
+
+		const char *en = std::getenv("LEIA_D3D12_ADAPTIVE_LATENCY");
+		sr->adaptive_latency_enabled = !(en != nullptr && en[0] == '0');
+		// N_buffered default follows the runtime's late-weave gate (same
+		// process, same env): 0 under late-weave (weave ~1 refresh before
+		// scanout), 1 when opted out via DXR_LATE_WEAVE=0. Interim coupling
+		// until the runtime passes measured timing across the DP vtable.
+		const char *lw = std::getenv("DXR_LATE_WEAVE");
+		const float frames_def = (lw != nullptr && lw[0] == '0') ? 1.0f : 0.0f;
+		sr->latency_frames_factor = getf("LEIA_D3D12_LATENCY_FRAMES", frames_def);
+		sr->latency_min_us = getu("LEIA_D3D12_LATENCY_MIN_US", 5000);
+		sr->latency_max_us = getu("LEIA_D3D12_LATENCY_MAX_US", 60000);
+		sr->latency_fixed_us = getu("LEIA_D3D12_LATENCY_FIXED_US", 0);
+		float a = getf("LEIA_D3D12_LATENCY_EMA_ALPHA", 0.15f);
+		sr->latency_ema_alpha = a < 0.01f ? 0.01f : (a > 1.0f ? 1.0f : a);
+
+		float panel_hz = getf("LEIA_D3D12_PANEL_HZ", 60.0f);
+		uint64_t disp_default = (panel_hz > 1.0f) ? (uint64_t)(1.0e6 / panel_hz + 0.5) : 16667;
+		sr->display_term_us = getu("LEIA_D3D12_LATENCY_DISPLAY_US", disp_default);
+
+		if (sr->latency_fixed_us > 0) {
+			sr->weaver->setLatency(sr->latency_fixed_us);
+			sr->last_set_latency_us = sr->latency_fixed_us;
+			sr->adaptive_latency_enabled = false;
+			U_LOG_W("Leia D3D12 weave latency: FIXED %llu us (adaptive disabled)",
+			        (unsigned long long)sr->latency_fixed_us);
+		} else if (sr->adaptive_latency_enabled) {
+			U_LOG_W("Leia D3D12 weave latency: ADAPTIVE (horizon = %.2f x frame_interval + %llu us display, clamp %llu..%llu us, alpha %.2f)",
+			        (double)sr->latency_frames_factor,
+			        (unsigned long long)sr->display_term_us,
+			        (unsigned long long)sr->latency_min_us,
+			        (unsigned long long)sr->latency_max_us, sr->latency_ema_alpha);
+		} else {
+			U_LOG_W("Leia D3D12 weave latency: SDK frames-based default (adaptive off)");
+		}
+	}
 
 	*out = sr;
 
@@ -325,6 +395,52 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	}
 
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(command_list);
+
+	// Adaptive weave latency: same model and deadband as the D3D11/VK arms —
+	// push the estimated motion-to-photon horizon via setLatency() BEFORE
+	// weave() so this frame's eye prediction uses it.
+	if (leiasr->adaptive_latency_enabled && leiasr->latency_fixed_us == 0) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (leiasr->prev_weave_ns != 0) {
+			const uint64_t dt_ns = now_ns - leiasr->prev_weave_ns;
+			if (dt_ns < 250ULL * 1000 * 1000) {
+				if (leiasr->ema_interval_ns <= 0.0) {
+					leiasr->ema_interval_ns = (double)dt_ns;
+				} else {
+					const double a = leiasr->latency_ema_alpha;
+					leiasr->ema_interval_ns =
+					    a * (double)dt_ns + (1.0 - a) * leiasr->ema_interval_ns;
+				}
+			}
+		}
+		leiasr->prev_weave_ns = now_ns;
+
+		if (leiasr->ema_interval_ns > 0.0) {
+			double horizon_us = (double)leiasr->latency_frames_factor *
+			                        leiasr->ema_interval_ns / 1000.0 +
+			                    (double)leiasr->display_term_us;
+			if (horizon_us < (double)leiasr->latency_min_us)
+				horizon_us = (double)leiasr->latency_min_us;
+			if (horizon_us > (double)leiasr->latency_max_us)
+				horizon_us = (double)leiasr->latency_max_us;
+			const uint64_t latency_us = (uint64_t)(horizon_us + 0.5);
+
+			const uint64_t prev = leiasr->last_set_latency_us;
+			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
+			if (prev == 0 || diff >= 250) {
+				leiasr->weaver->setLatency(latency_us);
+				if (prev == 0 || diff >= 2000) {
+					U_LOG_I("Leia D3D12 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
+					        (unsigned long long)latency_us,
+					        leiasr->ema_interval_ns / 1e6,
+					        1e9 / leiasr->ema_interval_ns,
+					        (double)leiasr->latency_frames_factor,
+					        (unsigned long long)leiasr->display_term_us);
+				}
+				leiasr->last_set_latency_us = latency_us;
+			}
+		}
+	}
 
 	// Diagnostic: log weave parameters periodically
 	static uint32_t weave_counter = 0;

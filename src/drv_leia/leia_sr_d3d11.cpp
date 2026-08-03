@@ -305,7 +305,13 @@ leiasr_d3d11_create(double max_time,
 
 		const char *en = std::getenv("LEIA_D3D11_ADAPTIVE_LATENCY");
 		sr->adaptive_latency_enabled = !(en != nullptr && en[0] == '0');
-		sr->latency_frames_factor = getf("LEIA_D3D11_LATENCY_FRAMES", 1.0f);
+		// N_buffered default follows the runtime's late-weave gate (same
+		// process, same env): 0 under late-weave (weave ~1 refresh before
+		// scanout), 1 when opted out via DXR_LATE_WEAVE=0. Interim coupling
+		// until the runtime passes measured timing across the DP vtable.
+		const char *lw = std::getenv("DXR_LATE_WEAVE");
+		const float frames_def = (lw != nullptr && lw[0] == '0') ? 1.0f : 0.0f;
+		sr->latency_frames_factor = getf("LEIA_D3D11_LATENCY_FRAMES", frames_def);
 		sr->latency_min_us = getu("LEIA_D3D11_LATENCY_MIN_US", 5000);
 		sr->latency_max_us = getu("LEIA_D3D11_LATENCY_MAX_US", 60000);
 		sr->latency_fixed_us = getu("LEIA_D3D11_LATENCY_FIXED_US", 0);
