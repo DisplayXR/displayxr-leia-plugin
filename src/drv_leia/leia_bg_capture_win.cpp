@@ -460,6 +460,49 @@ leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 
 	U_LOG_W("leia_bg_capture: ready (monitor=%ux%u, hwnd=0x%p, adapter_luid=0x%016llx)", monitor_w, monitor_h,
 	        hwnd, (unsigned long long)c->adapter_luid);
+
+	// #119 — cross-adapter guard: WGC monitor capture from a device on a
+	// DIFFERENT adapter than the monitor's scanout owner delivers black or no
+	// frames (Optimus boxes: session on the dGPU, panel on the iGPU). That
+	// presents downstream as an opaque squared Local2D / dark silhouette
+	// fringes and can intermittently work, which makes it a trap — so find
+	// the adapter that OWNS the captured monitor's output and WARN loudly on
+	// a mismatch. Detection only; the session must be placed on the scanout
+	// adapter (DXR_VK_FORCE_GPU / DXR_D3D_FORCE_GPU).
+	{
+		ComPtr<IDXGIFactory1> fac;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
+			bool found = false;
+			for (UINT a = 0; !found; ++a) {
+				ComPtr<IDXGIAdapter1> ad;
+				if (fac->EnumAdapters1(a, ad.GetAddressOf()) != S_OK) break;
+				for (UINT o = 0;; ++o) {
+					ComPtr<IDXGIOutput> out;
+					if (ad->EnumOutputs(o, out.GetAddressOf()) != S_OK) break;
+					DXGI_OUTPUT_DESC od = {};
+					if (SUCCEEDED(out->GetDesc(&od)) && od.Monitor == monitor) {
+						DXGI_ADAPTER_DESC1 adsc = {};
+						ad->GetDesc1(&adsc);
+						const uint64_t scanout_luid =
+						    ((uint64_t)(uint32_t)adsc.AdapterLuid.HighPart << 32) |
+						    (uint32_t)adsc.AdapterLuid.LowPart;
+						if (scanout_luid != c->adapter_luid) {
+							U_LOG_W(
+							    "leia_bg_capture: CROSS-ADAPTER CAPTURE — session/capture "
+							    "adapter 0x%016llx but the monitor is scanned out by "
+							    "0x%016llx (%ls). WGC will deliver black/no frames; "
+							    "transparent content will break. Place the session on the "
+							    "scanout adapter (DXR_VK_FORCE_GPU / DXR_D3D_FORCE_GPU).",
+							    (unsigned long long)c->adapter_luid,
+							    (unsigned long long)scanout_luid, adsc.Description);
+						}
+						found = true;
+						break;
+					}
+				}
+			}
+		}
+	}
 	return c;
 }
 
