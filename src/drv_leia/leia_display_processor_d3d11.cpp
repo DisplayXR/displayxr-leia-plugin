@@ -1897,6 +1897,16 @@ leia_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum x
 	leia_dp_d3d11(xdp)->atlas_encoding = atlas_encoding;
 }
 
+#ifdef XRT_DP_D3D11_HAS_FRAME_TIMING
+static void
+leia_dp_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 *xdp,
+                               uint64_t weave_to_scanout_ns,
+                               uint64_t frame_period_ns)
+{
+	leiasr_d3d11_set_frame_timing(leia_dp_d3d11(xdp)->leiasr, weave_to_scanout_ns, frame_period_ns);
+}
+#endif
+
 static void
 leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
@@ -1961,6 +1971,12 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.publish_local_zone_mask = leia_dp_d3d11_publish_local_zone_mask;
 	ldp->base.clear_local_zone_mask = leia_dp_d3d11_clear_local_zone_mask;
 	ldp->base.snap_window_rect = leia_dp_d3d11_snap_window_rect; // #625 window-drag phase lock (slot 18)
+#ifdef XRT_DP_D3D11_HAS_FRAME_TIMING
+	ldp->base.set_frame_timing = leia_dp_d3d11_set_frame_timing; // weave-latency timing loop (slot 19)
+	U_LOG_W("Leia D3D11 DP: set_frame_timing slot WIRED (struct_size=%u)", ldp->base.struct_size);
+#else
+	U_LOG_W("Leia D3D11 DP: set_frame_timing NOT COMPILED (old runtime headers)");
+#endif
 }
 
 

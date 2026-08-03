@@ -2342,6 +2342,16 @@ leia_dp_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
 	ldp->backdrop_h = height;
 }
 
+#ifdef XRT_DP_D3D12_HAS_FRAME_TIMING
+static void
+leia_dp_d3d12_set_frame_timing(struct xrt_display_processor_d3d12 *xdp,
+                               uint64_t weave_to_scanout_ns,
+                               uint64_t frame_period_ns)
+{
+	leiasr_d3d12_set_frame_timing(leia_dp_d3d12(xdp)->leiasr, weave_to_scanout_ns, frame_period_ns);
+}
+#endif
+
 static void
 leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
@@ -2513,6 +2523,9 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.set_background_2d = leia_dp_d3d12_set_background_2d; // #491 part 3
 	ldp->base.set_transparent_background = leia_dp_d3d12_set_transparent_background; // #573
 	ldp->base.set_shared_texture_present = leia_dp_d3d12_set_shared_texture_present; // #68
+#ifdef XRT_DP_D3D12_HAS_FRAME_TIMING
+	ldp->base.set_frame_timing = leia_dp_d3d12_set_frame_timing; // weave-latency timing loop (slot 19)
+#endif
 	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;
 	ldp->base.publish_local_zone_mask = leia_dp_d3d12_publish_local_zone_mask;

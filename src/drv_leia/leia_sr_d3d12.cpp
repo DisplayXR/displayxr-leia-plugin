@@ -73,6 +73,13 @@ struct leiasr_d3d12
 	uint64_t prev_weave_ns = 0;
 	double   ema_interval_ns = 0.0;
 	uint64_t last_set_latency_us = 0;
+
+	// Measured weave→scanout residual from the runtime's timing feedback
+	// loop (xrt_display_processor set_frame_timing). When fresh, it
+	// REPLACES the heuristic: exact per-path, per-panel-Hz horizon.
+	uint64_t measured_r_us = 0;
+	uint64_t measured_seen_ns = 0;
+	double   measured_ema_us = 0.0;
 };
 
 namespace {
@@ -382,6 +389,25 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
 // the immediate context. Removing the RSSetViewports/RSSetScissorRects calls
 // below will reintroduce the canvas-subrect black-screen bug.
 void
+leiasr_d3d12_set_frame_timing(struct leiasr_d3d12 *leiasr,
+                              uint64_t weave_to_scanout_ns,
+                              uint64_t frame_period_ns)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+	leiasr->measured_r_us = weave_to_scanout_ns / 1000;
+	if (weave_to_scanout_ns > 0) {
+		leiasr->measured_seen_ns = os_monotonic_get_ns();
+	}
+	// The panel period also upgrades the heuristic fallback's display term
+	// (previously a hard-coded 60 Hz constant).
+	if (frame_period_ns > 0) {
+		leiasr->display_term_us = frame_period_ns / 1000;
+	}
+}
+
+void
 leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    void *command_list,
                    int32_t viewport_x,
@@ -415,10 +441,31 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 		}
 		leiasr->prev_weave_ns = now_ns;
 
-		if (leiasr->ema_interval_ns > 0.0) {
-			double horizon_us = (double)leiasr->latency_frames_factor *
-			                        leiasr->ema_interval_ns / 1000.0 +
-			                    (double)leiasr->display_term_us;
+		// Prefer the runtime's MEASURED weave→scanout residual (timing
+		// feedback loop) when fresh; heuristic only as fallback.
+		const bool measured_fresh = leiasr->measured_r_us > 0 &&
+		                            (now_ns - leiasr->measured_seen_ns) < 250ULL * 1000 * 1000;
+		if (measured_fresh || leiasr->ema_interval_ns > 0.0) {
+			double horizon_us;
+			if (measured_fresh) {
+				// One-shot lifecycle log: the horizon source flipped from
+				// heuristic to runtime-measured (set_frame_timing loop).
+				if (leiasr->measured_ema_us <= 0.0) {
+					U_LOG_W("Leia D3D12 weave latency: MEASURED horizon engaged (%llu us, display term %llu us)",
+					        (unsigned long long)leiasr->measured_r_us,
+					        (unsigned long long)leiasr->display_term_us);
+				}
+				const double a = leiasr->latency_ema_alpha;
+				leiasr->measured_ema_us =
+				    (leiasr->measured_ema_us <= 0.0)
+				        ? (double)leiasr->measured_r_us
+				        : a * (double)leiasr->measured_r_us + (1.0 - a) * leiasr->measured_ema_us;
+				horizon_us = leiasr->measured_ema_us;
+			} else {
+				horizon_us = (double)leiasr->latency_frames_factor *
+				                 leiasr->ema_interval_ns / 1000.0 +
+				             (double)leiasr->display_term_us;
+			}
 			if (horizon_us < (double)leiasr->latency_min_us)
 				horizon_us = (double)leiasr->latency_min_us;
 			if (horizon_us > (double)leiasr->latency_max_us)
