@@ -124,6 +124,15 @@ leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
  *
  * @ingroup drv_leia
  */
+/*!
+ * Runtime timing feedback (set_frame_timing): measured weave→scanout of the
+ * last completed frame (0 = unknown) + display refresh period (0 = unknown).
+ */
+void
+leiasr_d3d12_set_frame_timing(struct leiasr_d3d12 *leiasr,
+                              uint64_t weave_to_scanout_ns,
+                              uint64_t frame_period_ns);
+
 void
 leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    void *command_list,

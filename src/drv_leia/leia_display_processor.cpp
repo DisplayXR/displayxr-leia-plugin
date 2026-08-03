@@ -1757,6 +1757,17 @@ leia_dp_is_alpha_native(struct xrt_display_processor *xdp)
 // client_presents=false); IPC VK clients route through the D3D11 service DP, so
 // the client-present branch never fires here but is kept for symmetry with the
 // D3D11/D3D12 slots.
+#ifdef XRT_DP_VK_HAS_FRAME_TIMING
+static void
+leia_dp_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
+                            uint64_t weave_to_scanout_ns,
+                            uint64_t frame_period_ns)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	leiasr_set_frame_timing(ldp->leiasr, weave_to_scanout_ns, frame_period_ns);
+}
+#endif
+
 static void
 leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
 {
@@ -1949,6 +1960,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
+#ifdef XRT_DP_VK_HAS_FRAME_TIMING
+	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
+#endif
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -2056,6 +2070,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
+#ifdef XRT_DP_VK_HAS_FRAME_TIMING
+	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
+#endif
 
 	ldp->leiasr = leiasr;
 	ldp->view_count = 2;

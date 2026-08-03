@@ -61,6 +61,15 @@ leiasr_destroy(struct leiasr *leiasr);
  * @param framebufferHeight Target framebuffer height
  * @param framebufferFormat Target framebuffer format
  */
+/*!
+ * Runtime timing feedback (set_frame_timing): measured weave→scanout of the
+ * last completed frame (0 = unknown) + display refresh period (0 = unknown).
+ */
+void
+leiasr_set_frame_timing(struct leiasr *leiasr,
+                        uint64_t weave_to_scanout_ns,
+                        uint64_t frame_period_ns);
+
 void
 leiasr_weave(struct leiasr *leiasr,
              VkCommandBuffer commandBuffer,
