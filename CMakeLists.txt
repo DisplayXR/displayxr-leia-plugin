@@ -105,7 +105,7 @@ else()
     # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
     # The rule-5 CI self-check below asserts this value equals the workflow's
     # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v2.2.0" CACHE STRING
+    set(DXR_RUNTIME_GIT_TAG "v2.4.0" CACHE STRING
         "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
     # Linux carries its own pin: the Windows/Android tag predates runtime
     # Linux support entirely (scripts/build_linux.sh first shipped in
