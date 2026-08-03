@@ -554,6 +554,13 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 		return false;
 	}
 
+	// One-shot delivery diagnostics (#116 debugging): distinguish "WGC never
+	// delivers a frame" from "frames arrive but their content is wrong".
+	static std::atomic<uint32_t> s_polls{0};
+	static std::atomic<bool> s_logged_first{false};
+	static std::atomic<bool> s_logged_none{false};
+	const uint32_t poll_n = s_polls.fetch_add(1, std::memory_order_relaxed) + 1;
+
 	// Drain framepool, keep newest.
 	ComPtr<WGC::IDirect3D11CaptureFrame> latest_frame;
 	for (;;) {
@@ -563,6 +570,18 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 			break;
 		}
 		latest_frame = std::move(f);
+	}
+	if (latest_frame != nullptr) {
+		bool expected = false;
+		if (s_logged_first.compare_exchange_strong(expected, true)) {
+			U_LOG_W("leia_bg_capture: first WGC frame drained (poll %u)", poll_n);
+		}
+	} else if (poll_n == 600 && !c->has_frame.load(std::memory_order_acquire)) {
+		bool expected = false;
+		if (s_logged_none.compare_exchange_strong(expected, true)) {
+			U_LOG_W("leia_bg_capture: NO WGC frames after %u polls — capture session delivering nothing",
+			        poll_n);
+		}
 	}
 	if (latest_frame != nullptr) {
 		ComPtr<WGD3D::IDirect3DSurface> wg_surface;
@@ -580,6 +599,53 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 					// queue before the consumer (on a different device) waits.
 					c->d3d11_context->Flush();
 					c->has_frame.store(true, std::memory_order_release);
+
+					// One-shot content probe (#116 debugging): mean byte of the
+					// frame's center 16x16 — 0 means WGC is delivering BLACK
+					// frames (the cross-adapter failure mode), >0 means real
+					// desktop content is arriving.
+					static std::atomic<bool> s_probed{false};
+					bool pexp = false;
+					if (s_probed.compare_exchange_strong(pexp, true)) {
+						D3D11_TEXTURE2D_DESC td = {};
+						wgc_tex->GetDesc(&td);
+						D3D11_TEXTURE2D_DESC sd = td;
+						sd.Width = 16;
+						sd.Height = 16;
+						sd.MipLevels = 1;
+						sd.ArraySize = 1;
+						sd.SampleDesc.Count = 1;
+						sd.SampleDesc.Quality = 0;
+						sd.Usage = D3D11_USAGE_STAGING;
+						sd.BindFlags = 0;
+						sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+						sd.MiscFlags = 0;
+						ComPtr<ID3D11Texture2D> probe;
+						ComPtr<ID3D11Device> dev;
+						c->d3d11_context->GetDevice(dev.GetAddressOf());
+						if (dev != nullptr &&
+						    SUCCEEDED(dev->CreateTexture2D(&sd, nullptr, probe.GetAddressOf()))) {
+							D3D11_BOX box = {td.Width / 2, td.Height / 2, 0,
+							                 td.Width / 2 + 16, td.Height / 2 + 16, 1};
+							c->d3d11_context->CopySubresourceRegion(probe.Get(), 0, 0, 0, 0,
+							                                        wgc_tex.Get(), 0, &box);
+							D3D11_MAPPED_SUBRESOURCE m = {};
+							if (SUCCEEDED(c->d3d11_context->Map(probe.Get(), 0, D3D11_MAP_READ,
+							                                    0, &m))) {
+								uint64_t sum = 0;
+								const uint8_t *rows = (const uint8_t *)m.pData;
+								for (uint32_t y = 0; y < 16; y++) {
+									for (uint32_t x = 0; x < 16 * 4; x++) {
+										sum += rows[y * m.RowPitch + x];
+									}
+								}
+								c->d3d11_context->Unmap(probe.Get(), 0);
+								U_LOG_W("leia_bg_capture: first-frame center 16x16 mean byte = "
+								        "%llu (0 = BLACK frames)",
+								        (unsigned long long)(sum / (16 * 16 * 4)));
+							}
+						}
+					}
 				}
 			}
 		}

@@ -25,16 +25,22 @@ layout(binding = 1) uniform sampler2D atlas;
 // premultiplied with its own alpha so DWM blends it OVER the live desktop
 // (opaque backdrop fully occludes; semi-transparent reveals the desktop).
 layout(binding = 2) uniform sampler2D backdrop;
+// #116 — captured desktop, for the flatten path (opaque present, runtime #833):
+// when the runtime presents opaque DWM completes no blends, so every partial-
+// alpha output must be flattened against the baked bg here instead.
+layout(binding = 3) uniform sampler2D bg;
 
 layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
-	uint  pad;
+	uint  flatten;        // #116 — 1 ⟹ complete all blends here (opaque present)
 	// #602 — the back-buffer copy (ck_strip_image) is allocated at a
 	// high-water-mark so content-fit zones stop churning it; only its top-left
 	// (w, h) sub-rect holds this frame's copy. Scale screen UV into that
 	// sub-rect: (w/alloc_w, h/alloc_h). (1,1) when the image matches exactly.
 	vec2  strip_uv_scale;
+	vec2  bg_uv_origin;   // #116 — window TL on monitor, normalized
+	vec2  bg_uv_extent;   // #116 — window size on monitor, normalized
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -64,9 +70,21 @@ void main()
 	// pixel, emit it premultiplied with its own alpha (DWM composites it over
 	// the live desktop). Sample at screen UV (= window-local) like the compose
 	// pass. Otherwise punch through to the live desktop (today's behavior).
+	// #116 — flatten (opaque present): DWM adds nothing, so complete the
+	// blend against the captured desktop and output alpha 1.
 	if (pc.has_backdrop != 0u) {
 		vec4 bd = texture(backdrop, in_uv); // premultiplied
+		if (pc.flatten != 0u) {
+			vec3 b = textureLod(bg, pc.bg_uv_origin + in_uv * pc.bg_uv_extent, 0.0).rgb;
+			out_color = vec4(bd.rgb + (1.0 - bd.a) * b, 1.0);
+			return;
+		}
 		out_color = vec4(bd.rgb, bd.a);
+		return;
+	}
+	if (pc.flatten != 0u) {
+		vec3 b = textureLod(bg, pc.bg_uv_origin + in_uv * pc.bg_uv_extent, 0.0).rgb;
+		out_color = vec4(b, 1.0); // baked desktop instead of live punch-through
 		return;
 	}
 	out_color = vec4(0.0, 0.0, 0.0, 0.0);   // live desktop

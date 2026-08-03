@@ -123,6 +123,7 @@ struct leia_display_processor
 
 	VkImage bg_image;
 	VkImageView bg_view;
+	float bg_uv_last[4]; //!< #116 — this frame's window-on-monitor UV rect (origin, extent).
 	VkDeviceMemory bg_mem;
 	uint32_t bg_w, bg_h;
 
@@ -175,6 +176,21 @@ leia_display_processor(struct xrt_display_processor *xdp)
  * them.)
  *
  */
+
+
+// #116 — the runtime presents opaque (DXR_PRESENT_OPAQUE, runtime #833): DWM
+// completes no blends, so the alpha-gate must flatten everything itself. Same
+// process env, read once.
+static bool
+env_present_opaque(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("DXR_PRESENT_OPAQUE");
+		cached = (v != NULL && (v[0] == '1' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+	}
+	return cached == 1;
+}
 
 static VkResult
 ck_create_shader_module(struct vk_bundle *vk,
@@ -928,20 +944,22 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 	// copy plumbing. Distinct descriptor set (2 image samplers — backbuffer
 	// copy + atlas) and push constants (tile_count).
 	if (ldp->alpha_gate_pipeline == VK_NULL_HANDLE) {
-		// 3-binding descriptor set: backbuffer (0) + atlas (1) + 2D-under
-		// backdrop (2, #491 part 3).
+		// 4-binding descriptor set: backbuffer (0) + atlas (1) + 2D-under
+		// backdrop (2, #491 part 3) + captured desktop (3, #116 flatten).
 		{
-			VkDescriptorSetLayoutBinding bs[3] = {
+			VkDescriptorSetLayoutBinding bs[4] = {
 			    {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 			    {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 			    {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
+			    {.binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			     .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT},
 			};
 			VkDescriptorSetLayoutCreateInfo ci = {
 			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-			    .bindingCount = 3, .pBindings = bs,
+			    .bindingCount = 4, .pBindings = bs,
 			};
 			res = vk->vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &ldp->alpha_gate_desc_layout);
 			if (res != VK_SUCCESS) {
@@ -949,13 +967,14 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 				return false;
 			}
 		}
-		// Push constants: uvec2 tile_count + uint has_backdrop + uint pad +
-		// vec2 strip_uv_scale (#602) = 24 bytes.
+		// Push constants: uvec2 tile_count + uint has_backdrop + uint flatten +
+		// vec2 strip_uv_scale (#602) + vec2 bg_uv_origin + vec2 bg_uv_extent
+		// (#116) = 40 bytes.
 		{
 			VkPushConstantRange pc = {
 			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 			    .offset = 0,
-			    .size = 24,
+			    .size = 40,
 			};
 			VkPipelineLayoutCreateInfo pli = {
 			    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -972,7 +991,7 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		{
 			VkDescriptorPoolSize size = {
 			    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			    .descriptorCount = 3, // backbuffer + atlas + backdrop (#491 part 3)
+			    .descriptorCount = 4, // backbuffer + atlas + backdrop + bg (#116)
 			};
 			VkDescriptorPoolCreateInfo dpi = {
 			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1202,6 +1221,8 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 	} push = {};
 	push.bg_uv_origin[0] = bg_origin[0]; push.bg_uv_origin[1] = bg_origin[1];
 	push.bg_uv_extent[0] = bg_extent[0]; push.bg_uv_extent[1] = bg_extent[1];
+	ldp->bg_uv_last[0] = bg_origin[0]; ldp->bg_uv_last[1] = bg_origin[1]; // #116
+	ldp->bg_uv_last[2] = bg_extent[0]; ldp->bg_uv_last[3] = bg_extent[1];
 	push.tile_count[0] = tile_columns;   push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u;
 	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout,
@@ -1259,7 +1280,10 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	// slot 1 = atlas_view, slot 2 = 2D-under backdrop (#491 part 3; dummy when
 	// absent — gated by has_backdrop below).
 	const bool have_backdrop = (ldp->backdrop_view != VK_NULL_HANDLE);
-	VkDescriptorImageInfo infos[3] = {
+	// #116 — bg at binding 3 for the flatten path (dummy = strip copy when the
+	// capture is off; gated by the flatten push constant).
+	const bool have_bg = (ldp->bg_view != VK_NULL_HANDLE);
+	VkDescriptorImageInfo infos[4] = {
 	    {.sampler = ldp->compose_sampler, .imageView = ldp->ck_strip_view,
 	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
 	    {.sampler = ldp->compose_sampler, .imageView = atlas_view,
@@ -1267,8 +1291,11 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	    {.sampler = ldp->compose_sampler,
 	     .imageView = have_backdrop ? ldp->backdrop_view : ldp->ck_strip_view,
 	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+	    {.sampler = ldp->compose_sampler,
+	     .imageView = have_bg ? ldp->bg_view : ldp->ck_strip_view,
+	     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
 	};
-	VkWriteDescriptorSet writes[3] = {
+	VkWriteDescriptorSet writes[4] = {
 	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 	     .dstSet = ldp->alpha_gate_set, .dstBinding = 0, .descriptorCount = 1,
 	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1281,8 +1308,12 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	     .dstSet = ldp->alpha_gate_set, .dstBinding = 2, .descriptorCount = 1,
 	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 	     .pImageInfo = &infos[2]},
+	    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	     .dstSet = ldp->alpha_gate_set, .dstBinding = 3, .descriptorCount = 1,
+	     .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	     .pImageInfo = &infos[3]},
 	};
-	vk->vkUpdateDescriptorSets(vk->device, 3, writes, 0, NULL);
+	vk->vkUpdateDescriptorSets(vk->device, 4, writes, 0, NULL);
 
 	// target PRESENT_SRC_KHR → TRANSFER_SRC; strip_image UNDEFINED/SR → TRANSFER_DST.
 	VkImageMemoryBarrier pre[2] = {
@@ -1354,12 +1385,19 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	struct {
 		uint32_t tile_count[2];
 		uint32_t has_backdrop;
-		uint32_t pad;
+		uint32_t flatten;        // #116 — opaque-present flatten
 		float strip_uv_scale[2]; // #602
+		float bg_uv_origin[2];   // #116
+		float bg_uv_extent[2];   // #116
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u; // #491 part 3
+	push.flatten = (env_present_opaque() && have_bg) ? 1u : 0u; // #116
+	push.bg_uv_origin[0] = ldp->bg_uv_last[0];
+	push.bg_uv_origin[1] = ldp->bg_uv_last[1];
+	push.bg_uv_extent[0] = ldp->bg_uv_last[2];
+	push.bg_uv_extent[1] = ldp->bg_uv_last[3];
 	// #602 — ck_strip_image is allocated at a high-water-mark; only its
 	// top-left (w, h) holds this frame's back-buffer copy. Scale screen UV into
 	// that sub-rect so the gate samples the valid region (1,1 when exact).
