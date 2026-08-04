@@ -36,11 +36,18 @@ layout(push_constant) uniform PC {
 	uint  flatten;        // #116 — 1 ⟹ complete all blends here (opaque present)
 	// #602 — the back-buffer copy (ck_strip_image) is allocated at a
 	// high-water-mark so content-fit zones stop churning it; only its top-left
-	// (w, h) sub-rect holds this frame's copy. Scale screen UV into that
+	// (w, h) sub-rect holds this frame's copy. Scale window UV into that
 	// sub-rect: (w/alloc_w, h/alloc_h). (1,1) when the image matches exactly.
 	vec2  strip_uv_scale;
-	vec2  bg_uv_origin;   // #116 — window TL on monitor, normalized
-	vec2  bg_uv_extent;   // #116 — window size on monitor, normalized
+	vec2  bg_uv_origin;      // #116 — window TL on monitor, normalized
+	vec2  bg_uv_extent;      // #116 — window size on monitor, normalized
+	// #121 — canvas sub-rect on the window, normalized (port of the D3D #131
+	// fix). The gate draws only over the canvas viewport, so in_uv (0..1 over
+	// that viewport) IS the tile-local atlas UV; window-local samples
+	// (backbuffer/backdrop/bg) map through this rect. Identity
+	// (origin 0,0 / extent 1,1) when the canvas fills the target.
+	vec2  canvas_uv_origin;
+	vec2  canvas_uv_extent;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -48,6 +55,9 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
+	// #121 — in_uv is canvas-local (= atlas tile-local); bb_uv is window-local.
+	vec2 bb_uv = pc.canvas_uv_origin + in_uv * pc.canvas_uv_extent;
+
 	bool all_transparent = true;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
@@ -62,20 +72,20 @@ void main()
 		// Woven 3D content (over the backdrop-over-desktop baked pre-weave):
 		// opaque so DWM shows it as-is. #602 — sample the strip's valid
 		// top-left sub-rect (the image may be over-allocated).
-		out_color = vec4(texture(backbuffer, in_uv * pc.strip_uv_scale).rgb, 1.0);
+		out_color = vec4(texture(backbuffer, bb_uv * pc.strip_uv_scale).rgb, 1.0);
 		return;
 	}
 
 	// Atlas transparent here. #491 part 3 — if a 2D-under backdrop covers this
 	// pixel, emit it premultiplied with its own alpha (DWM composites it over
-	// the live desktop). Sample at screen UV (= window-local) like the compose
-	// pass. Otherwise punch through to the live desktop (today's behavior).
+	// the live desktop). Sample at window-local UV like the compose pass.
+	// Otherwise punch through to the live desktop (today's behavior).
 	// #116 — flatten (opaque present): DWM adds nothing, so complete the
 	// blend against the captured desktop and output alpha 1.
 	if (pc.has_backdrop != 0u) {
-		vec4 bd = texture(backdrop, in_uv); // premultiplied
+		vec4 bd = texture(backdrop, bb_uv); // premultiplied
 		if (pc.flatten != 0u) {
-			vec3 b = textureLod(bg, pc.bg_uv_origin + in_uv * pc.bg_uv_extent, 0.0).rgb;
+			vec3 b = textureLod(bg, pc.bg_uv_origin + bb_uv * pc.bg_uv_extent, 0.0).rgb;
 			out_color = vec4(bd.rgb + (1.0 - bd.a) * b, 1.0);
 			return;
 		}
@@ -83,7 +93,7 @@ void main()
 		return;
 	}
 	if (pc.flatten != 0u) {
-		vec3 b = textureLod(bg, pc.bg_uv_origin + in_uv * pc.bg_uv_extent, 0.0).rgb;
+		vec3 b = textureLod(bg, pc.bg_uv_origin + bb_uv * pc.bg_uv_extent, 0.0).rgb;
 		out_color = vec4(b, 1.0); // baked desktop instead of live punch-through
 		return;
 	}

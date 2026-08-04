@@ -152,13 +152,20 @@ Texture2D<float4> atlas      : register(t1);
 // backdrop premultiplied with its own alpha (DWM composites it over the LIVE
 // desktop) instead of punching to full transparency.
 Texture2D<float4> backdrop   : register(t2);
+// #126 — captured desktop, for the flatten path (opaque present, runtime #833):
+// when the runtime presents opaque DWM completes no blends, so every partial-
+// alpha output must be flattened against the baked bg here instead. (Port of
+// the D3D11 #116 flatten semantics.)
+Texture2D<float4> bg         : register(t3);
 SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
     uint2 tile_count;
     uint  has_backdrop;       // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
-    uint  pad;
+    uint  flatten;            // #126 — 1 ⟹ complete all blends here (opaque present)
     float2 canvas_uv_origin;  // canvas sub-rect origin on the window, normalized
     float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
+    float2 bg_uv_origin;      // #126 — window TL on monitor, normalized
+    float2 bg_uv_extent;      // #126 — window size on monitor, normalized
 };
 float4 main(VSOut i) : SV_Target {
     // (#131) The gate runs only over the canvas sub-rect viewport, so i.uv (0..1)
@@ -181,13 +188,38 @@ float4 main(VSOut i) : SV_Target {
     }
     // #491 part 3 — atlas transparent: emit the backdrop premultiplied with its
     // own alpha (DWM adds the live desktop) instead of punching fully through.
+    // #126 — flatten (opaque present): DWM adds nothing, so complete the blend
+    // against the captured desktop and output alpha 1.
     if (has_backdrop != 0) {
         float4 bd = backdrop.Sample(samp, bb_uv);
+        if (flatten != 0) {
+            float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
+            return float4(bd.rgb + (1.0 - bd.a) * b, 1.0);
+        }
         return float4(bd.rgb, bd.a);
+    }
+    if (flatten != 0) {
+        float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
+        return float4(b, 1.0); // baked desktop instead of live punch-through
     }
     return float4(0.0, 0.0, 0.0, 0.0); // live desktop
 }
 )";
+
+// #126 — the runtime presents opaque (DXR_PRESENT_OPAQUE, runtime #833): DWM
+// completes no blends, so the alpha-gate must flatten everything itself. Same
+// process env, read once (Win32 env — matches the runtime's target branch).
+static bool
+env_present_opaque(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char buf[8];
+		DWORD n = GetEnvironmentVariableA("DXR_PRESENT_OPAQUE", buf, sizeof(buf));
+		cached = (n > 0 && n < sizeof(buf) && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T')) ? 1 : 0;
+	}
+	return cached == 1;
+}
 
 static const char *compose_under_bg_ps_source = R"(
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -295,7 +327,7 @@ struct leia_display_processor_d3d12_impl
 	// Post-weave alpha-gate (replaces ck_strip when compose is active).
 	// Reuses compose_root_sig (12 32-bit constants, 3-SRV table, linear sampler).
 	ID3D12PipelineState *alpha_gate_pso;
-	ID3D12DescriptorHeap *alpha_gate_srv_heap; //!< Shader-visible, 3 entries (backbuffer, atlas, backdrop).
+	ID3D12DescriptorHeap *alpha_gate_srv_heap; //!< Shader-visible, 4 entries (backbuffer, atlas, backdrop, bg #126).
 
 	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
 	//! process_atlas (set via set_background_2d; same D3D12 device as the
@@ -305,6 +337,11 @@ struct leia_display_processor_d3d12_impl
 	//! live desktop. NULL ⟹ no backdrop (desktop-only).
 	ID3D12Resource *backdrop_resource; //!< NOT owned (compositor-owned).
 	uint32_t backdrop_w, backdrop_h;
+
+	//! #126 — window-on-monitor UV rect of the last compose pass, reused by the
+	//! alpha-gate flatten path (opaque present) to sample the captured desktop
+	//! at the same mapping the compose used (mirror of D3D11's bg_uv_last).
+	float bg_uv_last[4];
 
 	//! #68 — set by set_shared_texture_present (compositor's has_shared_texture).
 	//! Skips the compose bg-UV remap for a self-presenting texture-zones app.
@@ -922,7 +959,7 @@ compose_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
 {
 	D3D12_DESCRIPTOR_RANGE srv_range = {};
 	srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	srv_range.NumDescriptors = 3;
+	srv_range.NumDescriptors = 4; // #126 — t3 = captured desktop for the gate's flatten path
 	srv_range.BaseShaderRegister = 0;
 	srv_range.OffsetInDescriptorsFromTableStart = 0;
 
@@ -1053,7 +1090,7 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 	if (ldp->compose_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = 3; // #491 part 3 — slot 2 = backdrop (t2)
+		hd.NumDescriptors = 4; // #491 part 3 — slot 2 = backdrop; #126 — slot 3 = bg (root-sig range grew to 4)
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		HRESULT hr = ldp->device->CreateDescriptorHeap(
 		    &hd, __uuidof(ID3D12DescriptorHeap),
@@ -1075,6 +1112,12 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 		    ldp->compose_srv_heap->GetCPUDescriptorHandleForHeapStart();
 		bg_cpu.ptr += ldp->cbv_srv_desc_size;
 		ldp->device->CreateShaderResourceView(ldp->bg_shared_tex, &bg_srv, bg_cpu);
+		// #126 — slot 3: duplicate bg SRV so the (now 4-wide) root-sig range
+		// never covers an uninitialized descriptor on the compose draw.
+		D3D12_CPU_DESCRIPTOR_HANDLE bg_cpu3 =
+		    ldp->compose_srv_heap->GetCPUDescriptorHandleForHeapStart();
+		bg_cpu3.ptr += 3 * ldp->cbv_srv_desc_size;
+		ldp->device->CreateShaderResourceView(ldp->bg_shared_tex, &bg_srv, bg_cpu3);
 	}
 
 	// Alpha-gate PSO (reuses compose_root_sig). Same fullscreen-tri VS,
@@ -1117,7 +1160,7 @@ compose_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
 	if (ldp->alpha_gate_srv_heap == nullptr) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		hd.NumDescriptors = 3; // #491 part 3 — slot 2 = backdrop (t2)
+		hd.NumDescriptors = 4; // #491 part 3 — slot 2 = backdrop; #126 — slot 3 = bg (flatten)
 		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		HRESULT hr = ldp->device->CreateDescriptorHeap(
 		    &hd, __uuidof(ID3D12DescriptorHeap),
@@ -1244,6 +1287,11 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 	cmd->SetGraphicsRootSignature(ldp->compose_root_sig);
 	ID3D12DescriptorHeap *heaps[] = {ldp->compose_srv_heap};
 	cmd->SetDescriptorHeaps(1, heaps);
+	// #126 — remember the window-on-monitor mapping for the alpha-gate flatten.
+	ldp->bg_uv_last[0] = bg_origin[0];
+	ldp->bg_uv_last[1] = bg_origin[1];
+	ldp->bg_uv_last[2] = bg_extent[0];
+	ldp->bg_uv_last[3] = bg_extent[1];
 	uint32_t consts[12];
 	memcpy(&consts[0], &bg_origin[0], sizeof(float));
 	memcpy(&consts[1], &bg_origin[1], sizeof(float));
@@ -1261,9 +1309,10 @@ compose_run_pre_weave(struct leia_display_processor_d3d12_impl *ldp,
 			        ldp->backdrop_w, ldp->backdrop_h);
 		}
 	}
-	// chroma_rgb (same key as the strip pass). ck_color stays set in compose
-	// mode — see set_chroma_key. Atlas α==0 pixels are emitted as this sentinel
-	// so the post-weave strip can rewrite them to α=0 → live desktop via DWM.
+	// chroma_rgb is a dead constant on this path (kept only for the shared
+	// 12-dword root-constant layout): the compose shader never emits a
+	// sentinel — transparency holes come from the post-weave alpha-gate's
+	// atlas-alpha test, exactly like D3D11 (#126 fixed the stale comment).
 	float chroma_r = ((ldp->ck_color >>  0) & 0xFF) / 255.0f;
 	float chroma_g = ((ldp->ck_color >>  8) & 0xFF) / 255.0f;
 	float chroma_b = ((ldp->ck_color >> 16) & 0xFF) / 255.0f;
@@ -1373,6 +1422,22 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 		bd_cpu.ptr += 2 * ldp->cbv_srv_desc_size;
 		ldp->device->CreateShaderResourceView(bd_res, &sd, bd_cpu);
 	}
+	// #126 — slot 3: captured desktop for the flatten path (opaque present).
+	// Dummy = ck_strip_tex keeps the slot valid when compose-under-bg is off;
+	// the flatten constant gates the sample.
+	{
+		ID3D12Resource *bg_res =
+		    (ldp->bg_shared_tex != nullptr) ? ldp->bg_shared_tex : ldp->ck_strip_tex;
+		D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.Format = (ldp->bg_shared_tex != nullptr) ? DXGI_FORMAT_B8G8R8A8_UNORM
+		                                            : (DXGI_FORMAT)ldp->ck_strip_fmt;
+		sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sd.Texture2D.MipLevels = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE bg_cpu = cpu_base;
+		bg_cpu.ptr += 3 * ldp->cbv_srv_desc_size;
+		ldp->device->CreateShaderResourceView(bg_res, &sd, bg_cpu);
+	}
 
 	// back_buffer RENDER_TARGET → COPY_SOURCE; ck_strip_tex → COPY_DEST.
 	D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -1422,14 +1487,19 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d12_impl *ldp,
 	}
 
 	// Root constants layout matches the cbuffer: tile_count.xy (0,1),
-	// has_backdrop (2) + pad (3), canvas_uv_origin.xy (4,5),
-	// canvas_uv_extent.xy (6,7). Remaining slots unused.
+	// has_backdrop (2), flatten (3), canvas_uv_origin.xy (4,5),
+	// canvas_uv_extent.xy (6,7), bg_uv_origin.xy (8,9), bg_uv_extent.xy (10,11).
 	uint32_t consts[12] = {tile_columns, tile_rows,
-	                       (ldp->backdrop_resource != nullptr) ? 1u : 0u, 0}; // #491 part 3
+	                       (ldp->backdrop_resource != nullptr) ? 1u : 0u, // #491 part 3
+	                       (env_present_opaque() && ldp->bg_shared_tex != nullptr) ? 1u : 0u}; // #126
 	memcpy(&consts[4], &cu_ox, sizeof(float));
 	memcpy(&consts[5], &cu_oy, sizeof(float));
 	memcpy(&consts[6], &cu_ex, sizeof(float));
 	memcpy(&consts[7], &cu_ey, sizeof(float));
+	memcpy(&consts[8],  &ldp->bg_uv_last[0], sizeof(float)); // #126
+	memcpy(&consts[9],  &ldp->bg_uv_last[1], sizeof(float));
+	memcpy(&consts[10], &ldp->bg_uv_last[2], sizeof(float));
+	memcpy(&consts[11], &ldp->bg_uv_last[3], sizeof(float));
 	cmd->SetGraphicsRoot32BitConstants(0, 12, consts, 0);
 	cmd->SetGraphicsRootDescriptorTable(
 	    1, ldp->alpha_gate_srv_heap->GetGPUDescriptorHandleForHeapStart());

@@ -263,11 +263,14 @@ ck_init_pipeline(struct leia_display_processor *ldp, VkFormat target_format)
 	// Render pass for the strip pass: writes the swapchain format and
 	// transitions to PRESENT_SRC_KHR so the swapchain image is presentable
 	// when we end the render pass.
+	// #121 — loadOp LOAD (was DONT_CARE): the alpha-gate now draws only over
+	// the canvas sub-rect, so the woven surround outside it must be preserved
+	// through the pass instead of left formally undefined.
 	{
 		VkAttachmentDescription att = {
 		    .format = target_format,
 		    .samples = VK_SAMPLE_COUNT_1_BIT,
-		    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
 		    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 		    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 		    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -969,12 +972,13 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		}
 		// Push constants: uvec2 tile_count + uint has_backdrop + uint flatten +
 		// vec2 strip_uv_scale (#602) + vec2 bg_uv_origin + vec2 bg_uv_extent
-		// (#116) = 40 bytes.
+		// (#116) + vec2 canvas_uv_origin + vec2 canvas_uv_extent (#121)
+		// = 56 bytes.
 		{
 			VkPushConstantRange pc = {
 			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 			    .offset = 0,
-			    .size = 40,
+			    .size = 56,
 			};
 			VkPipelineLayoutCreateInfo pli = {
 			    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1268,7 +1272,9 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
                           VkImage target_image,
                           VkImageView atlas_view,
                           uint32_t w, uint32_t h,
-                          uint32_t tile_columns, uint32_t tile_rows)
+                          uint32_t tile_columns, uint32_t tile_rows,
+                          int32_t canvas_offset_x, int32_t canvas_offset_y,
+                          uint32_t canvas_width, uint32_t canvas_height)
 {
 	struct vk_bundle *vk = ldp->vk;
 
@@ -1382,6 +1388,24 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 	                             ldp->alpha_gate_pipeline_layout, 0, 1, &ldp->alpha_gate_set, 0, NULL);
 
+	// #121 — canvas sub-rect mapping (port of the D3D #131 fix): restrict the
+	// gate draw to the canvas viewport so in_uv maps directly to the atlas
+	// tile-local UV; window-local samples go through the canvas rect. No
+	// sub-rect → full window, identity mapping (original behavior).
+	int32_t  vp_x = 0, vp_y = 0;
+	uint32_t vp_w = w, vp_h = h;
+	float cu_ox = 0.0f, cu_oy = 0.0f, cu_ex = 1.0f, cu_ey = 1.0f;
+	if (canvas_width > 0 && canvas_height > 0 && w > 0 && h > 0) {
+		vp_x = canvas_offset_x;
+		vp_y = canvas_offset_y;
+		vp_w = canvas_width;
+		vp_h = canvas_height;
+		cu_ox = (float)canvas_offset_x / (float)w;
+		cu_oy = (float)canvas_offset_y / (float)h;
+		cu_ex = (float)canvas_width  / (float)w;
+		cu_ey = (float)canvas_height / (float)h;
+	}
+
 	struct {
 		uint32_t tile_count[2];
 		uint32_t has_backdrop;
@@ -1389,6 +1413,8 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 		float strip_uv_scale[2]; // #602
 		float bg_uv_origin[2];   // #116
 		float bg_uv_extent[2];   // #116
+		float canvas_uv_origin[2]; // #121
+		float canvas_uv_extent[2]; // #121
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
@@ -1399,15 +1425,19 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	push.bg_uv_extent[0] = ldp->bg_uv_last[2];
 	push.bg_uv_extent[1] = ldp->bg_uv_last[3];
 	// #602 — ck_strip_image is allocated at a high-water-mark; only its
-	// top-left (w, h) holds this frame's back-buffer copy. Scale screen UV into
+	// top-left (w, h) holds this frame's back-buffer copy. Scale window UV into
 	// that sub-rect so the gate samples the valid region (1,1 when exact).
 	push.strip_uv_scale[0] = ldp->ck_strip_w > 0 ? (float)w / (float)ldp->ck_strip_w : 1.0f;
 	push.strip_uv_scale[1] = ldp->ck_strip_h > 0 ? (float)h / (float)ldp->ck_strip_h : 1.0f;
+	push.canvas_uv_origin[0] = cu_ox; // #121
+	push.canvas_uv_origin[1] = cu_oy;
+	push.canvas_uv_extent[0] = cu_ex;
+	push.canvas_uv_extent[1] = cu_ey;
 	vk->vkCmdPushConstants(cmd, ldp->alpha_gate_pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
-	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
-	VkRect2D sc = {{0, 0}, {w, h}};
+	VkViewport vp = {(float)vp_x, (float)vp_y, (float)vp_w, (float)vp_h, 0.0f, 1.0f};
+	VkRect2D sc = {{vp_x, vp_y}, {vp_w, vp_h}};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
 	vk->vkCmdSetScissor(cmd, 0, 1, &sc);
 
@@ -1657,7 +1687,9 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 		alpha_gate_run_post_weave(ldp, cmd_buffer,
 		                          (VkImage)target_image, atlas_view,
 		                          target_width, target_height,
-		                          tile_columns, tile_rows);
+		                          tile_columns, tile_rows,
+		                          canvas_offset_x, canvas_offset_y,
+		                          canvas_width, canvas_height); // #121
 	}
 #endif
 }
