@@ -90,30 +90,39 @@ if(DXR_LINUX_DESKTOP)
     endforeach()
 endif()
 
+# Runtime ABI pins. Declared OUTSIDE the fetch/local-checkout branch below
+# because they are the plug-in's ABI pairing statement, not merely a
+# FetchContent argument: installer/CMakeLists.txt derives the installer's
+# minimum-runtime floor from DXR_RUNTIME_GIT_TAG, and that floor must exist
+# in both build shapes (fetched pin AND local DXR_RUNTIME_SOURCE_DIR).
+# Keep both as literal quoted strings — the rule-5 CI self-check greps for
+# `DXR_RUNTIME_GIT_TAG\s+"([^"]+)"` and a computed value would defeat it.
+#
+# Pinned to displayxr-runtime v2.4.1. The ABI floor it encodes is plugin ABI
+# v5 (vk_bundle ABI-parity layout + the Linux dma-buf device-extension
+# guarantee, runtime#802) which this plug-in's bg-capture producer needs.
+# The DP vtables carry a struct_size header; the runtime's loader rejects
+# any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
+# This plug-in MUST be built against headers that ship the matching major,
+# or the runtime will log "ABI major mismatch — plugin_api=N, runtime
+# expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
+# The rule-5 CI self-check below asserts this value equals the workflow's
+# runtime checkout ref so the two can't drift.
+set(DXR_RUNTIME_GIT_TAG "v2.4.1" CACHE STRING
+    "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
+# Linux carries its own pin: the Windows/Android tag predates runtime
+# Linux support entirely (scripts/build_linux.sh first shipped in
+# v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
+# in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
+# equals its RUNTIME_REF so the two can't drift.
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
+    "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
+
 if(DXR_RUNTIME_SOURCE_DIR)
     message(STATUS "Using local runtime checkout: ${DXR_RUNTIME_SOURCE_DIR}")
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
 else()
     include(FetchContent)
-    # Pinned to displayxr-runtime v2.2.0 — the release that ships plugin ABI
-    # v5 (vk_bundle ABI-parity layout + the Linux dma-buf device-extension
-    # guarantee, runtime#802) which this plug-in's bg-capture producer needs.
-    # The DP vtables carry a struct_size header; the runtime's loader rejects
-    # any plug-in whose XRT_PLUGIN_API_VERSION_CURRENT differs from its own.
-    # This plug-in MUST be built against headers that ship the matching major,
-    # or the runtime will log "ABI major mismatch — plugin_api=N, runtime
-    # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
-    # The rule-5 CI self-check below asserts this value equals the workflow's
-    # runtime checkout ref so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG "v2.4.1" CACHE STRING
-        "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
-    # Linux carries its own pin: the Windows/Android tag predates runtime
-    # Linux support entirely (scripts/build_linux.sh first shipped in
-    # v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
-    # in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
-    # equals its RUNTIME_REF so the two can't drift.
-    set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
-        "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
     if(DXR_LINUX_DESKTOP)
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_LINUX}")
         if(_dxr_runtime_ref MATCHES "^v1\\.([0-9]|1[0-9]|2[0-7])\\.")

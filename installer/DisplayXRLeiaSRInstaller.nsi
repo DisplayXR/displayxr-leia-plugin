@@ -63,7 +63,7 @@
 			!finalize '${SIGN_CMD} "%1"'
 			; Build the inner installer (passes every define it needs to
 			; compile; OUTPUT_DIR/SIGN_CMD are deliberately omitted).
-			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "${__FILE__}"' = 0
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "-DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}" "${__FILE__}"' = 0
 			; Run it: .onInit writes %TEMP%\Uninstall.exe then Quit (exit 2).
 			!system '"$%TEMP%\DisplayXRLeiaSR_inner.exe"' = 2
 			; Sign the emitted uninstaller, then File it in the real pass.
@@ -101,6 +101,36 @@ AllowSkipFiles off
 !include "FileFunc.nsh"
 !include "x64.nsh"
 !include "LogicLib.nsh"
+!include "WordFunc.nsh"
+!insertmacro VersionCompare
+
+; installer/CMakeLists.txt always passes this (derived from the runtime ABI
+; pin, empty for a non-release pin). Default it so a hand-run makensis
+; compiles instead of erroring on an unknown constant — an absent define
+; means "no version floor", the same as the empty-string case.
+!ifndef MIN_RUNTIME_VERSION
+	!define MIN_RUNTIME_VERSION ""
+!endif
+
+;--------------------------------
+; Abort a pre-flight check without ever showing a modal in silent mode.
+;
+; NSIS does NOT suppress MessageBox under /S — it shows and blocks forever.
+; The meta-bundle runs every child installer as `ExecWait '<child> /S'`, so a
+; modal here would hang the whole bundle chain with no visible window. In
+; silent mode set a distinct exit code instead: the bundle already checks
+; `$0 != 0` and reports "installer exited with code $0. Aborting bundle."
+;
+; Codes: 3 = not 64-bit, 4 = runtime absent, 5 = runtime below the ABI floor.
+; (2 is reserved — the INNER uninstaller-emitting pass exits 2 by design.)
+!macro AbortWithReason CODE MSG
+	${If} ${Silent}
+		SetErrorLevel ${CODE}
+	${Else}
+		MessageBox MB_ICONSTOP "${MSG}"
+	${EndIf}
+	Abort
+!macroend
 
 ;--------------------------------
 ; Interface Settings
@@ -335,9 +365,48 @@ Function .onInit
 	Quit
 !endif
 	${IfNot} ${RunningX64}
-		MessageBox MB_ICONSTOP "DisplayXR Leia SR Plug-in requires 64-bit Windows."
-		Abort
+		!insertmacro AbortWithReason 3 "DisplayXR Leia SR Plug-in requires 64-bit Windows."
 	${EndIf}
+
+	; -----------------------------------------------------------------
+	; Runtime prereq + ABI-pairing floor.
+	;
+	; The runtime's loader rejects a plug-in whose plug-in-API major differs
+	; from its own and then falls back to sim-display (ProbeOrder 200) — the
+	; user sees "3D stopped working" with the only evidence a WARN line in a
+	; log they'll never open. ADR-020 rule 3. This plug-in is compiled against
+	; runtime ${MIN_RUNTIME_VERSION} headers, so installing it over an older
+	; runtime guarantees that silent fallback.
+	;
+	; The meta-bundle installs the matching pair and can't reach this state,
+	; but it only compares VERSIONS, never ABI — so a standalone run of this
+	; installer on an older runtime is the one path left. Refuse it here,
+	; loudly, instead of shipping a plug-in that will be skipped at runtime.
+	;
+	; NSIS is a 32-bit binary: HKLM reads are redirected through WOW6432Node
+	; by default, while the runtime writes the 64-bit view. Match it.
+	SetRegView 64
+	ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+	ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
+	SetRegView 32
+
+	${If} $0 == ""
+		!insertmacro AbortWithReason 4 "The DisplayXR runtime is not installed.$\r$\n$\r$\nThis plug-in is a display processor FOR the runtime and cannot work without it.$\r$\n$\r$\nInstall the runtime first:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+	${EndIf}
+
+	; MIN_RUNTIME_VERSION is empty when the plug-in was built against a
+	; non-release runtime pin (branch/SHA) — there is no ordered version to
+	; compare, so the floor is omitted rather than guessed. See
+	; installer/CMakeLists.txt.
+	!if "${MIN_RUNTIME_VERSION}" != ""
+		; $R0: 0 = equal, 1 = installed newer, 2 = floor newer (too old).
+		; Installed-first, floor-second — inverting the operands silently
+		; inverts the gate.
+		${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $R0
+		${If} $R0 == 2
+			!insertmacro AbortWithReason 5 "DisplayXR runtime $1 is too old for this plug-in.$\r$\n$\r$\nLeia SR ${VERSION} is built against runtime ${MIN_RUNTIME_VERSION} and needs ${MIN_RUNTIME_VERSION} or later. Installing it on $1 would leave the runtime unable to load it — 3D would silently fall back to the simulated display.$\r$\n$\r$\nUpdate the runtime (or install the DisplayXR bundle, which keeps the pair matched):$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+		${EndIf}
+	!endif
 FunctionEnd
 
 ;--------------------------------

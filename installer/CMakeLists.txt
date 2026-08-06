@@ -29,6 +29,36 @@ set(DXR_LEIA_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJEC
 
 set(DXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
+# Minimum runtime version the installer will install onto, DERIVED from the
+# ABI pin in the top-level CMakeLists.txt rather than restated here.
+#
+# Why a gate at all: the runtime's plug-in loader rejects any plug-in whose
+# XRT_PLUGIN_API_VERSION_CURRENT differs from its own, then silently falls
+# back to sim-display (ProbeOrder 200). To the user that reads as "3D just
+# stopped working" with no error anywhere. The meta-bundle can't catch it —
+# its UpgradeOrSkip compares versions, never ABI — so a standalone plug-in
+# installer run on top of an older runtime is the one remaining way to reach
+# that state. Refuse at install time instead, where we can say why.
+#
+# Why derived: a second hand-maintained version literal is a drift vector,
+# and this one would drift SILENTLY (a stale floor simply stops gating).
+# DXR_RUNTIME_GIT_TAG is the value this plug-in's headers are compiled
+# against, which is exactly the ABI contract the floor needs to express.
+string(REGEX MATCH "^v?([0-9]+\\.[0-9]+\\.[0-9]+)$" _dxr_min_rt_match "${DXR_RUNTIME_GIT_TAG}")
+if(_dxr_min_rt_match)
+    set(MIN_RUNTIME_VERSION "${CMAKE_MATCH_1}")
+    message(STATUS "Installer minimum runtime floor: ${MIN_RUNTIME_VERSION} (from DXR_RUNTIME_GIT_TAG=${DXR_RUNTIME_GIT_TAG})")
+else()
+    # Non-release pin (branch or SHA) — there is no ordered version to compare
+    # against, so ship without the version gate rather than with a wrong one.
+    # The "runtime absent entirely" check in the NSI stays active regardless.
+    set(MIN_RUNTIME_VERSION "")
+    message(WARNING
+        "DXR_RUNTIME_GIT_TAG='${DXR_RUNTIME_GIT_TAG}' is not a vX.Y.Z release tag — "
+        "the installer's minimum-runtime version gate will be OMITTED from this build. "
+        "Release builds must pin a release tag.")
+endif()
+
 # Optional code-signing command, sourced from the SIGN_CMD environment
 # variable at configure time. Empty on any machine without it (clones,
 # GitHub-hosted CI) -> installer + uninstaller build unsigned. On a
@@ -82,6 +112,7 @@ add_custom_target(installer
         "/DBUILD_NUM=${BUILD_NUM}"
         "/DBIN_DIR=${DXR_BIN_DIR}"
         "/DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}"
+        "/DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}"
         "/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
         "/DSIGN_CMD=${SIGN_CMD}"
