@@ -78,14 +78,46 @@ struct leiasr
 	std::mutex eyeMutex;
 
 	// --- Adaptive weave-latency estimation (VK), microseconds ---------------
-	// TEMPORARY WORKAROUND. The SR Vulkan weaver does NOT implement late
-	// latching, and its setLatencyInFrames() is a no-op (the frames->time
-	// conversion is commented out in the SDK: vkweaver.cpp "todo:????"). Only
-	// setLatency() (absolute microseconds) actually feeds the eye-position
-	// predictor. Until the SR VK weaver gains real late-latching / predictive
-	// tracking in frames, we synthesize the motion-to-photon horizon here and
-	// push it every frame. REMOVE this whole block and switch to the SDK's
-	// frames-based predictive path once it is implemented in VK.
+	// Verified against the LeiaSR source at v1.37.1 (2026-08-08). Both setters
+	// write the SAME `latency` member on WeaverBaseImpl, and BOTH consumers
+	// below read it:
+	//
+	//   setLatency(L)        -> latency = L, useLatencyInFrames = false  [raw]
+	//   setLatencyInFrames(N)-> per weave: latency = min(1e6 * (N * avgWeaveInterval_s
+	//                                     + 1/monitorRefreshRate), 150000)
+	//
+	//   weave  : predictingWeaverTracker->predict(latency, weaverPosition)
+	//            -> WeaverPositionPredictor: predictionTime = 1e-6 * latency  [RAW]
+	//   app-facing getPredictedEyePositions()
+	//            -> EyePairPredictor: predictionTime = 1e-6 * latency + (1/60/2)
+	//               (a HARDCODED 60 Hz half-frame — see the upstream report;
+	//                it does NOT affect the weave, only the eye positions we
+	//                hand the runtime for the app's camera.)
+	//
+	// WHY WE STILL SYNTHESIZE THE HORIZON rather than use setLatencyInFrames:
+	// we push the runtime's MEASURED weave->scanout residual, which is exact
+	// per-path and per-panel; the frames path can only ever be a heuristic
+	// (N pinned by us, times the weaver's own cadence average). Measured beats
+	// estimated, so this is a deliberate choice, not a workaround for a broken
+	// API. Because setLatency() clears useLatencyInFrames, it is honored by
+	// EVERY SR version — so no version gate is needed or wanted here (and one
+	// would be unreliable: the VK frames-path fix landed in some v1.37.1-*
+	// lineages but NOT the plain v1.37.1 tag).
+	//
+	// STALE CLAIM CORRECTED: this block used to say setLatencyInFrames() is a
+	// no-op in VK with the conversion commented out ("todo:????"). That was
+	// fixed upstream — VulkanWeaverBase now derives from WeaverBaseImpl and the
+	// VK weave path calls updateLatencyState() (LeiaSR commit e0a523065,
+	// 2026-05-08, "Simplify Vulkan weaver"). Do not remove this block on that
+	// premise.
+	//
+	// WHAT IS STILL MISSING: real late latching in VK. At v1.37.1
+	// enableLateLatching() is `/*Not implemented*/` and isLateLatchingEnabled()
+	// returns false. Work exists on the LeiaSR branch
+	// `ST-5520-Add-Late-Latching-in-Vulkan` (~190 commits ahead of v1.37.1, last
+	// touched 2026-07-22) but has not shipped in a release. WHEN that lands,
+	// revisit this block: late latching samples the pose at submit time and
+	// makes most of this horizon estimate unnecessary.
 	//
 	// Motion-to-photon is structurally ADDITIVE, not a single multiplier:
 	//     horizon = N_buffered * frame_interval  +  T_display
