@@ -1648,6 +1648,46 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	             (int)target_height,
 	             (VkFormat)target_format);
 
+	/*
+	 * runtime#879: restore this DP's OWN layout contract after the weave.
+	 *
+	 * Our exposed render pass (the one the runtime builds target_fb from)
+	 * declares finalLayout = PRESENT_SRC_KHR, and everything downstream — the
+	 * alpha-gate's first barrier below, the runtime's zones composite, the
+	 * present — relies on that. But render-pass COMPATIBILITY ignores layouts,
+	 * and the SR weaver begins/ends its OWN internal render pass on our
+	 * framebuffer, whose color attachment is declared
+	 * COLOR_ATTACHMENT_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL
+	 * (srVulkan vkweaver.cpp). So the target actually leaves weave() in
+	 * COLOR_ATTACHMENT_OPTIMAL, and the alpha-gate's PRESENT_SRC->TRANSFER_SRC
+	 * barrier declared a wrong oldLayout — validation's
+	 * VUID-VkImageMemoryBarrier-oldLayout-01197, 10 per swapchain image per
+	 * run (the duplicate-message cap), attributed by handle correlation to
+	 * exactly the swapchain targets.
+	 *
+	 * One explicit transition here makes the exposed contract true on every
+	 * path. If a future SDK weaver ever ends in PRESENT_SRC itself, this
+	 * barrier becomes the wrong one — every weaver source known (1.34 bundled
+	 * legacy through the 1.37 machine weaver, all from the same srVulkan
+	 * lineage) ends in COLOR_ATTACHMENT_OPTIMAL.
+	 */
+	if (target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+		VkImageMemoryBarrier to_present = {};
+		to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		to_present.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+		to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_present.image = (VkImage)target_image;
+		to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vk->vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &to_present);
+	}
+
 	// Post-weave alpha-gate (compose path): samples the ORIGINAL atlas to derive
 	// the screen-space "all views α==0" mask and zeroes alpha on those pixels —
 	// DWM blends the LIVE desktop into the holes (no captured-bg lag, no fringe
