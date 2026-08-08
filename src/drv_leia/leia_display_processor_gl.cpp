@@ -981,6 +981,50 @@ compose_run_pre_weave_gl(struct leia_display_processor_gl_impl *ldp,
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
+	/*
+	 * runtime#885 / #135 diag (LEIA_DP_GL_DIAG=1): sample the LOCKED interop bg
+	 * texture per calling thread, few-shot. If this reads black on the repaint
+	 * thread but content on the app thread, the NV_DX_interop import itself is
+	 * the thread-affine step (lock "succeeded" but carried no pixels).
+	 */
+	{
+		static int s_diag = -1;
+		if (s_diag < 0) {
+			const char *e = getenv("LEIA_DP_GL_DIAG");
+			s_diag = (e != nullptr && e[0] == '1') ? 1 : 0;
+		}
+		if (s_diag == 1) {
+			static DWORD s_tid[2] = {0, 0};
+			static int s_shots[2] = {0, 0};
+			DWORD tid = GetCurrentThreadId();
+			int slot = -1;
+			for (int i = 0; i < 2; i++) {
+				if (s_tid[i] == tid) { slot = i; break; }
+				if (s_tid[i] == 0) { s_tid[i] = tid; slot = i; break; }
+			}
+			if (slot >= 0 && s_shots[slot] < 4) {
+				s_shots[slot]++;
+				uint8_t px[4] = {0, 0, 0, 0};
+				GLint prev_read_fbo = 0;
+				glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+				GLuint tmp_fbo = 0;
+				glGenFramebuffers(1, &tmp_fbo);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, tmp_fbo);
+				glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				                       GL_TEXTURE_2D, ldp->bg_gl_tex, 0);
+				GLenum st = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+				if (st == GL_FRAMEBUFFER_COMPLETE) {
+					glReadPixels(64, 64, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+				}
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+				glDeleteFramebuffers(1, &tmp_fbo);
+				U_LOG_W("#135 diag tid=%lu LOCKED bg_gl_tex=%u fbo_status=0x%x px(64,64) rgba=(%u,%u,%u,%u)",
+				        (unsigned long)tid, ldp->bg_gl_tex, (unsigned)st, px[0], px[1], px[2],
+				        px[3]);
+			}
+		}
+	}
+
 	// Save GL state we trample (mirror ck_run_pre_weave_fill, plus 3 TUs).
 	GLint prev_fbo = 0, prev_program = 0, prev_vao = 0, prev_active_tex = 0;
 	GLint prev_tex0 = 0, prev_tex1 = 0, prev_tex2 = 0;
@@ -1247,14 +1291,100 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 		}
 	}
 
+	/*
+	 * runtime#885 / #135 diag (LEIA_DP_GL_DIAG=1): the runtime's repaint calls
+	 * this from a SECOND thread (same HGLRC, serialized by the compositor
+	 * lock) and the weave comes out wrong there. Per-thread, few-shot:
+	 *  - which pre-weave path ran (compose / chroma-key / raw);
+	 *  - a 1px readback from the weaver input's first tile centre — the direct
+	 *    test of whether the composed atlas is already black on this thread;
+	 *  - a GL error drain before/after the SDK weave, so SDK-internal errors
+	 *    (the observed "[zones] strip" 0x501) attribute to a thread.
+	 */
+	static int s_diag = -1;
+	if (s_diag < 0) {
+		const char *e = getenv("LEIA_DP_GL_DIAG");
+		s_diag = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	DWORD diag_tid = 0;
+	bool diag_shot = false;
+	if (s_diag == 1) {
+		// Time-throttled per-thread pairs (~1 line/2 s each) instead of
+		// few-shot: the failure is per-launch intermittent, so a bad launch
+		// needs live app-vs-repaint pairs for its whole lifetime.
+		static DWORD s_tid[2] = {0, 0};
+		static ULONGLONG s_last_ms[2] = {0, 0};
+		diag_tid = GetCurrentThreadId();
+		int slot = -1;
+		for (int i = 0; i < 2; i++) {
+			if (s_tid[i] == diag_tid) { slot = i; break; }
+			if (s_tid[i] == 0) { s_tid[i] = diag_tid; slot = i; break; }
+		}
+		ULONGLONG now_ms = GetTickCount64();
+		if (slot >= 0 && now_ms - s_last_ms[slot] >= 2000) {
+			s_last_ms[slot] = now_ms;
+			diag_shot = true;
+			// Read the SAME texel from the compose INPUT (the runtime's cropped
+			// atlas) and the compose OUTPUT (weaver_input, ck_fill when compose
+			// ran) — input-black ⟹ the divergence is upstream (runtime crop);
+			// input-good/output-black ⟹ the compose draw itself diverges.
+			uint8_t in_px[4] = {0, 0, 0, 0}, out_px[4] = {0, 0, 0, 0};
+			GLint prev_read_fbo = 0;
+			glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+			if (ldp->read_fbo == 0) {
+				glGenFramebuffers(1, &ldp->read_fbo);
+			}
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->read_fbo);
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+			                       atlas_texture, 0);
+			// w/4: stay inside zone A's content across display modes (the tile
+			// centre lands on zone A's right edge in 4-view tiles).
+			if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+				glReadPixels((GLint)(view_width / 4), (GLint)(view_height / 2), 1, 1, GL_RGBA,
+				             GL_UNSIGNED_BYTE, in_px);
+			}
+			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+			                       weaver_input, 0);
+			if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+				glReadPixels((GLint)(view_width / 4), (GLint)(view_height / 2), 1, 1, GL_RGBA,
+				             GL_UNSIGNED_BYTE, out_px);
+			}
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+			U_LOG_W("#135 diag tid=%lu path=%s view=%ux%u @(%u,%u) in=%u(%u,%u,%u,%u) out=%u(%u,%u,%u,%u)",
+			        (unsigned long)diag_tid,
+			        compose_active ? "compose" : (ck_active ? "chroma" : "raw"), view_width,
+			        view_height, view_width / 4, view_height / 2, atlas_texture, in_px[0],
+			        in_px[1], in_px[2], in_px[3], weaver_input, out_px[0], out_px[1], out_px[2],
+			        out_px[3]);
+		}
+	}
+
 	leiasr_gl_set_input_texture(ldp->leiasr, weaver_input, view_width, view_height, format);
 
 	// Restore target viewport — SR weaver reads glViewport at weave() time,
 	// but set_input_texture may have reset it to input dimensions.
 	glViewport(0, 0, target_width, target_height);
 
+	if (diag_shot) {
+		GLenum pre;
+		int drained = 0;
+		while ((pre = glGetError()) != GL_NO_ERROR && drained < 8) {
+			U_LOG_W("#135 diag tid=%lu PRE-weave GL error 0x%x", (unsigned long)diag_tid, pre);
+			drained++;
+		}
+	}
+
 	// Perform weaving to the currently bound framebuffer
 	leiasr_gl_weave(ldp->leiasr);
+
+	if (diag_shot) {
+		GLenum post;
+		int drained = 0;
+		while ((post = glGetError()) != GL_NO_ERROR && drained < 8) {
+			U_LOG_W("#135 diag tid=%lu POST-weave GL error 0x%x", (unsigned long)diag_tid, post);
+			drained++;
+		}
+	}
 
 	if (compose_active) {
 		alpha_gate_run_post_weave_gl(ldp, atlas_texture, tile_columns, tile_rows, target_width,
