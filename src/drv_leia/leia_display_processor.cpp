@@ -669,15 +669,50 @@ compose_import_bg_image(struct leia_display_processor *ldp)
 	    .pNext = &import,
 	    .image = ldp->bg_image,
 	};
+	/*
+	 * runtime#879: an IMPORT must pick its memoryTypeIndex from
+	 * VkMemoryWin32HandlePropertiesKHR::memoryTypeBits, not from the plain
+	 * image requirements. Picking from reqs alone chose index 0 where the
+	 * handle's legal set was 0x2 — validation's
+	 * VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645, 6 per run. Both
+	 * constraints apply, so intersect. If the loader did not resolve the
+	 * import-direction proc (pre-#879 runtime), fall back to the old
+	 * behaviour rather than break the compose path.
+	 */
+	uint32_t legal_bits = reqs.memoryTypeBits;
+	// Resolved locally: the vk_bundle crosses the plug-in ABI boundary, so no
+	// new slot can be added to it (ADR-020 append-only), and its loader skips
+	// the external-memory procs on this path anyway.
+	PFN_vkGetMemoryWin32HandlePropertiesKHR get_handle_props =
+	    (PFN_vkGetMemoryWin32HandlePropertiesKHR)vk->vkGetDeviceProcAddr(
+	        vk->device, "vkGetMemoryWin32HandlePropertiesKHR");
+	if (get_handle_props != NULL) {
+		VkMemoryWin32HandlePropertiesKHR hp = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+		};
+		if (get_handle_props(
+		        vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, handle, &hp) ==
+		        VK_SUCCESS &&
+		    hp.memoryTypeBits != 0) {
+			legal_bits = hp.memoryTypeBits & reqs.memoryTypeBits;
+			if (legal_bits == 0) {
+				// Disjoint sets should not happen for a dedicated import;
+				// trust the handle side, which is the spec-required one.
+				legal_bits = hp.memoryTypeBits;
+			}
+		}
+	}
 	VkPhysicalDeviceMemoryProperties mp = {};
 	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mp);
 	uint32_t mti = UINT32_MAX;
 	for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-		if ((reqs.memoryTypeBits & (1u << i)) != 0) {
+		if ((legal_bits & (1u << i)) != 0) {
 			mti = i;
 			break;
 		}
 	}
+	U_LOG_W("Leia VK DP #879: bg import — props_proc=%p legal_bits=0x%x (img 0x%x) -> mti=%u",
+	        (void *)get_handle_props, legal_bits, reqs.memoryTypeBits, mti);
 	if (mti == UINT32_MAX) {
 		U_LOG_W("Leia VK DP: no memory type for bg import");
 		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
