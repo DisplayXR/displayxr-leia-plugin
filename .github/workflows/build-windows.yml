@@ -269,6 +269,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: _package/DisplayXRLeiaSRSetup-*.exe
+          # ONLY this workflow may set generate_release_notes in this repo. The
+          # action folds the flag into `body` before calling the API, and on
+          # update does `body = existing + "\n\n" + notes` — so flagging
+          # build-linux.yml too would repeat the notes. Gives every release a
+          # "## What's Changed" floor; /dxr-release PHASE 3.6 prepends curated
+          # "## Highlights" above it, which the website's news feed parses.
+          generate_release_notes: true
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
