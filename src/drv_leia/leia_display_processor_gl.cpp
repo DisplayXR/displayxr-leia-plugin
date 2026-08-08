@@ -123,11 +123,17 @@ void main() {
     // window-local vertical fraction must be flipped (1.0 - tile_local.y) BEFORE
     // mapping through origin/extent — NOT after — otherwise the sample lands on
     // the wrong monitor band (off by the window's offset), not behind the window.
-    // Channels are in storage (BGRA) order so swizzle .bgr (on-device toggle:
-    // drop if the driver honors BGRA).
+    // NO channel swizzle. WGL_NV_DX_interop2 presents the BGRA8 D3D11 texture
+    // to GL with the channel order already resolved, so texture() returns RGBA
+    // directly — the .bgr swizzle this line used to carry was a second swap on
+    // top of that, and it inverted red/blue in the composited desktop. It only
+    // showed on a SATURATED background (cyan came out yellow); greys and
+    // near-neutral desktops are unchanged by an R/B swap, which is why it
+    // survived. The D3D11 DP's equivalent shader samples straight, and D3D11
+    // output was verified correct on the same desktop.
     vec2 bg_uv = vec2(bg_uv_origin.x + tile_local.x * bg_uv_extent.x,
                       bg_uv_origin.y + (1.0 - tile_local.y) * bg_uv_extent.y);
-    vec3 b = texture(bg, bg_uv).bgr;
+    vec3 b = texture(bg, bg_uv).rgb;
     if (has_backdrop != 0) {
         // Backdrop is a GL-pipeline texture (bottom-up, like the atlas) → sample
         // at the unflipped tile_local.
