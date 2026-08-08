@@ -1407,6 +1407,20 @@ leia_dp_gl_get_window_metrics(struct xrt_display_processor_gl *xdp,
  *
  */
 
+/*
+ * runtime#894 — weave-latency timing loop (vtable slot 18). GL was the only
+ * backend that never received this, so its eye-prediction horizon was pinned at
+ * setLatencyInFrames(1) from init; the D3D11/D3D12/VK legs have consumed a
+ * runtime-supplied horizon since #867. See leiasr_gl_set_frame_timing.
+ */
+static void
+leia_dp_gl_set_frame_timing(struct xrt_display_processor_gl *xdp,
+                            uint64_t weave_to_scanout_ns,
+                            uint64_t frame_period_ns)
+{
+	leiasr_gl_set_frame_timing(leia_dp_gl(xdp)->leiasr, weave_to_scanout_ns, frame_period_ns);
+}
+
 static bool
 leia_dp_gl_get_local_zone_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_local_zone_caps *out_caps)
 {
@@ -1644,6 +1658,7 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.set_background_2d = leia_dp_gl_set_background_2d; // #491 part 3 (no-op store; GL composite deferred)
 	ldp->base.set_shared_texture_present = leia_dp_gl_set_shared_texture_present; // #68
 	// #613 / ADR-027 — display-zones vtable (slots 13/14/15, GL port of D3D11).
+	ldp->base.set_frame_timing = leia_dp_gl_set_frame_timing; // weave-latency timing loop (slot 18, runtime#894)
 	ldp->base.get_local_zone_caps = leia_dp_gl_get_local_zone_caps;
 	ldp->base.publish_local_zone_mask = leia_dp_gl_publish_local_zone_mask;
 	ldp->base.clear_local_zone_mask = leia_dp_gl_clear_local_zone_mask;

@@ -91,6 +91,23 @@ void
 leiasr_gl_weave(struct leiasr_gl *leiasr);
 
 /*!
+ * runtime#894 — accept the runtime's per-weave timing horizon.
+ *
+ * @param weave_to_scanout_ns Measured weave→scanout residual, or 0 when the
+ *        caller cannot measure it (currently always 0 on GL — no DXGI frame
+ *        statistics, no present_wait). 0 keeps the additive heuristic.
+ * @param frame_period_ns The REAL panel period; replaces the 60 Hz constant in
+ *        the heuristic's display term. 0 leaves the previous value.
+ *
+ * The first call takes latency control away from the init-time
+ * setLatencyInFrames(1), so a runtime that never calls this is unaffected.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_gl_set_frame_timing(struct leiasr_gl *leiasr, uint64_t weave_to_scanout_ns, uint64_t frame_period_ns);
+
+/*!
  * Get predicted eye positions from the weaver's LookaroundFilter.
  *
  * @param leiasr The GL weaver instance.

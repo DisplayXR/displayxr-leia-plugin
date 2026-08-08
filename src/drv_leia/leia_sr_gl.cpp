@@ -37,6 +37,31 @@ struct leiasr_gl
 	uint32_t view_height = 0;
 	uint32_t input_format = 0; // GL_RGBA8
 
+	// --- Weave-latency horizon (runtime#894) --------------------------------
+	// The runtime offers (weave→scanout residual, panel period) every weave via
+	// xrt_display_processor_gl::set_frame_timing. GL is the one backend where
+	// the residual is currently always 0 ("unmeasured" — the GL path has no
+	// DXGI frame statistics and no present_wait), so we synthesise the horizon
+	// from the SAME additive model the D3D11/VK legs use:
+	//
+	//     horizon = N_buffered * frame_interval  +  T_display
+	//
+	// with T_display taken from the runtime's REAL panel period instead of a
+	// 60 Hz constant, and frame_interval measured from our own weave cadence.
+	// When the runtime starts supplying a measured residual (the
+	// DwmGetCompositionTimingInfo path named in runtime#894) it REPLACES this
+	// heuristic, exactly as it does on the other backends.
+	//
+	// Before this, GL pinned setLatencyInFrames(1) at init and never updated —
+	// so the horizon ignored both the panel rate and the app's actual cadence.
+	uint64_t display_term_us = 16667;   // T_display; overwritten by the runtime's period
+	uint64_t measured_r_us = 0;         // runtime-measured weave→scanout (0 = none yet)
+	uint64_t measured_seen_ns = 0;      // when that measurement last arrived
+	double   ema_interval_ns = 0.0;     // smoothed weave→weave interval
+	uint64_t prev_weave_ns = 0;
+	uint64_t last_set_latency_us = 0;   // last value pushed to setLatency()
+	bool     latency_active = false;    // true once we take over from setLatencyInFrames
+
 	// Display dimensions in meters (for Kooima FOV calculation)
 	float display_width_m = 0.0f;
 	float display_height_m = 0.0f;
@@ -260,6 +285,97 @@ leiasr_gl_set_input_texture(struct leiasr_gl *leiasr,
 	                                     static_cast<int>(format));
 }
 
+/*
+ * runtime#894 — compute and push the weave-latency horizon.
+ *
+ * Mirrors the D3D11/VK legs' policy so all four backends predict the same way:
+ * a measured weave→scanout residual from the runtime wins outright when fresh;
+ * otherwise synthesise `N_buffered * frame_interval + T_display`, where
+ * T_display is the runtime-supplied REAL panel period and frame_interval is our
+ * own smoothed weave cadence. Clamped, and only pushed when it actually moves
+ * (setLatency() is cheap but the log should not be).
+ *
+ * Until the runtime offers timing (older runtimes leave the slot unwired) this
+ * never engages and the init-time setLatencyInFrames(1) stands — so an old
+ * runtime + new plug-in behaves exactly as before.
+ */
+static void
+leiasr_gl_apply_latency(struct leiasr_gl *leiasr)
+{
+	// Smooth the weave→weave interval regardless of which branch we take: a
+	// pause (occlusion, drag, debugger) is not a frame cost, so reset rather
+	// than poison the average — same guard as the other legs.
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (leiasr->prev_weave_ns != 0 && now_ns > leiasr->prev_weave_ns) {
+		const double dt_ns = (double)(now_ns - leiasr->prev_weave_ns);
+		if (dt_ns > 250e6) {
+			leiasr->ema_interval_ns = 0.0;
+		} else {
+			leiasr->ema_interval_ns = (leiasr->ema_interval_ns == 0.0)
+			                              ? dt_ns
+			                              : leiasr->ema_interval_ns * 0.85 + dt_ns * 0.15;
+		}
+	}
+	leiasr->prev_weave_ns = now_ns;
+
+	if (!leiasr->latency_active) {
+		return; // runtime never offered timing — keep setLatencyInFrames(1)
+	}
+
+	uint64_t horizon_us = 0;
+	if (leiasr->measured_r_us > 0 && leiasr->measured_seen_ns != 0 &&
+	    (now_ns - leiasr->measured_seen_ns) < 500000000ull /* 500 ms freshness */) {
+		horizon_us = leiasr->measured_r_us; // exact — beats any heuristic
+	} else {
+		const uint64_t interval_us =
+		    (leiasr->ema_interval_ns > 0.0) ? (uint64_t)(leiasr->ema_interval_ns / 1000.0) : 0;
+		horizon_us = interval_us + leiasr->display_term_us;
+	}
+
+	// Clamp to the same window the other legs use.
+	if (horizon_us < 5000) {
+		horizon_us = 5000;
+	}
+	if (horizon_us > 60000) {
+		horizon_us = 60000;
+	}
+
+	// Only push on a meaningful change (>0.5 ms) — avoids churning the weaver.
+	const uint64_t prev = leiasr->last_set_latency_us;
+	const uint64_t delta = (horizon_us > prev) ? (horizon_us - prev) : (prev - horizon_us);
+	if (prev != 0 && delta < 500) {
+		return;
+	}
+	leiasr->weaver->setLatency(horizon_us);
+	leiasr->last_set_latency_us = horizon_us;
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("Leia GL DP: weave-latency horizon now runtime-driven — setLatency(%llu us) "
+		        "(T_display %llu us from the runtime's panel period, measured residual %s)",
+		        (unsigned long long)horizon_us, (unsigned long long)leiasr->display_term_us,
+		        leiasr->measured_r_us > 0 ? "present" : "unmeasured on GL");
+	}
+}
+
+void
+leiasr_gl_set_frame_timing(struct leiasr_gl *leiasr, uint64_t weave_to_scanout_ns, uint64_t frame_period_ns)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+	leiasr->measured_r_us = weave_to_scanout_ns / 1000;
+	if (weave_to_scanout_ns > 0) {
+		leiasr->measured_seen_ns = os_monotonic_get_ns();
+	}
+	if (frame_period_ns > 0) {
+		leiasr->display_term_us = frame_period_ns / 1000;
+	}
+	// The runtime is offering timing — take over from setLatencyInFrames(1).
+	leiasr->latency_active = true;
+}
+
 void
 leiasr_gl_weave(struct leiasr_gl *leiasr)
 {
@@ -267,6 +383,10 @@ leiasr_gl_weave(struct leiasr_gl *leiasr)
 		U_LOG_W("leiasr_gl_weave called with null instance or weaver");
 		return;
 	}
+
+	// runtime#894: push this frame's horizon BEFORE weave() so the eye
+	// prediction inside this weave uses it (same ordering as the VK leg).
+	leiasr_gl_apply_latency(leiasr);
 
 	// The weaver writes to the currently bound framebuffer
 	leiasr->weaver->weave();
