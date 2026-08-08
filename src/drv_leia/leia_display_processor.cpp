@@ -672,15 +672,50 @@ compose_import_bg_image(struct leia_display_processor *ldp)
 	    .pNext = &import,
 	    .image = ldp->bg_image,
 	};
+	/*
+	 * runtime#879: an IMPORT must pick its memoryTypeIndex from
+	 * VkMemoryWin32HandlePropertiesKHR::memoryTypeBits, not from the plain
+	 * image requirements. Picking from reqs alone chose index 0 where the
+	 * handle's legal set was 0x2 — validation's
+	 * VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645, 6 per run. Both
+	 * constraints apply, so intersect. If the loader did not resolve the
+	 * import-direction proc (pre-#879 runtime), fall back to the old
+	 * behaviour rather than break the compose path.
+	 */
+	uint32_t legal_bits = reqs.memoryTypeBits;
+	// Resolved locally: the vk_bundle crosses the plug-in ABI boundary, so no
+	// new slot can be added to it (ADR-020 append-only), and its loader skips
+	// the external-memory procs on this path anyway.
+	PFN_vkGetMemoryWin32HandlePropertiesKHR get_handle_props =
+	    (PFN_vkGetMemoryWin32HandlePropertiesKHR)vk->vkGetDeviceProcAddr(
+	        vk->device, "vkGetMemoryWin32HandlePropertiesKHR");
+	if (get_handle_props != NULL) {
+		VkMemoryWin32HandlePropertiesKHR hp = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+		};
+		if (get_handle_props(
+		        vk->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT, handle, &hp) ==
+		        VK_SUCCESS &&
+		    hp.memoryTypeBits != 0) {
+			legal_bits = hp.memoryTypeBits & reqs.memoryTypeBits;
+			if (legal_bits == 0) {
+				// Disjoint sets should not happen for a dedicated import;
+				// trust the handle side, which is the spec-required one.
+				legal_bits = hp.memoryTypeBits;
+			}
+		}
+	}
 	VkPhysicalDeviceMemoryProperties mp = {};
 	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mp);
 	uint32_t mti = UINT32_MAX;
 	for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
-		if ((reqs.memoryTypeBits & (1u << i)) != 0) {
+		if ((legal_bits & (1u << i)) != 0) {
 			mti = i;
 			break;
 		}
 	}
+	U_LOG_W("Leia VK DP #879: bg import — props_proc=%p legal_bits=0x%x (img 0x%x) -> mti=%u",
+	        (void *)get_handle_props, legal_bits, reqs.memoryTypeBits, mti);
 	if (mti == UINT32_MAX) {
 		U_LOG_W("Leia VK DP: no memory type for bg import");
 		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
@@ -1677,6 +1712,46 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	             (int)target_width,
 	             (int)target_height,
 	             (VkFormat)target_format);
+
+	/*
+	 * runtime#879: restore this DP's OWN layout contract after the weave.
+	 *
+	 * Our exposed render pass (the one the runtime builds target_fb from)
+	 * declares finalLayout = PRESENT_SRC_KHR, and everything downstream — the
+	 * alpha-gate's first barrier below, the runtime's zones composite, the
+	 * present — relies on that. But render-pass COMPATIBILITY ignores layouts,
+	 * and the SR weaver begins/ends its OWN internal render pass on our
+	 * framebuffer, whose color attachment is declared
+	 * COLOR_ATTACHMENT_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL
+	 * (srVulkan vkweaver.cpp). So the target actually leaves weave() in
+	 * COLOR_ATTACHMENT_OPTIMAL, and the alpha-gate's PRESENT_SRC->TRANSFER_SRC
+	 * barrier declared a wrong oldLayout — validation's
+	 * VUID-VkImageMemoryBarrier-oldLayout-01197, 10 per swapchain image per
+	 * run (the duplicate-message cap), attributed by handle correlation to
+	 * exactly the swapchain targets.
+	 *
+	 * One explicit transition here makes the exposed contract true on every
+	 * path. If a future SDK weaver ever ends in PRESENT_SRC itself, this
+	 * barrier becomes the wrong one — every weaver source known (1.34 bundled
+	 * legacy through the 1.37 machine weaver, all from the same srVulkan
+	 * lineage) ends in COLOR_ATTACHMENT_OPTIMAL.
+	 */
+	if (target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+		VkImageMemoryBarrier to_present = {};
+		to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		to_present.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		to_present.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+		to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_present.image = (VkImage)target_image;
+		to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vk->vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &to_present);
+	}
 
 	// Post-weave alpha-gate (compose path): samples the ORIGINAL atlas to derive
 	// the screen-space "all views α==0" mask and zeroes alpha on those pixels —
