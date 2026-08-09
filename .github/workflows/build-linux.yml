@@ -130,6 +130,24 @@ jobs:
             nm -D --defined-only "$SO"
             exit 1
           fi
+
+      - name: Assert no unresolved symbols
+        run: |
+          # The export check above says what the .so PROVIDES; this says whether it
+          # can LOAD at all. On Linux a shared library links successfully with
+          # dangling references and only dies when the loader binds them, so a green
+          # build proves nothing about loadability — the runtime would dlopen this
+          # plug-in and fail with `undefined symbol: <x>` on the target box.
+          # displayxr-unity#249 shipped exactly that. The link also passes
+          # -Wl,--no-undefined; keep both, because that flag is easy to drop in a
+          # refactor and this is the symptom a user actually hits.
+          SO=build/src/drv_leia_linux/DisplayXR-LeiaSR.so
+          if ldd -r "$SO" 2>&1 | grep -q 'undefined symbol'; then
+            echo "::error::unresolved symbols in $SO — the runtime will fail to dlopen it:"
+            ldd -r "$SO" 2>&1 | grep 'undefined symbol' | sort -u
+            exit 1
+          fi
+          echo "no unresolved symbols: OK"
           echo "OK: only xrtPluginNegotiate exported"
 
       - name: Selftest (discovery + ABI + display info)

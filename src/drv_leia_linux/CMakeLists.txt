@@ -160,6 +160,16 @@ set_target_properties(DisplayXR-LeiaSR PROPERTIES
 target_link_options(DisplayXR-LeiaSR PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/plugin_exports.version"
     "LINKER:--exclude-libs,ALL"
+    # --no-undefined: an unresolved symbol must be a LINK error, not a runtime
+    # surprise. On Linux a shared library links happily with dangling references
+    # and only fails when the loader BINDS them — unlike MSVC and macOS's
+    # two-level namespace, which reject it at link time. For a dlopen'd plug-in
+    # that means a fully green build can still produce a .so the runtime cannot
+    # load, and the failure surfaces on the target box as
+    # `undefined symbol: <x>`, arbitrarily far from the build that shipped it.
+    # (displayxr-unity#249 shipped exactly that; displayxr-runtime already sets
+    # the same flag globally in CompilerFlags.cmake.)
+    "LINKER:--no-undefined"
 )
 
 install(TARGETS DisplayXR-LeiaSR
