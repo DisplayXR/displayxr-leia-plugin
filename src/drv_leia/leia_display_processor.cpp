@@ -120,6 +120,12 @@ struct leia_display_processor
 	void *hwnd_opaque;                       //!< HWND from factory (Win-only). void* so the struct stays cross-platform.
 	struct leia_bg_capture *bg_capture;      //!< Owned (Win-only). NULL → DP stays opaque.
 	bool bg_compose_enabled;
+	//! Client-present mode (#904): the RUNTIME owns a transparent present and
+	//! DWM blends the live desktop into the α==0 holes — no compose-under-bg,
+	//! but the post-weave alpha-gate MUST still run (the SR weaver interlaces
+	//! into opaque RGB; without the gate the window is solid black). Mirrors
+	//! the D3D11 DP's #551 client_present_mode.
+	bool client_present_mode;
 
 	VkImage bg_image;
 	VkImageView bg_view;
@@ -1680,22 +1686,36 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	VkImageView weaver_input = atlas_view;
 #ifdef _WIN32
 	bool compose_active = compose_should_run(ldp) && (target_image != (VkImage_XDP)VK_NULL_HANDLE);
+	// #904: in client-present mode the post-weave gate runs WITHOUT the
+	// pre-weave compose (DWM supplies the desktop; the gate only has to
+	// reconstruct the α==0 holes the weaver destroyed). The gate's pipeline
+	// normally comes up as a side effect of the compose branch, so init it
+	// here explicitly — ck_init_pipeline is idempotent, and the gate's bg
+	// binding has a dummy fallback (strip copy) when no capture is imported.
+	bool gate_active = (compose_active || ldp->client_present_mode) &&
+	                   (target_image != (VkImage_XDP)VK_NULL_HANDLE);
+	// Order matters: compose_init_pipeline owns the gate pipeline AND the
+	// shared sampler but needs ck_fill_rp from ck_init_pipeline first. On the
+	// compose path it used to be reached via compose_run_pre_weave; in
+	// client-present mode nothing else creates it — skipping it left the
+	// gate's descriptors with a null sampler (first-submission crash).
+	if (gate_active && (!ck_init_pipeline(ldp, (VkFormat)target_format) ||
+	                    !compose_init_pipeline(ldp))) {
+		gate_active = false;
+		compose_active = false;
+	}
 	if (compose_active) {
 		uint32_t atlas_w = view_width * tile_columns;
 		uint32_t atlas_h = view_height * tile_rows;
-		// Compose reuses the fill render pass + intermediate (ck_fill_rp +
-		// ck_fill_image). ck_init_pipeline is idempotent and self-contained.
-		if (ck_init_pipeline(ldp, (VkFormat)target_format)) {
-			VkImageView composed = compose_run_pre_weave(ldp, cmd_buffer, atlas_view,
-			                                              atlas_w, atlas_h,
-			                                              tile_columns, tile_rows);
-			if (composed != VK_NULL_HANDLE) {
-				weaver_input = composed;
-			}
-			// On compose failure (e.g. no WGC frame yet) just pass through
-			// — atlas alpha=0 regions render as black RGB through the weaver,
-			// recovers next frame once WGC produces a frame.
+		VkImageView composed = compose_run_pre_weave(ldp, cmd_buffer, atlas_view,
+		                                             atlas_w, atlas_h,
+		                                             tile_columns, tile_rows);
+		if (composed != VK_NULL_HANDLE) {
+			weaver_input = composed;
 		}
+		// On compose failure (e.g. no WGC frame yet) just pass through
+		// — atlas alpha=0 regions render as black RGB through the weaver,
+		// recovers next frame once WGC produces a frame.
 	}
 #endif
 
@@ -1758,13 +1778,13 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	// DWM blends the LIVE desktop into the holes (no captured-bg lag, no fringe
 	// at silhouettes).
 #ifdef _WIN32
-	if (compose_active && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+	if (gate_active) {
 		alpha_gate_run_post_weave(ldp, cmd_buffer,
 		                          (VkImage)target_image, atlas_view,
 		                          target_width, target_height,
 		                          tile_columns, tile_rows,
 		                          canvas_offset_x, canvas_offset_y,
-		                          canvas_width, canvas_height); // #121
+		                          canvas_width, canvas_height); // #121, #904 client-present
 	}
 #endif
 }
@@ -1881,7 +1901,10 @@ leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool
 	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
 
 	// Client-present mode: the runtime owns a transparent present and blends the
-	// live screen into the holes, so the DP must NOT compose-under-bg.
+	// live screen into the holes, so the DP must NOT compose-under-bg — but the
+	// post-weave alpha-gate must still run (see client_present_mode field doc;
+	// without it the woven output keeps α=1 and the window is solid black).
+	ldp->client_present_mode = (enabled && client_presents);
 	if (enabled && client_presents) {
 #ifdef _WIN32
 		if (ldp->bg_compose_enabled) {
