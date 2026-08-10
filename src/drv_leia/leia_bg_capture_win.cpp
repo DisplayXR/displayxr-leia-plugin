@@ -396,6 +396,39 @@ leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 	if (SUCCEEDED(capture_session.As(&session3))) {
 		session3->put_IsBorderRequired(false);
 	}
+	// Capture delivery throttle (Suki's measurement, avatar iGPU study
+	// 2026-08-10): WGC delivers a frame per DESKTOP CHANGE — monitor capture
+	// is served by DWM, so every delivery is dwm-column GPU work, and a
+	// moving cursor alone drives it (~13 system GPU points). Capping delivery
+	// is FREE when the desktop is quiet (the still-cost is flat across every
+	// cap) and only bites when something changes; the trade is band
+	// freshness, bounded by the cap. The compose consumer only reads the
+	// latest frame, so dropped intermediates cost nothing. 66 ms measured as
+	// the knee (~9 points saved under motion). LEIA_DP_CAPTURE_MIN_INTERVAL_MS:
+	// unset = 66, 0 = uncapped, N = cap at N ms. Requires
+	// IGraphicsCaptureSession5 (Win11 24H2); QI failure = uncapped, as today.
+	{
+		long interval_ms = 66;
+		const char *e = getenv("LEIA_DP_CAPTURE_MIN_INTERVAL_MS");
+		if (e != nullptr && e[0] != '\0') {
+			interval_ms = atol(e);
+			if (interval_ms < 0 || interval_ms > 1000) {
+				interval_ms = 66;
+			}
+		}
+		if (interval_ms > 0) {
+			ComPtr<WGC::IGraphicsCaptureSession5> session5;
+			if (SUCCEEDED(capture_session.As(&session5))) {
+				ABI::Windows::Foundation::TimeSpan ts;
+				ts.Duration = (INT64)interval_ms * 10000; // 100 ns units
+				if (SUCCEEDED(session5->put_MinUpdateInterval(ts))) {
+					U_LOG_W("leia_bg_capture: delivery capped at %ld ms "
+					        "(LEIA_DP_CAPTURE_MIN_INTERVAL_MS)",
+					        interval_ms);
+				}
+			}
+		}
+	}
 
 	ComPtr<ID3D11Texture2D> staging_tex;
 	HANDLE staging_handle = nullptr;
