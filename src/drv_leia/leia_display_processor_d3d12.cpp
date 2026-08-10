@@ -317,6 +317,13 @@ struct leia_display_processor_d3d12_impl
 	ID3D12CommandQueue *command_queue;   //!< Saved from factory; needed for fence Wait().
 	struct leia_bg_capture *bg_capture;  //!< Owned; NULL → fall back to chroma-key.
 	bool bg_compose_enabled;             //!< Active when the new path is in use.
+	//! Client-present mode (#904): the RUNTIME owns a transparent present and
+	//! DWM blends the live desktop into the α==0 holes — the DP must NOT
+	//! compose-under-bg, but the post-weave alpha-gate MUST still run to
+	//! reconstruct those holes (the SR weaver interlaces into opaque RGB).
+	//! Without it the woven output keeps α=1 and the "transparent" window is
+	//! solid black. Mirrors the D3D11 DP's #551 client_present_mode.
+	bool client_present_mode;
 	ID3D12Resource *bg_shared_tex;       //!< Opened from bg_capture's shared NT handle.
 	ID3D12Fence *bg_fence;               //!< Opened from bg_capture's shared fence handle.
 	ID3D12RootSignature *compose_root_sig;
@@ -1687,7 +1694,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		if (target_resource != NULL) {
 			D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
 			bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
-			if (compose_should_run(ldp)) {
+			// #904: in client-present mode the gate runs WITHOUT compose —
+			// same predicate shape as the D3D11 DP's alpha_gate_should_run.
+			if (compose_should_run(ldp) || ldp->client_present_mode) {
 				alpha_gate_run_post_weave(
 				    ldp, cmd,
 				    static_cast<ID3D12Resource *>(target_resource), bb_rtv,
@@ -1869,7 +1878,8 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	if (target_resource != NULL) {
 		D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv_post;
 		bb_rtv_post.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
-		if (compose_should_run(ldp) && original_atlas_3d != NULL) {
+		// #904: client-present mode gates WITHOUT compose (see field doc).
+		if ((compose_should_run(ldp) || ldp->client_present_mode) && original_atlas_3d != NULL) {
 			alpha_gate_run_post_weave(
 			    ldp, cmd_3d,
 			    static_cast<ID3D12Resource *>(target_resource), bb_rtv_post,
@@ -2341,11 +2351,22 @@ leia_dp_d3d12_set_transparent_background(struct xrt_display_processor_d3d12 *xdp
 	ldp->ck_enabled = false; // no chroma-key strip/fill pass (#573)
 
 	// Client-present mode: the runtime owns a transparent present and blends the
-	// live desktop into the holes, so the DP must NOT compose-under-bg.
+	// live desktop into the holes, so the DP must NOT compose-under-bg — but the
+	// post-weave alpha-gate must still run (see client_present_mode field doc;
+	// without it the window is solid black, found by eyeball on the D3D12 cube).
+	ldp->client_present_mode = (enabled && client_presents);
 	if (enabled && client_presents) {
 		if (ldp->bg_compose_enabled) {
 			compose_release_resources(ldp);
 			ldp->bg_compose_enabled = false;
+		}
+		// Build the gate pipeline now — the compose init path that normally
+		// creates it never runs in this mode. Idempotent; null bg SRVs are
+		// legal descriptors and the flatten path that would read them is off
+		// (present_opaque=false on the live path by definition).
+		if (!compose_init_pipeline(ldp)) {
+			U_LOG_W("Leia D3D12 DP: client-present alpha-gate pipeline init FAILED — "
+			        "transparent output will be opaque");
 		}
 		U_LOG_W("Leia D3D12 DP: transparency = client-present (alpha-gate only, no WGC)");
 		return;
