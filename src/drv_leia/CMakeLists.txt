@@ -18,6 +18,7 @@ set(LEIA_SOURCES
     leia_sr_api_select.cpp
     leia_sr_v2_common.h
     leia_sr_v2_common.cpp
+    leia_vk_weaver_v2.cpp
     leia_plugin.c
 )
 
