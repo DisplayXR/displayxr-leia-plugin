@@ -8,6 +8,8 @@
  */
 
 #include "leia_sr_d3d12.h"
+#include "leia_sr_api_select.h"
+#include "leia_sr_v2_common.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -15,6 +17,11 @@
 #include <sr/world/display/display.h>
 #include <sr/sense/display/switchablehint.h>
 #include <sr/utility/exception.h>
+
+#ifdef DXR_LEIA_HAS_SR_V2
+#include <sr/sr_dx12.h>
+#include <sr/sr_weaver.h>
+#endif
 
 #include <d3d12.h>
 
@@ -29,10 +36,19 @@
  */
 struct leiasr_d3d12
 {
-	// SR SDK objects
+	// SR SDK objects, v1 (legacy C++). NULL on the v2 path.
 	SR::SRContext *context = nullptr;
 	SR::IDX12Weaver1 *weaver = nullptr;
 	SR::SwitchableLensHint *lens_hint = nullptr;
+
+#ifdef DXR_LEIA_HAS_SR_V2
+	// SR SDK objects, v2 (C99). NULL on the v1 path. `weaver_v2 != nullptr` is
+	// the discriminant at every call site — see leia_sr_d3d11.cpp for why the
+	// selector is consulted once, at create, rather than per call.
+	SrInstance instance_v2 = nullptr;
+	SrWeaver weaver_v2 = nullptr;
+	SrLens lens_v2 = nullptr;
+#endif
 
 	// D3D12 resources (references, not owned)
 	ID3D12Device *device = nullptr;
@@ -189,6 +205,266 @@ create_sr_context(double max_time, leiasr_d3d12 &sr)
 	return true;
 }
 
+#ifdef DXR_LEIA_HAS_SR_V2
+/*!
+ * The v2 creation sequence. Mirrors the D3D11 arm exactly, including the
+ * ordering constraint: `srInitialize` runs AFTER the weaver exists, because
+ * initialisation starts the senses.
+ *
+ * Note the weaver is created from the DEVICE, not the command queue — same as
+ * v1's `CreateDX12Weaver(context, device, hwnd, &weaver)`. The queue is kept on
+ * the struct for the runtime's own use, not the SDK's.
+ */
+bool
+create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
+{
+	if (!leia_sr_v2_create_instance(max_time, &sr.instance_v2)) {
+		return false;
+	}
+
+	leia_sr_v2_display_info info{};
+	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, &info)) {
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		return false;
+	}
+
+	sr.display_width_m = info.width_m;
+	sr.display_height_m = info.height_m;
+	sr.display_dims_valid = true;
+	sr.display_pixel_width = info.pixel_width;
+	sr.display_pixel_height = info.pixel_height;
+	sr.display_screen_left = info.screen_left;
+	sr.display_screen_top = info.screen_top;
+	sr.display_pixel_dims_valid = true;
+	// NOTE: unlike the D3D11 arm this struct caches no recommended_* fields —
+	// its v1 path never read them either, so leaving them unused keeps the two
+	// paths matched. info carries them if this arm ever needs them.
+
+	DPI_AWARENESS_CONTEXT oldDpiCtx = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	SrWeaverCreateInfoDX12 ci{};
+	ci.sType = SR_TYPE_WEAVER_CREATE_INFO_DX12;
+	ci.pNext = nullptr;
+	ci.d3d12Device = sr.device;
+	ci.window = (SrNativeWindowHandle)hwnd;
+
+	const SrResult wr = srCreateWeaverDX12(sr.instance_v2, &ci, &sr.weaver_v2);
+
+	if (oldDpiCtx != NULL) {
+		SetThreadDpiAwarenessContext(oldDpiCtx);
+	}
+
+	if (!SR_SUCCEEDED(wr) || sr.weaver_v2 == nullptr) {
+		U_LOG_E("srCreateWeaverDX12 failed: %s (%d)", leia_sr_v2_result_str(wr), (int)wr);
+		sr.weaver_v2 = nullptr;
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		return false;
+	}
+
+	if (!leia_sr_v2_initialize(sr.instance_v2)) {
+		srDestroyWeaver(sr.weaver_v2);
+		sr.weaver_v2 = nullptr;
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		return false;
+	}
+
+	srWeaverSetLatencyInFrames(sr.weaver_v2, 1);
+	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+
+	U_LOG_W("SR D3D12 weaver created via the v2 C API");
+	return true;
+}
+#endif // DXR_LEIA_HAS_SR_V2
+
+/* ------------------------------------------------------------------ *
+ * v1/v2 dispatch — one helper per operation. See leia_sr_d3d11.cpp.
+ * ------------------------------------------------------------------ */
+
+bool
+w_ready(const leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		return true;
+	}
+#endif
+	return sr->weaver != nullptr;
+}
+
+bool
+lens_present(const leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		return sr->lens_v2 != nullptr;
+	}
+#endif
+	return sr->lens_hint != nullptr;
+}
+
+void
+lens_set(leiasr_d3d12 *sr, bool enable)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		if (sr->lens_v2 != nullptr) {
+			enable ? srLensEnable(sr->lens_v2) : srLensDisable(sr->lens_v2);
+		}
+		return;
+	}
+#endif
+	if (sr->lens_hint != nullptr) {
+		enable ? sr->lens_hint->enable() : sr->lens_hint->disable();
+	}
+}
+
+bool
+lens_is_enabled(leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		SrBool32 enabled = SR_FALSE;
+		if (sr->lens_v2 == nullptr || !SR_SUCCEEDED(srLensIsEnabled(sr->lens_v2, &enabled))) {
+			return false;
+		}
+		return enabled == SR_TRUE;
+	}
+#endif
+	return sr->lens_hint != nullptr && sr->lens_hint->isEnabled();
+}
+
+void
+w_set_latency(leiasr_d3d12 *sr, uint64_t latency_us)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetLatency(sr->weaver_v2, latency_us);
+		return;
+	}
+#endif
+	sr->weaver->setLatency(latency_us);
+}
+
+void
+w_set_latency_in_frames(leiasr_d3d12 *sr, uint64_t frames)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetLatencyInFrames(sr->weaver_v2, frames);
+		return;
+	}
+#endif
+	sr->weaver->setLatencyInFrames(frames);
+}
+
+void
+w_set_output_format(leiasr_d3d12 *sr, DXGI_FORMAT fmt)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetOutputFormatDX12(sr->weaver_v2, (int32_t)fmt);
+		return;
+	}
+#endif
+	sr->weaver->setOutputFormat(fmt);
+}
+
+void
+w_set_input_texture(leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetInputTextureDX12(sr->weaver_v2, sr->input_resource, (int32_t)sr->view_width,
+		                            (int32_t)sr->view_height, (int32_t)sr->input_format);
+		return;
+	}
+#endif
+	sr->weaver->setInputViewTexture(sr->input_resource, static_cast<int>(sr->view_width),
+	                                static_cast<int>(sr->view_height), sr->input_format);
+}
+
+void
+w_set_command_list(leiasr_d3d12 *sr, ID3D12GraphicsCommandList *cmd_list)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetCommandListDX12(sr->weaver_v2, cmd_list);
+		return;
+	}
+#endif
+	sr->weaver->setCommandList(cmd_list);
+}
+
+//! v2 takes scalars where v1 takes a D3D12_VIEWPORT; the caller keeps the
+//! struct anyway because it also feeds RSSetViewports on the command list.
+void
+w_set_viewport(leiasr_d3d12 *sr, const D3D12_VIEWPORT &vp)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetViewportDX12(sr->weaver_v2, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth,
+		                        vp.MaxDepth);
+		return;
+	}
+#endif
+	sr->weaver->setViewport(vp);
+}
+
+void
+w_set_scissor(leiasr_d3d12 *sr, const D3D12_RECT &rc)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverSetScissorRectDX12(sr->weaver_v2, (int32_t)rc.left, (int32_t)rc.top, (int32_t)rc.right,
+		                           (int32_t)rc.bottom);
+		return;
+	}
+#endif
+	sr->weaver->setScissorRect(rc);
+}
+
+void
+w_weave(leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		srWeaverWeave(sr->weaver_v2);
+		return;
+	}
+#endif
+	sr->weaver->weave();
+}
+
+bool
+w_get_predicted_eyes(leiasr_d3d12 *sr, float left_mm[3], float right_mm[3])
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		SrPoint3f l{};
+		SrPoint3f r{};
+		if (!SR_SUCCEEDED(srWeaverGetPredictedEyePositions(sr->weaver_v2, &l, &r))) {
+			return false;
+		}
+		left_mm[0] = l.x;
+		left_mm[1] = l.y;
+		left_mm[2] = l.z;
+		right_mm[0] = r.x;
+		right_mm[1] = r.y;
+		right_mm[2] = r.z;
+		return true;
+	}
+#endif
+	try {
+		sr->weaver->getPredictedEyePositions(left_mm, right_mm);
+	} catch (...) {
+		return false;
+	}
+	return true;
+}
+
 } // namespace
 
 extern "C" {
@@ -213,37 +489,55 @@ leiasr_d3d12_create(double max_time,
 	sr->view_width = view_width;
 	sr->view_height = view_height;
 
-	// Create SR context
-	if (!create_sr_context(max_time, *sr)) {
-		delete sr;
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leia_sr_api_selected() == LEIA_SR_API_V2) {
+		// No fallback to v1 on failure — see leia_sr_d3d11.cpp for why a
+		// silent retry on the other path is worse than a clear error.
+		if (!create_v2(max_time, hwnd, *sr)) {
+			U_LOG_E("SR v2 weaver creation failed - not falling back to v1 "
+			        "(set DXR_LEIA_SR_API=v1 to force it)");
+			delete sr;
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+		}
+	} else
+#endif
+	{
+		// Create SR context
+		if (!create_sr_context(max_time, *sr)) {
+			delete sr;
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+		}
+
+		// Create D3D12 weaver — set DPI awareness so the SDK sees physical pixels
+		// when it queries the HWND. See LeiaInc/LeiaSR@a8a9fb9 for the pattern.
+		DPI_AWARENESS_CONTEXT oldDpiCtx =
+		    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		WeaverErrorCode result = SR::CreateDX12Weaver(sr->context,
+		                                               sr->device,
+		                                               static_cast<HWND>(hwnd),
+		                                               &sr->weaver);
+		if (oldDpiCtx != NULL) {
+			SetThreadDpiAwarenessContext(oldDpiCtx);
+		}
+		if (result != WeaverErrorCode::WeaverSuccess) {
+			U_LOG_E("Failed to create SR D3D12 weaver: %d", (int)result);
+			SR::SRContext::deleteSRContext(sr->context);
+			delete sr;
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+		}
+
+		// Initialize the context after creating the weaver.
+		sr->context->initialize();
+
+		// Set default latency (1 frame). Fallback for
+		// LEIA_D3D12_ADAPTIVE_LATENCY=0; the adaptive per-frame setLatency()
+		// below overrides it (setLatency disables the SDK's frames mode).
+		sr->weaver->setLatencyInFrames(1);
 	}
 
-	// Create D3D12 weaver — set DPI awareness so the SDK sees physical pixels
-	// when it queries the HWND. See LeiaInc/LeiaSR@a8a9fb9 for the pattern.
-	DPI_AWARENESS_CONTEXT oldDpiCtx =
-	    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-	WeaverErrorCode result = SR::CreateDX12Weaver(sr->context,
-	                                               sr->device,
-	                                               static_cast<HWND>(hwnd),
-	                                               &sr->weaver);
-	if (oldDpiCtx != NULL) {
-		SetThreadDpiAwarenessContext(oldDpiCtx);
-	}
-	if (result != WeaverErrorCode::WeaverSuccess) {
-		U_LOG_E("Failed to create SR D3D12 weaver: %d", (int)result);
-		SR::SRContext::deleteSRContext(sr->context);
-		delete sr;
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	// Initialize the context after creating the weaver.
-	sr->context->initialize();
-
-	// Set default latency (1 frame). Fallback for
-	// LEIA_D3D12_ADAPTIVE_LATENCY=0; the adaptive per-frame setLatency()
-	// below overrides it (setLatency disables the SDK's frames mode).
-	sr->weaver->setLatencyInFrames(1);
+	// EVERYTHING BELOW IS SHARED BY BOTH PATHS. The adaptive-latency block is
+	// runtime policy, not SDK plumbing — an early return from the v2 branch
+	// would silently leave v2 on the SDK default and present as "v2 is slower".
 
 	// Adaptive-latency knobs, mirroring LEIA_D3D11_* / LEIA_VK_*.
 	{
@@ -277,7 +571,7 @@ leiasr_d3d12_create(double max_time,
 		sr->display_term_us = getu("LEIA_D3D12_LATENCY_DISPLAY_US", disp_default);
 
 		if (sr->latency_fixed_us > 0) {
-			sr->weaver->setLatency(sr->latency_fixed_us);
+			w_set_latency(sr, sr->latency_fixed_us);
 			sr->last_set_latency_us = sr->latency_fixed_us;
 			sr->adaptive_latency_enabled = false;
 			U_LOG_W("Leia D3D12 weave latency: FIXED %llu us (adaptive disabled)",
@@ -309,6 +603,31 @@ leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 
 	leiasr_d3d12 *sr = *leiasr_ptr;
 
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		// srDestroyLens frees the caller-owned handle WRAPPER only; the hint
+		// underneath stays owned by the context. So unlike v1 (where deleting
+		// is a double-free) this must be called, and there is no hazard in
+		// calling it. Full rationale in leia_sr_d3d11.cpp.
+		if (sr->lens_v2 != nullptr) {
+			srDestroyLens(sr->lens_v2);
+			sr->lens_v2 = nullptr;
+		}
+		srDestroyWeaver(sr->weaver_v2);
+		sr->weaver_v2 = nullptr;
+
+		if (sr->instance_v2 != nullptr) {
+			srDestroyInstance(sr->instance_v2);
+			sr->instance_v2 = nullptr;
+		}
+
+		delete sr;
+		*leiasr_ptr = nullptr;
+		U_LOG_I("Destroyed D3D12 SR weaver (v2)");
+		return;
+	}
+#endif
+
 	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
 	sr->lens_hint = nullptr;
 
@@ -333,12 +652,12 @@ leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 void
 leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format)
 {
-	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
 		return;
 	}
 
 	DXGI_FORMAT dxgi_format = static_cast<DXGI_FORMAT>(format);
-	leiasr->weaver->setOutputFormat(dxgi_format);
+	w_set_output_format(leiasr, dxgi_format);
 	U_LOG_W("SR D3D12 weaver output format set to %u", (unsigned)format);
 }
 
@@ -349,7 +668,7 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
                                uint32_t view_height,
                                uint32_t format)
 {
-	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
 		return;
 	}
 
@@ -370,10 +689,7 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
 
 	// Configure the weaver with the input texture
 	// SR SDK DX12 weaver takes ID3D12Resource*, width, height, format
-	leiasr->weaver->setInputViewTexture(leiasr->input_resource,
-	                                     static_cast<int>(view_width),
-	                                     static_cast<int>(view_height),
-	                                     leiasr->input_format);
+w_set_input_texture(leiasr);
 }
 
 // Records SR SDK weave commands onto `command_list` constrained to
@@ -414,7 +730,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    uint32_t viewport_width,
                    uint32_t viewport_height)
 {
-	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
 		U_LOG_W("leiasr_d3d12_weave called with null instance or weaver");
 		return;
 	}
@@ -474,7 +790,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 			const uint64_t prev = leiasr->last_set_latency_us;
 			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
 			if (prev == 0 || diff >= 250) {
-				leiasr->weaver->setLatency(latency_us);
+				w_set_latency(leiasr, latency_us);
 				if (prev == 0 || diff >= 2000) {
 					U_LOG_I("Leia D3D12 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
 					        (unsigned long long)latency_us,
@@ -501,7 +817,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	}
 
 	// Set command list for the weaver to record commands onto
-	leiasr->weaver->setCommandList(cmd_list);
+	w_set_command_list(leiasr, cmd_list);
 
 	// #740: the weaver's setViewport feeds BOTH the phase term
 	//   xOffset = window_WeavingX + vpX
@@ -528,7 +844,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	viewport.Height = static_cast<float>(viewport_height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-	leiasr->weaver->setViewport(viewport);
+	w_set_viewport(leiasr, viewport);
 
 	// Set scissor rect to match the RENDER viewport sub-rect.
 	D3D12_RECT scissor = {};
@@ -536,7 +852,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	scissor.top = static_cast<LONG>(viewport_y);
 	scissor.right = static_cast<LONG>(viewport_x) + static_cast<LONG>(viewport_width);
 	scissor.bottom = static_cast<LONG>(viewport_y) + static_cast<LONG>(viewport_height);
-	leiasr->weaver->setScissorRect(scissor);
+	w_set_scissor(leiasr, scissor);
 
 	// Also set viewport + scissor on the command list itself. The SR SDK
 	// weaver records draw commands but does not call RSSetViewports/Scissor
@@ -551,7 +867,7 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	// Set DPI awareness so any internal GetClientRect returns physical pixels.
 	DPI_AWARENESS_CONTEXT oldDpiCtx =
 	    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-	leiasr->weaver->weave();
+	w_weave(leiasr);
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
 	}
@@ -562,17 +878,16 @@ leiasr_d3d12_get_predicted_eye_positions(struct leiasr_d3d12 *leiasr,
                                          float out_left_eye[3],
                                          float out_right_eye[3])
 {
-	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
 		return false;
 	}
 
-	// SR SDK throws std::runtime_error ~per frame from inside this call
-	// as routine internal control flow. Catch at the DP boundary so it
-	// never crosses the C ABI. See [[feedback_leia_eye_pos_throws_intrinsic]].
+	// On v1 the SR SDK throws std::runtime_error ~per frame from inside this
+	// call as routine internal control flow; the catch keeps it from crossing
+	// the C ABI. See [[feedback_leia_eye_pos_throws_intrinsic]]. On v2 the same
+	// condition arrives as an SrResult. Both handled inside the helper.
 	float left_mm[3], right_mm[3];
-	try {
-		leiasr->weaver->getPredictedEyePositions(left_mm, right_mm);
-	} catch (...) {
+	if (!w_get_predicted_eyes(leiasr, left_mm, right_mm)) {
 		return false;
 	}
 
@@ -647,22 +962,18 @@ leiasr_d3d12_supports_display_mode_switch(struct leiasr_d3d12 *leiasr)
 		return false;
 	}
 
-	return leiasr->lens_hint != nullptr;
+	return lens_present(leiasr);
 }
 
 bool
 leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d)
 {
-	if (leiasr == nullptr || leiasr->lens_hint == nullptr) {
+	if (leiasr == nullptr || !lens_present(leiasr)) {
 		return false;
 	}
 
 	try {
-		if (enable_3d) {
-			leiasr->lens_hint->enable();
-		} else {
-			leiasr->lens_hint->disable();
-		}
+		lens_set(leiasr, enable_3d);
 		U_LOG_W("SR D3D12 display mode switched to %s", enable_3d ? "3D" : "2D");
 		return true;
 	} catch (...) {
@@ -674,11 +985,11 @@ leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d)
 bool
 leiasr_d3d12_get_hardware_3d_state(struct leiasr_d3d12 *leiasr, bool *out_is_3d)
 {
-	if (leiasr == nullptr || leiasr->lens_hint == nullptr || out_is_3d == nullptr) {
+	if (leiasr == nullptr || !lens_present(leiasr) || out_is_3d == nullptr) {
 		return false;
 	}
 	try {
-		*out_is_3d = leiasr->lens_hint->isEnabled();
+		*out_is_3d = lens_is_enabled(leiasr);
 		return true;
 	} catch (...) {
 		return false;
