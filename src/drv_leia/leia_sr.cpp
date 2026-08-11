@@ -553,7 +553,13 @@ leiasr_weave(struct leiasr *leiasr,
 	leiasr->weaver_ops->set_scissor_rect(leiasr->weaver, rect);
 	// If caller provides a command buffer, use it; otherwise use the
 	// pre-allocated one from leiasr_create(). The weaver always needs a
-	// valid command buffer — passing VK_NULL_HANDLE causes black screen.
+	// valid command buffer — passing VK_NULL_HANDLE causes a black screen,
+	// and silently: v1's weave() early-returns on a null command buffer with
+	// no error and no log (vkweaver.cpp:1260-1262), so the fallback above is
+	// load-bearing, not defensive. The v2 C surface rejects null outright
+	// (srWeaverSetCommandBufferVK -> SR_ERROR_VALIDATION_FAILURE), a
+	// deliberate divergence from the C++ interface — so on the v2 path this
+	// becomes a reported error instead of a black screen.
 	VkCommandBuffer cmd = (commandBuffer != VK_NULL_HANDLE)
 	                          ? commandBuffer
 	                          : leiasr->commandBuffer;
@@ -562,8 +568,20 @@ leiasr_weave(struct leiasr *leiasr,
 	                                           imageHeight, imageFormat);
 	// Set the output framebuffer for weaving. The weaver renders to the
 	// application-provided framebuffer — it does not manage its own swapchain.
-	// VK_NULL_HANDLE is only valid if setOutputFrameBuffer was called on a
-	// prior frame and the framebuffer hasn't changed.
+	//
+	// Retaining the previous framebuffer is done by NOT CALLING the setter,
+	// which is what the skip below does. Do NOT "simplify" this by passing
+	// VK_NULL_HANDLE through: the SDK stores the handle unconditionally,
+	// including null, so passing null CLEARS the binding. Its weave() then
+	// begins no render pass at all (`if (outputFramebuffer != nullptr)` guards
+	// both vkCmdBeginRenderPass and vkCmdEndRenderPass), producing an invalid
+	// recording rather than a wrong image.
+	//
+	// At the SDK boundary VK_NULL_HANDLE has a different, deliberate meaning:
+	// "the command buffer I gave you has already begun a render pass, record
+	// into it". We never use that mode. Confirmed against vkweaver.cpp with
+	// the SDK team; an earlier comment here asserted the opposite and was
+	// never exercised, because this skip meant null was never passed.
 	if (framebuffer != VK_NULL_HANDLE) {
 		leiasr->weaver_ops->set_output_framebuffer(leiasr->weaver, framebuffer, framebufferWidth,
 		                                           framebufferHeight, framebufferFormat);
