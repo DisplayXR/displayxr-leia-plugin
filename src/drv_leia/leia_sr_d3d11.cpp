@@ -675,11 +675,22 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
-		// Ownership differs from v1 in one important way: the v2 lens is an
-		// independently-created handle we own and MUST destroy, whereas the v1
-		// SwitchableLensHint belongs to the SRContext and destroying it is a
-		// double-free. Same concept, opposite obligation — hence the separate
-		// teardown rather than a shared one.
+		// The v2 lens must be destroyed here; the v1 one must NOT. That is not
+		// because ownership inverted — it is because v2 adds a second, smaller
+		// object that v1 has no equivalent of:
+		//
+		//   v1 SwitchableLensHint : owned by the SRContext. Deleting it is a
+		//                           double-free, which is why the v1 branch
+		//                           below only nulls the pointer.
+		//   v2 SrLens             : a thin handle WRAPPER we own, over that same
+		//                           context-owned hint. srDestroyLens frees only
+		//                           the wrapper and deliberately does not touch
+		//                           the hint underneath.
+		//
+		// So there is no double-free hazard in calling it, and skipping it leaks
+		// the wrapper (one small struct), not the lens. Confirmed against the SR
+		// runtime source — sr_lens.h documents neither, so do not go looking for
+		// it there.
 		if (sr->lens_v2 != nullptr) {
 			srDestroyLens(sr->lens_v2);
 			sr->lens_v2 = nullptr;
