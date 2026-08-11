@@ -14,8 +14,42 @@ set(LEIA_SOURCES
     leia_interface.h
     leia_types.h
     leia_sr_probe.cpp
+    leia_sr_api_select.h
+    leia_sr_api_select.cpp
     leia_plugin.c
 )
+
+# --- SR v2 C99 API (optional, additive) --------------------------------------
+# The v2 API (SrInstance/SrWeaver) lives in a SEPARATE SDK root from the pinned
+# C++ SDK, so adopting it does not disturb the C++ link at all: LEIASR_SDKROOT
+# keeps driving every existing path byte-identically, and this only adds the v2
+# headers + the static loader.
+#
+# The loader does NOT link against the SR Platform - it is a static C99 lib that
+# LoadLibrary's LeiaSR_runtime.dll at call time. So a machine with an older
+# Platform cannot fail to load this plug-in; leia_sr_api_select.cpp simply
+# resolves to the v1 path. That property is what makes the dual-path safe.
+#
+# Point LEIASR_V2_SDKROOT at an extracted simulatedreality-SDK-*-win64 tree.
+# Absent => DXR_LEIA_HAS_SR_V2 undefined => v2 compiles out entirely and the
+# plug-in builds exactly as it does today against the C++-only SDK.
+set(LEIA_SR_V2_AVAILABLE FALSE)
+if(NOT DEFINED LEIASR_V2_SDKROOT AND DEFINED ENV{LEIASR_V2_SDKROOT})
+    set(LEIASR_V2_SDKROOT "$ENV{LEIASR_V2_SDKROOT}")
+endif()
+if(LEIASR_V2_SDKROOT AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_instance.h")
+    if(EXISTS "${LEIASR_V2_SDKROOT}/lib/srSDK_loader.lib")
+        set(LEIA_SR_V2_AVAILABLE TRUE)
+        message(STATUS "Found SR v2 C99 SDK at ${LEIASR_V2_SDKROOT} - enabling the v2 path")
+    else()
+        message(WARNING "LEIASR_V2_SDKROOT has headers but no lib/srSDK_loader.lib - "
+                        "incomplete SDK artifact; building v1-only. Re-cut the drop rather "
+                        "than concluding the v2 API is unavailable.")
+    endif()
+elseif(LEIASR_V2_SDKROOT)
+    message(WARNING "LEIASR_V2_SDKROOT='${LEIASR_V2_SDKROOT}' has no include/sr/sr_instance.h - "
+                    "incomplete SDK artifact; building v1-only.")
+endif()
 
 # Vulkan weaver path. The weaver DLL is resolved and loaded at RUNTIME (see
 # leia_vk_weaver_select.cpp), so no SR Vulkan import library is linked and the
@@ -155,6 +189,24 @@ target_link_libraries(DisplayXR-LeiaSR
         ${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 )
 add_dependencies(DisplayXR-LeiaSR ${RUNTIME_TARGET})
+
+if(LEIA_SR_V2_AVAILABLE)
+    # Additive by construction: the v2 headers sit in their own SDK root and the
+    # loader is a STATIC lib, so nothing about the C++ link above changes and no
+    # new DLL import is introduced. DXR_LEIA_HAS_SR_V2 is the single gate every
+    # v2 code path is guarded by.
+    target_include_directories(DisplayXR-LeiaSR PRIVATE "${LEIASR_V2_SDKROOT}/include")
+    # advapi32: sr_loader.c's sr_do_init() reads the runtime's location from the
+    # registry (RegOpenKeyExA/RegQueryValueExA/RegCloseKey). Linking the loader
+    # WITHOUT this only appears to work while nothing calls it -- the linker does
+    # not pull sr_loader.obj until there is a reference, so the first real v2
+    # call site would be the thing that "broke" the link. Found by building a
+    # standalone probe against the loader before wiring any call sites.
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE
+        "${LEIASR_V2_SDKROOT}/lib/srSDK_loader.lib"
+        advapi32)
+    target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_V2=1)
+endif()
 
 if(LEIA_SR_VULKAN_AVAILABLE)
     # Both ABI dispatch tables are linked in; which one is used is decided at
