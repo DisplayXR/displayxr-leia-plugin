@@ -90,7 +90,28 @@ resolve_once(void)
 	//     results compared. Without it, exercising v1 would mean uninstalling
 	//     a Platform, which is exactly the friction that lets a dual-path
 	//     divergence go unnoticed.
-	const char *env = std::getenv("DXR_LEIA_SR_API");
+	const char *env_raw = std::getenv("DXR_LEIA_SR_API");
+
+	// Trim surrounding whitespace before comparing. `set DXR_LEIA_SR_API=v1 &&
+	// app.exe` in cmd.exe puts the space BEFORE the `&&` inside the value, so
+	// the variable is "v1 " and a strict compare rejects it. Caught by walking
+	// into it during the first A/B run: the selector correctly warned and
+	// resolved automatically, which meant the "v1 control" silently ran v2 —
+	// the exact class of mistake this env var exists to prevent.
+	char env_buf[32] = {0};
+	const char *env = nullptr;
+	if (env_raw != nullptr) {
+		while (*env_raw == ' ' || *env_raw == '\t') {
+			env_raw++;
+		}
+		snprintf(env_buf, sizeof(env_buf), "%s", env_raw);
+		size_t n = strlen(env_buf);
+		while (n > 0 && (env_buf[n - 1] == ' ' || env_buf[n - 1] == '\t' || env_buf[n - 1] == '\r')) {
+			env_buf[--n] = '\0';
+		}
+		env = env_buf;
+	}
+
 	if (env != nullptr && env[0] != '\0' && _stricmp(env, "auto") != 0) {
 		if (_stricmp(env, "v1") == 0) {
 			g_api = LEIA_SR_API_V1;
