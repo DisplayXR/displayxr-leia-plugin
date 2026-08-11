@@ -184,6 +184,16 @@ if not "%DXR_RUNTIME_SOURCE_DIR%"=="" (
     )
 )
 
+REM Optional SR v2 (C99) SDK, kept as a SEPARATE root from LEIASR_SDKROOT
+REM because the two SDKs are independent drops and the migration needs both
+REM present at once. Unset simply builds the v1-only plug-in, which is the
+REM shipping configuration until a win64 v2 drop is generally available.
+REM   set LEIASR_V2_SDKROOT=C:\path\to\simulatedreality-SDK-...-win64-Release
+if not "%LEIASR_V2_SDKROOT%"=="" (
+    set CMAKE_ARGS=!CMAKE_ARGS! -DLEIASR_V2_SDKROOT="%LEIASR_V2_SDKROOT%"
+    echo Building WITH the SR v2 C API ^(LEIASR_V2_SDKROOT set^).
+)
+
 cmake !CMAKE_ARGS!
 if %ERRORLEVEL% NEQ 0 (
     echo CMake generate FAILED

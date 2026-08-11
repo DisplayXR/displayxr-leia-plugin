@@ -16,6 +16,8 @@ set(LEIA_SOURCES
     leia_sr_probe.cpp
     leia_sr_api_select.h
     leia_sr_api_select.cpp
+    leia_sr_v2_common.h
+    leia_sr_v2_common.cpp
     leia_plugin.c
 )
 
