@@ -16,6 +16,13 @@
 // the ABI-neutral shim, whose backing DLL and vtable are chosen at runtime.
 // See leia_vk_weaver.h for the full explanation.
 #include "leia_vk_weaver.h"
+#include "leia_sr_api_select.h"
+#include "leia_sr_v2_common.h"
+
+#ifdef DXR_LEIA_HAS_SR_V2
+#include <sr/sr_vk.h>
+#include <sr/sr_weaver.h>
+#endif
 
 #include <sr/world/display/display.h>
 #include <sr/sense/display/switchablehint.h>
@@ -47,8 +54,17 @@ struct leiasr
 	//! (its vtable layout depends on which weaver DLL was loaded).
 	void *weaver = nullptr;
 	//! Dispatch table matching the loaded weaver's ABI; null iff `weaver` is null.
+	//! On the v2 path this is `leia_vk_weaver_ops_v2()` and `weaver` is an
+	//! `SrWeaver` — every per-frame call site is unchanged either way.
 	const struct leia_vk_weaver_ops *weaver_ops = nullptr;
 	SR::SwitchableLensHint *lens_hint = nullptr;
+
+#ifdef DXR_LEIA_HAS_SR_V2
+	//! v2 objects. `instance_v2 != nullptr` is this arm's v1/v2 discriminant
+	//! (unlike the other arms, `weaver` is non-null on BOTH paths).
+	SrInstance instance_v2 = nullptr;
+	SrLens lens_v2 = nullptr;
+#endif
 
 	// Display dimensions in meters (for Kooima FOV calculation)
 	float display_width_m = 0.0f;
@@ -265,8 +281,118 @@ CreateSRContext(double maxTime, leiasr &sr)
 	return (sr.context != nullptr) && displayReady;
 }
 
+#ifdef DXR_LEIA_HAS_SR_V2
 /*!
- * Create the SR Vulkan weaver.
+ * The v2 creation sequence for the Vulkan arm.
+ *
+ * Creation is the one operation NOT routed through `leia_vk_weaver_ops`: it
+ * needs the `SrInstance`, which the shared vtable signature has no room for.
+ * Every per-frame call still goes through the table, so no call site changes.
+ *
+ * @warning `srCreateWeaverVK` SUBMITS to `graphics_queue` and then waits for it
+ * to go idle (transient uploads for the correction texture and vertex buffers).
+ * That stalls the queue we hand it — which is the application's main graphics
+ * queue, not a private one. Acceptable only because this runs once at
+ * display-processor creation; do not move it onto a per-frame or resize path.
+ */
+bool
+create_v2(double max_time,
+          HWND hwnd,
+          VkDevice device,
+          VkPhysicalDevice physical_device,
+          VkQueue graphics_queue,
+          VkCommandPool command_pool,
+          leiasr &sr,
+          bool *out_unsupported)
+{
+	if (out_unsupported != nullptr) {
+		*out_unsupported = false;
+	}
+	if (!leia_sr_v2_create_instance(max_time, &sr.instance_v2)) {
+		return false;
+	}
+
+	leia_sr_v2_display_info info{};
+	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, &info)) {
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		return false;
+	}
+
+	sr.display_width_m = info.width_m;
+	sr.display_height_m = info.height_m;
+	sr.display_dims_valid = true;
+	sr.display_pixel_width = info.pixel_width;
+	sr.display_pixel_height = info.pixel_height;
+	sr.display_pixel_dims_valid = true;
+	sr.display_screen_left = info.screen_left;
+	sr.display_screen_top = info.screen_top;
+	sr.display_screen_right = info.screen_left + (int32_t)info.pixel_width;
+	sr.display_screen_bottom = info.screen_top + (int32_t)info.pixel_height;
+	sr.recommended_view_width = info.recommended_view_width;
+	sr.recommended_view_height = info.recommended_view_height;
+	sr.recommended_dims_valid = info.recommended_valid;
+
+	SrWeaverCreateInfoVulkan ci{};
+	ci.sType = SR_TYPE_WEAVER_CREATE_INFO_VULKAN;
+	ci.pNext = nullptr;
+	ci.device = device;
+	ci.physicalDevice = physical_device;
+	ci.graphicsQueue = graphics_queue;
+	ci.commandPool = command_pool;
+	ci.window = (SrNativeWindowHandle)hwnd;
+
+	SrWeaver weaver = nullptr;
+	const SrResult wr = srCreateWeaverVK(sr.instance_v2, &ci, &weaver);
+	if (!SR_SUCCEEDED(wr) || weaver == nullptr) {
+		// SR_ERROR_FUNCTION_UNSUPPORTED is NOT a fault — it is the loader
+		// reporting that this runtime has no Vulkan dispatch slots at all
+		// (an SR Platform predating the C99 Vulkan surface, or a 32-bit build,
+		// where Vulkan is not built). Vulkan is the only arm that can hit this:
+		// D3D11/D3D12/GL slots have existed since the first v2 runtime, so for
+		// them any creation failure really is a fault v1 would share.
+		//
+		// This is exactly the case v1 CAN serve, so it is the one place where
+		// falling back is right rather than the silent-divergence hazard the
+		// other arms guard against. `*out_unsupported` tells the caller to
+		// take the v1 path instead of failing the session.
+		if (wr == SR_ERROR_FUNCTION_UNSUPPORTED) {
+			U_LOG_W("SR v2 has no Vulkan surface on this runtime (%s) - using the v1 weaver. "
+			        "Install an SR Platform carrying the C99 Vulkan surface to use v2 here.",
+			        leia_sr_v2_result_str(wr));
+		} else {
+			U_LOG_E("srCreateWeaverVK failed: %s (%d)", leia_sr_v2_result_str(wr), (int)wr);
+		}
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		if (out_unsupported != nullptr) {
+			*out_unsupported = (wr == SR_ERROR_FUNCTION_UNSUPPORTED);
+		}
+		return false;
+	}
+
+	if (!leia_sr_v2_initialize(sr.instance_v2)) {
+		srDestroyWeaver(weaver);
+		srDestroyInstance(sr.instance_v2);
+		sr.instance_v2 = nullptr;
+		return false;
+	}
+
+	// The whole point of this arm's existing indirection: hand the table the
+	// SrWeaver and every per-frame call site works unmodified.
+	sr.weaver = (void *)weaver;
+	sr.weaver_ops = leia_vk_weaver_ops_v2();
+
+	srWeaverSetLatencyInFrames(weaver, 1);
+	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+
+	U_LOG_W("SR Vulkan weaver created via the v2 C API");
+	return true;
+}
+#endif // DXR_LEIA_HAS_SR_V2
+
+/*!
+ * Create the SR Vulkan weaver (v1 path).
  */
 bool
 CreateSRWeaver(SR::SRContext *context,
@@ -408,13 +534,35 @@ leiasr_create(double maxTime,
 	// setOutputFrameBuffer / setInputViewTexture and records interlacing
 	// commands into them.
 	HWND weaverHwnd = (HWND)windowHandle;
-	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd, sr)) {
-		U_LOG_E("Failed to create SR weaver");
+
+#ifdef DXR_LEIA_HAS_SR_V2
+	bool v2_vk_unsupported = false;
+	if (leia_sr_api_selected() == LEIA_SR_API_V2 &&
+	    create_v2(maxTime, weaverHwnd, device, physicalDevice, graphicsQueue, commandPool, *sr,
+	              &v2_vk_unsupported)) {
+		// v2 weaver is up; nothing else to do.
+	} else if (leia_sr_api_selected() == LEIA_SR_API_V2 && !v2_vk_unsupported) {
+		// A real fault, not a missing surface — do NOT silently run v1 on a
+		// path the operator asked for v2 on. See leia_sr_d3d11.cpp.
+		U_LOG_E("SR v2 Vulkan weaver creation failed - not falling back to v1 "
+		        "(set DXR_LEIA_SR_API=v1 to force it)");
 		delete sr;
 		return XRT_ERROR_VULKAN;
+	} else
+#endif
+	{
+		if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd,
+		                    sr)) {
+			U_LOG_E("Failed to create SR weaver");
+			delete sr;
+			return XRT_ERROR_VULKAN;
+		}
+
+		sr->context->initialize();
 	}
 
-	sr->context->initialize();
+	// EVERYTHING BELOW IS SHARED BY BOTH PATHS — the adaptive-latency policy is
+	// runtime policy, not SDK plumbing.
 
 	// Apply adaptive weave-latency policy (VK-only setLatency tuning; the app
 	// never calls anything Leia-specific — we derive FPS from the weave cadence).
@@ -467,6 +615,32 @@ leiasr_destroy(struct leiasr *leiasr)
 	// Mitigation 2: Explicitly destroy the weaver before deleting the context.
 	// This ensures the window subclass is restored (via restoreOriginalWindowProc)
 	// before the object memory is freed, reducing the race window further.
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr->instance_v2 != nullptr) {
+		// v2 teardown. No WndProc subclass to restore and no SRContext, so the
+		// message-pump mitigations around the v1 path do not apply.
+		if (leiasr->weaver != nullptr) {
+			leiasr->weaver_ops->destroy(leiasr->weaver);
+			leiasr->weaver = nullptr;
+			leiasr->weaver_ops = nullptr;
+		}
+		if (leiasr->lens_v2 != nullptr) {
+			// Frees the caller-owned handle wrapper only; see leia_sr_d3d11.cpp.
+			srDestroyLens(leiasr->lens_v2);
+			leiasr->lens_v2 = nullptr;
+		}
+		srDestroyInstance(leiasr->instance_v2);
+		leiasr->instance_v2 = nullptr;
+
+		// NOTE: this arm's destroy takes `struct leiasr *`, not a
+		// pointer-to-pointer like the D3D/GL arms — there is no caller pointer
+		// to null out here.
+		delete leiasr;
+		U_LOG_I("Destroyed VK SR weaver (v2)");
+		return;
+	}
+#endif
+
 	if (leiasr->weaver != nullptr) {
 		U_LOG_I("leiasr_destroy: explicitly destroying weaver");
 		leiasr->weaver_ops->destroy(leiasr->weaver);
