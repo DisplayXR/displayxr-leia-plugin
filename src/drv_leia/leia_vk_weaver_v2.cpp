@@ -146,6 +146,47 @@ v2_get_predicted_eye_positions(void *raw, float left[3], float right[3])
 	return true;
 }
 
+void
+v2_weave_submitted(void *raw, VkQueue queue)
+{
+	// MUST be the queue the weave command buffer went to: the weaver puts an
+	// empty fence-carrying submit on it to count frames in flight, so a
+	// different queue tracks the wrong thing. A null queue is rejected by the
+	// SDK with VALIDATION_FAILURE rather than silently accepted.
+	const SrResult r = srWeaverWeaveSubmittedVulkan(as_weaver(raw), (SrVkQueue)queue);
+	if (!SR_SUCCEEDED(r)) {
+		// Once, not per frame — this sits on the hot path.
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_E("srWeaverWeaveSubmittedVulkan failed: %s (%d) - late latching will not run",
+			        leia_sr_v2_result_str(r), (int)r);
+			warned = true;
+		}
+	}
+}
+
+bool
+v2_enable_late_latching(void *raw, bool enable)
+{
+	SrWeaver w = as_weaver(raw);
+	const SrResult r = srWeaverEnableLateLatching(w, enable ? SR_TRUE : SR_FALSE);
+	if (!SR_SUCCEEDED(r)) {
+		U_LOG_W("srWeaverEnableLateLatching failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
+		return false;
+	}
+
+	// Read back the EFFECTIVE state rather than trusting the enable. The
+	// unimplemented backends return a hardcoded false here, and a live backend
+	// clears the flag itself on failure — so this is the only honest answer to
+	// "did it take". Believing the enable is how you end up standing a latency
+	// predictor down in favour of a latch that never runs.
+	SrBool32 effective = SR_FALSE;
+	if (!SR_SUCCEEDED(srWeaverIsLateLatchingEnabled(w, &effective))) {
+		return false;
+	}
+	return (effective == SR_TRUE) == enable;
+}
+
 const struct leia_vk_weaver_ops g_ops_v2 = {
     v2_create,
     v2_destroy,
@@ -157,6 +198,8 @@ const struct leia_vk_weaver_ops g_ops_v2 = {
     v2_set_latency,
     v2_weave,
     v2_get_predicted_eye_positions,
+    v2_weave_submitted,
+    v2_enable_late_latching,
 };
 
 } // namespace

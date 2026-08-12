@@ -221,6 +221,24 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 	}
 
 	srWeaverSetLatencyInFrames(sr.weaver_v2, 1);
+
+	// Late latching: automatic on this backend. It submits implicitly as it
+	// records, so the weaver places its own completion marker inside weave()
+	// (D3D11_QUERY_EVENT / glFenceSync) and needs nothing from us — unlike
+	// Vulkan, where the compositor owns the submit and must call
+	// srWeaverWeaveSubmittedVulkan.
+	//
+	// Read the EFFECTIVE state back rather than trusting the enable: the
+	// unimplemented backends return a hardcoded false, and a live one clears
+	// the flag itself on failure. Believing the enable is how a latency
+	// predictor stands down in favour of a latch that never runs.
+	if (SR_SUCCEEDED(srWeaverEnableLateLatching(sr.weaver_v2, SR_TRUE))) {
+		SrBool32 ll = SR_FALSE;
+		if (SR_SUCCEEDED(srWeaverIsLateLatchingEnabled(sr.weaver_v2, &ll))) {
+			U_LOG_W("SR %s late latching: %s", "GL",
+			        ll == SR_TRUE ? "ENABLED (effective)" : "declined by the backend");
+		}
+	}
 	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
 
 	U_LOG_W("SR GL weaver created via the v2 C API");

@@ -65,6 +65,26 @@ leiasr_destroy(struct leiasr *leiasr);
  * Runtime timing feedback (set_frame_timing): measured weave→scanout of the
  * last completed frame (0 = unknown) + display refresh period (0 = unknown).
  */
+/*!
+ * Tell the weaver this frame's weave command buffer has been submitted, on
+ * @p queue. Vulkan-only and REQUIRED for late latching: the weaver records into
+ * a buffer the compositor submits, so it cannot mark the frame in flight itself
+ * the way the D3D11 / GL weavers do. Omit this and the latch never runs while
+ * enable still reports success.
+ *
+ * No-op on the v1 path — `weaveSubmitted` has no C++ surface there.
+ */
+void
+leiasr_weave_submitted(struct leiasr *leiasr, void *queue);
+
+/*!
+ * Turn late latching on, returning whether it is EFFECTIVELY on afterwards
+ * (read back, not the enable's return — see leia_vk_weaver.h). False on the v1
+ * path and on any backend whose implementation is a stub.
+ */
+bool
+leiasr_enable_late_latching(struct leiasr *leiasr, bool enable);
+
 void
 leiasr_set_frame_timing(struct leiasr *leiasr,
                         uint64_t weave_to_scanout_ns,

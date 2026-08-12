@@ -90,6 +90,29 @@ struct leia_vk_weaver_ops
 	//! Returns false if the SDK threw — it throws ~per frame as routine control
 	//! flow, and that must never cross the plug-in's C ABI.
 	bool (*get_predicted_eye_positions)(void *raw, float left[3], float right[3]);
+
+	/*!
+	 * Tell the weaver the weave command buffer has been submitted, and on
+	 * which queue. Vulkan-only: the weaver records into a command buffer the
+	 * COMPOSITOR submits, so it cannot place its own completion marker the way
+	 * the D3D11 and GL weavers do (D3D11_QUERY_EVENT / glFenceSync inside
+	 * weave()). Without this, late latching silently declines to latch while
+	 * enableLateLatching still reports success.
+	 *
+	 * NULL on the v1 backends — `weaveSubmitted` has no C++ surface for them to
+	 * reach, so v1 simply never late-latches. Callers must null-check.
+	 */
+	void (*weave_submitted)(void *raw, VkQueue queue);
+
+	/*!
+	 * Enable late latching and report the EFFECTIVE state afterwards, not the
+	 * enable's return. The vendor clears the flag itself on failure (e.g.
+	 * "Exceeded maximum frames in flight"), and the unimplemented backends
+	 * return a hardcoded false — so reading it back is the only way to know
+	 * whether the enable took. Returns false if unsupported or if it did not
+	 * take. NULL on the v1 backends.
+	 */
+	bool (*enable_late_latching)(void *raw, bool enable);
 };
 
 //! Dispatch table compiled against `sr_vk_abi/legacy/sr/weaver/vkweaver.h`.
