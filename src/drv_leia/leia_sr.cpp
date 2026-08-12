@@ -382,12 +382,23 @@ create_v2(double max_time,
 		return false;
 	}
 
-	// The whole point of this arm's existing indirection: hand the table the
-	// SrWeaver and every per-frame call site works unmodified.
-	sr.weaver = (void *)weaver;
-	sr.weaver_ops = leia_vk_weaver_ops_v2();
+	// (sr.weaver / sr.weaver_ops assigned above, before enabling late latching.)
 
 	srWeaverSetLatencyInFrames(weaver, 1);
+
+	// Late latching on Vulkan REQUIRES the submit hook, because the compositor
+	// owns the vkQueueSubmit and the weaver cannot mark the frame in flight
+	// itself. leiasr_enable_late_latching refuses to enable without it, so this
+	// cannot silently become a latch that never runs — but note that whether it
+	// does anything ALSO depends on frames actually being queued: a compositor
+	// that waits on the submit fence immediately leaves nothing to patch.
+	sr.weaver = (void *)weaver;
+	sr.weaver_ops = leia_vk_weaver_ops_v2();
+	if (leiasr_enable_late_latching(&sr, true)) {
+		U_LOG_W("SR Vulkan late latching: ENABLED (effective) - submit hook wired");
+	} else {
+		U_LOG_W("SR Vulkan late latching: not enabled (unsupported, or the enable did not take)");
+	}
 	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
 
 	U_LOG_W("SR Vulkan weaver created via the v2 C API");
@@ -689,6 +700,39 @@ leiasr_destroy(struct leiasr *leiasr)
 	delete leiasr;
 
 	U_LOG_I("Destroyed leiasr instance");
+}
+
+void
+leiasr_weave_submitted(struct leiasr *leiasr, void *queue)
+{
+	if (leiasr == nullptr || leiasr->weaver == nullptr || leiasr->weaver_ops == nullptr) {
+		return;
+	}
+	// NULL on v1 — the null-check IS the version gate, in one place.
+	if (leiasr->weaver_ops->weave_submitted == nullptr) {
+		return;
+	}
+	leiasr->weaver_ops->weave_submitted(leiasr->weaver, (VkQueue)queue);
+}
+
+bool
+leiasr_enable_late_latching(struct leiasr *leiasr, bool enable)
+{
+	if (leiasr == nullptr || leiasr->weaver == nullptr || leiasr->weaver_ops == nullptr) {
+		return false;
+	}
+	if (leiasr->weaver_ops->enable_late_latching == nullptr) {
+		return false; // v1 path: no C99 surface, never latches.
+	}
+	// Refuse to enable without the submit hook. Enabling it anyway would give
+	// a latch that reports success and never runs, which is worse than none —
+	// a horizon predictor could stand down in its favour.
+	if (enable && leiasr->weaver_ops->weave_submitted == nullptr) {
+		U_LOG_W("late latching: refusing to enable without a weave-submitted hook "
+		        "(it would report success and never latch)");
+		return false;
+	}
+	return leiasr->weaver_ops->enable_late_latching(leiasr->weaver, enable);
 }
 
 void

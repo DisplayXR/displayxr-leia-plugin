@@ -1884,6 +1884,24 @@ leia_dp_is_alpha_native(struct xrt_display_processor *xdp)
 // client_presents=false); IPC VK clients route through the D3D11 service DP, so
 // the client-present branch never fires here but is kept for symmetry with the
 // D3D11/D3D12 slots.
+#ifdef XRT_DP_VK_HAS_WEAVE_SUBMITTED
+/*!
+ * The compositor telling us this frame's weave went to the GPU. We recorded the
+ * weave into ITS command buffer, so this is the only way we learn the submit
+ * happened — and vendor late latching needs exactly that edge to patch the
+ * vertex buffer of a queued frame with a freshly predicted eye position.
+ */
+static void
+leia_dp_vk_weave_submitted(struct xrt_display_processor_vk *xdp, VkQueue queue)
+{
+	auto *ldp = (struct leia_display_processor *)xdp;
+	if (ldp == nullptr || ldp->leiasr == nullptr) {
+		return;
+	}
+	leiasr_weave_submitted(ldp->leiasr, (void *)queue);
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 static void
 leia_dp_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
@@ -2090,6 +2108,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.base.set_background_2d = leia_dp_set_background_2d; // #491 part 3
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
+#ifdef XRT_DP_VK_HAS_WEAVE_SUBMITTED
+	ldp->base.weave_submitted = leia_dp_vk_weave_submitted; // late latching (appended VK-variant slot)
+#endif
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
 #endif
@@ -2200,6 +2221,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.base.destroy = leia_dp_destroy;
 	ldp->base.notify_target_recreated = leia_dp_notify_target_recreated; // #602 (appended VK-variant slot)
+#ifdef XRT_DP_VK_HAS_WEAVE_SUBMITTED
+	ldp->base.weave_submitted = leia_dp_vk_weave_submitted; // late latching (appended VK-variant slot)
+#endif
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
 #endif

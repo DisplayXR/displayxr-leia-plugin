@@ -171,6 +171,13 @@ const struct leia_vk_weaver_ops g_ops = {
     impl_set_latency,
     impl_weave,
     impl_get_predicted_eye_positions,
+    // weave_submitted / enable_late_latching: NULL on v1. `weaveSubmitted` has
+    // no C++ surface on IVulkanWeaver1, so the v1 path can never drive late
+    // latching — and enabling it without the submit hook produces a latch that
+    // reports success and never runs. Left explicitly NULL rather than stubbed
+    // so the caller's null-check is the thing that decides, in one place.
+    nullptr,
+    nullptr,
 };
 
 } // namespace
