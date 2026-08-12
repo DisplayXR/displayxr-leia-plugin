@@ -107,7 +107,7 @@ leia_vk_weaver_ops_stamp(void);
  * Unlike the two above, this one is not selected by probing weaver DLLs — it is
  * chosen by `leia_sr_api_selected()`, and its `create` member is never called
  * (creation needs an `SrInstance`, which the shared signature has no room for;
- * `leia_sr.cpp` calls `srCreateWeaverVK` directly).
+ * `leia_sr.cpp` calls `srCreateWeaverVulkan` directly).
  */
 const struct leia_vk_weaver_ops *
 leia_vk_weaver_ops_v2(void);

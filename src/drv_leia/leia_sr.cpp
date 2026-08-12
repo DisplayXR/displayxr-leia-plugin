@@ -289,7 +289,7 @@ CreateSRContext(double maxTime, leiasr &sr)
  * needs the `SrInstance`, which the shared vtable signature has no room for.
  * Every per-frame call still goes through the table, so no call site changes.
  *
- * @warning `srCreateWeaverVK` SUBMITS to `graphics_queue` and then waits for it
+ * @warning `srCreateWeaverVulkan` SUBMITS to `graphics_queue` and then waits for it
  * to go idle (transient uploads for the correction texture and vertex buffers).
  * That stalls the queue we hand it — which is the application's main graphics
  * queue, not a private one. Acceptable only because this runs once at
@@ -333,17 +333,21 @@ create_v2(double max_time,
 	sr.recommended_view_height = info.recommended_view_height;
 	sr.recommended_dims_valid = info.recommended_valid;
 
+	// The create-info is field-for-field what this arm already passes; only the
+	// typenames differ. ST-5530's Sr* typedefs are 32-bit-correct by
+	// construction — void* for dispatchable handles, uint64_t for
+	// non-dispatchable — so these casts are widening on 64-bit and exact on 32.
 	SrWeaverCreateInfoVulkan ci{};
 	ci.sType = SR_TYPE_WEAVER_CREATE_INFO_VULKAN;
 	ci.pNext = nullptr;
-	ci.device = device;
-	ci.physicalDevice = physical_device;
-	ci.graphicsQueue = graphics_queue;
-	ci.commandPool = command_pool;
+	ci.device = (SrVkDevice)device;
+	ci.physicalDevice = (SrVkPhysicalDevice)physical_device;
+	ci.graphicsQueue = (SrVkQueue)graphics_queue;
+	ci.commandPool = (SrVkCommandPool)command_pool;
 	ci.window = (SrNativeWindowHandle)hwnd;
 
 	SrWeaver weaver = nullptr;
-	const SrResult wr = srCreateWeaverVK(sr.instance_v2, &ci, &weaver);
+	const SrResult wr = srCreateWeaverVulkan(sr.instance_v2, &ci, &weaver);
 	if (!SR_SUCCEEDED(wr) || weaver == nullptr) {
 		// SR_ERROR_FUNCTION_UNSUPPORTED is NOT a fault — it is the loader
 		// reporting that this runtime has no Vulkan dispatch slots at all
@@ -361,7 +365,7 @@ create_v2(double max_time,
 			        "Install an SR Platform carrying the C99 Vulkan surface to use v2 here.",
 			        leia_sr_v2_result_str(wr));
 		} else {
-			U_LOG_E("srCreateWeaverVK failed: %s (%d)", leia_sr_v2_result_str(wr), (int)wr);
+			U_LOG_E("srCreateWeaverVulkan failed: %s (%d)", leia_sr_v2_result_str(wr), (int)wr);
 		}
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
@@ -737,7 +741,7 @@ leiasr_weave(struct leiasr *leiasr,
 	// and silently: v1's weave() early-returns on a null command buffer with
 	// no error and no log (vkweaver.cpp:1260-1262), so the fallback above is
 	// load-bearing, not defensive. The v2 C surface rejects null outright
-	// (srWeaverSetCommandBufferVK -> SR_ERROR_VALIDATION_FAILURE), a
+	// (srWeaverSetCommandBufferVulkan -> SR_ERROR_VALIDATION_FAILURE), a
 	// deliberate divergence from the C++ interface — so on the v2 path this
 	// becomes a reported error instead of a black screen.
 	VkCommandBuffer cmd = (commandBuffer != VK_NULL_HANDLE)

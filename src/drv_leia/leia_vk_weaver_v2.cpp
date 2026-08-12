@@ -38,7 +38,7 @@ as_weaver(void *raw)
 }
 
 /*!
- * Not used. The v2 weaver is created in `leia_sr.cpp` via `srCreateWeaverVK`,
+ * Not used. The v2 weaver is created in `leia_sr.cpp` via `srCreateWeaverVulkan`,
  * because creation needs the `SrInstance` — which the v1 signature has no room
  * for (it takes an `SR::SRContext *`). Rather than widen the shared vtable for
  * one backend, creation stays out of the table and only the per-frame ops go
@@ -66,14 +66,14 @@ v2_set_viewport(void *raw, RECT vp)
 	// left/top/RIGHT/BOTTOM — not left/top/width/height. Both are int32_t x4,
 	// so the wrong reading compiles cleanly and weaves into a wrong rectangle.
 	// (Note this differs from the DX12 viewport call, which is x/y/w/h floats.)
-	srWeaverSetViewportVK(as_weaver(raw), (int32_t)vp.left, (int32_t)vp.top, (int32_t)vp.right,
+	srWeaverSetViewportVulkan(as_weaver(raw), (int32_t)vp.left, (int32_t)vp.top, (int32_t)vp.right,
 	                      (int32_t)vp.bottom);
 }
 
 void
 v2_set_scissor_rect(void *raw, RECT rc)
 {
-	srWeaverSetScissorRectVK(as_weaver(raw), (int32_t)rc.left, (int32_t)rc.top, (int32_t)rc.right,
+	srWeaverSetScissorRectVulkan(as_weaver(raw), (int32_t)rc.left, (int32_t)rc.top, (int32_t)rc.right,
 	                         (int32_t)rc.bottom);
 }
 
@@ -85,19 +85,25 @@ v2_set_command_buffer(void *raw, VkCommandBuffer cmd)
 	// caller already substitutes its pre-allocated buffer, so this should never
 	// fire — but log it rather than discard the result, because a black screen
 	// with no explanation is exactly what this API change was made to prevent.
-	const SrResult r = srWeaverSetCommandBufferVK(as_weaver(raw), cmd);
+	const SrResult r = srWeaverSetCommandBufferVulkan(as_weaver(raw), (SrVkCommandBuffer)cmd);
 	if (!SR_SUCCEEDED(r)) {
-		U_LOG_E("srWeaverSetCommandBufferVK failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
+		U_LOG_E("srWeaverSetCommandBufferVulkan failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
 	}
 }
 
 void
 v2_set_input_view_texture(void *raw, VkImageView left, VkImageView right, int width, int height, VkFormat format)
 {
-	// Separate left/right views, matching what this arm has always passed.
-	// srWeaverSetInputTextureVK (singular) takes one side-by-side image and is
-	// the wrong entry point here — the two differ by one character.
-	srWeaverSetInputTexturesVK(as_weaver(raw), left, right, (int32_t)width, (int32_t)height, format);
+	// SINGLE side-by-side image. `left` IS the SBS atlas and `right` is always
+	// VK_NULL_HANDLE — see the only caller, leia_display_processor.cpp:
+	//   "// SR weaver expects SBS atlas as left_view, VK_NULL_HANDLE as right"
+	// The two-parameter shape is vestigial, inherited from IVulkanWeaver1's
+	// setInputViewTexture(left, right, ...). v2 makes the contract honest by
+	// taking one image; the unused parameter stays only because the shared
+	// leia_vk_weaver_ops vtable is also implemented by the two v1 backends.
+	(void)right;
+	srWeaverSetInputTextureVulkan(as_weaver(raw), (SrVkImageView)left, (int32_t)width, (int32_t)height,
+	                              (SrVkFormat)format);
 }
 
 void
@@ -107,7 +113,8 @@ v2_set_output_framebuffer(void *raw, VkFramebuffer fb, int width, int height, Vk
 	// render pass open", NOT "keep the previous framebuffer" — it clears the
 	// binding. The caller retains a framebuffer by not calling this at all.
 	// See the long comment at the leia_sr.cpp call site.
-	srWeaverSetOutputFramebufferVK(as_weaver(raw), fb, (int32_t)width, (int32_t)height, format);
+	srWeaverSetOutputFrameBufferVulkan(as_weaver(raw), (SrVkFramebuffer)fb, (int32_t)width,
+	                                   (int32_t)height, (SrVkFormat)format);
 }
 
 void
