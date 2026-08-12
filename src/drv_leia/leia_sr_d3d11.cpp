@@ -986,26 +986,68 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr->weaver_v2 != nullptr) {
-		// The probe workaround is v1-only by construction: it needs a second
-		// SR::IDX11Weaver1 built on an SR::SRContext, neither of which exists
-		// here. The v2 replacement is srWeaverSnapToPhase — the windowless entry
-		// point we asked for and Leia added (LeiaInc/LeiaSR#164) — but it is NOT
-		// in the SDK drop this builds against, and a build that does export it
-		// may still predate the orientation-canonicalisation fix (#169). Wiring
-		// it unverified would reintroduce exactly the failure that cost days on
-		// #163: a snap that silently returns its input is indistinguishable from
-		// one that had nothing to correct.
+		// The windowless snap — the entry point we asked Leia for, and the
+		// reason the v1 probe below exists at all. The probe is a hidden window
+		// bound to a SECOND SR weaver, driven with a synthetic drag so the SDK's
+		// WndProc subclass snaps it, with the phase grid recovered BY
+		// MEASUREMENT. It is unavailable here by construction (no SRContext, no
+		// IDX11Weaver1) and it was fragile everywhere: every failure mode
+		// returned the target unchanged with no signal, which is what made
+		// LeiaInc/LeiaSR#163 take an elimination matrix to isolate.
 		//
-		// So: decline honestly and once. The caller keeps its unsnapped target,
-		// which costs phase coherence during a cross-process drag and nothing
-		// else. Wiring this up is the follow-up once #169 lands in a drop.
-		static bool warned = false;
-		if (!warned) {
-			U_LOG_W("#625 snap: unavailable on the SR v2 path (srWeaverSnapToPhase not in this SDK) - "
-			        "window drags will not phase-snap; use DXR_LEIA_SR_API=v1 if you need it");
-			warned = true;
+		// This call replaces all of that with one function.
+		//
+		// THE HANDLE MUST BE VALID. The loader's weaver trampolines null-check
+		// the handle BEFORE the dispatch slot, so calling with a NULL weaver
+		// returns SR_ERROR_HANDLE_INVALID whether the slot is present or not —
+		// it is NOT a capability probe. (The SDK team hit exactly this and got
+		// a false "present" against a runtime that lacked the slot.) We always
+		// hold a real weaver here, so the slot check is reached and
+		// SR_ERROR_FUNCTION_UNSUPPORTED genuinely means "older runtime".
+		int32_t sx = target_x;
+		int32_t sy = target_y;
+		const SrResult r =
+		    srWeaverSnapToPhase(leiasr->weaver_v2, origin_x, origin_y, target_x, target_y, &sx, &sy);
+
+		if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+			// Runtime predates the windowless snap. Not a fault — and NOT a
+			// reason to fall back to the probe, which cannot run on this path.
+			static bool warned = false;
+			if (!warned) {
+				U_LOG_W("#625 snap: this SR runtime has no srWeaverSnapToPhase - window drags "
+				        "will not phase-snap on the v2 path (DXR_LEIA_SR_API=v1 still snaps)");
+				warned = true;
+			}
+			return false;
 		}
-		return false;
+
+		if (r == SR_DECLINED) {
+			// "Nothing to correct" — a real answer, not a failure. Distinct
+			// from a silent no-op precisely so we can tell them apart, which
+			// is the whole lesson of #163. Caller keeps its target.
+			return false;
+		}
+
+		if (!SR_SUCCEEDED(r)) {
+			U_LOG_E("srWeaverSnapToPhase failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
+			return false;
+		}
+
+		// Log the FIRST successful snap, once. Without this there is no way to
+		// tell "the v2 snap ran and corrected the target" from "the v2 snap was
+		// never called and the drag happened to look fine" — which is the exact
+		// ambiguity that made #163 expensive. Includes the delta so a zero
+		// correction is visibly a correction of zero rather than a no-op.
+		static bool logged_first = false;
+		if (!logged_first) {
+			U_LOG_W("#625 snap: v2 srWeaverSnapToPhase LIVE — (%d,%d) -> (%d,%d), delta (%d,%d)",
+			        target_x, target_y, sx, sy, sx - target_x, sy - target_y);
+			logged_first = true;
+		}
+
+		*out_x = sx;
+		*out_y = sy;
+		return true;
 	}
 #endif
 
