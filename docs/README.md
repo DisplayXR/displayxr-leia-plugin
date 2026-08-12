@@ -21,6 +21,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 - **[Weaver internals](weaver.md)** — DX11 / DX12 / OpenGL / Vulkan weaver creation, inputs, weave() flow, DPI handling, phase math.
 - **[Transparency model](transparency.md)** — current primary path: WGC compose-under-bg on D3D11 / D3D12 / Vulkan. Replaces the older chroma-key approach for those APIs.
 - **[Chroma-key overlay (legacy / OpenGL fallback)](chroma-key-overlay.md)** — fallback path; still the only transparency path on the Leia OpenGL DP.
+- **[Late latching](late-latching.md)** — which backends implement it (D3D11/GL automatic, VK needs our submit hook, D3D12 is a stub), what `srWeaverIsLateLatchingEnabled` hides, the once-per-frame / deferred-context contract from the shipped header, and the dot test — including why `pattern = 450` makes it lie.
 - **[Window phase snapping](window-phase-snapping.md)** — the SR weaver's automatic `WndProc` subclassing for lenticular phase alignment during window drag (Windows), and the resolved `WndProcDispatcher` race.
 - **[Display mode switching (2D/3D)](display-mode-switching.md)** — how the plug-in maps the neutral mode-request API onto `SwitchableLensHint` (Windows) / `leia_core_set_backlight` (Android).
 - **[CNSDK Android calibration](cnsdk-android-calibration.md)** — symptom→fix procedure for the three CNSDK convention assumptions (face axes, tile-to-eye mapping, UV flip); pending Lume Pad hardware validation.
