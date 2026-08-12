@@ -504,12 +504,10 @@ leiasr_create(double maxTime,
 {
 	leiasr *sr = new leiasr;
 
-	if (!CreateSRContext(maxTime, *sr)) {
-		U_LOG_E("Failed to create SR context");
-		delete sr;
-		return XRT_ERROR_VULKAN;
-	}
-
+	// NOTE: the v1 SR::SRContext is created LAZILY, in the v1 branch below —
+	// NOT here. Creating it up front would open a second connection to the SR
+	// server on the v2 path (which has its own SrInstance), duplicate the lens,
+	// and leak the context on v2 teardown. Keep this ordering.
 	{
 		VkCommandBufferAllocateInfo allocInfo = {};
 		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -551,6 +549,12 @@ leiasr_create(double maxTime,
 	} else
 #endif
 	{
+		if (!CreateSRContext(maxTime, *sr)) {
+			U_LOG_E("Failed to create SR context");
+			delete sr;
+			return XRT_ERROR_VULKAN;
+		}
+
 		if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd,
 		                    sr)) {
 			U_LOG_E("Failed to create SR weaver");
@@ -617,8 +621,10 @@ leiasr_destroy(struct leiasr *leiasr)
 	// before the object memory is freed, reducing the race window further.
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr->instance_v2 != nullptr) {
-		// v2 teardown. No WndProc subclass to restore and no SRContext, so the
-		// message-pump mitigations around the v1 path do not apply.
+		// v2 teardown. No WndProc subclass to restore, so the message-pump
+		// mitigations around the v1 path do not apply. There is also no v1
+		// SRContext on this path — it is created lazily in the v1 branch of
+		// leiasr_create precisely so this teardown has nothing to miss.
 		if (leiasr->weaver != nullptr) {
 			leiasr->weaver_ops->destroy(leiasr->weaver);
 			leiasr->weaver = nullptr;
