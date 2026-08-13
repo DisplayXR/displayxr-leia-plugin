@@ -6,6 +6,27 @@ and how to verify it — including why the obvious verification is a trap.
 Runtime-side latency levers (late weave, repaint, deferred present, queue tiering) are documented
 in the runtime repo: `docs/reference/motion-to-photon-levers.md`. This file is the vendor half.
 
+## Status: verified on D3D11, unverified on VK
+
+**It works.** Measured quantitatively 2026-08-12 by LeiaSR on D3D11 through the v2 C99 API, with
+an automated harness that weaves offscreen, reads pixels back and computes red/green centroid
+separation — no eyeballs in the loop:
+
+```
+GPU held ~37 fps, frames-in-flight bounded ~6 by an event-query ring,
+viewer tracked (eyeSep 63.7-64.1 mm, telemetry from inside the weaver) and moving
+
+latch ON    mean 9.04 px   max 10.15 px   46/49 samples separated
+            useWeaveShader=1, fif~6, never self-disabled
+```
+
+The OFF control read 0.00 px but its tracking state was not verified at the time, so it is not
+being claimed — though structurally the latch-off path writes `DXYInitial = DXY` at record, so 0 is
+forced. Tool: `C:\Libs\srprobe\latch_test.exe --load N --latch 0|1 --seconds S`; it self-validates
+and prints `RUN INVALID` rather than a fake null when the viewer is not tracked.
+
+**Vulkan remains unverified** — see the backend table and the author's statement below.
+
 ## What it does
 
 Re-samples the eye position at submit time and patches the vertex buffer of frames **already
@@ -64,6 +85,37 @@ latching`, across all 2,665 logs on the reference box — and vendor lines are c
 DisplayXR log stream, so that is a real negative rather than a capture gap. Recorded because a
 silent self-disable would look exactly like a working feature: **if repaint's cadence changes,
 grep for both strings again.**
+
+### THE lifecycle trap: a weaver created AFTER `srInitialize` has a dead eye pipeline
+
+The weaver's internal predicting trackers are **senses**, and senses created after `srInitialize`
+never start. The failure is total and completely silent:
+
+```
+getEyeSeparation()      0.0 forever (nominal, identical eyes)
+isTracking              false forever
+useWeaveShader          false -> the app BLITS with the "searching for user"
+                        pulse animation and never weaves at all
+late latching           gated off permanently
+every API call          SR_SUCCESS
+isLateLatchingEnabled   TRUE
+```
+
+Correct order — `sr_instance.h` documents it, nothing enforces it:
+
+```
+srCreateInstance -> srCreateWeaver* / srCreateEyeTracker + callbacks -> srInitialize
+```
+
+**`isLateLatchingEnabled` does not catch this.** It stays `true` while the latch is structurally
+dead, which is precisely why "enable and assert the effective flag" is not a sufficient check.
+
+**We are safe by construction, and it is worth knowing where that safety lives:**
+`leia_sr_v2_create_instance` deliberately does **not** initialise (`leia_sr_v2_common.h`), and each
+arm calls `leia_sr_v2_initialize` only after its weaver exists — see the ordering comments in
+`leia_sr_d3d11.cpp` and `leia_sr_d3d12.cpp`, which mirror the identical v1 constraint. Because the
+rule is enforced in the shared helper rather than by per-arm discipline, a new arm inherits it by
+default. Keep it that way.
 
 ### Capability-probing trap
 
@@ -135,9 +187,12 @@ mid-session, so the last four runs straddled a module swap.
 `leiasr_enable_late_latching` **refuses** to enable on VK without the submit hook, so the dangerous
 combination — enabled but never marked in flight — is unreachable. D3D12 is deliberately not
 enabled, with the reason in the code. Standing decision (David, 2026-08-12): **keep the wiring; it
-reports healthy and costs nothing.** Whether it actually latches is unresolved and is not worth
-further hardware time until there is a valid instrument. The bar it must keep clearing is only: no
-crash, no regression.
+reports healthy and costs nothing.** The bar it must keep clearing is: no crash, no regression.
+
+That decision was taken when the feature was entirely unproven. It now has a quantitative positive
+result on D3D11 (above), so the D3D11 and GL arms are enabling something real. **Vulkan is still
+unproven** — the author's "just DX11 and OpenGL" predates the submit hook, and our own VK runs
+measured nothing (with an invalid instrument, so they establish neither direction).
 
 Note also that the runtime's repaint may make late latching redundant *by construction* — it
 re-weaves at display rate with a fresh eye pose, so the staleness late latching exists to remove is
