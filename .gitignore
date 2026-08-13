@@ -27,6 +27,7 @@ __MACOSX/
 
 # Fetched SR SDK (not committed; downloaded by CI / scripts/build-windows.bat)
 LeiaSR-SDK-*/
+simulatedreality-SDK-*/
 
 # Installer artifacts (built into _package/)
 DisplayXRLeiaSRSetup-*.exe

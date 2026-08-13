@@ -36,6 +36,10 @@ set SR_TAG=1.35.0.2011
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
+:: SR v2 C99 SDK pin (landing set; see the release notes on this tag).
+:: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml.
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1450
+set SR_V2_DIR=simulatedreality-SDK-1.37.0+1450.2bd551714b-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
@@ -142,9 +146,33 @@ if not exist "%LEIASR_SDKROOT%\bin\SimulatedRealityVulkan.dll" (
     gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "%LEIASR_SDKROOT%\lib"
 )
 
+:: --- SR v2 C99 SDK (defines DXR_LEIA_HAS_SR_V2; v2 lazy-loads at runtime
+:: with automatic v1 fallback, so building it in is safe on every machine).
+:: An existing LEIASR_V2_SDKROOT (e.g. a local dev drop) takes priority;
+:: otherwise self-provision the pinned landing-set SDK like the v1 SDK above.
+if "%LEIASR_V2_SDKROOT%"=="" (
+    set LEIASR_V2_SDKROOT=%REPO%%SR_V2_DIR%
+)
+if not exist "%LEIASR_V2_SDKROOT%\lib\srSDK_loader.lib" (
+    echo === Downloading SR v2 C99 SDK ^(%SR_V2_TAG%^) ===
+    gh release download %SR_V2_TAG% -R DisplayXR/displayxr-leia-plugin -p "%SR_V2_DIR%.zip" -D "%REPO_NOSLASH%"
+    if !ERRORLEVEL! NEQ 0 (
+        echo ERROR: Failed to download the SR v2 SDK ^(%SR_V2_TAG%^).
+        exit /b 1
+    )
+    powershell -Command "Expand-Archive -Path '%REPO%%SR_V2_DIR%.zip' -DestinationPath '%REPO_NOSLASH%' -Force"
+    if not exist "%LEIASR_V2_SDKROOT%\lib\srSDK_loader.lib" (
+        echo ERROR: SR v2 SDK extract did not produce lib\srSDK_loader.lib under %LEIASR_V2_SDKROOT%
+        exit /b 1
+    )
+    del "%REPO%%SR_V2_DIR%.zip" 2>nul
+    echo SR v2 SDK ready.
+)
+
 echo.
 echo === Dependencies ready ===
 echo   LEIASR_SDKROOT=%LEIASR_SDKROOT%
+echo   LEIASR_V2_SDKROOT=%LEIASR_V2_SDKROOT%
 echo   DXR_RUNTIME_SOURCE_DIR=%DXR_RUNTIME_SOURCE_DIR%
 echo.
 
