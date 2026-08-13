@@ -51,6 +51,16 @@ jobs:
       # it is grafted from a different SR branch than SR_TAG's SDK — v1.36.4 tree
       # with v1.37.1's modules/srVulkan. See that release's notes.
       SR_VKSTAMP_TAG: sr-sdk-v1.36.4.17537-vkstamp
+      # SR v2 C99 SDK (win64). Defines DXR_LEIA_HAS_SR_V2 so the v2 path
+      # compiles IN; at runtime the plug-in still lazy-loads
+      # LeiaSR_runtime.dll and falls back to v1 on older SR Platforms.
+      # This pin is the ST-5656-free LANDING SET (LeiaInc/LeiaSR run
+      # 31577655173, test/sdk-v2-super @ 2bd551714), re-hosted as a release
+      # asset here because upstream ships the win64 v2 SDK only as a CI run
+      # artifact — there is no upstream release asset to point at. Replace
+      # with one when the SR v2 PRs land.
+      SR_V2_TAG: sr-sdk-v2-1.37.0.1450
+      SR_V2_DIR: simulatedreality-SDK-1.37.0+1450.2bd551714b-win64-Release
       GH_TOKEN: ${{ github.token }}
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
@@ -119,6 +129,17 @@ jobs:
           gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download stamp-aware weaver ($env:SR_VKSTAMP_TAG)" }
           gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
+
+      - name: Download SR v2 C99 SDK
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          gh release download $env:SR_V2_TAG -R DisplayXR/displayxr-leia-plugin -p "$env:SR_V2_DIR.zip" -D .
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download SR v2 SDK ($env:SR_V2_TAG)" }
+          tar -xf "$env:SR_V2_DIR.zip" -C .
+          # The two files the CMake gate keys on — fail here, not at configure.
+          foreach ($f in @("include/sr/sr_instance.h", "lib/srSDK_loader.lib")) {
+            if (-not (Test-Path "$env:SR_V2_DIR/$f")) { throw "SR v2 SDK missing $f" }
+          }
 
       # The plug-in CMake adds the runtime as a subdirectory, so we need
       # all the runtime's own build prereqs (vcpkg, Vulkan SDK, OpenXR
@@ -200,6 +221,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
+          LEIASR_V2_SDKROOT: ${{ github.workspace }}/${{ env.SR_V2_DIR }}
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DDXR_RUNTIME_SOURCE_DIR="${{ github.workspace }}/displayxr-runtime" `
@@ -240,6 +262,25 @@ jobs:
             exit 1
           }
           Write-Host "PASS: plug-in DLL exports xrtPluginNegotiate."
+          # v2 gate assertion: DXR_LEIA_HAS_SR_V2 must have been defined, or
+          # this workflow would silently ship a v1-only DLL that everything
+          # downstream believes is v2-capable. The marker string is emitted
+          # by the api selector, which only compiles on the v2 path.
+          $raw = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($dll))
+          if (-not $raw.Contains("v2 (C99)")) {
+            Write-Host "::error::$dll lacks the 'v2 (C99)' marker — DXR_LEIA_HAS_SR_V2 was NOT defined; the v2 path compiled out. Check the SR v2 SDK download/extract and the LEIASR_V2_SDKROOT env on the Generate step."
+            exit 1
+          }
+          Write-Host "PASS: v2 path compiled in (DXR_LEIA_HAS_SR_V2)."
+          # And the flip side: v2 must stay a LAZY load. A static import of
+          # LeiaSR_runtime.dll would make plug-in load fail outright on every
+          # machine without the v2 runtime — exactly the fallback we promise.
+          $v2import = & dumpbin /imports $dll 2>&1 | Select-String -Pattern "LeiaSR_runtime.dll"
+          if ($v2import) {
+            Write-Host "::error::$dll statically imports LeiaSR_runtime.dll — the v2 loader must LoadLibrary lazily or v1-only machines cannot load the plug-in at all."
+            exit 1
+          }
+          Write-Host "PASS: no static LeiaSR_runtime.dll import (lazy v2 load intact)."
 
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
