@@ -6,26 +6,29 @@ and how to verify it — including why the obvious verification is a trap.
 Runtime-side latency levers (late weave, repaint, deferred present, queue tiering) are documented
 in the runtime repo: `docs/reference/motion-to-photon-levers.md`. This file is the vendor half.
 
-## Status: verified on D3D11, unverified on VK
+## Status: UNVERIFIED on every backend — and unverifiable on hybrid laptops
 
-**It works.** Measured quantitatively 2026-08-12 by LeiaSR on D3D11 through the v2 C99 API, with
-an automated harness that weaves offscreen, reads pixels back and computes red/green centroid
-separation — no eyeballs in the loop:
+**A quantitative D3D11 verification ("mean 9.04 px separation") was claimed on 2026-08-12 and
+WITHDRAWN the same day.** The detector was classifying the entire woven frame: a grey test input,
+subpixel-interlaced by the weave, produces channel-dominant pixels everywhere, and the centroid of
+that field moved with the pose — it measured *weaving*, not *latching*. The corrected detector
+(saturated dots only, load fill moved to blue) finds genuine dots and genuinely zero separation.
+If you encounter the 9.04 px number anywhere, it is dead.
 
-```
-GPU held ~37 fps, frames-in-flight bounded ~6 by an event-query ring,
-viewer tracked (eyeSep 63.7-64.1 mm, telemetry from inside the weaver) and moving
+**The deeper finding: the dot test cannot verify late latching on a hybrid laptop at all.** On
+that hardware class the SR display is driven by the iGPU while the app renders on the dGPU, and:
 
-latch ON    mean 9.04 px   max 10.15 px   46/49 samples separated
-            useWeaveShader=1, fif~6, never self-disabled
-```
+- loading the iGPU (any naive load tool — it is the default adapter) starves composition *and the
+  eye-tracking pipeline*: pose latency balloons to **seconds**;
+- with tracking seconds-stale, a fused yellow dot is expected **whether or not the latch works** —
+  it corrects ~100–200 ms of render staleness, invisible under seconds of pose latency.
 
-The OFF control read 0.00 px but its tracking state was not verified at the time, so it is not
-being claimed — though structurally the latch-off path writes `DXYInitial = DXY` at record, so 0 is
-forced. Tool: `C:\Libs\srprobe\latch_test.exe --load N --latch 0|1 --seconds S`; it self-validates
-and prints `RUN INVALID` rather than a fake null when the viewer is not tracked.
-
-**Vulkan remains unverified** — see the backend table and the author's statement below.
+So "latch broken" and "latch working" are indistinguishable there — a platform limit, not an
+instrument bug. This also retroactively explains customer yellow-dot reports from March 2025 on
+RTX 4050/3080 *laptops* (the hybrid hypothesis was raised at the time and never followed up), and
+it means the latch's benefit window on hybrids may be swallowed by tracking-pipeline latency even
+when it works. **Verification needs a desktop where the SR display hangs off the render GPU**; a
+self-validating harness exists (`C:\Libs\srprobe`) and the A/B there is ~40 seconds.
 
 ## What it does
 
@@ -189,10 +192,10 @@ combination — enabled but never marked in flight — is unreachable. D3D12 is 
 enabled, with the reason in the code. Standing decision (David, 2026-08-12): **keep the wiring; it
 reports healthy and costs nothing.** The bar it must keep clearing is: no crash, no regression.
 
-That decision was taken when the feature was entirely unproven. It now has a quantitative positive
-result on D3D11 (above), so the D3D11 and GL arms are enabling something real. **Vulkan is still
-unproven** — the author's "just DX11 and OpenGL" predates the submit hook, and our own VK runs
-measured nothing (with an invalid instrument, so they establish neither direction).
+The feature remains unproven in either direction on every backend — the one positive result was
+withdrawn (see Status above), and every null to date is explained by instrument or platform
+problems rather than by the latch. The wiring stays because it is cheap and reports healthy, not
+because it is known to do anything.
 
 Note also that the runtime's repaint may make late latching redundant *by construction* — it
 re-weaves at display rate with a fresh eye pose, so the staleness late latching exists to remove is
