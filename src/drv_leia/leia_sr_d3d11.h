@@ -50,6 +50,27 @@ leiasr_d3d11_create(double max_time,
                     struct leiasr_d3d11 **out);
 
 /*!
+ * #144: like leiasr_d3d11_create but returns IMMEDIATELY with a pending
+ * handle; a detached worker runs the real SDK creation (SR-service retry
+ * loops, correction-texture disk I/O, senses start — seconds) and publishes
+ * atomically. Until then every entry point degrades exactly as a NULL
+ * weaver would (weave/eye-pos return false, the DP flat-blits), and
+ * leiasr_d3d11_request_display_mode records the lens wish for application
+ * at publish. Enables ID3D11Multithread protection on the immediate context
+ * (v1 construction and both arms' destructors touch it off-thread).
+ *
+ * @ingroup drv_leia
+ */
+xrt_result_t
+leiasr_d3d11_create_async(double max_time,
+                          void *d3d11_device,
+                          void *d3d11_context,
+                          void *hwnd,
+                          uint32_t view_width,
+                          uint32_t view_height,
+                          struct leiasr_d3d11 **out);
+
+/*!
  * Destroy a D3D11 SR weaver instance.
  *
  * @param leiasr The instance to destroy (can be NULL).
@@ -58,6 +79,30 @@ leiasr_d3d11_create(double max_time,
  */
 void
 leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr);
+
+/*!
+ * #144: non-blocking destroy — SDK teardown (weaver destroy, SRContext
+ * teardown, a context Flush) runs on a detached reaper thread, so callers
+ * on the service critical path (DP destroy under render_mutex on close /
+ * deactivate) return immediately. A still-pending async create is cancelled
+ * and cleaned up by its own worker.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d11_destroy_async(struct leiasr_d3d11 **leiasr_ptr);
+
+/*!
+ * #144: block until an async create publishes (or fails/cancels), bounded.
+ * For one-shot capability queries that must see the real weaver (e.g. the
+ * in-process compositors' create-time zone-caps probe).
+ *
+ * @return true if the weaver is ready and usable.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_wait_ready(struct leiasr_d3d11 *leiasr, uint32_t timeout_ms);
 
 /*!
  * Set the input stereo texture for weaving.
