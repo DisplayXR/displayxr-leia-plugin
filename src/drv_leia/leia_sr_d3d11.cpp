@@ -24,12 +24,23 @@
 #endif
 
 #include <d3d11.h>
+#include <d3d11_4.h> // ID3D11Multithread — #144 async weaver create/destroy
 
 #include <windows.h>
 #include <sysinfoapi.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <thread>
+
+//! #144 async-creation states (see the struct comment block below).
+enum
+{
+	LEIASR_ASYNC_PENDING = 0,   //!< worker still creating; entry points degrade
+	LEIASR_ASYNC_READY = 1,     //!< SDK objects published; normal operation
+	LEIASR_ASYNC_CANCELLED = 2, //!< destroyed while pending; worker self-cleans
+};
 
 /*!
  * D3D11 SR weaver instance.
@@ -132,6 +143,25 @@ struct leiasr_d3d11
 	uint64_t measured_r_us = 0;
 	uint64_t measured_seen_ns = 0;
 	double   measured_ema_us = 0.0;
+
+	// --- #144 async weaver creation/destruction --------------------------
+	// SR context + weaver creation blocks for seconds (SR-service retry
+	// loops, correction-texture PNG loads from disk, senses start) and the
+	// runtime's DP factory runs on the service's critical path holding
+	// render_mutex. leiasr_d3d11_create_async() returns a PENDING handle
+	// immediately; a detached worker runs the real creation and publishes
+	// via async_state (release), which every entry point gates on through
+	// w_ready() (acquire) — until then callers see the same "no weaver"
+	// degradation the existing NULL checks already implement.
+	//
+	// Lifecycle contract: the worker is DETACHED. Whoever loses the
+	// PENDING→{READY,CANCELLED} CAS race owns the struct:
+	//   worker CAS PENDING→READY ok  → caller owns; worker never touches
+	//                                  sr again (the CAS is its last access).
+	//   destroy CAS PENDING→CANCELLED ok → worker observes it, tears down
+	//                                  whatever it created, deletes sr.
+	std::atomic<int> async_state{LEIASR_ASYNC_READY}; // sync create default
+	std::atomic<int> pending_lens_wish{-1}; //!< -1 none, 0 → 2D, 1 → 3D
 };
 
 namespace {
@@ -474,6 +504,12 @@ w_get_predicted_eyes(leiasr_d3d11 *sr, float left_mm[3], float right_mm[3])
 bool
 w_ready(const leiasr_d3d11 *sr)
 {
+	// #144: while an async create is pending, the SDK-object fields are
+	// being written by the worker — the acquire load here is what makes
+	// reading them safe after it flips to READY (release CAS in the worker).
+	if (sr->async_state.load(std::memory_order_acquire) != LEIASR_ASYNC_READY) {
+		return false;
+	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
 		return true;
@@ -525,30 +561,16 @@ lens_is_enabled(leiasr_d3d11 *sr)
 	return sr->lens_hint != nullptr && sr->lens_hint->isEnabled();
 }
 
-} // namespace
-
-extern "C" {
-
-xrt_result_t
-leiasr_d3d11_create(double max_time,
-                    void *d3d11_device,
-                    void *d3d11_context,
-                    void *hwnd,
-                    uint32_t view_width,
-                    uint32_t view_height,
-                    struct leiasr_d3d11 **out)
+/*!
+ * One full weaver-creation attempt (both API arms + the shared latency
+ * config). Factored out of leiasr_d3d11_create so the #144 async worker can
+ * run the identical body off the critical path. On failure every partially
+ * created SDK object is torn down and nulled, so the struct is reusable for
+ * a retry.
+ */
+bool
+create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 {
-	if (d3d11_device == nullptr || d3d11_context == nullptr) {
-		U_LOG_E("D3D11 device or context is null");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	leiasr_d3d11 *sr = new leiasr_d3d11;
-	sr->device = static_cast<ID3D11Device *>(d3d11_device);
-	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
-	sr->view_width = view_width;
-	sr->view_height = view_height;
-
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leia_sr_api_selected() == LEIA_SR_API_V2) {
 		// Deliberately NOT falling back to v1 on failure.
@@ -563,16 +585,20 @@ leiasr_d3d11_create(double max_time,
 		if (!create_v2(max_time, hwnd, *sr)) {
 			U_LOG_E("SR v2 weaver creation failed - not falling back to v1 "
 			        "(set DXR_LEIA_SR_API=v1 to force it)");
-			delete sr;
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
+			return false;
 		}
 	} else
 #endif
 	{
 		// Create SR context
 		if (!create_sr_context(max_time, *sr)) {
-			delete sr;
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
+			// create_sr_context can fail AFTER the context exists (display
+			// never became ready) — clean the partial so a retry starts fresh.
+			if (sr->context != nullptr) {
+				SR::SRContext::deleteSRContext(sr->context);
+				sr->context = nullptr;
+			}
+			return false;
 		}
 
 		// Create D3D11 weaver (SR SDK installs its WndProc via SetWindowLongPtr).
@@ -590,8 +616,9 @@ leiasr_d3d11_create(double max_time,
 		if (result != WeaverErrorCode::WeaverSuccess) {
 			U_LOG_E("Failed to create SR D3D11 weaver: %d", (int)result);
 			SR::SRContext::deleteSRContext(sr->context);
-			delete sr;
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
+			sr->context = nullptr;
+			sr->weaver = nullptr;
+			return false;
 		}
 
 		// Initialize the context AFTER the weaver has been registered.
@@ -664,22 +691,17 @@ leiasr_d3d11_create(double max_time,
 		}
 	}
 
-	*out = sr;
-
-	U_LOG_I("Created D3D11 SR weaver for HWND %p, view size %ux%u", hwnd, view_width, view_height);
-
-	return XRT_SUCCESS;
+	return true;
 }
 
+/*!
+ * Tear down every SDK object on the struct (both arms + the #625 snap
+ * probe), leaving the struct itself alive. Shared by leiasr_d3d11_destroy
+ * and the #144 async worker's cancelled path.
+ */
 void
-leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
+destroy_sdk_objects(leiasr_d3d11 *sr)
 {
-	if (leiasr_ptr == nullptr || *leiasr_ptr == nullptr) {
-		return;
-	}
-
-	leiasr_d3d11 *sr = *leiasr_ptr;
-
 	// #625: tear down the phase-snap probe (weaver restores the probe window's
 	// WndProc) before the SRContext goes away.
 	if (sr->snap_probe_weaver != nullptr) {
@@ -720,10 +742,6 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 			srDestroyInstance(sr->instance_v2);
 			sr->instance_v2 = nullptr;
 		}
-
-		delete sr;
-		*leiasr_ptr = nullptr;
-		U_LOG_I("Destroyed D3D11 SR weaver (v2)");
 		return;
 	}
 #endif
@@ -744,11 +762,200 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 		SR::SRContext::deleteSRContext(sr->context);
 		sr->context = nullptr;
 	}
+}
 
-	delete sr;
+/*!
+ * #144: worker/reaper threads issue D3D11 calls concurrently with the
+ * render thread on the SAME immediate context — v1 weaver construction does
+ * one UpdateSubresource, and both arms' SDK destructors call Flush(). The
+ * documented D3D11 mechanism for that is ID3D11Multithread protection
+ * (a driver-level critical section per context call, negligible next to a
+ * 16 ms frame). Enabled once, left on.
+ */
+void
+enable_context_multithread_protection(ID3D11DeviceContext *ctx)
+{
+	ID3D11Multithread *mt = nullptr;
+	if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt)) && mt != nullptr) {
+		BOOL prev = mt->SetMultithreadProtected(TRUE);
+		mt->Release();
+		U_LOG_W("Leia D3D11 async weaver: immediate-context multithread protection ON (was %d)", (int)prev);
+	} else {
+		U_LOG_W("Leia D3D11 async weaver: ID3D11Multithread unavailable — "
+		        "async create/destroy may race the render thread's context use");
+	}
+}
+
+} // namespace
+
+extern "C" {
+
+xrt_result_t
+leiasr_d3d11_create(double max_time,
+                    void *d3d11_device,
+                    void *d3d11_context,
+                    void *hwnd,
+                    uint32_t view_width,
+                    uint32_t view_height,
+                    struct leiasr_d3d11 **out)
+{
+	if (d3d11_device == nullptr || d3d11_context == nullptr) {
+		U_LOG_E("D3D11 device or context is null");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	leiasr_d3d11 *sr = new leiasr_d3d11;
+	sr->device = static_cast<ID3D11Device *>(d3d11_device);
+	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	sr->view_width = view_width;
+	sr->view_height = view_height;
+
+	if (!create_weaver_attempt(sr, max_time, hwnd)) {
+		delete sr;
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	// async_state already defaults to LEIASR_ASYNC_READY on the sync path.
+
+	*out = sr;
+
+	U_LOG_I("Created D3D11 SR weaver for HWND %p, view size %ux%u", hwnd, view_width, view_height);
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+leiasr_d3d11_create_async(double max_time,
+                          void *d3d11_device,
+                          void *d3d11_context,
+                          void *hwnd,
+                          uint32_t view_width,
+                          uint32_t view_height,
+                          struct leiasr_d3d11 **out)
+{
+	if (d3d11_device == nullptr || d3d11_context == nullptr) {
+		U_LOG_E("D3D11 device or context is null");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	leiasr_d3d11 *sr = new leiasr_d3d11;
+	sr->device = static_cast<ID3D11Device *>(d3d11_device);
+	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	sr->view_width = view_width;
+	sr->view_height = view_height;
+	sr->async_state.store(LEIASR_ASYNC_PENDING, std::memory_order_relaxed);
+
+	// The worker (and the async destroy reaper) will touch the shared
+	// immediate context from off-thread — see the helper's comment.
+	enable_context_multithread_protection(sr->d3d11_context);
+
+	// Detached by design: whoever loses the PENDING→{READY,CANCELLED} CAS
+	// owns/frees the struct (see the struct's async comment block).
+	std::thread([sr, max_time, hwnd]() {
+		uint32_t attempt = 0;
+		for (;;) {
+			if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
+				delete sr;
+				return;
+			}
+			attempt++;
+			if (create_weaver_attempt(sr, max_time, hwnd)) {
+				// Apply any lens wish recorded while we were creating —
+				// BEFORE the READY CAS, which must be the last access to
+				// sr this thread makes on the success path. A wish that
+				// lands in the tiny window between this exchange and the
+				// CAS is self-applied by the recorder (it re-checks state
+				// after storing), or re-driven by the next mode request.
+				int wish = sr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
+				if (wish >= 0 && lens_present(sr)) {
+					try {
+						lens_set(sr, wish == 1);
+						U_LOG_W("Leia D3D11 async weaver: applied recorded lens wish (%s)",
+						        wish == 1 ? "3D" : "2D");
+					} catch (...) {
+					}
+				}
+				int expected = LEIASR_ASYNC_PENDING;
+				if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_READY,
+				                                            std::memory_order_acq_rel)) {
+					U_LOG_W("Leia D3D11 weaver READY (async create, attempt %u)", attempt);
+					return;
+				}
+				// Destroyed while we were creating — tear down and free.
+				destroy_sdk_objects(sr);
+				delete sr;
+				return;
+			}
+			U_LOG_W("Leia D3D11 async weaver: create attempt %u failed — retrying in 5 s", attempt);
+			for (int i = 0; i < 50; i++) {
+				if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
+					delete sr;
+					return;
+				}
+				Sleep(100);
+			}
+		}
+	}).detach();
+
+	*out = sr;
+
+	U_LOG_W("Leia D3D11 weaver creation started ASYNC for HWND %p — DP degrades to flat blit until ready", hwnd);
+
+	return XRT_SUCCESS;
+}
+
+void
+leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
+{
+	if (leiasr_ptr == nullptr || *leiasr_ptr == nullptr) {
+		return;
+	}
+
+	leiasr_d3d11 *sr = *leiasr_ptr;
 	*leiasr_ptr = nullptr;
 
+	// #144: still creating? Flag CANCELLED and hand ownership to the worker —
+	// it observes the flag, tears down whatever it created, and frees sr.
+	int expected = LEIASR_ASYNC_PENDING;
+	if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_CANCELLED,
+	                                            std::memory_order_acq_rel)) {
+		U_LOG_W("Leia D3D11 weaver destroy while async create pending — worker will clean up");
+		return;
+	}
+
+	destroy_sdk_objects(sr);
+	delete sr;
+
 	U_LOG_I("Destroyed D3D11 SR weaver");
+}
+
+void
+leiasr_d3d11_destroy_async(struct leiasr_d3d11 **leiasr_ptr)
+{
+	if (leiasr_ptr == nullptr || *leiasr_ptr == nullptr) {
+		return;
+	}
+
+	leiasr_d3d11 *sr = *leiasr_ptr;
+	*leiasr_ptr = nullptr;
+
+	// Still creating? Same hand-off as the sync destroy.
+	int expected = LEIASR_ASYNC_PENDING;
+	if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_CANCELLED,
+	                                            std::memory_order_acq_rel)) {
+		U_LOG_W("Leia D3D11 weaver destroy while async create pending — worker will clean up");
+		return;
+	}
+
+	// #144: SDK teardown blocks too (weaver->destroy / SRContext teardown /
+	// a context Flush in both arms' destructors) and the runtime calls the
+	// DP destroy under render_mutex on close/deactivate. Reap detached; the
+	// immediate context already has multithread protection on (create_async).
+	std::thread([sr]() {
+		leiasr_d3d11 *victim = sr;
+		destroy_sdk_objects(victim);
+		delete victim;
+		U_LOG_W("Leia D3D11 weaver destroyed (async reaper)");
+	}).detach();
 }
 
 void
@@ -787,6 +994,11 @@ leiasr_d3d11_set_frame_timing(struct leiasr_d3d11 *leiasr,
                               uint64_t frame_period_ns)
 {
 	if (leiasr == nullptr) {
+		return;
+	}
+	// #144: while the async worker is creating, it also writes the latency
+	// config fields — skip this push (it re-arrives every frame anyway).
+	if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
 		return;
 	}
 	leiasr->measured_r_us = weave_to_scanout_ns / 1000;
@@ -998,7 +1210,9 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
 	}
 	*out_x = target_x; // default: no-op snap
 	*out_y = target_y;
-	if (leiasr == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
+		// #144: also covers "async create pending" — snap simply reports
+		// unavailable and the runtime uses the raw drag position.
 		return false;
 	}
 
@@ -1230,7 +1444,9 @@ leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d
 		return false;
 	}
 
-	if (!leiasr->display_dims_valid) {
+	// #144: w_ready also gates "async create pending" — the dims fields are
+	// written by the worker and only safe to read after the READY publish.
+	if (!w_ready(leiasr) || !leiasr->display_dims_valid) {
 		out_dims->valid = false;
 		return false;
 	}
@@ -1251,7 +1467,7 @@ leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
                                      float *out_display_width_m,
                                      float *out_display_height_m)
 {
-	if (leiasr == nullptr || out_display_pixel_width == nullptr ||
+	if (leiasr == nullptr || !w_ready(leiasr) || out_display_pixel_width == nullptr ||
 	    out_display_pixel_height == nullptr || out_display_screen_left == nullptr ||
 	    out_display_screen_top == nullptr || out_display_width_m == nullptr ||
 	    out_display_height_m == nullptr) {
@@ -1277,7 +1493,7 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
                                               uint32_t *out_width,
                                               uint32_t *out_height)
 {
-	if (leiasr == nullptr || out_width == nullptr || out_height == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr) || out_width == nullptr || out_height == nullptr) {
 		return false;
 	}
 
@@ -1532,7 +1748,33 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 bool
 leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 {
-	if (leiasr == nullptr || !lens_present(leiasr)) {
+	if (leiasr == nullptr) {
+		return false;
+	}
+
+	// #144: weaver still creating — record the wish; the worker applies it at
+	// publish. Re-check afterwards: if creation completed between the store
+	// and the worker's own wish-consume, apply it ourselves (the exchange
+	// makes application happen exactly once). This is a *request* API —
+	// acceptance, not physical completion — so returning true is honest.
+	if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+		leiasr->pending_lens_wish.store(enable_3d ? 1 : 0, std::memory_order_release);
+		if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_READY) {
+			int wish = leiasr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
+			if (wish >= 0 && lens_present(leiasr)) {
+				try {
+					lens_set(leiasr, wish == 1);
+				} catch (...) {
+				}
+			}
+		} else {
+			U_LOG_W("SR D3D11 display mode wish (%s) recorded — weaver still creating",
+			        enable_3d ? "3D" : "2D");
+		}
+		return true;
+	}
+
+	if (!lens_present(leiasr)) {
 		return false;
 	}
 
@@ -1549,7 +1791,7 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 bool
 leiasr_d3d11_supports_display_mode_switch(struct leiasr_d3d11 *leiasr)
 {
-	if (leiasr == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr)) {
 		return false;
 	}
 
@@ -1559,7 +1801,7 @@ leiasr_d3d11_supports_display_mode_switch(struct leiasr_d3d11 *leiasr)
 bool
 leiasr_d3d11_get_hardware_3d_state(struct leiasr_d3d11 *leiasr, bool *out_is_3d)
 {
-	if (leiasr == nullptr || !lens_present(leiasr) || out_is_3d == nullptr) {
+	if (leiasr == nullptr || !w_ready(leiasr) || !lens_present(leiasr) || out_is_3d == nullptr) {
 		return false;
 	}
 
@@ -1569,6 +1811,22 @@ leiasr_d3d11_get_hardware_3d_state(struct leiasr_d3d11 *leiasr, bool *out_is_3d)
 	} catch (...) {
 		return false;
 	}
+}
+
+bool
+leiasr_d3d11_wait_ready(struct leiasr_d3d11 *leiasr, uint32_t timeout_ms)
+{
+	if (leiasr == nullptr) {
+		return false;
+	}
+	const uint64_t deadline = GetTickCount64() + timeout_ms;
+	while (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+		if (GetTickCount64() >= deadline) {
+			return false;
+		}
+		Sleep(20);
+	}
+	return w_ready(leiasr);
 }
 
 } // extern "C"

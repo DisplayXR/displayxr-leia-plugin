@@ -301,6 +301,11 @@ struct leia_display_processor_d3d11_impl
 	struct xrt_display_processor_d3d11 base;
 	struct leiasr_d3d11 *leiasr; //!< Owned — destroyed in leia_dp_d3d11_destroy.
 
+	//! #144: weaver was created via leiasr_d3d11_create_async (default; env
+	//! DXR_LEIA_ASYNC_WEAVER=0 reverts to the old blocking create). Selects
+	//! the async destroy on teardown and the flat-blit fallback while pending.
+	bool async_weaver;
+
 	ID3D11Device *device;              //!< Cached device reference (not owned, for blit init).
 	HWND hwnd;                         //!< Native window handle from factory, used by bg-capture for self-exclusion + window-on-monitor rect.
 
@@ -1380,6 +1385,60 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	//      reconstructs alpha=0 holes for DWM. AA edges collapse to hard
 	//      masks. Used when WGC is unavailable (Win<2004, DRM, env-disabled).
 	//
+	// #144: weaver still creating (async) — flat-blit view 0 so frames keep
+	// flowing instead of drawing nothing (the weave call below would no-op and
+	// leave the target stale/garbage). Plain opaque blit: the transparency
+	// passes need weaver-adjacent state and the window lasts ~a second.
+	if (!leiasr_d3d11_is_ready(ldp->leiasr)) {
+		if (ldp->blit_vs == NULL || ldp->blit_ps == NULL) {
+			return;
+		}
+		{
+			static uint64_t last_log_ms;
+			uint64_t now_ms = GetTickCount64();
+			if (now_ms - last_log_ms > 1000) {
+				last_log_ms = now_ms;
+				U_LOG_W("Leia D3D11 DP: weaver not ready — flat-blitting view 0 (%ux%u of %ux%u grid)",
+				        view_width, view_height, tile_columns, tile_rows);
+			}
+		}
+		// Sample only the first tile: it sits at the atlas origin, so the
+		// blit constant buffer's u/v scale IS the tile fraction.
+		struct
+		{
+			float u_scale;
+			float v_scale;
+			float pad0;
+			float pad1;
+		} cb_data;
+		cb_data.u_scale = (tile_columns > 0) ? 1.0f / (float)tile_columns : 1.0f;
+		cb_data.v_scale = (tile_rows > 0) ? 1.0f / (float)tile_rows : 1.0f;
+		cb_data.pad0 = 0.0f;
+		cb_data.pad1 = 0.0f;
+		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
+
+		D3D11_VIEWPORT viewport = {};
+		viewport.TopLeftX = static_cast<float>(vp_x);
+		viewport.TopLeftY = static_cast<float>(vp_y);
+		viewport.Width = static_cast<float>(vp_w);
+		viewport.Height = static_cast<float>(vp_h);
+		viewport.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &viewport);
+
+		ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
+		ctx->VSSetShader(ldp->blit_vs, NULL, 0);
+		ctx->PSSetShader(ldp->blit_ps, NULL, 0);
+		ctx->PSSetSamplers(0, 1, &ldp->blit_sampler);
+		ctx->PSSetShaderResources(0, 1, &srv);
+		ctx->PSSetConstantBuffers(0, 1, &ldp->blit_cb);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->IASetInputLayout(NULL);
+		ctx->Draw(4, 0);
+		ID3D11ShaderResourceView *null_srv = NULL;
+		ctx->PSSetShaderResources(0, 1, &null_srv);
+		return;
+	}
+
 	// Legacy apps that pre-filled their swapchain with the key color on an
 	// alpha=1 surface stay backward-compatible under either path: chroma-key
 	// is a no-op (lerp(key, src.rgb, 1.0) == src.rgb); compose-under-bg
@@ -1574,6 +1633,15 @@ leia_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struc
 	}
 	// Zones are driven through the per-client SR lens hint — needs the hint
 	// channel to exist (same gate as request_display_mode support).
+	//
+	// #144: the in-process compositors query zone caps ONCE at their own
+	// create and cache the answer — a pending async weaver would freeze
+	// "no zones" permanently. Bounded wait on the caller's (app) thread;
+	// the SERVICE compositor never calls this slot, so the service critical
+	// path is unaffected.
+	if (!leiasr_d3d11_wait_ready(ldp->leiasr, 10000)) {
+		return false;
+	}
 	if (!leiasr_d3d11_supports_display_mode_switch(ldp->leiasr)) {
 		return false;
 	}
@@ -1933,7 +2001,14 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	}
 
 	if (ldp->leiasr != NULL) {
-		leiasr_d3d11_destroy(&ldp->leiasr);
+		// #144: the runtime destroys the DP on the service critical path
+		// (close / workspace deactivate, under render_mutex) — hand the
+		// blocking SDK teardown to the reaper when async is enabled.
+		if (ldp->async_weaver) {
+			leiasr_d3d11_destroy_async(&ldp->leiasr);
+		} else {
+			leiasr_d3d11_destroy(&ldp->leiasr);
+		}
 	}
 	free(ldp);
 }
@@ -2082,9 +2157,21 @@ leia_dp_factory_d3d11(void *d3d11_device,
 	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
 	// so we pass 0,0 here (avoids creating a redundant temp SR context just to
 	// query recommended dims that leiasr_d3d11_create queries again internally).
+	//
+	// #144: creation is ASYNC by default — the runtime calls this factory on
+	// its service critical path (holding render_mutex, sometimes on the render
+	// thread itself), and the SDK create blocks for seconds (SR-service retry
+	// loops, correction-texture disk I/O, senses start). The DP flat-blits
+	// until the worker publishes. DXR_LEIA_ASYNC_WEAVER=0 reverts to the old
+	// blocking create for bisecting.
+	const char *async_env = std::getenv("DXR_LEIA_ASYNC_WEAVER");
+	const bool async_weaver = !(async_env != NULL && async_env[0] == '0');
 	struct leiasr_d3d11 *weaver = NULL;
-	xrt_result_t ret = leiasr_d3d11_create(5.0, d3d11_device, d3d11_context,
-	                                       window_handle, 0, 0, &weaver);
+	xrt_result_t ret = async_weaver
+	                       ? leiasr_d3d11_create_async(5.0, d3d11_device, d3d11_context,
+	                                                   window_handle, 0, 0, &weaver)
+	                       : leiasr_d3d11_create(5.0, d3d11_device, d3d11_context,
+	                                             window_handle, 0, 0, &weaver);
 	if (ret != XRT_SUCCESS || weaver == NULL) {
 		U_LOG_W("Failed to create SR D3D11 weaver");
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -2093,12 +2180,17 @@ leia_dp_factory_d3d11(void *d3d11_device,
 	struct leia_display_processor_d3d11_impl *ldp =
 	    (struct leia_display_processor_d3d11_impl *)calloc(1, sizeof(*ldp));
 	if (ldp == NULL) {
-		leiasr_d3d11_destroy(&weaver);
+		if (async_weaver) {
+			leiasr_d3d11_destroy_async(&weaver);
+		} else {
+			leiasr_d3d11_destroy(&weaver);
+		}
 		return XRT_ERROR_ALLOCATION;
 	}
 
 	leia_dp_d3d11_init_vtable(ldp);
 	ldp->leiasr = weaver;
+	ldp->async_weaver = async_weaver;
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
 	ldp->hwnd = static_cast<HWND>(window_handle);
 	ldp->view_count = 2;
