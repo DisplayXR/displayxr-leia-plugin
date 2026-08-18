@@ -98,7 +98,12 @@ endif()
 # Keep both as literal quoted strings — the rule-5 CI self-check greps for
 # `DXR_RUNTIME_GIT_TAG\s+"([^"]+)"` and a computed value would defeat it.
 #
-# Pinned to displayxr-runtime v2.4.1. The ABI floor it encodes is plugin ABI
+# Pinned to displayxr-runtime v2.7.0. That tag is the first runtime that ships the
+# append-only D3D11 DP vtable slot 20 `set_window` (runtime#1008) whose
+# implementation below is guarded on XRT_DP_D3D11_HAS_SET_WINDOW: built against
+# an older runtime the guard compiles the slot OUT and the runtime silently
+# falls back to destroy+recreate on every focus change, so this pin is what
+# makes the in-place weaver re-bind actually ship. The ABI floor it encodes is plugin ABI
 # v5 (vk_bundle ABI-parity layout + the Linux dma-buf device-extension
 # guarantee, runtime#802) which this plug-in's bg-capture producer needs.
 # The DP vtables carry a struct_size header; the runtime's loader rejects
@@ -108,7 +113,7 @@ endif()
 # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.6.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.7.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin: the Windows/Android tag predates runtime
 # Linux support entirely (scripts/build_linux.sh first shipped in
