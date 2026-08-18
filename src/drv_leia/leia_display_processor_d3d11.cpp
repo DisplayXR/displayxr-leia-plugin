@@ -30,6 +30,17 @@
 #include <cstdlib>
 #include <cstring>
 
+/*
+ * runtime#1008 slot 20 (set_window). The runtime header announces the slot the
+ * same way it announces set_frame_timing — a HAS_* macro — so a plug-in built
+ * against older runtime headers still compiles, it just doesn't fill the slot
+ * (and struct_size then tells the runtime it's absent, so the runtime keeps its
+ * destroy+recreate fallback). One local alias so the guard is spelled once.
+ */
+#if defined(XRT_DP_D3D11_HAS_SET_WINDOW)
+#define DXR_LEIA_DP_D3D11_SET_WINDOW 1
+#endif
+
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
 static const char *blit_vs_source = R"(
@@ -1975,6 +1986,64 @@ leia_dp_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 *xdp,
 }
 #endif
 
+#ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
+/*
+ * runtime#1008 (slot 20) — re-bind this DP to another window without
+ * recreating the weaver.
+ *
+ * Under the runtime's one-pipeline policy the panel DP follows the active
+ * presenter's HWND across focus changes. Without this slot the runtime does it
+ * by create → publish → retire: a fresh SR weaver every focus change, ~200 ms
+ * of async create with a flat blit meanwhile. Here it is one SDK call.
+ *
+ * Everything derived from the bound window is brought along:
+ *   - the SR weaver's phase/position reference (leiasr_d3d11_set_window);
+ *   - the WGC background capture, which targets the monitor of the HWND, keeps
+ *     the window-on-monitor rect for the compose bg-UV remap, and sets
+ *     WDA_EXCLUDEFROMCAPTURE on the window so our own woven output is not
+ *     captured back — it must be re-created against the new window, else the
+ *     compose pass would keep punching the OLD window's rectangle out of the
+ *     desktop and the new window would self-capture. Only re-created when
+ *     compose is actually active (client-present transparency uses no WGC, and
+ *     an opaque session has no capture at all).
+ *   - the #625 snap probe needs nothing: it is a hidden service-owned window
+ *     with its own weaver, driven in absolute screen coordinates.
+ *
+ * Bounded: no blocking waits, and the hardware lens state is untouched.
+ */
+static bool
+leia_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_handle)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	HWND hwnd = static_cast<HWND>(window_handle);
+
+	if (hwnd == nullptr || IsWindow(hwnd) == FALSE) {
+		U_LOG_W("Leia D3D11 DP: set_window rejected — hwnd=%p is not a window", window_handle);
+		return false;
+	}
+	if (hwnd == ldp->hwnd) {
+		return true; // already bound there
+	}
+	if (!leiasr_d3d11_set_window(ldp->leiasr, hwnd)) {
+		return false; // runtime falls back to destroy+recreate
+	}
+
+	ldp->hwnd = hwnd;
+
+	// Re-target the WGC capture at the new window's monitor/rect (see above).
+	// enable_transparency only (re-)creates when bg_compose_enabled is false,
+	// so release first; on failure it falls back to chroma-key exactly as it
+	// does at session start.
+	if (ldp->bg_compose_enabled) {
+		compose_release_resources(ldp); // clears bg_compose_enabled
+		leia_dp_d3d11_enable_transparency(ldp, true /* transparent */, false /* client_presents */);
+	}
+
+	U_LOG_W("Leia D3D11 DP: re-bound to hwnd=%p (no weaver recreate)", (void *)hwnd);
+	return true;
+}
+#endif
+
 static void
 leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
@@ -2051,6 +2120,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	U_LOG_W("Leia D3D11 DP: set_frame_timing slot WIRED (struct_size=%u)", ldp->base.struct_size);
 #else
 	U_LOG_W("Leia D3D11 DP: set_frame_timing NOT COMPILED (old runtime headers)");
+#endif
+#ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
+	ldp->base.set_window = leia_dp_d3d11_set_window; // runtime#1008 focus re-bind (slot 20)
 #endif
 }
 

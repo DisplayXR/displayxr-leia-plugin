@@ -22,6 +22,21 @@ The weaver takes a **stereo texture** and a **tracked eye position**, and produc
 
 All interfaces inherit from `IWeaverBase1` (common weaving API) and `IWeaverSettings1` (quality tuning).
 
+### Re-binding a live weaver (displayxr-runtime#1008)
+
+`setWindowHandle()` (v1, on `IWeaverBase1`) / `srWeaverSetWindowHandle()` (v2) re-point an
+**already-created** weaver at another window: the SDK re-reads that window's geometry and
+re-subclasses its WndProc, without re-querying the panel, rebuilding correction textures, or
+touching the lens. The D3D11 DP exposes this as vtable slot 20 `set_window`, so the runtime's
+focus-driven re-bind of the panel DP costs one SDK call instead of the ~200 ms
+create/publish/retire of a fresh weaver (during which it flat-blits).
+
+Bound-window state the DP carries along on a re-bind: the WGC background capture is
+re-created against the new window (it targets that window's monitor, keeps the
+window-on-monitor rect for the compose bg-UV remap, and sets `WDA_EXCLUDEFROMCAPTURE` on it) —
+only when compose-under-bg is actually active. The #625 phase-snap probe needs nothing: it is a
+hidden service-owned window with its own weaver, driven in absolute screen coordinates.
+
 ### Deprecated API
 
 Older classes (`DX11Weaver`, `PredictingDX11Weaver`, `DX12Weaver`, `PredictingDX12Weaver`, `GLWeaver`, `PredictingGLWeaver`) are still available but deprecated.

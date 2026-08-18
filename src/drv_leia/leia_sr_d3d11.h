@@ -389,6 +389,34 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
                               int32_t *out_x,
                               int32_t *out_y);
 
+/*!
+ * Re-bind the LIVE weaver to a different window (displayxr-runtime#1008).
+ *
+ * The SR SDK supports this on both API families — v1
+ * `SR::IWeaverBase1::setWindowHandle()`, v2 `srWeaverSetWindowHandle()` — so a
+ * focus change that moves the panel's present ownership from one HWND to
+ * another costs a single SDK call instead of the ~200 ms create/publish/retire
+ * of a whole new weaver (during which the runtime flat-blits).
+ *
+ * The new window MUST be on the same display: this re-binds the weaver's
+ * position/phase reference only; it does not re-query the panel, re-create the
+ * correction textures, or touch the hardware lens state.
+ *
+ * Bounded — no blocking waits. Safe to call while a #144 async create is still
+ * pending: the handle is recorded and applied by the creating worker at publish
+ * (same mechanism as the pending lens wish), and the call still reports success
+ * because the weaver that eventually publishes will be bound to it.
+ *
+ * @param leiasr The D3D11 weaver instance.
+ * @param hwnd   The new window handle (HWND); must be non-NULL.
+ * @return true if the re-bind was performed (or recorded for a pending create);
+ *         false ⟹ unsupported/failed, caller falls back to destroy+recreate.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_set_window(struct leiasr_d3d11 *leiasr, void *hwnd);
+
 #ifdef __cplusplus
 }
 #endif
