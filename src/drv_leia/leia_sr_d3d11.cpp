@@ -162,6 +162,10 @@ struct leiasr_d3d11
 	//                                  whatever it created, deletes sr.
 	std::atomic<int> async_state{LEIASR_ASYNC_READY}; // sync create default
 	std::atomic<int> pending_lens_wish{-1}; //!< -1 none, 0 → 2D, 1 → 3D
+	//! runtime#1008: HWND handed to leiasr_d3d11_set_window while the async
+	//! create was still PENDING. Applied by the worker at publish, exactly
+	//! like @ref pending_lens_wish. 0 = none.
+	std::atomic<uintptr_t> pending_hwnd{0};
 };
 
 namespace {
@@ -562,6 +566,48 @@ lens_is_enabled(leiasr_d3d11 *sr)
 }
 
 /*!
+ * runtime#1008: re-point a LIVE weaver at another window, on whichever API
+ * family this instance is on. Both families expose it (v1
+ * IWeaverBase1::setWindowHandle, v2 srWeaverSetWindowHandle) — the SDK
+ * re-reads the window's geometry and re-subclasses its WndProc; it does not
+ * touch the lens. Caller guarantees w_ready().
+ *
+ * Returns false on any SDK refusal so the runtime can fall back to
+ * destroy+recreate. Never throws (the runtime is C).
+ */
+bool
+w_set_window(leiasr_d3d11 *sr, HWND hwnd)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->weaver_v2 != nullptr) {
+		const SrResult r = srWeaverSetWindowHandle(sr->weaver_v2, (SrNativeWindowHandle)hwnd);
+		if (!SR_SUCCEEDED(r)) {
+			U_LOG_W("SR v2 srWeaverSetWindowHandle failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
+			return false;
+		}
+		return true;
+	}
+#endif
+	if (sr->weaver == nullptr) {
+		return false;
+	}
+	try {
+		// Same DPI dance as creation: the SDK re-reads the HWND's geometry
+		// here and must see physical pixels (see create_weaver_attempt).
+		DPI_AWARENESS_CONTEXT oldDpiCtx =
+		    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		sr->weaver->setWindowHandle(hwnd);
+		if (oldDpiCtx != NULL) {
+			SetThreadDpiAwarenessContext(oldDpiCtx);
+		}
+	} catch (...) {
+		U_LOG_E("SR D3D11 setWindowHandle(%p) threw — re-bind refused", (void *)hwnd);
+		return false;
+	}
+	return true;
+}
+
+/*!
  * One full weaver-creation attempt (both API arms + the shared latency
  * config). Factored out of leiasr_d3d11_create so the #144 async worker can
  * run the identical body off the critical path. On failure every partially
@@ -859,6 +905,19 @@ leiasr_d3d11_create_async(double max_time,
 			}
 			attempt++;
 			if (create_weaver_attempt(sr, max_time, hwnd)) {
+				// runtime#1008: apply a window re-bind recorded while we
+				// were creating (the weaver was built against the ORIGINAL
+				// hwnd, so without this the DP would silently weave against
+				// a window the runtime no longer presents to). Same
+				// exactly-once exchange discipline as the lens wish below.
+				uintptr_t want = sr->pending_hwnd.exchange(0, std::memory_order_acq_rel);
+				if (want != 0) {
+					if (w_set_window(sr, reinterpret_cast<HWND>(want))) {
+						U_LOG_W("Leia D3D11 async weaver: applied recorded window "
+						        "re-bind (hwnd=%p)",
+						        (void *)want);
+					}
+				}
 				// Apply any lens wish recorded while we were creating —
 				// BEFORE the READY CAS, which must be the last access to
 				// sr this thread makes on the success path. A wish that
@@ -1324,6 +1383,44 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
 	*out_x = r.left;
 	*out_y = r.top;
 	return true;
+}
+
+bool
+leiasr_d3d11_set_window(struct leiasr_d3d11 *leiasr, void *hwnd)
+{
+	if (leiasr == nullptr || hwnd == nullptr) {
+		return false;
+	}
+
+	// #144: weaver still creating — record the handle; the worker applies it
+	// at publish. Re-check afterwards exactly as request_display_mode does: if
+	// creation completed between the store and the worker's own consume, apply
+	// it here (the exchange makes application happen exactly once).
+	if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+		leiasr->pending_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_release);
+		if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_READY) {
+			uintptr_t want = leiasr->pending_hwnd.exchange(0, std::memory_order_acq_rel);
+			if (want != 0) {
+				return w_set_window(leiasr, reinterpret_cast<HWND>(want));
+			}
+		} else {
+			U_LOG_W("SR D3D11 window re-bind (hwnd=%p) recorded — weaver still creating",
+			        (void *)hwnd);
+		}
+		// Accepted: whichever weaver publishes will be bound to this window,
+		// so the runtime must NOT fall back to destroy+recreate.
+		return true;
+	}
+
+	if (!w_ready(leiasr)) {
+		return false;
+	}
+
+	// The snap probe (#625) deliberately needs NO update: it is a hidden
+	// service-owned window with its own weaver, and SnapToPhase keys off
+	// absolute screen coordinates plus the DLL-global phase grid — it never
+	// referenced the bound presentation window.
+	return w_set_window(leiasr, static_cast<HWND>(hwnd));
 }
 
 /*!

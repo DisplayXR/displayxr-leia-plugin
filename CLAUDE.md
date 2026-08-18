@@ -63,6 +63,14 @@ ABI from the runtime headers it was built against:
 - `src/drv_leia/leia_plugin.c::xrtPluginNegotiate` reports that value.
 - The runtime's loader (`target_plugin_loader.c`) **rejects** plug-ins reporting an ABI major different from the runtime's current ABI (ADR-020 rule 3).
 
+**Appended DP slots are NOT an ABI major.** A new vtable slot (e.g. D3D11 slot
+19 `set_frame_timing`, slot 20 `set_window` / displayxr-runtime#1008) is
+compiled only when the runtime headers announce it (`XRT_DP_D3D11_HAS_*`), and
+`struct_size` then tells the runtime the slot is filled — so the plug-in builds
+against both old and new headers and old runtimes keep their fallback. What is
+still required: re-pin `DXR_RUNTIME_GIT_TAG` to the runtime tag that carries the
+slot, or a released plug-in silently ships without it.
+
 **To bump a runtime ABI major:** update `DXR_RUNTIME_GIT_TAG` in
 `CMakeLists.txt` to the new runtime tag, tag a new plug-in release.
 If you forget, the loader will silently fall back to `sim_display`
