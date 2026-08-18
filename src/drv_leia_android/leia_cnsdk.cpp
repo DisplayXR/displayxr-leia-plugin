@@ -237,6 +237,38 @@ overlay_mode_active(void)
 	return android_globals_get_overlay_mode() || get_prop_bool("debug.dxr.overlay", false);
 }
 
+/*!
+ * PoC-0 (runtime #1032 / epic #1031, this repo #151): concurrent multi-app
+ * weaving on Android.
+ *
+ * The panel's switchable 3D backlight is DISPLAY-GLOBAL, held by
+ * `BacklightMultiClientControlService` as a binder BIND-REFCOUNT across
+ * processes. `leia_core_enable_3d(false)` both drops the global backlight AND
+ * unbinds this process's client — so a single satellite compositor calling it
+ * flattens the panel underneath a sibling app that is still weaving.
+ *
+ * With N apps that is wrong: a window that merely lost its own surface (a
+ * multi-window relayout destroys and recreates the app's SurfaceView surface)
+ * must RELEASE its share of the refcount, never force the display to 2D. In
+ * multi-app mode we therefore keep the bind (and the 3D backlight) held across
+ * `on_pause`; only `leia_cnsdk_destroy` — the real last-client release — still
+ * forces 2D, which is what keeps stuck-3D-after-close fixed.
+ *
+ * Gated behind `debug.dxr.multiapp` (read once, cached) so single-client
+ * behaviour cannot regress. Default OFF.
+ */
+static bool
+multiapp_mode_active(void)
+{
+	static std::atomic<int> cached{-1};
+	int v = cached.load(std::memory_order_acquire);
+	if (v < 0) {
+		v = get_prop_bool("debug.dxr.multiapp", false) ? 1 : 0;
+		cached.store(v, std::memory_order_release);
+	}
+	return v != 0;
+}
+
 #ifdef XRT_OS_ANDROID
 // Tri-state property override: returns `derived` when the property is unset,
 // otherwise the property's boolean value. Lets orientation-derived axis
@@ -795,6 +827,16 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 	// skip the 2D drop (the weave loop keeps forcing 3D each frame).
 	if (overlay_mode_active()) {
 		DXR_HW_DBG("on_pause: overlay mode — keeping 3D (skip force-2D)");
+		return;
+	}
+	// PoC-0 multi-app (#1032 / #151): a paused window must not flatten the
+	// panel for the sibling that is still visible and weaving. Hold the
+	// multi-client backlight bind (this process's share of the refcount) and
+	// leave the panel in 3D; destroy() is the real release. WARN so PoC-0 can
+	// read the transition off logcat.
+	if (multiapp_mode_active()) {
+		U_LOG_W("HW_DBG_CNSDK: on_pause: multi-app mode — holding backlight bind, panel stays 3D "
+		        "(skip force-2D; release happens at destroy)");
 		return;
 	}
 	force_backlight_2d(cnsdk, "on_pause");
