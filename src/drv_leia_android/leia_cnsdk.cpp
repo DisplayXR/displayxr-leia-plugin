@@ -597,6 +597,20 @@ leia_cnsdk_set_host_android_accessors(void *(*get_vm)(void), void *(*get_activit
 	g_host_get_android_activity = get_activity;
 }
 
+// Optional third accessor (runtime #1037 / ADR-036 D2): a Context whose
+// getClassLoader() is the RUNTIME APK's. Used ONLY as the core loader's
+// Context — CNSDK derives its DexClassLoader parent from it — which is why it
+// is separate from the Activity accessor above; everything Activity-typed
+// (limit_orientations, permission dialogs) keeps using the Activity.
+// NULL on a runtime without the slot -> previous behaviour.
+static void *(*g_host_get_class_host_context)(void) = nullptr;
+
+extern "C" void
+leia_cnsdk_set_host_class_context_accessor(void *(*get_class_host_context)(void))
+{
+	g_host_get_class_host_context = get_class_host_context;
+}
+
 extern "C" xrt_result_t
 leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 {
@@ -624,7 +638,19 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 #ifdef XRT_OS_ANDROID
 	struct leia_core_library_load_android android_load = {};
 	android_load.vm = (JavaVM *)vm;
-	android_load.context = (jobject)activity;  // Activity is-a android.content.Context
+	// #1037: prefer the runtime's class-host Context. CNSDK builds the core
+	// loader's DexClassLoader with `context.getClassLoader()` as the parent, so
+	// THIS is what decides whether com.leia.sdk.internal.Plugin resolves out of
+	// the RUNTIME APK (Architecture A: the plug-in runs in the app's process and
+	// the app bundles no vendor AAR, ADR-025 + ADR-036 D2) or out of the host
+	// app's dex (the previous coupling). NULL — an older runtime, or one that
+	// could not build the Context — falls back to the Activity / Service Context,
+	// which is what every shipping configuration used until now. Either way it is
+	// an android.content.Context, which is all the loader needs.
+	void *class_ctx = g_host_get_class_host_context != nullptr ? g_host_get_class_host_context() : nullptr;
+	android_load.context = (jobject)(class_ctx != nullptr ? class_ctx : activity);
+	DXR_HW_DBG("leia_cnsdk_create: core loader context=%p (%s)", (void *)android_load.context,
+	           class_ctx != nullptr ? "runtime class-host" : "app activity/service context");
 	load_req.android = &android_load;
 #endif
 	struct leia_core_library *lib = leia_core_library_load(&load_req);
