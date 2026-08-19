@@ -41,6 +41,17 @@
 #define DXR_LEIA_DP_D3D11_SET_WINDOW 1
 #endif
 
+/*
+ * leia-plugin#158 / runtime slot 21 (get_backend_state) — same coupled-addition
+ * pattern as set_window above. Until the runtime pin carries the slot this
+ * compiles out entirely and the self-heal is armed by the ~1 Hz poll in
+ * process_atlas instead; when the pin moves, the runtime can also poll the slot
+ * directly and surface the state to the workspace.
+ */
+#if defined(XRT_DP_D3D11_HAS_BACKEND_STATE)
+#define DXR_LEIA_DP_D3D11_BACKEND_STATE 1
+#endif
+
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
 static const char *blit_vs_source = R"(
@@ -422,6 +433,18 @@ struct leia_display_processor_d3d11_impl
 	// Post-weave alpha-gate (replaces ck_strip when compose is active).
 	ID3D11PixelShader *alpha_gate_ps;
 	ID3D11Buffer *alpha_gate_constants;  //!< sizeof(AlphaGateConstants).
+	//! @}
+
+	//! @name #158 SR platform hot reconnect
+	//! The plug-in learns about an SR platform restart by POLLING (the SDK has
+	//! no notification), and that poll is what arms the in-place weaver
+	//! rebuild — so it must happen even against a runtime too old to call
+	//! get_backend_state. process_atlas drives it at ~1 Hz. Per-instance, not
+	//! a function-local static: several DPs can be live at once (satellite
+	//! compositors) and a shared gate would starve all but one.
+	//! @{
+	uint64_t backend_poll_ms; //!< GetTickCount64 of the last poll (0 = never).
+	uint32_t backend_state;   //!< Last polled leia_sr_backend_state.
 	//! @}
 
 	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
@@ -1268,6 +1291,20 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
+	// #158: ~1 Hz SR-platform health poll. This is the thing that ARMS the
+	// in-place weaver reconnect — the SR SDK never reports a platform restart,
+	// so somebody has to look, and process_atlas is the only guaranteed
+	// heartbeat the DP has. Cheap: the underlying generation token is itself
+	// cached ~1 s, and the rebuild (if any) runs on a detached worker. No log
+	// here — the sr layer logs the state edges.
+	{
+		const uint64_t now_ms = GetTickCount64();
+		if (ldp->backend_poll_ms == 0 || (now_ms - ldp->backend_poll_ms) > 1000) {
+			ldp->backend_poll_ms = now_ms;
+			ldp->backend_state = leiasr_d3d11_poll_backend_state(ldp->leiasr);
+		}
+	}
+
 	// ADR-021: drive the weaver's sRGB conversion from the atlas encoding the
 	// runtime declared out-of-band via set_atlas_encoding (stored in
 	// ldp->atlas_encoding). When the runtime composed in linear (Model B) it
@@ -2089,6 +2126,43 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
  *
  */
 
+#ifdef DXR_LEIA_DP_D3D11_BACKEND_STATE
+// The poll returns the plug-in-side enum and the runtime reads its own
+// XRT_DP_BACKEND_STATE_* contract; tie the two together at compile time so a
+// future renumbering on either side is a build error rather than a display that
+// silently reports the wrong health. Asserted once, here — the other arms hand
+// back values from the same enum.
+static_assert((uint32_t)LEIA_SR_BACKEND_OK == XRT_DP_BACKEND_STATE_OK &&
+                  (uint32_t)LEIA_SR_BACKEND_DEGRADED == XRT_DP_BACKEND_STATE_DEGRADED &&
+                  (uint32_t)LEIA_SR_BACKEND_STALE == XRT_DP_BACKEND_STATE_STALE,
+              "leia_sr_backend_state must match the runtime's XRT_DP_BACKEND_STATE_* values");
+
+/*!
+ * #158 slot 21: report the SR backend's health to the runtime.
+ *
+ * Refreshes on demand rather than only handing back the cached value, so a
+ * runtime that polls this slot itself (instead of relying on our process_atlas
+ * heartbeat) still arms the self-heal — e.g. a session whose client stopped
+ * submitting frames, which is precisely when a stale weaver goes unnoticed.
+ * Non-blocking: the poll is a cached SCM read plus at most a detached-thread
+ * spawn.
+ */
+static bool
+leia_dp_d3d11_get_backend_state(struct xrt_display_processor_d3d11 *xdp, uint32_t *out_state)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	if (ldp == NULL || out_state == NULL) {
+		return false;
+	}
+
+	ldp->backend_poll_ms = GetTickCount64();
+	ldp->backend_state = leiasr_d3d11_poll_backend_state(ldp->leiasr);
+	*out_state = ldp->backend_state;
+	return true;
+}
+#endif
+
+
 static void
 leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 {
@@ -2123,6 +2197,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #endif
 #ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
 	ldp->base.set_window = leia_dp_d3d11_set_window; // runtime#1008 focus re-bind (slot 20)
+#endif
+#ifdef DXR_LEIA_DP_D3D11_BACKEND_STATE
+	ldp->base.get_backend_state = leia_dp_d3d11_get_backend_state; // #158 SR restart self-heal (slot 21)
 #endif
 }
 

@@ -9,6 +9,7 @@
 
 #include "leia_sr_d3d11.h"
 #include "leia_sr_api_select.h"
+#include "leia_sr_liveness.h"
 #include "leia_sr_v2_common.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -166,6 +167,44 @@ struct leiasr_d3d11
 	//! create was still PENDING. Applied by the worker at publish, exactly
 	//! like @ref pending_lens_wish. 0 = none.
 	std::atomic<uintptr_t> pending_hwnd{0};
+
+	// --- #158 SR platform hot reconnect -----------------------------------
+	// The SR platform can restart underneath a long-lived process (a LeiaSR
+	// installer upgrade while displayxr-service.exe keeps running). The SDK
+	// gives no notification and keeps answering getPredictedEyePositions with
+	// a SUCCESS code and a FROZEN pair — so the only honest signal is the SR
+	// service process's identity (leia_sr_liveness.h). On a change we rebuild
+	// the SDK objects IN PLACE: this struct and the owning xrt_display_processor
+	// keep their addresses, so nothing above the plug-in has to react.
+	//
+	// The rebuild reuses the #144 async machinery wholesale — CAS READY→PENDING
+	// (which is exactly what every entry point's w_ready() gate already
+	// degrades on), run the same worker body, CAS PENDING→READY. The lifecycle
+	// contract is unchanged: a destroy racing the reconnect flips PENDING→
+	// CANCELLED and the worker frees the struct.
+
+	//! Generation token (leia_sr_liveness_platform_generation) captured at the
+	//! last successful weaver create. Written before the publishing release
+	//! CAS, so any reader that saw READY sees a valid value. 0 = never known.
+	uint64_t platform_generation = 0;
+	//! HWND the live weaver is bound to — the create argument, kept current by
+	//! w_set_window. The reconnect worker has no caller to get it from.
+	std::atomic<uintptr_t> bound_hwnd{0};
+	//! Last 2D/3D wish the runtime asked for (-1 none). Sticky, unlike
+	//! @ref pending_lens_wish which is consumed at publish: a reconnect must
+	//! re-assert 3D on the fresh lens or the panel silently comes back 2D.
+	std::atomic<int> last_lens_wish{-1};
+	//! Completed in-place reconnects (diagnostics; also the "attempt N" in the log).
+	std::atomic<uint64_t> reconnect_count{0};
+	//! Backend state last returned by leiasr_d3d11_poll_backend_state.
+	std::atomic<uint32_t> last_backend_state{LEIA_SR_BACKEND_OK};
+	//! @name One-shot WARN edges for the poll (it runs ~1 Hz forever, so a
+	//! plain log would be per-frame-class bloat). Cleared when the condition
+	//! clears, so a second occurrence logs again.
+	//! @{
+	std::atomic<bool> warned_platform_down{false};
+	std::atomic<bool> warned_client_skew{false};
+	//! @}
 };
 
 namespace {
@@ -585,6 +624,9 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 			U_LOG_W("SR v2 srWeaverSetWindowHandle failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
 			return false;
 		}
+		// #158: a reconnect recreates the weaver from scratch and has no
+		// caller to take the window from — keep the record current here.
+		sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
 		return true;
 	}
 #endif
@@ -604,6 +646,8 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 		U_LOG_E("SR D3D11 setWindowHandle(%p) threw — re-bind refused", (void *)hwnd);
 		return false;
 	}
+	// #158: see the v2 branch — the reconnect worker recreates from this.
+	sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
 	return true;
 }
 
@@ -832,6 +876,188 @@ enable_context_multithread_protection(ID3D11DeviceContext *ctx)
 	}
 }
 
+/*!
+ * Shared body of the #144 async CREATE worker and the #158 in-place RECONNECT
+ * worker. Runs on a detached thread and owns the PENDING→READY publish.
+ *
+ * The two are one function on purpose: the ownership contract is the delicate
+ * part, and a second copy of it is a second place for it to rot. That contract
+ * (from the struct's async comment block) is unchanged — the thread is
+ * DETACHED, so whoever loses the PENDING→{READY,CANCELLED} CAS owns the
+ * struct. Every checkpoint below re-reads async_state; on CANCELLED the
+ * destroy caller has ALREADY nulled its own pointer and is expecting us to
+ * free, so we tear down and delete.
+ *
+ * @param sr        The instance, in PENDING state.
+ * @param max_time  Per-attempt SDK wait budget, in seconds.
+ * @param reconnect Accounting/logging only — true when re-driven by
+ *                  leiasr_d3d11_poll_backend_state after an SR platform
+ *                  generation change.
+ * @param start_ms  GetTickCount64() at the trigger, for the reconnect log.
+ */
+void
+async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint64_t start_ms)
+{
+	uint32_t attempt = 0;
+	for (;;) {
+		if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
+			// Idempotent, and needed on every path: on the first create
+			// iteration there is nothing to tear down, on a retry
+			// create_weaver_attempt already cleaned its own partials, and
+			// after a reconnect teardown everything is already null.
+			destroy_sdk_objects(sr);
+			delete sr;
+			return;
+		}
+		attempt++;
+
+		void *hwnd = reinterpret_cast<void *>(sr->bound_hwnd.load(std::memory_order_relaxed));
+
+		// The SDK throws as routine control flow and this is a detached
+		// thread — an escaping exception is std::terminate, i.e. the whole
+		// service dies. Treat a throw as a failed attempt and retry.
+		bool created = false;
+		try {
+			created = create_weaver_attempt(sr, max_time, hwnd);
+		} catch (...) {
+			U_LOG_E("Leia D3D11 weaver create attempt %u threw — treating as failure", attempt);
+			try {
+				destroy_sdk_objects(sr);
+			} catch (...) {
+			}
+			created = false;
+		}
+
+		if (created) {
+			// runtime#1008: apply a window re-bind recorded while we
+			// were creating (the weaver was built against the ORIGINAL
+			// hwnd, so without this the DP would silently weave against
+			// a window the runtime no longer presents to). Same
+			// exactly-once exchange discipline as the lens wish below.
+			uintptr_t want = sr->pending_hwnd.exchange(0, std::memory_order_acq_rel);
+			if (want != 0) {
+				if (w_set_window(sr, reinterpret_cast<HWND>(want))) {
+					U_LOG_W("Leia D3D11 async weaver: applied recorded window "
+					        "re-bind (hwnd=%p)",
+					        (void *)want);
+				}
+			}
+			// Apply any lens wish recorded while we were creating —
+			// BEFORE the READY CAS, which must be the last access to
+			// sr this thread makes on the success path. A wish that
+			// lands in the tiny window between this exchange and the
+			// CAS is self-applied by the recorder (it re-checks state
+			// after storing), or re-driven by the next mode request.
+			// #158 seeds this from last_lens_wish before a reconnect, so
+			// a rebuilt weaver comes back in the mode the runtime asked for.
+			int wish = sr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
+			if (wish >= 0 && lens_present(sr)) {
+				try {
+					lens_set(sr, wish == 1);
+					U_LOG_W("Leia D3D11 async weaver: applied recorded lens wish (%s)",
+					        wish == 1 ? "3D" : "2D");
+				} catch (...) {
+				}
+			}
+
+			// #158: stamp the incarnation we just connected to BEFORE the
+			// release CAS, so any reader that observes READY (acquire) also
+			// observes a valid generation. A zero here (SCM unreachable)
+			// disables detection rather than faking a restart — see
+			// leiasr_d3d11_poll_backend_state.
+			const uint64_t prev_gen = sr->platform_generation;
+			sr->platform_generation = leia_sr_liveness_platform_generation();
+
+			int expected = LEIASR_ASYNC_PENDING;
+			if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_READY,
+			                                            std::memory_order_acq_rel)) {
+				if (reconnect) {
+					sr->reconnect_count.fetch_add(1, std::memory_order_relaxed);
+					U_LOG_W("SR weaver reconnected (generation %llu → %llu), "
+					        "%llu ms after trigger, attempt %u",
+					        (unsigned long long)prev_gen,
+					        (unsigned long long)sr->platform_generation,
+					        (unsigned long long)(GetTickCount64() - start_ms), attempt);
+				} else {
+					U_LOG_W("Leia D3D11 weaver READY (async create, attempt %u)", attempt);
+				}
+				return;
+			}
+			// Destroyed while we were creating — tear down and free.
+			destroy_sdk_objects(sr);
+			delete sr;
+			return;
+		}
+
+		U_LOG_W("Leia D3D11 %s weaver: create attempt %u failed — retrying in 5 s",
+		        reconnect ? "reconnect" : "async", attempt);
+		for (int i = 0; i < 50; i++) {
+			if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
+				destroy_sdk_objects(sr);
+				delete sr;
+				return;
+			}
+			Sleep(100);
+		}
+	}
+}
+
+/*!
+ * #158: rebuild the SR SDK objects IN PLACE after the platform restarted.
+ *
+ * "In place" is the whole point — the @ref leiasr_d3d11 pointer and the
+ * owning xrt_display_processor keep their addresses, so the runtime, the
+ * compositor and every IPC client are untouched. The alternative (tearing the
+ * DP down and asking the runtime to recreate it) is what a service restart
+ * already does, and is exactly the outage this issue is about.
+ *
+ * Entered with async_state already CAS'd READY→PENDING by the poller, so every
+ * public entry point is degrading through w_ready() before we touch anything.
+ */
+void
+reconnect_worker_body(leiasr_d3d11 *sr, double max_time)
+{
+	const uint64_t start_ms = GetTickCount64();
+
+	// A reader that passed w_ready() microseconds before the poller's CAS can
+	// still be inside an SDK call. This is the same exposure the #144
+	// async-destroy reaper already accepts, and the runtime additionally
+	// serialises eye-pos reads against DP lifetime under its render mutex.
+	// 100 ms is far longer than any single weaver call.
+	Sleep(100);
+
+	// We are about to run SDK teardown + construction off-thread against the
+	// shared immediate context, which is what create_async enables this for.
+	// Doing it here too is not redundant: a weaver created through the SYNC
+	// path (DXR_LEIA_ASYNC_WEAVER=0) never went through create_async, so
+	// without this a reconnect on that path would be the one unprotected
+	// off-thread context user. Idempotent.
+	enable_context_multithread_protection(sr->d3d11_context);
+
+	// Re-assert the mode the runtime last asked for. pending_lens_wish is
+	// CONSUMED at publish so it is empty by now; last_lens_wish is the sticky
+	// record. Seed it before teardown so a wish arriving mid-rebuild (which
+	// writes pending_lens_wish itself) simply wins over this one.
+	const int wish = sr->last_lens_wish.load(std::memory_order_acquire);
+	if (wish >= 0) {
+		sr->pending_lens_wish.store(wish, std::memory_order_release);
+	}
+
+	try {
+		destroy_sdk_objects(sr);
+	} catch (...) {
+		U_LOG_E("Leia D3D11 reconnect: SDK teardown threw — continuing into a fresh create");
+	}
+
+	// #625: the snap probe is gone with the old SRContext, and a previous
+	// lazy-init failure was a property of THAT context — give the fresh one its
+	// own chance rather than inheriting a permanent no-snap verdict. Safe to
+	// write here: every snap caller is parked on w_ready() while we are PENDING.
+	sr->snap_probe_failed = false;
+
+	async_create_worker_body(sr, max_time, /*reconnect=*/true, start_ms);
+}
+
 } // namespace
 
 extern "C" {
@@ -855,11 +1081,15 @@ leiasr_d3d11_create(double max_time,
 	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
 	sr->view_width = view_width;
 	sr->view_height = view_height;
+	// #158: the reconnect worker recreates from this, not from a caller.
+	sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
 
 	if (!create_weaver_attempt(sr, max_time, hwnd)) {
 		delete sr;
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	// #158: stamp the SR platform incarnation we connected to.
+	sr->platform_generation = leia_sr_liveness_platform_generation();
 	// async_state already defaults to LEIASR_ASYNC_READY on the sync path.
 
 	*out = sr;
@@ -888,6 +1118,8 @@ leiasr_d3d11_create_async(double max_time,
 	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
 	sr->view_width = view_width;
 	sr->view_height = view_height;
+	// #158: the reconnect worker recreates from this, not from a caller.
+	sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
 	sr->async_state.store(LEIASR_ASYNC_PENDING, std::memory_order_relaxed);
 
 	// The worker (and the async destroy reaper) will touch the shared
@@ -895,64 +1127,11 @@ leiasr_d3d11_create_async(double max_time,
 	enable_context_multithread_protection(sr->d3d11_context);
 
 	// Detached by design: whoever loses the PENDING→{READY,CANCELLED} CAS
-	// owns/frees the struct (see the struct's async comment block).
-	std::thread([sr, max_time, hwnd]() {
-		uint32_t attempt = 0;
-		for (;;) {
-			if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
-				delete sr;
-				return;
-			}
-			attempt++;
-			if (create_weaver_attempt(sr, max_time, hwnd)) {
-				// runtime#1008: apply a window re-bind recorded while we
-				// were creating (the weaver was built against the ORIGINAL
-				// hwnd, so without this the DP would silently weave against
-				// a window the runtime no longer presents to). Same
-				// exactly-once exchange discipline as the lens wish below.
-				uintptr_t want = sr->pending_hwnd.exchange(0, std::memory_order_acq_rel);
-				if (want != 0) {
-					if (w_set_window(sr, reinterpret_cast<HWND>(want))) {
-						U_LOG_W("Leia D3D11 async weaver: applied recorded window "
-						        "re-bind (hwnd=%p)",
-						        (void *)want);
-					}
-				}
-				// Apply any lens wish recorded while we were creating —
-				// BEFORE the READY CAS, which must be the last access to
-				// sr this thread makes on the success path. A wish that
-				// lands in the tiny window between this exchange and the
-				// CAS is self-applied by the recorder (it re-checks state
-				// after storing), or re-driven by the next mode request.
-				int wish = sr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
-				if (wish >= 0 && lens_present(sr)) {
-					try {
-						lens_set(sr, wish == 1);
-						U_LOG_W("Leia D3D11 async weaver: applied recorded lens wish (%s)",
-						        wish == 1 ? "3D" : "2D");
-					} catch (...) {
-					}
-				}
-				int expected = LEIASR_ASYNC_PENDING;
-				if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_READY,
-				                                            std::memory_order_acq_rel)) {
-					U_LOG_W("Leia D3D11 weaver READY (async create, attempt %u)", attempt);
-					return;
-				}
-				// Destroyed while we were creating — tear down and free.
-				destroy_sdk_objects(sr);
-				delete sr;
-				return;
-			}
-			U_LOG_W("Leia D3D11 async weaver: create attempt %u failed — retrying in 5 s", attempt);
-			for (int i = 0; i < 50; i++) {
-				if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
-					delete sr;
-					return;
-				}
-				Sleep(100);
-			}
-		}
+	// owns/frees the struct (see the struct's async comment block). The body
+	// is shared with the #158 in-place reconnect worker — hwnd comes off the
+	// struct (bound_hwnd), which set_window keeps current.
+	std::thread([sr, max_time]() {
+		async_create_worker_body(sr, max_time, /*reconnect=*/false, /*start_ms=*/0);
 	}).detach();
 
 	*out = sr;
@@ -1849,6 +2028,11 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 		return false;
 	}
 
+	// #158: sticky record of what the runtime last asked for, so an in-place
+	// reconnect can re-assert it on the freshly created lens. Distinct from
+	// pending_lens_wish, which is consumed at publish and empty thereafter.
+	leiasr->last_lens_wish.store(enable_3d ? 1 : 0, std::memory_order_release);
+
 	// #144: weaver still creating — record the wish; the worker applies it at
 	// publish. Re-check afterwards: if creation completed between the store
 	// and the worker's own wish-consume, apply it ourselves (the exchange
@@ -1908,6 +2092,75 @@ leiasr_d3d11_get_hardware_3d_state(struct leiasr_d3d11 *leiasr, bool *out_is_3d)
 	} catch (...) {
 		return false;
 	}
+}
+
+uint32_t
+leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr)
+{
+	if (leiasr == nullptr) {
+		return LEIA_SR_BACKEND_OK;
+	}
+
+	// A create or a reconnect is already in flight. Every public entry point
+	// degrades through w_ready() while that is true, so there is nothing to
+	// detect here and nothing to trigger.
+	if (leiasr->async_state.load(std::memory_order_acquire) != LEIASR_ASYNC_READY) {
+		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+
+	const uint64_t gen = leia_sr_liveness_platform_generation();
+
+	if (gen == 0) {
+		// SR platform is down. Deliberately do NOT tear the weaver down: it
+		// keeps weaving on the last known eye positions, which is a far
+		// better picture than the flat blit a teardown would drop us to —
+		// and when the service comes back the generation check below fires
+		// and rebuilds. Nothing is lost by waiting.
+		if (!leiasr->warned_platform_down.exchange(true, std::memory_order_relaxed)) {
+			U_LOG_W("SR platform is DOWN — weaving untracked; will reconnect when it returns");
+		}
+		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_platform_down.store(false, std::memory_order_relaxed);
+
+	// platform_generation == 0 means we never managed to read a token at
+	// create time (SCM unreachable). Detection is simply off in that case —
+	// treating "unknown then known" as a restart would rebuild the weaver for
+	// no reason on every such machine.
+	if (leiasr->platform_generation != 0 && gen != leiasr->platform_generation) {
+		// THIS is what arms the self-heal. Winning the CAS both parks every
+		// entry point on the w_ready() degrade path and claims the right to
+		// spawn exactly one reconnect worker.
+		int expected = LEIASR_ASYNC_READY;
+		if (leiasr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_PENDING,
+		                                                std::memory_order_acq_rel)) {
+			const uint64_t n = leiasr->reconnect_count.load(std::memory_order_relaxed) + 1;
+			U_LOG_W("SR platform restarted (generation %llu → %llu) — reconnecting weaver "
+			        "in place, attempt %llu",
+			        (unsigned long long)leiasr->platform_generation, (unsigned long long)gen,
+			        (unsigned long long)n);
+			// Detached, same ownership contract as the create worker.
+			std::thread([leiasr]() { reconnect_worker_body(leiasr, 5.0); }).detach();
+		}
+		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+
+	if (!leia_sr_liveness_client_matches_platform()) {
+		if (!leiasr->warned_client_skew.exchange(true, std::memory_order_relaxed)) {
+			U_LOG_W("SR client DLLs mapped in this process predate the installed SR platform "
+			        "— reconnected sessions run on the OLD client libraries; restart the "
+			        "DisplayXR service to load the new ones");
+		}
+		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_client_skew.store(false, std::memory_order_relaxed);
+
+	leiasr->last_backend_state.store(LEIA_SR_BACKEND_OK, std::memory_order_relaxed);
+	return LEIA_SR_BACKEND_OK;
 }
 
 bool
