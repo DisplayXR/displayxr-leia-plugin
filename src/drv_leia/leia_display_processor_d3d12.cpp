@@ -2433,6 +2433,26 @@ leia_dp_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
 	ldp->backdrop_h = height;
 }
 
+#ifdef XRT_DP_D3D12_HAS_BACKEND_STATE
+/*!
+ * #158: report the SR backend's health to the runtime.
+ *
+ * Detection only on this arm (no in-place reconnect — see the poll's doc):
+ * a restarted SR platform is reported STALE, and the runtime's remedy is to
+ * recreate the display processor. Computed on demand; non-blocking.
+ */
+static bool
+leia_dp_d3d12_get_backend_state(struct xrt_display_processor_d3d12 *xdp, uint32_t *out_state)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	if (ldp == NULL || out_state == NULL) {
+		return false;
+	}
+	*out_state = leiasr_d3d12_poll_backend_state(ldp->leiasr);
+	return true;
+}
+#endif
+
 #ifdef XRT_DP_D3D12_HAS_FRAME_TIMING
 static void
 leia_dp_d3d12_set_frame_timing(struct xrt_display_processor_d3d12 *xdp,
@@ -2616,6 +2636,9 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.set_shared_texture_present = leia_dp_d3d12_set_shared_texture_present; // #68
 #ifdef XRT_DP_D3D12_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_d3d12_set_frame_timing; // weave-latency timing loop (slot 19)
+#endif
+#ifdef XRT_DP_D3D12_HAS_BACKEND_STATE
+	ldp->base.get_backend_state = leia_dp_d3d12_get_backend_state; // #158 SR restart detection
 #endif
 	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;

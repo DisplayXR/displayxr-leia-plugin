@@ -1913,6 +1913,26 @@ leia_dp_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_BACKEND_STATE
+/*!
+ * #158: report the SR backend's health to the runtime.
+ *
+ * Detection only on this arm (no in-place reconnect — see the poll's doc): a
+ * restarted SR platform is reported STALE, and the runtime's remedy is to
+ * recreate the display processor. Computed on demand; non-blocking.
+ */
+static bool
+leia_dp_vk_get_backend_state(struct xrt_display_processor_vk *xdp, uint32_t *out_state)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	if (ldp == nullptr || out_state == nullptr) {
+		return false;
+	}
+	*out_state = leiasr_poll_backend_state(ldp->leiasr);
+	return true;
+}
+#endif
+
 static void
 leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
 {
@@ -2114,6 +2134,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
 #endif
+#ifdef XRT_DP_VK_HAS_BACKEND_STATE
+	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
+#endif
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -2226,6 +2249,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 #endif
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
+#endif
+#ifdef XRT_DP_VK_HAS_BACKEND_STATE
+	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
 #endif
 
 	ldp->leiasr = leiasr;
