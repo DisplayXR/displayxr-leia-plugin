@@ -16,6 +16,7 @@
 #include <winver.h>
 
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace {
@@ -154,23 +155,69 @@ mapped_module_version(HMODULE mod)
 	return pack_version(ffi);
 }
 
-//! File version of the module's file ON DISK — i.e. what is installed now.
-uint64_t
-installed_module_version(HMODULE mod)
+/*!
+ * Directory the SR platform is INSTALLED in, derived from a module that is
+ * always mapped straight out of it.
+ *
+ * `SimulatedRealityCore.dll` is the anchor on purpose. The obvious alternative
+ * — ask each module for its own path — is WRONG here: the runtime pre-loads a
+ * sanitized per-build COPY of `DimencoWeaving.dll` (displayxr-runtime#434) from
+ * %LOCALAPPDATA%\DisplayXR\ThirdParty\..., so that module's path names the
+ * cache, not the install. `SimulatedRealityCore.dll` is not sanitized and maps
+ * from `...\LeiaSR\Platform\bin`.
+ *
+ * @return false when the anchor is not loaded or its path cannot be taken.
+ *         Callers must answer "undeterminable" then, never "mismatch".
+ */
+bool
+sr_platform_dir(std::wstring &out)
 {
-	wchar_t path[MAX_PATH * 2] = {};
-	DWORD n = GetModuleFileNameW(mod, path, (DWORD)(sizeof(path) / sizeof(path[0])));
-	if (n == 0 || n >= (sizeof(path) / sizeof(path[0]))) {
-		return 0;
+	HMODULE anchor = GetModuleHandleW(L"SimulatedRealityCore.dll");
+	if (anchor == nullptr) {
+		return false;
 	}
 
+	wchar_t path[MAX_PATH * 2] = {};
+	DWORD n = GetModuleFileNameW(anchor, path, (DWORD)(sizeof(path) / sizeof(path[0])));
+	if (n == 0 || n >= (sizeof(path) / sizeof(path[0]))) {
+		return false;
+	}
+
+	wchar_t *slash = wcsrchr(path, L'\\');
+	if (slash == nullptr) {
+		return false;
+	}
+	*slash = L'\0';
+	out.assign(path);
+	return true;
+}
+
+/*!
+ * File version of @p name ON DISK in the installed platform directory — i.e.
+ * what is installed now.
+ *
+ * Takes the directory rather than the HMODULE deliberately. Deriving the path
+ * from `GetModuleFileNameW(mod)` is a structural false negative for the one
+ * module most likely to be stale: `DimencoWeaving.dll` is mapped from the
+ * runtime's sanitized COPY (see sr_platform_dir), so that comparison pits the
+ * cached copy against ITSELF and can only ever report "matches". Observed live:
+ * mapped v1.37.0+1470 against installed v1.37.0+1473, verdict "matches", zero
+ * warnings.
+ *
+ * @return 0 if unavailable.
+ */
+uint64_t
+installed_module_version(const std::wstring &dir, const wchar_t *name)
+{
+	const std::wstring path = dir + L"\\" + name;
+
 	DWORD handle = 0;
-	DWORD size = GetFileVersionInfoSizeW(path, &handle);
+	DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
 	if (size == 0) {
 		return 0;
 	}
 	std::vector<uint8_t> buf(size);
-	if (!GetFileVersionInfoW(path, handle, size, buf.data())) {
+	if (!GetFileVersionInfoW(path.c_str(), handle, size, buf.data())) {
 		return 0;
 	}
 	VS_FIXEDFILEINFO *ffi = nullptr;
@@ -189,14 +236,14 @@ installed_module_version(HMODULE mod)
  * undeterminable must never read as a mismatch.
  */
 bool
-module_matches_disk(const wchar_t *name)
+module_matches_disk(const std::wstring &platform_dir, const wchar_t *name)
 {
 	HMODULE mod = GetModuleHandleW(name);
 	if (mod == nullptr) {
 		return true;
 	}
 	uint64_t mapped = mapped_module_version(mod);
-	uint64_t disk = installed_module_version(mod);
+	uint64_t disk = installed_module_version(platform_dir, name);
 	if (mapped == 0 || disk == 0) {
 		return true;
 	}
@@ -206,9 +253,19 @@ module_matches_disk(const wchar_t *name)
 bool
 compute_client_matches(void)
 {
+	// The on-disk side must be read from the INSTALLED platform directory, not
+	// from each module's own path — DimencoWeaving.dll is the sanitized copy the
+	// runtime pre-loads, which is exactly why the directory is anchored on
+	// SimulatedRealityCore.dll instead (see sr_platform_dir).
+	std::wstring dir;
+	if (!sr_platform_dir(dir)) {
+		// Undeterminable — never a mismatch. See the header.
+		return true;
+	}
+
 	// DimencoWeaving carries the weaver itself; SimulatedRealityCore the
 	// client transport. Either one going stale is worth the warning.
-	return module_matches_disk(L"DimencoWeaving.dll") && module_matches_disk(L"SimulatedRealityCore.dll");
+	return module_matches_disk(dir, L"DimencoWeaving.dll") && module_matches_disk(dir, L"SimulatedRealityCore.dll");
 }
 
 } // namespace
