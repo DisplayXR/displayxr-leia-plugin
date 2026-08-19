@@ -23,6 +23,7 @@ so you can iterate without rebuilding/reinstalling the plug-in:
 | `debug.dxr.leia.face_flip_y` | 0 | Negate `out_y` in `leia_cnsdk_get_primary_face` |
 | `debug.dxr.leia.face_flip_z` | 0 | Negate `out_z` in `leia_cnsdk_get_primary_face` |
 | `debug.dxr.leia.face_swap_xy` | 0 | Swap `out_x` and `out_y` (applied BEFORE the flips) |
+| `debug.dxr.leia.capture_lux` | 0 | Call `leia_core_set_face_tracking_capture_lux(core, 1)` **before** face tracking is enabled, so the value rides in the head-tracking `ClientHello` (see below) |
 
 Values: `1`/`true`/`t`/`yes`/`y` → enabled; anything else → disabled.
 
@@ -34,8 +35,35 @@ adb shell setprop debug.dxr.leia.face_flip_x 1
 adb shell am force-stop com.displayxr.cube_handle_vk_android
 adb shell am start -n com.displayxr.cube_handle_vk_android/android.app.NativeActivity
 adb logcat | grep 'HW_DBG_CNSDK calibration'
-# → flip_uv=1 face_flip_xyz=100 face_swap_xy=0
+# → flip_uv=1 face_flip_xyz=100 face_swap_xy=0 capture_lux=0
 ```
+
+### `capture_lux` is a test knob, not a calibration knob
+
+It does not affect our weave at all — we never consume the lux value. It exists
+because CNSDK's head-tracking service applies four settings (face detector,
+device orientation, profiling, lux capture) that are single-valued **in the
+engine** but requested **per client**, and `enableLuxCapture` is the only one of
+the four that a plug-in can vary from outside CNSDK's public API. Setting it
+before face tracking is enabled means the value travels in the `ClientHello`
+rather than as a later global write, which makes it a genuine per-client input
+to the service's aggregation (`LeiaInc/CNSDK#698`).
+
+Because the property is read once per satellite process, flipping it between two
+app launches gives the two head-tracking clients different Hello arguments — the
+only way we have found to make the aggregation observable from logcat:
+
+```bash
+adb shell setprop debug.dxr.leia.capture_lux 1
+adb shell am start -n com.displayxr.cube_handle_vk_android/.MainActivity
+adb shell setprop debug.dxr.leia.capture_lux 0
+adb shell am start -n com.displayxr.cube_handle_vk_android.b/com.displayxr.cube_handle_vk_android.MainActivity
+adb logcat -s HeadTracking | grep -E 'requested engine config|applied config'
+```
+
+With `LeiaInc/CNSDK#698` + `#713` on the device, the second client's
+`requested engine config` line is followed by **no** `applied config` line — the
+first client's setting survived. Full evidence: LeiaInc/CNSDK#698.
 
 The active values are logged once at `xrCreateInstance` time (in the
 plug-in's `probe()`) so they're visible even when the test reaches

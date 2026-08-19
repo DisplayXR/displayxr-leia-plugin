@@ -234,6 +234,15 @@ struct calibration_knobs {
 	bool face_flip_y;    // debug.dxr.leia.face_flip_y     default 0
 	bool face_flip_z;    // debug.dxr.leia.face_flip_z     default 0
 	bool face_swap_xy;   // debug.dxr.leia.face_swap_xy    default 0
+	// debug.dxr.leia.capture_lux    default 0. Requests CNSDK's lux capture on
+	// this core BEFORE face tracking is enabled, so the value travels in the
+	// head-tracking ClientHello rather than as a later global write. That makes
+	// it a per-client input to the service's engine-config aggregation
+	// (LeiaInc/CNSDK#698) — the only knob we have that varies a Hello field,
+	// which is what makes the aggregation testable from logcat
+	// (LeiaInc/CNSDK#709). Read once per satellite process, so setting it
+	// between two app launches gives the two clients different values.
+	bool capture_lux;
 };
 
 static struct calibration_knobs g_calib = {};
@@ -343,11 +352,12 @@ ensure_calibration_loaded(void)
 	g_calib.face_flip_y   = get_prop_bool("debug.dxr.leia.face_flip_y",   false);
 	g_calib.face_flip_z   = get_prop_bool("debug.dxr.leia.face_flip_z",   false);
 	g_calib.face_swap_xy  = get_prop_bool("debug.dxr.leia.face_swap_xy",  false);
+	g_calib.capture_lux   = get_prop_bool("debug.dxr.leia.capture_lux",   false);
 	g_calib_loaded.store(true, std::memory_order_release);
-	U_LOG_W("HW_DBG_CNSDK calibration: flip_uv=%d face_flip_xyz=%d%d%d face_swap_xy=%d",
+	U_LOG_W("HW_DBG_CNSDK calibration: flip_uv=%d face_flip_xyz=%d%d%d face_swap_xy=%d capture_lux=%d",
 	        (int)g_calib.flip_uv,
 	        (int)g_calib.face_flip_x, (int)g_calib.face_flip_y, (int)g_calib.face_flip_z,
-	        (int)g_calib.face_swap_xy);
+	        (int)g_calib.face_swap_xy, (int)g_calib.capture_lux);
 }
 
 extern "C" void
@@ -784,6 +794,18 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 		leia_core_library_release(lib);
 		*out_cnsdk = NULL;
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// debug.dxr.leia.capture_lux — set BEFORE the worker enables face tracking, so
+	// the value rides in the head-tracking ClientHello (a per-client input to the
+	// service's engine-config aggregation, LeiaInc/CNSDK#698) instead of becoming a
+	// later global write. Off by default; the only effect when on is that the
+	// service's engine captures ambient lux, which we do not consume.
+	ensure_calibration_loaded();
+	if (g_calib.capture_lux) {
+		leia_core_set_face_tracking_capture_lux(core, 1);
+		U_LOG_W("HW_DBG_CNSDK: debug.dxr.leia.capture_lux=1 — requested lux capture "
+		        "pre-ClientHello for this core");
 	}
 
 	// Do NOT touch the core here — leia_core_init_async() only *kicks off*
