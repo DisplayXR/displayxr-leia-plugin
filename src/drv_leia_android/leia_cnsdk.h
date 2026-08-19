@@ -14,6 +14,8 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
+
+#include <stdint.h>
 #include "xrt/xrt_vulkan_includes.h"
 
 #ifdef __cplusplus
@@ -260,6 +262,37 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  int32_t vp_y,
                  uint32_t vp_w,
                  uint32_t vp_h);
+
+/*!
+ * Report this window's rectangle on the panel (runtime#1033 / #150, ADR-036 D6).
+ *
+ * The runtime's per-window compositor instance calls this before every weave. It
+ * becomes the BASE screen position the interlace phase is referenced to; the
+ * per-frame zone/canvas offset is added on top
+ * (`set_viewport_screen_position = window origin + zone offset`).
+ *
+ * Coordinates are CURRENT-orientation screen pixels, exactly as Android's
+ * `View.getLocationOnScreen()` reports them — CNSDK rotates them into the panel's
+ * natural orientation itself (`interlacer.cpp`: "the user provides data in the
+ * current orientation space, we convert it to the natural one"), which is also
+ * what CNSDK's own `InterlacedSurfaceView._updatePosition` passes through. Do NOT
+ * pre-rotate and do NOT grid-snap here: snapping is the weaver's business
+ * (ADR-033), and the runtime deliberately reports the raw geometry.
+ *
+ * Cached; a repeat of the same rect makes no vendor call. Never calling it leaves
+ * the base at (0,0) = display-scoped weaving, the pre-#150 behaviour.
+ *
+ * @param cnsdk       Handle (NULL-safe).
+ * @param x           Window left edge, current-orientation screen pixels.
+ * @param y           Window top edge, current-orientation screen pixels.
+ * @param w           Window width in screen pixels.
+ * @param h           Window height in screen pixels.
+ * @param display_id  Android `Display.getDisplayId()`; -1 = unknown. Recorded
+ *                    only — CNSDK has no multi-display concept yet (L6).
+ */
+void
+leia_cnsdk_set_window_screen_rect(
+    struct leia_cnsdk *cnsdk, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id);
 
 #ifdef __cplusplus
 }
