@@ -59,8 +59,8 @@ jobs:
       # asset here because upstream ships the win64 v2 SDK only as a CI run
       # artifact — there is no upstream release asset to point at. Replace
       # with one when the SR v2 PRs land.
-      SR_V2_TAG: sr-sdk-v2-1.37.0.1479
-      SR_V2_DIR: simulatedreality-SDK-1.37.0+1479.028e2b09fd-win64-Release
+      SR_V2_TAG: sr-sdk-v2-1.37.0.1450
+      SR_V2_DIR: simulatedreality-SDK-1.37.0+1450.2bd551714b-win64-Release
       GH_TOKEN: ${{ github.token }}
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
