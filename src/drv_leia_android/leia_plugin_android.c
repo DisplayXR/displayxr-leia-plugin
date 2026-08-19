@@ -366,6 +366,15 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 	// which case leia_cnsdk falls back to its own android_globals.
 	if (host != NULL) {
 		leia_cnsdk_set_host_android_accessors(host->get_android_vm, host->get_android_activity);
+#ifdef XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT
+		// runtime #1037 / ADR-036 D2: the Context whose classloader is the
+		// runtime APK's, so the CNSDK core loader resolves com.leia.* Java
+		// glue the app does not ship. Also carved from reserved[], so the
+		// value is simply NULL on a runtime that predates it — and the
+		// #ifdef keeps this compiling against runtime headers that predate
+		// the field (DXR_RUNTIME_GIT_TAG may still point at such a tag).
+		leia_cnsdk_set_host_class_context_accessor(host->get_android_class_host_context);
+#endif
 	}
 
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;

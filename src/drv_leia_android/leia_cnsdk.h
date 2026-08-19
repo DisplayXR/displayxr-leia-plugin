@@ -51,6 +51,22 @@ void
 leia_cnsdk_set_host_android_accessors(void *(*get_vm)(void), void *(*get_activity)(void));
 
 /*!
+ * Register the runtime's optional "class-host Context" accessor
+ * (`xrt_plugin_host_iface::get_android_class_host_context`, runtime #1037 /
+ * ADR-036 D2). When the plug-in runs IN THE APP's process the app ships no
+ * vendor Java glue, so CNSDK's core loader must build its DexClassLoader with
+ * the RUNTIME APK's classloader as the parent — which it takes from the
+ * Context handed to `leia_core_library_load`. Class loading only: everything
+ * Activity-typed keeps using the accessor above.
+ *
+ * NULL (an older runtime without the slot, or a runtime that could not create
+ * the Context) keeps the previous behaviour — the Activity / Service Context
+ * is used for everything.
+ */
+void
+leia_cnsdk_set_host_class_context_accessor(void *(*get_class_host_context)(void));
+
+/*!
  * Read all `debug.dxr.leia.*` calibration setprops and log them.
  *
  * Idempotent (cached after first call). Safe to call from the plug-in
