@@ -223,49 +223,79 @@ Only via a **privileged** path, and not from our code today. Findings on NP02J (
 
 ---
 
-## 5. The 3D backlight is DISPLAY-GLOBAL — and `on_pause` cannot express "not right now"
+## 5. The 3D lens is DISPLAY-GLOBAL — so `on_pause` releases a *vote*, it does not command the panel
 
-The panel's switchable 3D backlight is **not** per-app state. On this hardware it is held by
-`BacklightMultiClientControlService` as a binder **bind-refcount across processes**: the first
-client to bind turns 3D on, the last to unbind turns it off. The plug-in resolves to that
-multi-client service (tier 1) and never to the legacy `BacklightControlService`, which forces
-2D and `stopSelf`s on unbind.
+The panel's switchable 3D backlight is **not** per-app state. On this hardware it is arbitrated by
+`BacklightMultiClientControlService` as a binder **bind-refcount across processes**:
 
-`leia_core_enable_3d(false)` does **both** things at once — it drops the global backlight *and*
-unbinds this process. So a single compositor instance calling it from `leia_cnsdk_on_pause`
-takes the refcount to 0 and flattens the panel **underneath a sibling app that is still
-weaving**. Two producers reach `on_pause` on the Android OOP path, and neither is Activity
-lifecycle: surface loss (`MonadoView.surfaceDestroyed` → `clearAppSurface` →
-`android_window_transition_locked`) and `multi_compositor_end_session`. A multi-window relayout
-genuinely destroys and recreates an app's `SurfaceView` surface, so the pause is legitimate —
-what is wrong is taking the whole display down with it.
+| Service callback | What it does |
+|---|---|
+| `onBind` / `onRebind` | `requestBacklightMode(MODE_3D)` — the first vote turns the lens on |
+| `onUnbind` (Android delivers it only when the **last** client has disconnected) | `requestBacklightMode(MODE_2D)` |
 
-### `debug.dxr.multiapp` — opt in to holding the bind
+So the service already **is** the OR-of-votes arbiter the multi-window case needs. The plug-in
+resolves to that multi-client service (tier 1) and never to the legacy `BacklightControlService`,
+which forces 2D and `stopSelf`s on unbind.
+
+### `leia_core_enable_3d(false)` is a pure UNBIND on that tier
+
+This corrects the premise of #151. CNSDK `device::SetBacklightMode` (`androidDevice.cpp`) takes the
+multi-client branch **first and returns from it**:
+
+```
+leia_core_enable_3d(false)
+  -> leia_core::SetBacklight(false) -> ForceSetBacklight -> device::SetBacklightMode(false, cfg)
+       if (g_backlightMultiClientService) { Connect(env, false); return; }   <-- taken
+       g_backlightService->requestBacklightMode("MODE_2D")                   <-- never reached
+       LeiaManagerUtility::SetBacklightMode(false)                           <-- never reached
+  Connect(env,false) -> Java BaseServiceConnection.connect(false) -> context.unbindService(this)
+```
+
+It never commands the display; it only gives this process's vote back. The
+`LeiaLightsManagerV4: setBacklightMode:false` seen in #151's trace came from the **service** pid
+reacting to its refcount hitting zero, not from the plug-in.
+
+### The contract the plug-in implements
+
+Per the runtime's `xrt_display_processor.h` (DisplayXR/displayxr-runtime#1039):
+
+| DP call | Meaning | Implementation |
+|---|---|---|
+| `on_pause` | "this session's window is not visible: stop weaving and **release** your lens preference" — **not** "force the panel to 2D" | `release_lens_preference()` → `leia_core_enable_3d(false)` = unbind, refcount-- |
+| `on_resume` | "visible again: **re-assert**" | `assert_lens_preference()` → `leia_core_enable_3d(true)` = re-bind, refcount++ |
+| `destroy` | implies `on_pause` — last chance | `release_lens_preference("destroy")` |
+
+Both directions then fall out of the refcount for free:
+
+- **multi-window** — a window whose `SurfaceView` surface was destroyed by a relayout drops the
+  refcount to N−1; the panel stays 3D for the sibling that is still weaving;
+- **last app out** — refcount reaches 0, the service itself requests `MODE_2D`. That is
+  stuck-3D-after-close (runtime #563), fixed without any special case.
+
+The runtime guarantees the pause is keyed on **surface visibility**, never on Activity `onPause`
+(in multi-window only one Activity is top-resumed while both windows weave), and that pause/resume
+are edge-triggered and paired per session — see `comp_multi_system.c::android_window_transition_locked`.
+
+### `debug.dxr.multiapp` — DEPRECATED
 
 | Property | Default | Effect |
 |---|---|---|
-| `debug.dxr.multiapp` | `0` (off) | `1` ⟹ `leia_cnsdk_on_pause` **skips** `force_backlight_2d`: this process keeps its bind (its share of the refcount) and the panel stays 3D. `leia_cnsdk_destroy` still forces 2D, so it remains the sole release path. |
+| `debug.dxr.multiapp` | `0` (off) | `1` ⟹ `leia_cnsdk_on_pause` **holds** the bind instead of releasing it (the #151 behaviour). Kept only to A/B the two on a device. |
 
-```bash
-adb shell setprop debug.dxr.multiapp 1     # before launching the apps
-```
+Holding is now wrong in both directions: it takes a lens vote for a window nobody can see, and in
+the single-app case the compositor process survives as a foreground service so `destroy` never
+runs — the panel would sit in 3D over the launcher, i.e. runtime #563 again. Nothing should depend
+on the property; it will be removed.
 
-Read once via `__system_property_get` and cached, so it must be set before the first
-`on_pause`. With the property unset, single-client behaviour is byte-identical to before.
+### Vendor gap (limitations L2/L3, runtime #1038)
 
-**Why this is opt-in and not the Android default.** Holding the bind is unambiguously right when
-another window is still visible and weaving — but `on_pause` cannot tell that case apart from
-"this is the only app and it just went to the background". In the single-app case the
-compositor process survives as a foreground service, `destroy` never runs, and the panel would
-sit in 3D over the launcher or over an ordinary 2D app: exactly the stuck-3D regression the
-force-2D exists to prevent (runtime #563).
-
-The clean fix is a *preference* rather than a bind: each client says "bound, but I want 2D right
-now" and the service aggregates. The service has no such API today — it is a binary
-bind-refcount (limitation **L2**) — and the runtime side does not yet distinguish "my window is
-hidden" from "my window is one of N visible" (DisplayXR/displayxr-runtime#1039, #1038). Until
-one of those lands, the safe default is the old behaviour and the property is how a
-multi-window run opts out of it.
+On a device where the multi-client service is **absent**, CNSDK falls back to the legacy
+`BacklightControlService` or `LeiaManagerUtility`, and there the *same* `enable_3d(false)` call
+**does** force a global `MODE_2D` — those tiers expose no "unbind only". A release therefore
+degrades to a global command, and concurrent multi-window weaving is only claimed on the
+multi-client tier. The durable fix on the vendor side is an explicit per-client *preference*
+("bound, but I want 2D right now") that the service aggregates, as LeiaSR's
+`switchablehintserver.cpp` already does.
 
 ---
 
