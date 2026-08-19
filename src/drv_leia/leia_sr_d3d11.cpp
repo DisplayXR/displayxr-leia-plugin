@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 
@@ -877,6 +878,26 @@ enable_context_multithread_protection(ID3D11DeviceContext *ctx)
 }
 
 /*!
+ * The arm's v2 `SrInstance` as an opaque pointer for the leia_sr_liveness_*
+ * entry points, or NULL on the v1 path (and on a build without the v2 SDK,
+ * where the member does not exist at all).
+ *
+ * Wrapping it keeps every call site identical on both builds — and every one of
+ * them MUST pass this, stamp sites included: mixing an SDK-id stamp with an
+ * SCM-derived poll would read as a restart that never happened.
+ */
+void *
+v2_instance_of(const leiasr_d3d11 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	return sr != nullptr ? static_cast<void *>(sr->instance_v2) : nullptr;
+#else
+	(void)sr;
+	return nullptr;
+#endif
+}
+
+/*!
  * Shared body of the #144 async CREATE worker and the #158 in-place RECONNECT
  * worker. Runs on a detached thread and owns the PENDING→READY publish.
  *
@@ -966,7 +987,7 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			// disables detection rather than faking a restart — see
 			// leiasr_d3d11_poll_backend_state.
 			const uint64_t prev_gen = sr->platform_generation;
-			sr->platform_generation = leia_sr_liveness_platform_generation();
+			sr->platform_generation = leia_sr_liveness_platform_generation_ex(v2_instance_of(sr));
 
 			int expected = LEIASR_ASYNC_PENDING;
 			if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_READY,
@@ -1058,6 +1079,34 @@ reconnect_worker_body(leiasr_d3d11 *sr, double max_time)
 	async_create_worker_body(sr, max_time, /*reconnect=*/true, start_ms);
 }
 
+/*!
+ * Arm an in-place reconnect: park every entry point on the w_ready() degrade
+ * path and spawn exactly one worker.
+ *
+ * Winning the READY→PENDING CAS both parks the arm and claims the right to
+ * spawn, so the WARN is inherently one-shot per armed reconnect. Factored out
+ * because there are now TWO detectors that can arm one — the SDK's connection
+ * state and the generation token — and this ownership contract must not exist
+ * in two copies.
+ *
+ * @param reason Logged verbatim, so the line names the detector that fired.
+ * @return true when THIS call won the claim.
+ */
+bool
+arm_reconnect(leiasr_d3d11 *sr, const char *reason)
+{
+	int expected = LEIASR_ASYNC_READY;
+	if (!sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_PENDING, std::memory_order_acq_rel)) {
+		return false;
+	}
+
+	const uint64_t n = sr->reconnect_count.load(std::memory_order_relaxed) + 1;
+	U_LOG_W("%s — reconnecting weaver in place, attempt %llu", reason, (unsigned long long)n);
+	// Detached, same ownership contract as the create worker.
+	std::thread([sr]() { reconnect_worker_body(sr, 5.0); }).detach();
+	return true;
+}
+
 } // namespace
 
 extern "C" {
@@ -1089,7 +1138,7 @@ leiasr_d3d11_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	// #158: stamp the SR platform incarnation we connected to.
-	sr->platform_generation = leia_sr_liveness_platform_generation();
+	sr->platform_generation = leia_sr_liveness_platform_generation_ex(v2_instance_of(sr));
 	// async_state already defaults to LEIASR_ASYNC_READY on the sync path.
 
 	*out = sr;
@@ -2109,7 +2158,11 @@ leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr)
 		return LEIA_SR_BACKEND_DEGRADED;
 	}
 
-	const uint64_t gen = leia_sr_liveness_platform_generation();
+	// One source for the whole poll: the SDK-reported platform id when this arm
+	// has a v2 instance and the SDK is new enough, the SCM probe otherwise
+	// (leia_sr_liveness.h).
+	void *const v2 = v2_instance_of(leiasr);
+	const uint64_t gen = leia_sr_liveness_platform_generation_ex(v2);
 
 	if (gen == 0) {
 		// SR platform is down. Deliberately do NOT tear the weaver down: it
@@ -2125,25 +2178,32 @@ leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr)
 	}
 	leiasr->warned_platform_down.store(false, std::memory_order_relaxed);
 
+	// The SDK's own LIVENESS signal, and a strictly independent detector from
+	// the identity comparison below — the vendor expects both to be wired. It
+	// catches two cases identity cannot: a platform that crashed while its last
+	// published id still lingers, and any machine where no token was readable at
+	// create time (which switches the comparison below off entirely). A no-op
+	// unless the SDK is new enough (DXR_LEIA_HAS_SR_CONNECTION_STATE).
+	//
+	// TODO(#158 follow-up): SR_ERROR_PLATFORM_DISCONNECTED can also come back
+	// from the per-frame w_get_predicted_eyes() path. Deliberately NOT wired
+	// there in this change — this 1 Hz poll already covers the case, and the hot
+	// path stays untouched.
+	if (leia_sr_liveness_connection_is_dead(v2)) {
+		arm_reconnect(leiasr, "SR platform connection reported DEAD by the SDK");
+		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+
 	// platform_generation == 0 means we never managed to read a token at
-	// create time (SCM unreachable). Detection is simply off in that case —
-	// treating "unknown then known" as a restart would rebuild the weaver for
-	// no reason on every such machine.
+	// create time (no SDK id and the SCM unreachable). Detection is simply off
+	// in that case — treating "unknown then known" as a restart would rebuild
+	// the weaver for no reason on every such machine.
 	if (leiasr->platform_generation != 0 && gen != leiasr->platform_generation) {
-		// THIS is what arms the self-heal. Winning the CAS both parks every
-		// entry point on the w_ready() degrade path and claims the right to
-		// spawn exactly one reconnect worker.
-		int expected = LEIASR_ASYNC_READY;
-		if (leiasr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_PENDING,
-		                                                std::memory_order_acq_rel)) {
-			const uint64_t n = leiasr->reconnect_count.load(std::memory_order_relaxed) + 1;
-			U_LOG_W("SR platform restarted (generation %llu → %llu) — reconnecting weaver "
-			        "in place, attempt %llu",
-			        (unsigned long long)leiasr->platform_generation, (unsigned long long)gen,
-			        (unsigned long long)n);
-			// Detached, same ownership contract as the create worker.
-			std::thread([leiasr]() { reconnect_worker_body(leiasr, 5.0); }).detach();
-		}
+		char reason[192];
+		snprintf(reason, sizeof(reason), "SR platform restarted (generation %llu → %llu)",
+		         (unsigned long long)leiasr->platform_generation, (unsigned long long)gen);
+		arm_reconnect(leiasr, reason);
 		leiasr->last_backend_state.store(LEIA_SR_BACKEND_DEGRADED, std::memory_order_relaxed);
 		return LEIA_SR_BACKEND_DEGRADED;
 	}

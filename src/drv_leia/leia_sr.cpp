@@ -518,6 +518,26 @@ ConfigureAdaptiveLatency(leiasr *sr)
 	}
 }
 
+/*!
+ * The arm's v2 `SrInstance` as an opaque pointer for the leia_sr_liveness_*
+ * entry points, or NULL on the v1 path (and on a build without the v2 SDK,
+ * where the member does not exist at all).
+ *
+ * Every liveness call site MUST pass this, stamp sites included: mixing an
+ * SDK-id stamp with an SCM-derived poll would read as a restart that never
+ * happened.
+ */
+void *
+v2_instance_of(const struct leiasr *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	return sr != nullptr ? static_cast<void *>(sr->instance_v2) : nullptr;
+#else
+	(void)sr;
+	return nullptr;
+#endif
+}
+
 } // namespace anonymous
 
 extern "C" {
@@ -603,7 +623,7 @@ leiasr_create(double maxTime,
 
 	// #158: stamp the SR platform incarnation we connected to, so a later poll
 	// can tell "the platform restarted" from "the viewer is holding still".
-	sr->platform_generation = leia_sr_liveness_platform_generation();
+	sr->platform_generation = leia_sr_liveness_platform_generation_ex(v2_instance_of(sr));
 
 	*out = sr;
 
@@ -1252,7 +1272,11 @@ leiasr_poll_backend_state(struct leiasr *leiasr)
 		return LEIA_SR_BACKEND_DEGRADED;
 	}
 
-	const uint64_t gen = leia_sr_liveness_platform_generation();
+	// One source for the whole poll: the SDK-reported platform id when this arm
+	// has a v2 instance and the SDK is new enough, the SCM probe otherwise
+	// (leia_sr_liveness.h).
+	void *const v2 = v2_instance_of(leiasr);
+	const uint64_t gen = leia_sr_liveness_platform_generation_ex(v2);
 
 	if (gen == 0) {
 		// Platform down. The weaver keeps weaving on the last known eye
@@ -1265,6 +1289,25 @@ leiasr_poll_backend_state(struct leiasr *leiasr)
 		return LEIA_SR_BACKEND_DEGRADED;
 	}
 	leiasr->warned_platform_down = false;
+
+	// The SDK's own LIVENESS signal — independent of the identity comparison
+	// below, which the vendor expects to keep as the belt-and-braces backup. A
+	// no-op unless the SDK is new enough (DXR_LEIA_HAS_SR_CONNECTION_STATE).
+	// DISCONNECTED is terminal for the instance, and this arm cannot rebuild in
+	// place, so it is exactly the STALE verdict.
+	//
+	// TODO(#158 follow-up): SR_ERROR_PLATFORM_DISCONNECTED can also come back
+	// from the per-frame eye-position path; deliberately not wired there in this
+	// change — this 1 Hz poll covers it and the hot path stays untouched.
+	if (leia_sr_liveness_connection_is_dead(v2)) {
+		if (!leiasr->warned_stale) {
+			leiasr->warned_stale = true;
+			U_LOG_W("SR platform connection reported DEAD by the SDK (VK arm) — the "
+			        "weaver is STALE and cannot rebuild in place; recreate the display "
+			        "processor (or restart the DisplayXR service) to recover eye tracking");
+		}
+		return LEIA_SR_BACKEND_STALE;
+	}
 
 	// A zero stamp means the token was never readable at create time, so
 	// detection is simply off rather than firing on "unknown -> known".
