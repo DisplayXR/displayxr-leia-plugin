@@ -11,6 +11,7 @@
 #include "leia_cnsdk.h"
 
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 // CNSDK 0.10.x headers (relocated from leia/sdk/ → leia/core/ vs 0.7.28).
 #include <leia/core/core.h>
@@ -121,9 +122,17 @@ struct leia_cnsdk
 	// limit_orientations registration below.
 	bool host_is_activity{false};
 
+	// Camera extrinsics snapshot (leia_camera::translation_mm, mm->m at
+	// storage time) — the camera's position relative to the DISPLAY CENTER.
+	// Read once by the worker from leia_device_config_get_camera_data, then
+	// read on the render thread only after face_tracking_started acquires.
+	// Used to lift the frame-listener's CAMERA-space face into display-center
+	// space; the core's predicted / non-predicted faces already carry the
+	// extrinsics and must NOT be translated again (#152 L-c).
 	float camera_center_x_m{0.0f};
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
+	bool camera_extrinsics_ok{false};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -137,6 +146,13 @@ struct leia_cnsdk
 	struct leia_headtracking_frame_listener *frame_listener{nullptr};
 	std::atomic<bool> listener_face_valid{false};
 	std::atomic<int> listener_miss_count{0};
+	// Monotonic timestamp of the LAST frame-listener invocation — stamped on
+	// every callback, hit or miss. listener_miss_count only advances while the
+	// callback keeps firing, so on its own it can never expire a latched face
+	// when the callback STOPS (service hiccup, client eviction, camera loss):
+	// the last tuple would stay valid forever and the DP would keep weaving a
+	// stale eye. This wall clock is what bounds that (#152 L-c).
+	std::atomic<int64_t> listener_frame_ns{0};
 	std::atomic<float> listener_face_x_mm{0.0f};
 	std::atomic<float> listener_face_y_mm{0.0f};
 	std::atomic<float> listener_face_z_mm{0.0f};
@@ -353,6 +369,18 @@ leia_cnsdk_log_calibration_knobs(void)
 
 namespace {
 
+// Wall-clock lifetime of a latched frame-listener face, measured from the last
+// callback invocation (not the last HIT — see listener_frame_ns). The system
+// head-tracking service delivers frames at >=30 Hz whenever it is streaming,
+// and keeps delivering them with numFaces==0 while it sees nobody, so 500 ms is
+// >=15 consecutive missed DELIVERIES: far beyond scheduler jitter, yet short
+// enough that a wedged/evicted service can't steer the weave off a stale eye
+// for a human-noticeable stretch. Deliberately looser than the 90-miss
+// (~1 s at the service rate) hold in on_headtracking_frame, which stays the
+// authority while the callback is alive: this timer only fires when the
+// callback itself has stopped. (#152 L-c)
+constexpr int64_t kListenerFrameStaleNs = 500 * 1000 * 1000LL;
+
 // Frame listener callback — invoked on a CNSDK background thread for every
 // head-tracking frame the service delivers (the HTS-Binder onMessage(Frame)
 // stream). Cache the primary face's Kalman-filtered point so the render thread
@@ -361,6 +389,13 @@ void
 on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 {
 	struct leia_cnsdk *cnsdk = static_cast<struct leia_cnsdk *>(userData);
+
+	// Stamp the liveness clock on EVERY invocation, hit or miss — this measures
+	// "is the listener still being called at all", which is exactly the
+	// condition the miss counter below cannot observe (#152 L-c).
+	if (cnsdk != nullptr) {
+		cnsdk->listener_frame_ns.store(os_monotonic_get_ns(), std::memory_order_relaxed);
+	}
 
 	// Read the head position. On this device the Kalman tracking_result comes
 	// back empty, but the raw DETECTED faces (posePosition, mm, camera origin)
@@ -496,10 +531,13 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// conversion happens at storage time so render-thread reads are
 	// branch-free.
 	// CNSDK 0.10.x: leia_device_config is opaque — read via typed property
-	// getters instead of struct fields. Camera-center (used only to translate
-	// our get_primary_face output, which feeds the app's per-eye cameras, NOT
-	// the in-service weave steering) moved into a leia_camera struct; defer it
-	// (left 0) — the weave is steered by CNSDK's own in-service face data.
+	// getters instead of struct fields. Camera-center moved into a leia_camera
+	// struct (leia_device_config_get_camera_data); the 0.10.x port deferred it
+	// and left the cached value 0, which silently made the camera->display
+	// translation a no-op. That was harmless for the core's predicted /
+	// non-predicted faces (already display-center) but wrong for the
+	// frame-listener fallback, which is raw camera-space — #152 L-c. Read it
+	// for real here; it is applied ONLY to the listener value.
 	struct leia_device_config *cfg = leia_core_get_device_config(cnsdk->core);
 	if (cfg != NULL) {
 		float display_size_mm[2] = {0.0f, 0.0f};
@@ -531,6 +569,26 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		if (leia_device_config_get_i32(
 		        cfg, LEIA_DEVICE_CONFIG_PROPERTY_DEVICE_NATURAL_ORIENTATION, 1, &natural_ori)) {
 			cnsdk->natural_orientation.store(natural_ori, std::memory_order_relaxed);
+		}
+
+		// Camera 0 = the face-tracking camera. translation_mm is its offset from
+		// the display center; rotation_deg is logged (not applied) so a device
+		// whose camera is NOT display-plane-aligned shows up in triage instead
+		// of silently skewing the fallback face.
+		struct leia_camera cam = {};
+		if (leia_device_config_get_camera_data(cfg, &cam, 0)) {
+			cnsdk->camera_center_x_m = cam.translation_mm.x / 1000.0f;
+			cnsdk->camera_center_y_m = cam.translation_mm.y / 1000.0f;
+			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
+			cnsdk->camera_extrinsics_ok = true;
+			U_LOG_W("CNSDK camera extrinsics: translation=(%.1f,%.1f,%.1f) mm "
+			        "rotation=(%.1f,%.1f,%.1f) deg sensorOri=%d frontFacing=%d",
+			        cam.translation_mm.x, cam.translation_mm.y, cam.translation_mm.z,
+			        cam.rotation_deg.x, cam.rotation_deg.y, cam.rotation_deg.z,
+			        (int)cam.sensorOrientation, (int)cam.frontFacing);
+		} else {
+			U_LOG_W("leia_device_config_get_camera_data(0) failed; frame-listener "
+			        "face fallback keeps a zero camera offset (axis flip still applied)");
 		}
 		leia_device_config_release(cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
@@ -1076,12 +1134,47 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	// extrinsics applied). The frame-listener detection is raw CAMERA-space
 	// posePosition (a fallback for when the core face is empty). The diagnostic is
 	// U_LOG_W (WARN) on purpose — aux INFO is dropped from the Android hot path.
-	const bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
+	bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
 	float lst_pos[3] = {
 	    cnsdk->listener_face_x_mm.load(std::memory_order_relaxed),
 	    cnsdk->listener_face_y_mm.load(std::memory_order_relaxed),
 	    cnsdk->listener_face_z_mm.load(std::memory_order_relaxed),
 	};
+
+	// Expire the latch if the frame listener has gone quiet. Only the callback
+	// can clear listener_face_valid, so without this the last tuple is latched
+	// valid FOREVER once the callback stops firing (#152 L-c) and the DP keeps
+	// weaving for an eye that left minutes ago. Invalidating drops us to the
+	// no-face path (this function returns false unless the core has a face),
+	// and the DP then uses the nominal viewer with is_tracking = false —
+	// which is the honest answer, not the stale one.
+	if (lst_ok) {
+		const int64_t last_ns = cnsdk->listener_frame_ns.load(std::memory_order_relaxed);
+		const int64_t age_ns = os_monotonic_get_ns() - last_ns;
+		if (last_ns == 0 || age_ns > kListenerFrameStaleNs) {
+			cnsdk->listener_face_valid.store(false, std::memory_order_release);
+			lst_ok = false;
+			// One-shot WARN so the first expiry is unmissable in a bug report;
+			// recurrences are throttled INFO (this is a per-frame call site, so
+			// a repeating WARN would flood the log). NOTE: aux INFO is dropped
+			// from the Android hot path, so treat the WARN as the signal and
+			// the INFO as a bonus on verbose builds.
+			static bool warned_once = false;
+			if (!warned_once) {
+				warned_once = true;
+				U_LOG_W("HW_FACE: frame listener stale (%lld ms, limit %lld ms) — "
+				        "invalidating latched face, falling back to the nominal viewer",
+				        (long long)(age_ns / 1000000), (long long)(kListenerFrameStaleNs / 1000000));
+			} else {
+				static int stale_dbg = 0;
+				if ((stale_dbg++ % 300) == 0) {
+					U_LOG_I("HW_FACE: frame listener stale again (%lld ms) — "
+					        "latched face invalidated",
+					        (long long)(age_ns / 1000000));
+				}
+			}
+		}
+	}
 
 	float pred_pos[3] = {0, 0, 0};
 	float np_pos[3] = {0, 0, 0};
@@ -1110,6 +1203,14 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	// which is CAMERA-space (origin at the camera, sensor axes, Y image-down);
 	// using it directly skips the extrinsics (the offset + inverted-Y we saw), so
 	// it is only a last resort when the core face is genuinely empty.
+	// Everything below this point works in DISPLAY-CENTER millimeters. The
+	// core's faces already are; the listener's is not, so it gets lifted here
+	// rather than downstream (#152 L-c) — mixing the two frames further down
+	// was the coordinate-frame bug: the listener value used to flow straight
+	// into the shared conversion, which subtracted a camera center that the
+	// 0.10.x port had left permanently 0, so the extrinsics were simply never
+	// applied and the fallback face carried the camera's offset and an
+	// upside-down Y.
 	float position[3];
 	bool used_nonpred = false;
 	if (np_ok) {
@@ -1118,17 +1219,45 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	} else if (pred_ok) {
 		position[0] = pred_pos[0]; position[1] = pred_pos[1]; position[2] = pred_pos[2];
 	} else if (lst_ok) {
-		position[0] = lst_pos[0]; position[1] = lst_pos[1]; position[2] = lst_pos[2];
+		// Camera space -> display-center space. posePosition has its origin at
+		// the camera with image axes (Y points DOWN the image), so: flip Y into
+		// the display's Y-up convention, then translate by the camera's own
+		// offset from the display center. camera_center_*_m is 0 (and
+		// camera_extrinsics_ok false) if the device config had no camera 0 — the
+		// axis flip is a fixed convention and still applies, the translation
+		// just degrades to the pre-fix behaviour. leia_camera::rotation_deg is
+		// NOT applied: for a display-plane-mounted front camera it is ~0, and it
+		// is logged once at snapshot time so a device where it isn't shows up.
+		//
+		// We do NOT drop this fallback: under
+		// LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the core's own faces stay empty
+		// on this hardware (see the pred=0 note at the top of this file), so the
+		// listener is the ONLY face source there — refusing it would kill head
+		// tracking outright on the NP02J.
+		position[0] = lst_pos[0] + cnsdk->camera_center_x_m * 1000.0f;
+		position[1] = -lst_pos[1] + cnsdk->camera_center_y_m * 1000.0f;
+		position[2] = lst_pos[2] + cnsdk->camera_center_z_m * 1000.0f;
+
+		static bool listener_fallback_warned = false;
+		if (!listener_fallback_warned) {
+			listener_fallback_warned = true;
+			U_LOG_W("HW_FACE: core face empty — using the frame-listener fallback "
+			        "(camera-space -> display-center, extrinsics_ok=%d, "
+			        "offset=(%.1f,%.1f,%.1f) mm)",
+			        (int)cnsdk->camera_extrinsics_ok,
+			        cnsdk->camera_center_x_m * 1000.0f,
+			        cnsdk->camera_center_y_m * 1000.0f,
+			        cnsdk->camera_center_z_m * 1000.0f);
+		}
 	} else {
 		return false;
 	}
 
-	// CNSDK returns millimeters relative to the camera. xrt_eye_position
-	// wants meters relative to the display center, so divide by 1000 then
-	// subtract the cached camera center (also already in meters).
-	float pos_x_m = position[0] / 1000.0f - cnsdk->camera_center_x_m;
-	float pos_y_m = position[1] / 1000.0f - cnsdk->camera_center_y_m;
-	float pos_z_m = position[2] / 1000.0f - cnsdk->camera_center_z_m;
+	// Display-center millimeters -> meters. NO camera-center subtraction here:
+	// every source above is already display-center by construction (#152 L-c).
+	float pos_x_m = position[0] / 1000.0f;
+	float pos_y_m = position[1] / 1000.0f;
+	float pos_z_m = position[2] / 1000.0f;
 
 	// The predicted/non-predicted faces arrive in the display's NATURAL
 	// orientation frame (that's the frame CNSDK weaves in). Our look-around face
