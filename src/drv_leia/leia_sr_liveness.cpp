@@ -19,6 +19,37 @@
 #include <string>
 #include <vector>
 
+/*
+ * ==========================================================================
+ * DXR_LEIA_HAS_SR_CONNECTION_STATE — a gate DELIBERATELY NARROWER than
+ * DXR_LEIA_HAS_SR_V2. Do NOT "simplify" the two into one.
+ *
+ * Everything behind it is the SDK's own identity (`srGetPlatformInstanceId`)
+ * and liveness (`srInstanceGetConnectionState`) pair, ST-5673. Two independent
+ * reasons it cannot ride on DXR_LEIA_HAS_SR_V2:
+ *
+ *  1. AGE. The SDK this repo pins (SR_V2_TAG) has the v2 API but predates
+ *     these two functions, so an unconditional v2 gate would not compile the
+ *     pinned/CI build at all.
+ *
+ *  2. DISPATCH-INDEX LINEAGE — the dangerous one. The SDK drop the functions
+ *     first appeared in carries five appended dispatch slots from other,
+ *     still-unmerged PRs positioned AHEAD of them, so the two sit at DIFFERENT
+ *     loader dispatch-table indices there than on the release-candidate
+ *     lineage. A binary linked against one lineage's loader running against
+ *     the other lineage's runtime mis-dispatches BY SLOT INDEX: silent type
+ *     confusion, not a clean SR_ERROR_FUNCTION_UNSUPPORTED. The gate therefore
+ *     has to be an explicit per-SDK opt-in that a stock configure never turns
+ *     on by accident.
+ *
+ * Gate OFF must be byte-for-byte today's behaviour: the SCM probe alone.
+ * ==========================================================================
+ */
+#ifdef DXR_LEIA_HAS_SR_CONNECTION_STATE
+#include <sr/sr_instance.h>
+#include <sr/sr_result.h>
+#endif
+
 namespace {
 
 //! The SCM key of the SR platform's core service ("Simulated Reality Service").
@@ -28,9 +59,17 @@ constexpr wchar_t kSrServiceName[] = L"SR Service";
 constexpr uint64_t kGenerationCacheMs = 1000;
 
 std::mutex g_lock;
-uint64_t g_gen_value = 0;      //!< Last computed token (0 = platform down).
+uint64_t g_gen_value = 0;      //!< Last SCM token (0 = platform down).
 uint64_t g_gen_stamp_ms = 0;   //!< GetTickCount64() when it was computed.
 bool g_gen_valid = false;      //!< g_gen_value/g_gen_stamp_ms are meaningful.
+// Second cache slot, for the SDK-reported platform id. Kept SEPARATE from the
+// SCM slot above and keyed by the instance it was asked through, so a bare
+// leia_sr_liveness_platform_generation() call (the version tripwire makes one
+// every second) cannot evict an arm's id, nor an arm's id answer the bare call.
+const void *g_gen_v2_key = nullptr;
+uint64_t g_gen_v2_value = 0;
+uint64_t g_gen_v2_stamp_ms = 0;
+bool g_gen_v2_valid = false;
 uint64_t g_match_for_gen = 0;  //!< Generation g_match_value was computed for.
 bool g_match_value = true;     //!< Cached client/platform version verdict.
 bool g_match_valid = false;    //!< g_match_* are meaningful.
@@ -268,14 +307,73 @@ compute_client_matches(void)
 	return module_matches_disk(dir, L"DimencoWeaving.dll") && module_matches_disk(dir, L"SimulatedRealityCore.dll");
 }
 
+#ifdef DXR_LEIA_HAS_SR_CONNECTION_STATE
+/*!
+ * Platform identity straight from the SDK, or 0 when it will not say.
+ *
+ * 0 is returned for every failure, not just the documented
+ * SR_ERROR_RUNTIME_UNAVAILABLE: a pre-ST-5673 platform leaves the loader's
+ * dispatch slot NULL and its trampoline answers SR_ERROR_FUNCTION_UNSUPPORTED
+ * instead (verified by disassembling srSDK_loader.lib — the trampoline
+ * null-checks the slot, so calling into an older platform is safe). Either way
+ * the caller falls back to the SCM probe, which is what a mixed install needs.
+ *
+ * 0 doubles as the "down/unknown" sentinel everywhere in this file, and the SDK
+ * documents the id as never 0 on success, so no folding is needed — a 0 simply
+ * cannot be mistaken for an identity.
+ */
+uint64_t
+sdk_platform_instance_id(void *inst)
+{
+	if (inst == nullptr) {
+		return 0;
+	}
+
+	uint64_t id = 0;
+	// The v2 API is C99 and cannot throw, but this file is reached from C and a
+	// stray exception would cross the ABI — belt and braces, exactly as every
+	// other SR call site in this plug-in.
+	try {
+		if (!SR_SUCCEEDED(srGetPlatformInstanceId(static_cast<SrInstance>(inst), &id))) {
+			return 0;
+		}
+	} catch (...) {
+		return 0;
+	}
+	return id;
+}
+#endif // DXR_LEIA_HAS_SR_CONNECTION_STATE
+
 } // namespace
 
 extern "C" uint64_t
-leia_sr_liveness_platform_generation(void)
+leia_sr_liveness_platform_generation_ex(void *sr_instance_v2)
 {
 	const uint64_t now_ms = GetTickCount64();
 
 	std::lock_guard<std::mutex> guard(g_lock);
+
+	if (sr_instance_v2 != nullptr) {
+		if (g_gen_v2_valid && g_gen_v2_key == sr_instance_v2 &&
+		    (now_ms - g_gen_v2_stamp_ms) < kGenerationCacheMs) {
+			return g_gen_v2_value;
+		}
+#ifdef DXR_LEIA_HAS_SR_CONNECTION_STATE
+		const uint64_t id = sdk_platform_instance_id(sr_instance_v2);
+		if (id != 0) {
+			g_gen_v2_key = sr_instance_v2;
+			g_gen_v2_value = id;
+			g_gen_v2_stamp_ms = now_ms;
+			g_gen_v2_valid = true;
+			return id;
+		}
+		// The SDK would not answer — an older platform, or one that is gone.
+		// Fall through to the SCM probe, and deliberately do NOT cache that in
+		// the v2 slot: the identity API must be retried on the next poll rather
+		// than written off for this instance's lifetime.
+#endif
+	}
+
 	if (g_gen_valid && (now_ms - g_gen_stamp_ms) < kGenerationCacheMs) {
 		return g_gen_value;
 	}
@@ -284,6 +382,42 @@ leia_sr_liveness_platform_generation(void)
 	g_gen_stamp_ms = now_ms;
 	g_gen_valid = true;
 	return g_gen_value;
+}
+
+extern "C" uint64_t
+leia_sr_liveness_platform_generation(void)
+{
+	return leia_sr_liveness_platform_generation_ex(nullptr);
+}
+
+extern "C" bool
+leia_sr_liveness_connection_is_dead(void *sr_instance_v2)
+{
+#ifdef DXR_LEIA_HAS_SR_CONNECTION_STATE
+	if (sr_instance_v2 == nullptr) {
+		return false;
+	}
+
+	SrConnectionState state = SR_CONNECTION_STATE_CONNECTED;
+	try {
+		if (!SR_SUCCEEDED(
+		        srInstanceGetConnectionState(static_cast<SrInstance>(sr_instance_v2), &state))) {
+			// Includes SR_ERROR_FUNCTION_UNSUPPORTED from a pre-ST-5673
+			// platform. Undeterminable is never "dead".
+			return false;
+		}
+	} catch (...) {
+		return false;
+	}
+
+	// SR_CONNECTION_STATE_RECONNECTING is reserved and never returned by this
+	// runtime; it is explicitly NOT treated as dead, so nothing here waits for a
+	// state the SDK does not produce.
+	return state == SR_CONNECTION_STATE_DISCONNECTED;
+#else
+	(void)sr_instance_v2;
+	return false;
+#endif // DXR_LEIA_HAS_SR_CONNECTION_STATE
 }
 
 extern "C" bool
@@ -311,9 +445,23 @@ leia_sr_liveness_client_matches_platform(void)
  */
 
 extern "C" uint64_t
+leia_sr_liveness_platform_generation_ex(void *sr_instance_v2)
+{
+	(void)sr_instance_v2;
+	return 0;
+}
+
+extern "C" uint64_t
 leia_sr_liveness_platform_generation(void)
 {
 	return 0;
+}
+
+extern "C" bool
+leia_sr_liveness_connection_is_dead(void *sr_instance_v2)
+{
+	(void)sr_instance_v2;
+	return false;
 }
 
 extern "C" bool

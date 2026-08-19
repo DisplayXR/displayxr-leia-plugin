@@ -56,6 +56,54 @@ elseif(LEIASR_V2_SDKROOT)
                     "incomplete SDK artifact; building v1-only.")
 endif()
 
+# --- SR connection-state + platform-id APIs (a SEPARATE, NARROWER gate) ------
+# DO NOT fold this into DXR_LEIA_HAS_SR_V2. It is not redundant with it.
+#
+# srInstanceGetConnectionState() / srGetPlatformInstanceId() (ST-5673) are the
+# SDK's liveness + identity signals, used by leia_sr_liveness.cpp. Two reasons
+# they need their own gate:
+#
+#  1. AGE - the SDK this repo PINS (SR_V2_TAG, what CI and every release build
+#     use) has the v2 API but predates these two functions. Compiling them
+#     under DXR_LEIA_HAS_SR_V2 would break the pinned build outright.
+#
+#  2. DISPATCH-INDEX LINEAGE - the dangerous one. The drop the functions first
+#     appeared in (integration/sdk-v2-super) carries five appended dispatch
+#     slots from other, still-unmerged PRs positioned AHEAD of them, so the two
+#     sit at DIFFERENT loader dispatch-table indices there than on the
+#     release-candidate lineage. A binary linked against one lineage's loader
+#     running against the other lineage's runtime mis-dispatches BY SLOT INDEX -
+#     silent type confusion, NOT a clean SR_ERROR_FUNCTION_UNSUPPORTED. So this
+#     must stay an explicit per-SDK opt-in that a stock configure cannot switch
+#     on by accident, and nothing built against a super-branch drop may ship.
+#
+# The probe is a header grep rather than check_cxx_symbol_exists on purpose: the
+# question is "does THIS SDK root declare them", and the loader is a static lib
+# whose link would happily succeed either way.
+set(LEIA_SR_CONNECTION_STATE_AVAILABLE FALSE)
+if(LEIA_SR_V2_AVAILABLE)
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_instance.h" _leia_sr_instance_hdr)
+    set(_leia_sr_result_hdr "")
+    if(EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_result.h")
+        file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_result.h" _leia_sr_result_hdr)
+    endif()
+    if(_leia_sr_instance_hdr MATCHES "srInstanceGetConnectionState"
+       AND _leia_sr_instance_hdr MATCHES "srGetPlatformInstanceId"
+       AND _leia_sr_result_hdr MATCHES "SR_ERROR_PLATFORM_DISCONNECTED")
+        set(LEIA_SR_CONNECTION_STATE_AVAILABLE TRUE)
+    endif()
+    unset(_leia_sr_instance_hdr)
+    unset(_leia_sr_result_hdr)
+endif()
+if(LEIA_SR_CONNECTION_STATE_AVAILABLE)
+    message(STATUS "SR connection-state APIs: ENABLED (SDK declares "
+                   "srInstanceGetConnectionState + srGetPlatformInstanceId) - "
+                   "SR liveness uses the SDK's own identity + liveness signals")
+else()
+    message(STATUS "SR connection-state APIs: DISABLED (SDK predates ST-5673, or no v2 SDK) - "
+                   "SR liveness falls back to the SCM probe alone")
+endif()
+
 # Vulkan weaver path. The weaver DLL is resolved and loaded at RUNTIME (see
 # leia_vk_weaver_select.cpp), so no SR Vulkan import library is linked and the
 # gate below only asks "were Vulkan weaver bits fetched at all". Either name
@@ -221,6 +269,12 @@ if(LEIA_SR_V2_AVAILABLE)
         "${LEIASR_V2_SDKROOT}/lib/srSDK_loader.lib"
         advapi32)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_V2=1)
+
+    # Narrower gate, set only when this SDK root actually declares the ST-5673
+    # connection-state/platform-id pair. See the long note above the probe.
+    if(LEIA_SR_CONNECTION_STATE_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_CONNECTION_STATE=1)
+    endif()
 endif()
 
 if(LEIA_SR_VULKAN_AVAILABLE)
