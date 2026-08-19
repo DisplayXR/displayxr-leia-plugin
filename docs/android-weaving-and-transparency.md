@@ -223,7 +223,53 @@ Only via a **privileged** path, and not from our code today. Findings on NP02J (
 
 ---
 
-## 5. Quick reference — pitfalls checklist
+## 5. The 3D backlight is DISPLAY-GLOBAL — and `on_pause` cannot express "not right now"
+
+The panel's switchable 3D backlight is **not** per-app state. On this hardware it is held by
+`BacklightMultiClientControlService` as a binder **bind-refcount across processes**: the first
+client to bind turns 3D on, the last to unbind turns it off. The plug-in resolves to that
+multi-client service (tier 1) and never to the legacy `BacklightControlService`, which forces
+2D and `stopSelf`s on unbind.
+
+`leia_core_enable_3d(false)` does **both** things at once — it drops the global backlight *and*
+unbinds this process. So a single compositor instance calling it from `leia_cnsdk_on_pause`
+takes the refcount to 0 and flattens the panel **underneath a sibling app that is still
+weaving**. Two producers reach `on_pause` on the Android OOP path, and neither is Activity
+lifecycle: surface loss (`MonadoView.surfaceDestroyed` → `clearAppSurface` →
+`android_window_transition_locked`) and `multi_compositor_end_session`. A multi-window relayout
+genuinely destroys and recreates an app's `SurfaceView` surface, so the pause is legitimate —
+what is wrong is taking the whole display down with it.
+
+### `debug.dxr.multiapp` — opt in to holding the bind
+
+| Property | Default | Effect |
+|---|---|---|
+| `debug.dxr.multiapp` | `0` (off) | `1` ⟹ `leia_cnsdk_on_pause` **skips** `force_backlight_2d`: this process keeps its bind (its share of the refcount) and the panel stays 3D. `leia_cnsdk_destroy` still forces 2D, so it remains the sole release path. |
+
+```bash
+adb shell setprop debug.dxr.multiapp 1     # before launching the apps
+```
+
+Read once via `__system_property_get` and cached, so it must be set before the first
+`on_pause`. With the property unset, single-client behaviour is byte-identical to before.
+
+**Why this is opt-in and not the Android default.** Holding the bind is unambiguously right when
+another window is still visible and weaving — but `on_pause` cannot tell that case apart from
+"this is the only app and it just went to the background". In the single-app case the
+compositor process survives as a foreground service, `destroy` never runs, and the panel would
+sit in 3D over the launcher or over an ordinary 2D app: exactly the stuck-3D regression the
+force-2D exists to prevent (runtime #563).
+
+The clean fix is a *preference* rather than a bind: each client says "bound, but I want 2D right
+now" and the service aggregates. The service has no such API today — it is a binary
+bind-refcount (limitation **L2**) — and the runtime side does not yet distinguish "my window is
+hidden" from "my window is one of N visible" (DisplayXR/displayxr-runtime#1039, #1038). Until
+one of those lands, the safe default is the old behaviour and the property is how a
+multi-window run opts out of it.
+
+---
+
+## 6. Quick reference — pitfalls checklist
 
 - **Don't pre-rotate the tracked eye.** Hand CNSDK eyes in natural orientation; viewport/zone data in
   current orientation. It reconciles them (§2).
@@ -234,6 +280,9 @@ Only via a **privileged** path, and not from our code today. Findings on NP02J (
   rotation path is identity. Test landscape (§3).
 - **Per-pixel-alpha transparency is fundamentally lossy** at avatar silhouettes; the alpha-gate is a
   palliative. The true fix is privileged background capture, which needs an OEM-signed service (§4).
+- **Never force the backlight to 2D on behalf of the whole display from a per-window pause.** The
+  backlight is display-global and refcounted across processes; `debug.dxr.multiapp=1` holds the
+  bind instead, and `destroy` stays the release path (§5).
 - **Any view-keyed Vulkan resource cache on Android OOP must also key on (width,height)** — Adreno
   recycles destroyed view handles across portrait⇄landscape, so a view-only key returns a stale
   wrong-dimension resource (this bit the alpha-gate framebuffer cache; fixed by keying on dims).
