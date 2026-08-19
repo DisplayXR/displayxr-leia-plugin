@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_results.h"
 #include "leia_types.h"
+#include "leia_sr_liveness.h" // enum leia_sr_backend_state — the poll below returns it
 
 #ifdef __cplusplus
 extern "C" {
@@ -416,6 +417,33 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
  */
 bool
 leiasr_d3d11_set_window(struct leiasr_d3d11 *leiasr, void *hwnd);
+
+/*!
+ * Poll the SR backend's health, and SELF-HEAL a restarted SR platform
+ * (leia-plugin#158).
+ *
+ * Polling this is not passive: observing a change in the SR platform's
+ * generation token is what ARMS the in-place reconnect, so a caller that never
+ * polls never self-heals. It is cheap by construction (the token is cached
+ * ~1 s inside leia_sr_liveness_platform_generation) and non-blocking — the
+ * rebuild runs on a detached worker exactly like the #144 async create.
+ *
+ * "In place" means the @ref leiasr_d3d11 pointer and the owning
+ * xrt_display_processor keep their addresses across the rebuild; the caller
+ * needs no lifecycle reaction. While it runs, every other entry point degrades
+ * exactly as it does during an async create (weave/eye-pos return false, the DP
+ * flat-blits) — typically for a few hundred ms.
+ *
+ * @param leiasr The D3D11 weaver instance (NULL ⟹ LEIA_SR_BACKEND_OK: nothing
+ *               to report about an instance that does not exist).
+ * @return A @ref leia_sr_backend_state value, whose numbering matches the
+ *         runtime's XRT_DP_BACKEND_STATE_* contract. This arm never returns
+ *         STALE — it self-heals instead.
+ *
+ * @ingroup drv_leia
+ */
+uint32_t
+leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr);
 
 #ifdef __cplusplus
 }
