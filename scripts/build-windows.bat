@@ -38,8 +38,8 @@ set SR_TAG=1.35.0.2011
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: SR v2 C99 SDK pin (landing set; see the release notes on this tag).
 :: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1450
-set SR_V2_DIR=simulatedreality-SDK-1.37.0+1450.2bd551714b-win64-Release
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1479
+set SR_V2_DIR=simulatedreality-SDK-1.37.0+1479.028e2b09fd-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
