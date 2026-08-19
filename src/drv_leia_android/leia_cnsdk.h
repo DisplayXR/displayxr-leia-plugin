@@ -207,11 +207,22 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
  *
  * Returns false until face tracking is running and CNSDK has a face
  * lock. Position is returned in meters relative to the **display
- * center** (matching `xrt_eye_position`'s convention), even though
- * CNSDK natively returns millimeters relative to the camera. The
- * wrapper does the unit conversion + camera-center translation using
- * the cached `cameraCenterX/Y/Z` from `leia_device_config` populated
- * once the core is initialized.
+ * center** (matching `xrt_eye_position`'s convention).
+ *
+ * Three sources, in preference order: the core's non-predicted face,
+ * the core's predicted face, then the head-tracking service's raw
+ * frame-listener detection. The first two already carry the camera
+ * extrinsics and are used as-is; the third is CAMERA-space
+ * `posePosition` (origin at the camera, image Y down) and is lifted
+ * into display-center space with the `leia_camera::translation_mm`
+ * snapshot taken from `leia_device_config` once the core initialized.
+ *
+ * The listener source also carries a wall-clock liveness bound: if the
+ * frame-listener callback stops firing, the cached face expires and is
+ * no longer served (only the callback used to be able to clear it, so
+ * a wedged service could latch a stale eye forever — #152 L-c). When
+ * no source has a face this returns false and the caller falls back to
+ * the nominal viewer with `is_tracking` false.
  *
  * @param[out] out_x  Face position X (meters, display-relative).
  * @param[out] out_y  Face position Y (meters, display-relative).
