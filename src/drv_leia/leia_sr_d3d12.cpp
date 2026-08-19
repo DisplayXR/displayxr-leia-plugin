@@ -10,6 +10,7 @@
 #include "leia_sr_d3d12.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
+#include "leia_sr_liveness.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -96,6 +97,19 @@ struct leiasr_d3d12
 	uint64_t measured_r_us = 0;
 	uint64_t measured_seen_ns = 0;
 	double   measured_ema_us = 0.0;
+
+	// --- #158 SR platform restart detection -------------------------------
+	// Reporting only on this arm. Unlike D3D11 — which rebuilds its SDK
+	// objects IN PLACE off a detached worker, behind the async_state gate every
+	// entry point already honours — there is no async create/publish machinery
+	// here, so there is no safe point at which to swap the weaver out from
+	// under the render thread. A generation change is therefore reported as
+	// STALE, and the remedy is the caller recreating the display processor.
+	// TODO(#158 follow-up): port the D3D11 in-place reconnect.
+	uint64_t platform_generation = 0;  //!< Incarnation at create (0 = unknown).
+	bool warned_platform_down = false; //!< One-shot WARN edges: the poll runs at
+	bool warned_client_skew = false;   //!< ~1 Hz forever, so a plain log would be
+	bool warned_stale = false;         //!< per-frame-class bloat.
 };
 
 namespace {
@@ -593,6 +607,10 @@ leiasr_d3d12_create(double max_time,
 		}
 	}
 
+	// #158: stamp the SR platform incarnation we connected to, so a later poll
+	// can tell "the platform restarted" from "the viewer is holding still".
+	sr->platform_generation = leia_sr_liveness_platform_generation();
+
 	*out = sr;
 
 	U_LOG_I("Created D3D12 SR weaver for HWND %p, view size %ux%u", hwnd, view_width, view_height);
@@ -1000,6 +1018,59 @@ leiasr_d3d12_get_hardware_3d_state(struct leiasr_d3d12 *leiasr, bool *out_is_3d)
 	} catch (...) {
 		return false;
 	}
+}
+
+uint32_t
+leiasr_d3d12_poll_backend_state(struct leiasr_d3d12 *leiasr)
+{
+	if (leiasr == nullptr) {
+		return LEIA_SR_BACKEND_OK;
+	}
+
+	// No weaver at all — the DP already degrades on its own NULL checks, and
+	// there is no connection whose generation could have changed.
+	if (!(w_ready(leiasr))) {
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+
+	const uint64_t gen = leia_sr_liveness_platform_generation();
+
+	if (gen == 0) {
+		// Platform down. The weaver keeps weaving on the last known eye
+		// positions, which beats no picture — do not tear anything down; the
+		// generation check below fires once the service is back.
+		if (!leiasr->warned_platform_down) {
+			leiasr->warned_platform_down = true;
+			U_LOG_W("SR platform is DOWN (D3D12 arm) — weaving untracked");
+		}
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_platform_down = false;
+
+	// A zero stamp means the token was never readable at create time, so
+	// detection is simply off rather than firing on "unknown -> known".
+	if (leiasr->platform_generation != 0 && gen != leiasr->platform_generation) {
+		if (!leiasr->warned_stale) {
+			leiasr->warned_stale = true;
+			U_LOG_W("SR platform restarted (generation %llu -> %llu) — the D3D12 weaver "
+			        "is STALE and cannot rebuild in place; recreate the display processor "
+			        "(or restart the DisplayXR service) to recover eye tracking",
+			        (unsigned long long)leiasr->platform_generation, (unsigned long long)gen);
+		}
+		return LEIA_SR_BACKEND_STALE;
+	}
+
+	if (!leia_sr_liveness_client_matches_platform()) {
+		if (!leiasr->warned_client_skew) {
+			leiasr->warned_client_skew = true;
+			U_LOG_W("SR client DLLs mapped in this process predate the installed SR platform "
+			        "(D3D12 arm) — restart the DisplayXR service to load the new ones");
+		}
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_client_skew = false;
+
+	return LEIA_SR_BACKEND_OK;
 }
 
 } // extern "C"

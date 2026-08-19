@@ -4,6 +4,7 @@
 #include "xrt/xrt_config_vulkan.h" // VK_USE_PLATFORM_WIN32_KHR etc.
 #include "xrt/xrt_windows.h"       // windows.h with proper defines (before vulkan.h)
 #include "leia_types.h"
+#include "leia_sr_liveness.h" // enum leia_sr_backend_state — the poll below returns it
 
 #include <vulkan/vulkan.h>
 
@@ -225,6 +226,28 @@ leiasr_supports_display_mode_switch(struct leiasr *leiasr);
  */
 bool
 leiasr_get_hardware_3d_state(struct leiasr *leiasr, bool *out_is_3d);
+
+/*!
+ * Report the SR backend's health (leia-plugin#158).
+ *
+ * DETECTION ONLY on this arm — see the #158 block in the holder struct in
+ * leia_sr.cpp. A generation change (the SR platform restarted underneath us) is
+ * reported as LEIA_SR_BACKEND_STALE, which is the honest answer: the weaver
+ * keeps returning stale eye positions with a SUCCESS code, and this arm has no
+ * async create/publish machinery to rebuild behind the render thread, so
+ * recovery needs the caller to recreate the display processor. The D3D11 arm
+ * self-heals in place instead.
+ *
+ * Cheap enough to poll per-frame (the underlying generation token is cached
+ * ~1 s); never blocks on the SR SDK and never throws.
+ *
+ * @param leiasr The leiasr instance (NULL ⟹ LEIA_SR_BACKEND_OK — nothing to
+ *               report about an instance that does not exist).
+ * @return A @ref leia_sr_backend_state value, whose numbering matches the
+ *         runtime's XRT_DP_BACKEND_STATE_* contract.
+ */
+uint32_t
+leiasr_poll_backend_state(struct leiasr *leiasr);
 
 #ifdef __cplusplus
 }

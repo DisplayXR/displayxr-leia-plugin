@@ -1626,6 +1626,26 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
  *
  */
 
+#ifdef XRT_DP_GL_HAS_BACKEND_STATE
+/*!
+ * #158: report the SR backend's health to the runtime.
+ *
+ * Detection only on this arm (no in-place reconnect — see the poll's doc): a
+ * restarted SR platform is reported STALE, and the runtime's remedy is to
+ * recreate the display processor. Computed on demand; non-blocking.
+ */
+static bool
+leia_dp_gl_get_backend_state(struct xrt_display_processor_gl *xdp, uint32_t *out_state)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	if (ldp == NULL || out_state == NULL) {
+		return false;
+	}
+	*out_state = leiasr_gl_poll_backend_state(ldp->leiasr);
+	return true;
+}
+#endif
+
 static void
 leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 {
@@ -1648,6 +1668,9 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.publish_local_zone_mask = leia_dp_gl_publish_local_zone_mask;
 	ldp->base.clear_local_zone_mask = leia_dp_gl_clear_local_zone_mask;
 	ldp->base.destroy = leia_dp_gl_destroy;
+#ifdef XRT_DP_GL_HAS_BACKEND_STATE
+	ldp->base.get_backend_state = leia_dp_gl_get_backend_state; // #158 SR restart detection
+#endif
 }
 
 

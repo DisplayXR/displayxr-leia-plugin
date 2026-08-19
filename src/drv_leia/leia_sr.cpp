@@ -18,6 +18,7 @@
 #include "leia_vk_weaver.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
+#include "leia_sr_liveness.h"
 
 #ifdef DXR_LEIA_HAS_SR_V2
 #include <sr/sr_vk.h>
@@ -159,6 +160,19 @@ struct leiasr
 	uint64_t measured_r_us = 0;
 	uint64_t measured_seen_ns = 0;
 	double   measured_ema_us = 0.0;
+
+	// --- #158 SR platform restart detection -------------------------------
+	// Reporting only on this arm. Unlike D3D11 — which rebuilds its SDK
+	// objects IN PLACE off a detached worker, behind the async_state gate every
+	// entry point already honours — there is no async create/publish machinery
+	// here, so there is no safe point at which to swap the weaver out from
+	// under the render thread. A generation change is therefore reported as
+	// STALE, and the remedy is the caller recreating the display processor.
+	// TODO(#158 follow-up): port the D3D11 in-place reconnect.
+	uint64_t platform_generation = 0;  //!< Incarnation at create (0 = unknown).
+	bool warned_platform_down = false; //!< One-shot WARN edges: the poll runs at
+	bool warned_client_skew = false;   //!< ~1 Hz forever, so a plain log would be
+	bool warned_stale = false;         //!< per-frame-class bloat.
 };
 
 namespace {
@@ -586,6 +600,10 @@ leiasr_create(double maxTime,
 	// Apply adaptive weave-latency policy (VK-only setLatency tuning; the app
 	// never calls anything Leia-specific — we derive FPS from the weave cadence).
 	ConfigureAdaptiveLatency(sr);
+
+	// #158: stamp the SR platform incarnation we connected to, so a later poll
+	// can tell "the platform restarted" from "the viewer is holding still".
+	sr->platform_generation = leia_sr_liveness_platform_generation();
 
 	*out = sr;
 
@@ -1218,6 +1236,60 @@ leiasr_get_hardware_3d_state(struct leiasr *leiasr, bool *out_is_3d)
 	} catch (...) {
 		return false;
 	}
+}
+
+uint32_t
+leiasr_poll_backend_state(struct leiasr *leiasr)
+{
+	if (leiasr == nullptr) {
+		return LEIA_SR_BACKEND_OK;
+	}
+
+	// No weaver at all — the DP already degrades on its own NULL checks, and
+	// there is no connection whose generation could have changed. (`weaver` is
+	// non-null on BOTH API families here, unlike the other arms.)
+	if (leiasr->weaver == nullptr) {
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+
+	const uint64_t gen = leia_sr_liveness_platform_generation();
+
+	if (gen == 0) {
+		// Platform down. The weaver keeps weaving on the last known eye
+		// positions, which beats no picture — do not tear anything down; the
+		// generation check below fires once the service is back.
+		if (!leiasr->warned_platform_down) {
+			leiasr->warned_platform_down = true;
+			U_LOG_W("SR platform is DOWN (VK arm) — weaving untracked");
+		}
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_platform_down = false;
+
+	// A zero stamp means the token was never readable at create time, so
+	// detection is simply off rather than firing on "unknown -> known".
+	if (leiasr->platform_generation != 0 && gen != leiasr->platform_generation) {
+		if (!leiasr->warned_stale) {
+			leiasr->warned_stale = true;
+			U_LOG_W("SR platform restarted (generation %llu -> %llu) — the VK weaver "
+			        "is STALE and cannot rebuild in place; recreate the display processor "
+			        "(or restart the DisplayXR service) to recover eye tracking",
+			        (unsigned long long)leiasr->platform_generation, (unsigned long long)gen);
+		}
+		return LEIA_SR_BACKEND_STALE;
+	}
+
+	if (!leia_sr_liveness_client_matches_platform()) {
+		if (!leiasr->warned_client_skew) {
+			leiasr->warned_client_skew = true;
+			U_LOG_W("SR client DLLs mapped in this process predate the installed SR platform "
+			        "(VK arm) — restart the DisplayXR service to load the new ones");
+		}
+		return LEIA_SR_BACKEND_DEGRADED;
+	}
+	leiasr->warned_client_skew = false;
+
+	return LEIA_SR_BACKEND_OK;
 }
 
 } // extern "C"
