@@ -192,7 +192,9 @@ struct leia_cnsdk
 };
 
 static void
-force_backlight_2d(struct leia_cnsdk *cnsdk, const char *reason);
+release_lens_preference(struct leia_cnsdk *cnsdk, const char *reason);
+static void
+assert_lens_preference(struct leia_cnsdk *cnsdk, const char *reason);
 
 
 /*
@@ -257,24 +259,20 @@ overlay_mode_active(void)
 }
 
 /*!
- * PoC-0 (runtime #1032 / epic #1031, this repo #151): concurrent multi-app
- * weaving on Android.
+ * DEPRECATED A/B override (runtime #1039; was the #151 opt-in).
  *
- * The panel's switchable 3D backlight is DISPLAY-GLOBAL, held by
- * `BacklightMultiClientControlService` as a binder BIND-REFCOUNT across
- * processes. `leia_core_enable_3d(false)` both drops the global backlight AND
- * unbinds this process's client — so a single satellite compositor calling it
- * flattens the panel underneath a sibling app that is still weaving.
+ * `debug.dxr.multiapp=1` restores the old behaviour where `leia_cnsdk_on_pause`
+ * HOLDS this process's backlight bind instead of releasing it. Keep it only to
+ * A/B the two behaviours on a device; nothing should depend on it.
  *
- * With N apps that is wrong: a window that merely lost its own surface (a
- * multi-window relayout destroys and recreates the app's SurfaceView surface)
- * must RELEASE its share of the refcount, never force the display to 2D. In
- * multi-app mode we therefore keep the bind (and the 3D backlight) held across
- * `on_pause`; only `leia_cnsdk_destroy` — the real last-client release — still
- * forces 2D, which is what keeps stuck-3D-after-close fixed.
+ * It exists because #151 assumed `leia_core_enable_3d(false)` "drops the global
+ * backlight AND unbinds". Traced through CNSDK, that is not what happens on the
+ * multi-client tier — see @ref release_lens_preference. Releasing is exactly the
+ * per-window "I no longer want the lens" vote the runtime contract asks for, so
+ * the hold is now wrong in BOTH directions (it takes a lens vote for a window
+ * nobody can see, which re-opens runtime #563) and the default is to release.
  *
- * Gated behind `debug.dxr.multiapp` (read once, cached) so single-client
- * behaviour cannot regress. Default OFF.
+ * Read once via `__system_property_get` and cached. Default OFF.
  */
 static bool
 multiapp_mode_active(void)
@@ -747,11 +745,12 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 	//
 	// Detaching leaks the std::thread but is the only option short of
 	// CNSDK exposing a cancel API.
-	// Panel back to flat 2D FIRST, while the core is healthiest — the
-	// switchable backlight is system-global and outlives this process
-	// (stuck-3D-after-close). Even if the worker join below times out,
-	// this call has already gone out to the display service.
-	force_backlight_2d(cnsdk, "destroy");
+	// Release the lens preference FIRST, while the core is healthiest — the
+	// arbiter's refcount outlives this process, so a vote we never give back
+	// leaves the panel in 3D forever (stuck-3D-after-close, runtime #563).
+	// DP destroy implies on_pause per the runtime contract (#1039). Even if
+	// the worker join below times out, this has already gone out.
+	release_lens_preference(cnsdk, "destroy");
 
 	cnsdk->shutting_down.store(true, std::memory_order_release);
 	if (cnsdk->worker.joinable()) {
@@ -838,33 +837,35 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 		DXR_HW_DBG("on_pause: skipped (core not initialized yet)");
 		return;
 	}
-	// Drop the panel to flat 2D before pausing — the backlight is
-	// system-global and the home screen / picker behind us is 2D content.
-	// The weave loop re-enables 3D on the first frame after resume.
+	// The runtime contract (runtime #1039, xrt_display_processor.h): on_pause
+	// means "this session's window is not visible — stop weaving and RELEASE
+	// your lens preference". It does NOT mean "force the panel to 2D": with a
+	// sibling window still weaving on the same panel, commanding 2D would
+	// flatten it under the sibling. Release is refcount-correct in both
+	// directions — see release_lens_preference for why, and why that also keeps
+	// stuck-3D-after-close (runtime #563) fixed.
 	// #558 overlay mode is the exception: the avatar intentionally backgrounds
-	// while still weaving the tiger on top of the launcher, so it must STAY 3D —
-	// skip the 2D drop (the weave loop keeps forcing 3D each frame).
+	// while still weaving the tiger on top of the launcher, so it keeps its
+	// vote (the weave loop keeps forcing 3D each frame).
 	if (overlay_mode_active()) {
-		DXR_HW_DBG("on_pause: overlay mode — keeping 3D (skip force-2D)");
+		DXR_HW_DBG("on_pause: overlay mode — still weaving, keeping the lens preference");
 		return;
 	}
-	// PoC-0 multi-app (#1032 / #151): a paused window must not flatten the
-	// panel for the sibling that is still visible and weaving. Hold the
-	// multi-client backlight bind (this process's share of the refcount) and
-	// leave the panel in 3D; destroy() is the real release. WARN so PoC-0 can
-	// read the transition off logcat.
+	// Deprecated A/B override (runtime #1039): the #151 behaviour, kept only
+	// so the two can be compared on a device. Holding the bind takes a lens
+	// vote for a window nobody can see, which re-opens runtime #563.
 	if (multiapp_mode_active()) {
-		U_LOG_W("HW_DBG_CNSDK: on_pause: multi-app mode — holding backlight bind, panel stays 3D "
-		        "(skip force-2D; release happens at destroy)");
+		U_LOG_W("HW_DBG_CNSDK: on_pause: debug.dxr.multiapp=1 (DEPRECATED) — holding the lens "
+		        "preference instead of releasing it; release happens at destroy");
 		return;
 	}
-	force_backlight_2d(cnsdk, "on_pause");
+	release_lens_preference(cnsdk, "on_pause");
 	if (!cnsdk->host_is_activity) {
 		// Out-of-process: leia_core_on_pause/on_resume are Activity-
 		// lifecycle APIs (on_resume calls FaceTrackingHelper.
 		// checkPermission(Activity,...) → CheckJNI abort with a Service
-		// context). The backlight drop above is the part that matters.
-		DXR_HW_DBG("on_pause: backlight only (service context, no Activity)");
+		// context). The release above is the part that matters.
+		DXR_HW_DBG("on_pause: lens preference released (service context, no Activity)");
 		return;
 	}
 	DXR_HW_DBG("on_pause: forwarding to leia_core_on_pause");
@@ -881,11 +882,15 @@ leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
 		DXR_HW_DBG("on_resume: skipped (core not initialized yet)");
 		return;
 	}
+	// Counterpart of the release in on_pause (runtime #1039): this session's
+	// window is visible again, so re-assert the lens preference NOW rather
+	// than waiting for the weave loop's first frame — the vendor arbiter is a
+	// refcount and the panel should come back the moment the window does.
+	assert_lens_preference(cnsdk, "on_resume");
 	if (!cnsdk->host_is_activity) {
 		// Out-of-process: see on_pause — the Activity-lifecycle API would
-		// abort the service. Nothing to do; the weave loop re-enables the
-		// 3D backlight on the first frame after resume.
-		DXR_HW_DBG("on_resume: no-op (service context, no Activity)");
+		// abort the service. The re-assert above is the part that matters.
+		DXR_HW_DBG("on_resume: lens preference re-asserted (service context, no Activity)");
 		return;
 	}
 	DXR_HW_DBG("on_resume: forwarding to leia_core_on_resume");
@@ -1163,7 +1168,7 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 	// #558 overlay mode: the avatar runs as a backgrounded system overlay over the
 	// 2D launcher, so face tracking is lost — MANAGED NoFaceMode would drop the
 	// WEAVE to flat 2D (lens may be on but the tiger looks flat) and on_pause would
-	// drop the BACKLIGHT to 2D. Force the light-field 3D + NoFaceMode OFF every
+	// release the lens preference. Force the light-field 3D + NoFaceMode OFF every
 	// weave so the tiger stays 3D regardless of face/foreground state. Gated on
 	// overlay mode — per-session, from the runtime (the app's manifest flag).
 	if (overlay_mode_active()) {
@@ -1171,8 +1176,8 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 		leia_core_enable_no_face_mode(cnsdk->core, false);
 	}
 
-	// Compare against the instance's APPLIED state: pause/destroy force it
-	// to 2D out-of-band, so the first weave after a resume re-enables 3D.
+	// Compare against the instance's APPLIED state: pause/destroy release the
+	// preference out-of-band, so a weave after a resume re-asserts it.
 	if (want != cnsdk->backlight_applied.load(std::memory_order_acquire)) {
 		leia_core_enable_3d(cnsdk->core, want != 0);
 		cnsdk->backlight_applied.store(want, std::memory_order_release);
@@ -1181,23 +1186,71 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 }
 
 /*!
- * Force the panel back to flat 2D. The switchable backlight is system-global
- * state held by the Leia display service — it stays 3D forever if the last
- * weaving client goes away without this (stuck-3D-after-close). Called from
- * on_pause (session end / backgrounding) and destroy (client teardown).
+ * RELEASE this instance's lens preference (runtime #1039). Called from on_pause
+ * (window not visible / session end) and destroy (client teardown).
+ *
+ * ## Why this is a release and not a "force the panel to 2D"
+ *
+ * The switchable 3D lens is display-global, but on this hardware it is arbitrated
+ * by `BacklightMultiClientControlService` as a binder BIND-REFCOUNT: `onBind` /
+ * `onRebind` request `MODE_3D`, `onUnbind` — which Android delivers only when the
+ * LAST client has disconnected — requests `MODE_2D`. So the service is the OR of
+ * every client's vote.
+ *
+ * `leia_core_enable_3d(false)` on that tier is a pure UNBIND. CNSDK
+ * `device::SetBacklightMode` (androidDevice.cpp) takes the multi-client branch
+ * first and RETURNS from it — `BaseServiceConnection::Connect(env, false)` →
+ * Java `connect(false)` → `context.unbindService(this)`. It never reaches the
+ * legacy `BacklightControlService::requestBacklightMode("MODE_2D")` nor
+ * `LeiaManagerUtility::SetBacklightMode(false)`, both of which WOULD command the
+ * panel globally. (#151's premise that enable_3d(false) "does both at once" was
+ * wrong; the `setBacklightMode:false` seen in its trace came from the SERVICE
+ * reacting to its refcount hitting zero, not from this process.)
+ *
+ * That makes one call correct in both directions:
+ *   - multi-window: a hidden window drops to refcount N-1, the panel stays 3D
+ *     for the sibling that is still weaving;
+ *   - last app out: refcount 0, the service itself flattens the panel — which is
+ *     stuck-3D-after-close (runtime #563), fixed for free.
+ *
+ * VENDOR GAP: on a device with no multi-client service, CNSDK falls back to the
+ * legacy service / `LeiaManagerUtility`, and there the same call DOES force a
+ * global `MODE_2D`. There is no "unbind only" on those tiers, so a release
+ * degrades to a global command. Tracked as limitations L2/L3 in the runtime's
+ * `docs/roadmap/android-concurrent-multi-app.md` (runtime #1038); multi-window
+ * weaving is only claimed on the multi-client tier.
  */
 static void
-force_backlight_2d(struct leia_cnsdk *cnsdk, const char *reason)
+release_lens_preference(struct leia_cnsdk *cnsdk, const char *reason)
 {
 	if (cnsdk == NULL || cnsdk->core == NULL || !leia_core_is_initialized(cnsdk->core)) {
 		return;
 	}
 	if (cnsdk->backlight_applied.load(std::memory_order_acquire) == 0) {
-		return; // already 2D
+		return; // already released
 	}
 	leia_core_enable_3d(cnsdk->core, false);
 	cnsdk->backlight_applied.store(0, std::memory_order_release);
-	U_LOG_W("HW_DBG_CNSDK: backlight -> 2D OFF (%s)", reason);
+	U_LOG_W("HW_DBG_CNSDK: lens preference RELEASED (unbind, refcount--) (%s)", reason);
+}
+
+/*!
+ * Re-ASSERT this instance's lens preference — the counterpart of
+ * @ref release_lens_preference. On the multi-client tier this is a re-bind
+ * (refcount++), and the service switches the panel to 3D on the first vote.
+ */
+static void
+assert_lens_preference(struct leia_cnsdk *cnsdk, const char *reason)
+{
+	if (cnsdk == NULL || cnsdk->core == NULL || !leia_core_is_initialized(cnsdk->core)) {
+		return;
+	}
+	if (cnsdk->backlight_applied.load(std::memory_order_acquire) == 1) {
+		return; // already asserted
+	}
+	leia_core_enable_3d(cnsdk->core, true);
+	cnsdk->backlight_applied.store(1, std::memory_order_release);
+	U_LOG_W("HW_DBG_CNSDK: lens preference ASSERTED (bind, refcount++) (%s)", reason);
 }
 
 extern "C" void
