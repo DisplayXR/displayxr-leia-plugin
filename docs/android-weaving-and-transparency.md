@@ -94,8 +94,16 @@ knobs**, and you must set **both**:
 The trap: `set_viewport` alone positions the pixels but leaves the phase referenced to the panel
 origin, so a band drawn 25% down the panel weaves at the **full-panel phase** and the 3D registers
 shifted (this was leia-plugin bug **#53**). The fix (`leia_cnsdk_weave`) sets the screen position to
-the band's panel origin alongside the placement viewport, and resets both to `(0,0)` on full-target
-frames so a prior band's phase never leaks.
+the band's panel origin alongside the placement viewport.
+
+**The screen position is `window origin + zone offset` (#150).** It used to be reset to `(0,0)` on
+full-target frames, on the assumption that the render target always *is* the panel. With
+per-window compositor instances (ADR-036, runtime#1033) that assumption is dead: a full-target
+frame inside a window that sits at `1280,60` still needs a real origin, and zeroing it there is
+precisely what collapsed the 3D in the right-hand window of a side-by-side pair. The window rect
+arrives through the DP slot `xrt_display_processor_vk::set_window_screen_rect` (see §3a) and
+becomes the **base** every zone offset is added to; a prior band's phase can no longer leak
+because the zone offset is recomputed from the base each frame.
 
 This is the CNSDK analog of the Windows SR path's `xOffset = window_WeavingX + vpX`. It is a
 **first-class, intentional CNSDK feature**, not a workaround.
@@ -104,6 +112,37 @@ This is the CNSDK analog of the Windows SR path's `xOffset = window_WeavingX + v
 surface mapped 1:1 to the current-orientation panel at origin (0,0)** (true for the Android OOP
 session framebuffer). If the target were ever offset or sub-panel, the screen position would have to
 be panel-relative and would diverge from the placement viewport.
+
+### 3a. The window origin (`set_window_screen_rect`) — per-window weave phase
+
+One compositor instance weaves into **one window**, so the phase must be referenced to where that
+window physically sits on the panel. The runtime reports it through the append-only VK DP slot
+`xrt_display_processor_vk::set_window_screen_rect(x, y, w, h, display_id)`
+(runtime#1033, this repo #150, ADR-036 D6); `leia_cnsdk_set_window_screen_rect` caches it and
+`leia_cnsdk_weave` uses it as the base:
+
+```
+set_viewport(vp_x, vp_y, vp_w, vp_h)                      # placement, render-target relative
+set_viewport_screen_position(win_x + vp_x, win_y + vp_y)  # phase, panel absolute
+```
+
+Three things to know:
+
+- **Android forces this.** A pure window *move* raises no resize
+  (`WindowFrames.didFrameSizeChange` compares w/h only) and SurfaceFlinger repositions the layer
+  with the *old* buffer, so nothing in the graphics path observes it. The client samples
+  `View.getLocationOnScreen()` from a `Choreographer` callback instead. Windows solves the same
+  problem inside the weaver by subclassing the HWND; Android exposes no such hook, which is why
+  the runtime reports.
+- **Do not pre-rotate.** Coordinates arrive in **current**-orientation screen space and go to
+  CNSDK unrotated — `interlacer.cpp` states "the user provides data in the current orientation
+  space, we convert it to the natural one", and CNSDK's own
+  `InterlacedSurfaceView._updatePosition` passes `getLocationOnScreen` straight through.
+- **Do not snap.** Phase, including any grid snapping, is the weaver's (ADR-033). The runtime
+  reports raw geometry on purpose.
+
+Never calling the slot leaves the base at `(0,0)` — display-scoped weaving, bit-identical to the
+pre-#150 behaviour — so an older runtime, or a single full-screen window, is unaffected.
 
 ### Portrait/landscape gotcha (read before trusting a "verified" zone)
 
@@ -189,7 +228,8 @@ Only via a **privileged** path, and not from our code today. Findings on NP02J (
 - **Don't pre-rotate the tracked eye.** Hand CNSDK eyes in natural orientation; viewport/zone data in
   current orientation. It reconciles them (§2).
 - **Sub-rect weave needs both viewport knobs.** Placement (`set_viewport`) **and** phase
-  (`set_viewport_screen_position`). Reset both to `(0,0)` on full-target frames (§3).
+  (`set_viewport_screen_position`). The phase base is the **window origin**, not `(0,0)` — do not
+  reset it on full-target frames (§3, §3a).
 - **A portrait-only zone test proves nothing about rotation** on a portrait-natural panel — the
   rotation path is identity. Test landscape (§3).
 - **Per-pixel-alpha transparency is fundamentally lossy** at avatar silhouettes; the alpha-gate is a
