@@ -1224,6 +1224,35 @@ set_transparent_background_cnsdk(struct xrt_display_processor_vk *xdp, bool enab
 	        client_presents ? 1 : 0);
 }
 
+#ifdef XRT_DP_VK_HAS_WINDOW_SCREEN_RECT
+// runtime#1033 / #150 (ADR-036 D6): the compositor instance that owns this
+// window reports where it sits on the panel, once per frame before the weave.
+// It becomes the base screen position the interlace phase references; the zone
+// offset is added on top inside leia_cnsdk_weave. Coordinates arrive as Android
+// reports them (current orientation) and go to CNSDK unrotated — CNSDK converts
+// to the natural orientation itself. Guarded so this file still builds against a
+// runtime whose headers predate the slot.
+//
+// ADR-033 unchanged: this is reported GEOMETRY. Phase — including any snapping —
+// stays the weaver's; we deliberately do not grid-snap the origin the way
+// CNSDK's own InterlacedSurfaceView optionally does.
+static void
+set_window_screen_rect_cnsdk(struct xrt_display_processor_vk *xdp,
+                             int32_t x,
+                             int32_t y,
+                             uint32_t w,
+                             uint32_t h,
+                             int32_t display_id)
+{
+	leia_dp_cnsdk *impl = reinterpret_cast<leia_dp_cnsdk *>(xdp); // dp_vk is at offset 0
+	if (impl == nullptr || impl->cnsdk == nullptr) {
+		return;
+	}
+	// Deduped inside (no vendor call and no log when unchanged) — this runs per frame.
+	leia_cnsdk_set_window_screen_rect(impl->cnsdk, x, y, w, h, display_id);
+}
+#endif // XRT_DP_VK_HAS_WINDOW_SCREEN_RECT
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -1564,6 +1593,12 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->dp_vk.base.set_eye_tracking_mode = set_eye_tracking_mode_cnsdk; // #522
 	impl->dp_vk.base.destroy = destroy_impl;
 	impl->dp_vk.set_transparent_background = set_transparent_background_cnsdk; // #568 (variant slot)
+#ifdef XRT_DP_VK_HAS_WINDOW_SCREEN_RECT
+	// runtime#1033 / #150: per-window weave phase. struct_size above already
+	// covers this slot (it is sizeof(xrt_display_processor_vk)), so filling the
+	// pointer is all the runtime needs to discover it.
+	impl->dp_vk.set_window_screen_rect = set_window_screen_rect_cnsdk;
+#endif
 
 	*out_xdp = &impl->dp_vk.base;
 

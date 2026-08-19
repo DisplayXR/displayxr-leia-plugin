@@ -170,6 +170,25 @@ struct leia_cnsdk
 	// up rather than retrying every frame. Read + written only by the
 	// render thread (no concurrent access; no atomic needed).
 	bool interlacer_init_failed{false};
+
+	// Window rect on the panel (runtime#1033 / #150, ADR-036 D6). The runtime's
+	// per-window compositor instance reports where THIS window sits on screen —
+	// in CURRENT-orientation screen pixels, exactly as Android's
+	// View.getLocationOnScreen returns them (CNSDK rotates into the natural
+	// orientation itself: interlacer.cpp "the user provides data in the current
+	// orientation space, we convert it to the natural one"). It is the BASE the
+	// per-frame zone/canvas offset is added to, so a window that is not at the
+	// panel origin weaves at its own interlace phase instead of the panel's.
+	// Written from the runtime's DP call (render thread), read in the weave on
+	// the same thread; atomic anyway because a future compositor could report
+	// off-thread. have_window_rect stays false until the first report ⟹ the
+	// pre-#1033 display-scoped behaviour is bit-identical.
+	std::atomic<bool> have_window_rect{false};
+	std::atomic<int32_t> window_screen_x{0};
+	std::atomic<int32_t> window_screen_y{0};
+	std::atomic<int32_t> window_screen_w{0};
+	std::atomic<int32_t> window_screen_h{0};
+	std::atomic<int32_t> window_display_id{-1};
 };
 
 static void
@@ -1140,6 +1159,31 @@ force_backlight_2d(struct leia_cnsdk *cnsdk, const char *reason)
 }
 
 extern "C" void
+leia_cnsdk_set_window_screen_rect(
+    struct leia_cnsdk *cnsdk, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id)
+{
+	if (cnsdk == NULL) {
+		return;
+	}
+	const bool had = cnsdk->have_window_rect.load(std::memory_order_acquire);
+	if (had && cnsdk->window_screen_x.load(std::memory_order_relaxed) == x &&
+	    cnsdk->window_screen_y.load(std::memory_order_relaxed) == y &&
+	    cnsdk->window_screen_w.load(std::memory_order_relaxed) == (int32_t)w &&
+	    cnsdk->window_screen_h.load(std::memory_order_relaxed) == (int32_t)h &&
+	    cnsdk->window_display_id.load(std::memory_order_relaxed) == display_id) {
+		return; // unchanged — skip the vendor call entirely
+	}
+	cnsdk->window_screen_x.store(x, std::memory_order_relaxed);
+	cnsdk->window_screen_y.store(y, std::memory_order_relaxed);
+	cnsdk->window_screen_w.store((int32_t)w, std::memory_order_relaxed);
+	cnsdk->window_screen_h.store((int32_t)h, std::memory_order_relaxed);
+	cnsdk->window_display_id.store(display_id, std::memory_order_relaxed);
+	cnsdk->have_window_rect.store(true, std::memory_order_release);
+	// Lifecycle event (a window moved or resized), never per frame.
+	U_LOG_W("HW_DBG_CNSDK: window screen rect %d,%d %ux%u display %d (#150/#1033)", x, y, w, h, display_id);
+}
+
+extern "C" void
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
                  VkPhysicalDevice physDev,
@@ -1203,11 +1247,25 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	// leaks. A/B: `setprop debug.dxr.leia.zonephase 0` reverts to the (shifted)
 	// pre-#53 phase for on-device comparison; 1 (default) applies the fix.
 	const bool zonephase = prop_override("debug.dxr.leia.zonephase", true);
+	// Per-window base origin (#150 / runtime#1033): where THIS window sits on the
+	// panel, in current-orientation screen pixels. Zone rects are relative to the
+	// render target, i.e. to the window — so the screen position the phase is
+	// referenced to is window origin + zone offset. Until the runtime reports a
+	// rect (older runtime, single full-screen window) the base is (0,0) and every
+	// line below is bit-identical to the pre-#150 behaviour.
+	//
+	// NOTE this is why the old "reset to (0,0) on a full-target frame" is gone: a
+	// full-target frame in a MOVED window is exactly the case that needs a real
+	// origin, and zeroing it there is what collapsed the 3D in the right-hand
+	// window of a side-by-side pair.
+	const bool have_win = cnsdk->have_window_rect.load(std::memory_order_acquire);
+	const int32_t win_x = have_win ? cnsdk->window_screen_x.load(std::memory_order_relaxed) : 0;
+	const int32_t win_y = have_win ? cnsdk->window_screen_y.load(std::memory_order_relaxed) : 0;
 	if (vp_w > 0u && vp_h > 0u) {
 		leia_interlacer_set_viewport(cnsdk->interlacer, vp_x, vp_y,
 		                             (int32_t)vp_w, (int32_t)vp_h);
-		const int32_t sp_x = zonephase ? vp_x : 0;
-		const int32_t sp_y = zonephase ? vp_y : 0;
+		const int32_t sp_x = win_x + (zonephase ? vp_x : 0);
+		const int32_t sp_y = win_y + (zonephase ? vp_y : 0);
 		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, sp_x, sp_y);
 		// #53 diagnostic: re-log whenever the band/phase changes (covers the live
 		// `debug.dxr.leia.zonephase` A/B toggle) — one WARN per distinct state.
@@ -1220,7 +1278,15 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		}
 	} else {
 		leia_interlacer_set_viewport(cnsdk->interlacer, 0, 0, (int32_t)w, (int32_t)h);
-		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, 0, 0);
+		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, win_x, win_y);
+		// One WARN per distinct window phase — the line the side-by-side PoC greps
+		// to prove each satellite weaves at its own origin. Never per frame.
+		static int32_t last_wx = INT32_MIN, last_wy = INT32_MIN;
+		if (win_x != last_wx || win_y != last_wy) {
+			last_wx = win_x; last_wy = win_y;
+			U_LOG_W("HW_DBG_CNSDK: weave full-target screen-pos %d,%d target %ux%u (#150)",
+			        win_x, win_y, w, h);
+		}
 	}
 
 	DXR_HW_DBG_ONCE("weave: first do_post_process atlas=%ux%u target=%ux%u",
