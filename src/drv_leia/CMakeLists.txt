@@ -18,6 +18,8 @@ set(LEIA_SOURCES
     leia_sr_api_select.cpp
     leia_sr_v2_common.h
     leia_sr_v2_common.cpp
+    leia_sr_liveness.h
+    leia_sr_liveness.cpp
     leia_vk_weaver_v2.cpp
     leia_plugin.c
 )
@@ -192,6 +194,16 @@ target_link_libraries(DisplayXR-LeiaSR
         ${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 )
 add_dependencies(DisplayXR-LeiaSR ${RUNTIME_TARGET})
+
+if(WIN32)
+    # leia_sr_liveness.cpp: advapi32 for the SCM query (OpenSCManager/
+    # QueryServiceStatusEx), version for the mapped-vs-installed SR client
+    # version tripwire (VerQueryValue/GetFileVersionInfo). `version` is also
+    # pulled in by the Vulkan weaver-ABI probe, but only when
+    # LEIA_SR_VULKAN_AVAILABLE -- the liveness probe is unconditional, so the
+    # link must be too (a Vulkan-less configure would otherwise fail to link).
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE advapi32 version)
+endif()
 
 if(LEIA_SR_V2_AVAILABLE)
     # Additive by construction: the v2 headers sit in their own SDK root and the
