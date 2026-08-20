@@ -98,12 +98,18 @@ endif()
 # Keep both as literal quoted strings — the rule-5 CI self-check greps for
 # `DXR_RUNTIME_GIT_TAG\s+"([^"]+)"` and a computed value would defeat it.
 #
-# Pinned to displayxr-runtime v2.7.0. That tag is the first runtime that ships the
-# append-only D3D11 DP vtable slot 20 `set_window` (runtime#1008) whose
-# implementation below is guarded on XRT_DP_D3D11_HAS_SET_WINDOW: built against
-# an older runtime the guard compiles the slot OUT and the runtime silently
-# falls back to destroy+recreate on every focus change, so this pin is what
-# makes the in-place weaver re-bind actually ship. The ABI floor it encodes is plugin ABI
+# Pinned to displayxr-runtime v2.8.0. That tag is the first runtime that ships the
+# append-only D3D11 DP vtable slot 21 `get_backend_state` (runtime#1062/#1064)
+# whose implementation is guarded on XRT_DP_D3D11_HAS_BACKEND_STATE: built
+# against an older runtime the guard compiles the slot OUT, and the SR-restart
+# self-heal still works (the ~1 Hz poll in process_atlas arms it) but the
+# runtime cannot SEE the backend state — no `dp=` in the service [HEALTH] line
+# and no forced DP recreate for a plug-in that reports STALE. v2.8.0 also
+# carries slot 20 `set_window` (runtime#1008, XRT_DP_D3D11_HAS_SET_WINDOW),
+# which the previous v2.7.0 pin existed for and which keeps the in-place weaver
+# re-bind on focus changes. Both slots are appended, and v2.8.0 reports the same
+# plug-in ABI major (v5) as v2.7.0, so this re-pin adds capability without
+# moving a single existing slot. The ABI floor it encodes is plugin ABI
 # v5 (vk_bundle ABI-parity layout + the Linux dma-buf device-extension
 # guarantee, runtime#802) which this plug-in's bg-capture producer needs.
 # The DP vtables carry a struct_size header; the runtime's loader rejects
@@ -113,7 +119,7 @@ endif()
 # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.7.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.8.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin: the Windows/Android tag predates runtime
 # Linux support entirely (scripts/build_linux.sh first shipped in
