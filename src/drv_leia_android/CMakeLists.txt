@@ -69,7 +69,8 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_plugin_android.c
 )
 
-# Post-weave alpha-gate shaders (#568) compiled to SPIR-V headers. Ported
+# Post-weave alpha-gate (#568) + pre-weave compose-under-bg (runtime#1073 T0)
+# shaders compiled to SPIR-V headers. Ported
 # verbatim from the desktop driver (src/drv_leia/shaders/). The runtime tree
 # owns the spirv_shaders macro; it's available because the runtime is added as
 # a subdirectory above (and glslangValidator runs on the host, not the target).
@@ -79,6 +80,7 @@ spirv_shaders(
     SOURCES
         shaders/fullscreen_tri.vert
         shaders/alpha_gate.frag
+        shaders/compose_under_bg.frag
 )
 list(APPEND DRV_LEIA_ANDROID_SOURCES ${LEIA_ANDROID_SHADER_HEADERS})
 

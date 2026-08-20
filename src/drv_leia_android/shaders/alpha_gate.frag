@@ -32,7 +32,18 @@ layout(binding = 2) uniform sampler2D backdrop;
 layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // always 0 on Android
-	uint  mode;           // 0 = legacy all-or-nothing, 1 = woven view-select (#568 de-occlusion fix)
+	uint  mode;           // 0 = legacy all-or-nothing, 1 = woven view-select (#568 de-occlusion fix),
+	                      // 2 = FLATTENED (runtime#1073 T0): a background was
+	                      // composed under every view BEFORE the weave, so the
+	                      // mixed-alpha band is genuinely opaque and needs no
+	                      // per-pixel alpha reconstruction at all. Same
+	                      // all-or-nothing test as mode 0 — but where mode 0 is
+	                      // a regression (it re-creates the fringe it is meant
+	                      // to hide), mode 2 is CORRECT, because the pixels it
+	                      // keeps opaque now contain the backdrop rather than
+	                      // an undefined de-occlusion colour. Selected
+	                      // automatically by the DP whenever the compose pass
+	                      // actually ran; never by the debug.dxr.alphagate knob.
 	// XR_DXR_display_zones (#568): the woven content occupies only this canvas
 	// sub-rect of the target (normalized: xy = offset, zw = extent). For a
 	// full-canvas avatar this is (0,0,1,1) and every branch below is identity.
@@ -66,7 +77,7 @@ void main()
 
 	vec3 woven = texture(backbuffer, in_uv).rgb;
 
-	if (pc.mode != 0u) {
+	if (pc.mode == 1u) {
 		// ── Woven per-pixel view-selection (#568 de-occlusion fix) ──
 		//
 		// The CNSDK interlacer draws each output pixel from ONE view (the
@@ -104,9 +115,19 @@ void main()
 		return;
 	}
 
-	// ── mode 0: legacy all-or-nothing (pre-#568), kept for A/B ──
+	// ── modes 0 and 2: all-or-nothing ──
 	// Opaque if ANY tile has content; transparent only where ALL tiles are
-	// α==0. This is what produced the black de-occlusion fringe.
+	// α==0.
+	//
+	//   mode 0 — legacy (pre-#568), kept for A/B. Nothing was composed under
+	//            the atlas, so the "opaque" band is whatever the weave made of
+	//            transparent pixels: the black/chromatic de-occlusion fringe.
+	//   mode 2 — flattened (runtime#1073 T0). The DP composed the runtime's
+	//            backdrop under every view before the weave, so the band is
+	//            legitimately opaque and all-or-nothing is exactly right. Fully
+	//            transparent regions still punch through to the live screen, so
+	//            live composition stays the default outside the band — which is
+	//            the whole point of the hybrid (design note §6).
 	bool all_transparent = true;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
