@@ -1140,6 +1140,172 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	return true;
 }
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * Orientation tripwire (runtime#1079).
+ *
+ * CNSDK decides the DEVICE orientation in
+ * `leia/core/android/java/com/leia/sdk/OrientationHelper.java`
+ * (`getRealOrientation()`): it reads
+ * `context.getSystemService(WINDOW_SERVICE).getDefaultDisplay().getMetrics()`
+ * and compares width vs height against `Display.getRotation()`.
+ *
+ * `Display.getMetrics()` is **window-adjusted** — inside an app's own process it
+ * reports the app's window, not the panel. So an app in a portrait-SHAPED
+ * multi-window (freeform / split-screen) window on a landscape panel — e.g.
+ * 1000x1500 on a 2560x1600 landscape display — makes CNSDK conclude PORTRAIT
+ * while the device is physically LANDSCAPE. The core then pushes
+ * `SetDeviceOrientation(Portrait)` to the head-tracking service, whose face
+ * detector runs the wrong camera/rotation and logs "could not find a face"
+ * forever; with no face the weave has no viewer to steer to and the output
+ * reads FLAT. The interlacer's own rotation compensation is wrong too.
+ *
+ * Out-of-process the runtime SERVICE's Context has no window, so its metrics are
+ * the panel's — which is exactly why the OOP route was never affected and the
+ * in-process route was.
+ *
+ * There is no client-side fix: the adjustment is applied per PROCESS (a
+ * `Context.createDisplayContext()` Context was measured to make no difference on
+ * an NP02J), and CNSDK exposes no orientation setter — only
+ * `leia_core_get_orientation()`. The real fix belongs in CNSDK:
+ * `getRealOrientation()` must use `Display.getRealMetrics()` (or
+ * `WindowManager.getMaximumWindowMetrics()`), which is window-independent,
+ * and/or CNSDK should expose `leia_core_set_device_orientation()`.
+ *
+ * Until then this tripwire turns a silent, baffling failure ("tracking just
+ * doesn't work in a floating window") into one greppable WARN. It computes the
+ * TRUE orientation the same way CNSDK does but from `getRealMetrics()`, and logs
+ * only when the two disagree, and only when the disagreement changes.
+ */
+static int
+true_device_orientation_android(JavaVM *vm, jobject ctx)
+{
+	// Returns a leia_orientation value, or -1 when it cannot be determined.
+	if (vm == nullptr || ctx == nullptr) {
+		return -1;
+	}
+	JNIEnv *env = nullptr;
+	if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK || env == nullptr) {
+		return -1;
+	}
+
+	int result = -1;
+	jclass ctx_cls = env->FindClass("android/content/Context");
+	jmethodID get_service =
+	    ctx_cls != nullptr
+	        ? env->GetMethodID(ctx_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;")
+	        : nullptr;
+	if (get_service == nullptr) {
+		env->ExceptionClear();
+		return -1;
+	}
+
+	jstring svc = env->NewStringUTF("window"); // Context.WINDOW_SERVICE
+	jobject wm = env->CallObjectMethod(ctx, get_service, svc);
+	env->DeleteLocalRef(svc);
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		wm = nullptr;
+	}
+	if (wm != nullptr) {
+		jclass wm_cls = env->GetObjectClass(wm);
+		jmethodID get_default =
+		    wm_cls != nullptr ? env->GetMethodID(wm_cls, "getDefaultDisplay", "()Landroid/view/Display;")
+		                      : nullptr;
+		jobject disp = get_default != nullptr ? env->CallObjectMethod(wm, get_default) : nullptr;
+		if (env->ExceptionCheck()) {
+			env->ExceptionClear();
+			disp = nullptr;
+		}
+		if (disp != nullptr) {
+			jclass disp_cls = env->GetObjectClass(disp);
+			jclass dm_cls = env->FindClass("android/util/DisplayMetrics");
+			jmethodID get_real =
+			    (disp_cls != nullptr && dm_cls != nullptr)
+			        ? env->GetMethodID(disp_cls, "getRealMetrics", "(Landroid/util/DisplayMetrics;)V")
+			        : nullptr;
+			jmethodID get_rot =
+			    disp_cls != nullptr ? env->GetMethodID(disp_cls, "getRotation", "()I") : nullptr;
+			jmethodID dm_ctor = dm_cls != nullptr ? env->GetMethodID(dm_cls, "<init>", "()V") : nullptr;
+			if (get_real != nullptr && get_rot != nullptr && dm_ctor != nullptr) {
+				jobject dm = env->NewObject(dm_cls, dm_ctor);
+				env->CallVoidMethod(disp, get_real, dm);
+				jfieldID w_fid = env->GetFieldID(dm_cls, "widthPixels", "I");
+				jfieldID h_fid = env->GetFieldID(dm_cls, "heightPixels", "I");
+				jint rot = env->CallIntMethod(disp, get_rot);
+				if (!env->ExceptionCheck() && w_fid != nullptr && h_fid != nullptr) {
+					jint w = env->GetIntField(dm, w_fid);
+					jint h = env->GetIntField(dm, h_fid);
+					// Same decision table as CNSDK's OrientationHelper, but on
+					// REAL (window-independent) metrics. Surface.ROTATION_* are
+					// 0/1/2/3 == 0/90/180/270 degrees.
+					const bool natural_portrait = ((rot == 0 || rot == 2) && h > w) ||
+					                              ((rot == 1 || rot == 3) && w > h);
+					static const int kPortraitTable[4] = {
+					    LEIA_ORIENTATION_PORTRAIT, LEIA_ORIENTATION_LANDSCAPE,
+					    LEIA_ORIENTATION_REVERSE_PORTRAIT, LEIA_ORIENTATION_REVERSE_LANDSCAPE};
+					static const int kLandscapeTable[4] = {
+					    LEIA_ORIENTATION_LANDSCAPE, LEIA_ORIENTATION_PORTRAIT,
+					    LEIA_ORIENTATION_REVERSE_LANDSCAPE, LEIA_ORIENTATION_REVERSE_PORTRAIT};
+					if (rot >= 0 && rot < 4) {
+						result = natural_portrait ? kPortraitTable[rot] : kLandscapeTable[rot];
+					}
+				} else {
+					env->ExceptionClear();
+				}
+				if (dm != nullptr) {
+					env->DeleteLocalRef(dm);
+				}
+			} else {
+				env->ExceptionClear();
+			}
+			env->DeleteLocalRef(disp);
+		}
+		env->DeleteLocalRef(wm);
+	}
+	return result;
+}
+
+//! Log once per distinct disagreement. See true_device_orientation_android().
+static void
+check_orientation_tripwire(struct leia_cnsdk *cnsdk)
+{
+	if (cnsdk == nullptr || cnsdk->core == nullptr) {
+		return;
+	}
+	void *vm = g_host_get_android_vm != nullptr ? g_host_get_android_vm() : (void *)android_globals_get_vm();
+	void *ctx = g_host_get_class_host_context != nullptr ? g_host_get_class_host_context() : nullptr;
+	if (ctx == nullptr) {
+		ctx = g_host_get_android_activity != nullptr ? g_host_get_android_activity()
+		                                             : android_globals_get_activity();
+	}
+	const int truth = true_device_orientation_android((JavaVM *)vm, (jobject)ctx);
+	if (truth < 0) {
+		return;
+	}
+	const int core_says = (int)leia_core_get_orientation(cnsdk->core);
+
+	static int last_truth = -2, last_core = -2;
+	if (truth == last_truth && core_says == last_core) {
+		return;
+	}
+	last_truth = truth;
+	last_core = core_says;
+	if (truth == core_says) {
+		return;
+	}
+	U_LOG_W("ORIENTATION MISMATCH (#1079): CNSDK core reports %d but the PANEL is %d. "
+	        "CNSDK derives this from Display.getMetrics(), which is window-adjusted in an "
+	        "app's own process, so a portrait-shaped freeform/split window on a landscape "
+	        "panel (or vice-versa) reads wrong. Consequence: the head-tracking service is "
+	        "told the wrong orientation, its face detector logs 'could not find a face', and "
+	        "with no viewer the weave reads FLAT. Out-of-process (debug.dxr.force_ipc 1) is "
+	        "unaffected. Vendor fix: OrientationHelper.getRealOrientation() must use "
+	        "Display.getRealMetrics().",
+	        core_says, truth);
+}
+#endif // XRT_OS_ANDROID
+
 extern "C" bool
 leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_x,
@@ -1156,6 +1322,12 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	// extrinsics applied). The frame-listener detection is raw CAMERA-space
 	// posePosition (a fallback for when the core face is empty). The diagnostic is
 	// U_LOG_W (WARN) on purpose — aux INFO is dropped from the Android hot path.
+#ifdef XRT_OS_ANDROID
+	// #1079 tripwire: a wrong core orientation is THE reason face detection dies
+	// in a floating window, so check it right where we read the face.
+	check_orientation_tripwire(cnsdk);
+#endif
+
 	bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
 	float lst_pos[3] = {
 	    cnsdk->listener_face_x_mm.load(std::memory_order_relaxed),
