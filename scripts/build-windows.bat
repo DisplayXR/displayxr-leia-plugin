@@ -46,8 +46,8 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: counts a comment's pfnWeaverGetACTMode as a phantom slot) and require that the new
 :: table APPENDS ONLY: every shared index must hold the same function. An insertion
 :: shifts indices and mis-dispatches SILENTLY, since only the index is checked.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1490
-set SR_V2_DIR=simulatedreality-SDK-1.37.0+1490.d3272356fb-win64-Release
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1494
+set SR_V2_DIR=simulatedreality-SDK-1.37.0+1494.812c51044c-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
