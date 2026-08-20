@@ -9,15 +9,12 @@
 
 #include "leia_sr_liveness.h"
 
-#include "util/u_logging.h"
-
 #ifdef _WIN32
 
 #include <windows.h>
 #include <winsvc.h>
 #include <winver.h>
 
-#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -68,7 +65,8 @@ constexpr uint64_t kGenerationCacheMs = 1000;
  * is a constant 0 for the whole time the platform is down, which is exactly the
  * window an upgrade replaces the files in — keyed on generation alone, a
  * verdict taken at the start of that window would still be the answer at the
- * end of it.
+ * end of it. The bound also lets the verdict recover: after a reconnect maps
+ * the new images the very next read reports "matches" again.
  */
 constexpr uint64_t kMatchCacheMs = 1000;
 
@@ -88,13 +86,6 @@ uint64_t g_match_for_gen = 0;   //!< Generation g_match_value was computed for.
 uint64_t g_match_stamp_ms = 0;  //!< GetTickCount64() when it was computed.
 bool g_match_value = true;      //!< Cached client/platform version verdict.
 bool g_match_valid = false;     //!< g_match_* are meaningful.
-//! #169: a positive mismatch is IRREVERSIBLE — Windows never swaps a mapped
-//! image, so the client DLLs can only get staler. Latching it keeps a later
-//! undeterminable read (a file locked mid-install reads as "cannot tell", which
-//! by contract means "matches") from re-opening the gate.
-bool g_match_latched_false = false;
-//! #169: one process-wide WARN edge for leia_sr_liveness_weaver_create_allowed.
-std::atomic<bool> g_warned_create_refused{false};
 
 /*!
  * The SR service's process id, or 0 when it is not running.
@@ -445,52 +436,23 @@ leia_sr_liveness_connection_is_dead(void *sr_instance_v2)
 extern "C" bool
 leia_sr_liveness_client_matches_platform(void)
 {
-	{
-		// Cheap out before touching the SCM: once mismatched, always
-		// mismatched (see g_match_latched_false).
-		std::lock_guard<std::mutex> guard(g_lock);
-		if (g_match_latched_false) {
-			return false;
-		}
-	}
-
-	// Deliberately OUTSIDE the lock — it takes g_lock itself.
+	// Deliberately computed OUTSIDE the lock — it takes g_lock itself.
 	const uint64_t gen = leia_sr_liveness_platform_generation();
 	const uint64_t now_ms = GetTickCount64();
 
 	std::lock_guard<std::mutex> guard(g_lock);
-	if (g_match_latched_false) {
-		return false; // another thread latched while we were unlocked
-	}
 	if (g_match_valid && g_match_for_gen == gen && (now_ms - g_match_stamp_ms) < kMatchCacheMs) {
 		return g_match_value;
 	}
 
+	// No latch: a mismatch is a transient upgrade window, not a permanent
+	// state, and it must be free to clear once the weaver is rebuilt on the
+	// new images. See the header.
 	g_match_value = compute_client_matches();
 	g_match_for_gen = gen;
 	g_match_stamp_ms = now_ms;
 	g_match_valid = true;
-	if (!g_match_value) {
-		g_match_latched_false = true;
-	}
 	return g_match_value;
-}
-
-extern "C" bool
-leia_sr_liveness_weaver_create_allowed(void)
-{
-	if (leia_sr_liveness_client_matches_platform()) {
-		return true;
-	}
-
-	if (!g_warned_create_refused.exchange(true, std::memory_order_relaxed)) {
-		U_LOG_W("SR platform was UPGRADED while this process was running — the OLD SR client DLLs are "
-		        "still mapped (Windows cannot swap a loaded image), so building a weaver from them "
-		        "against the new platform faults inside the vendor runtime (leia-plugin#169). Refusing "
-		        "every weaver create in this process; the panel falls back to a flat blit. RESTART the "
-		        "DisplayXR service to map the new SR client libraries and recover 3D.");
-	}
-	return false;
 }
 
 #else // !_WIN32
@@ -523,12 +485,6 @@ leia_sr_liveness_connection_is_dead(void *sr_instance_v2)
 
 extern "C" bool
 leia_sr_liveness_client_matches_platform(void)
-{
-	return true;
-}
-
-extern "C" bool
-leia_sr_liveness_weaver_create_allowed(void)
 {
 	return true;
 }
