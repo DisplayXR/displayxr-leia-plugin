@@ -1210,6 +1210,11 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	vp.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &vp);
 	// Scissor to the canvas sub-rect so the draw can't touch the surround region.
+	// Saved/restored below (#160): this is the runtime's SHARED immediate
+	// context, so leaving our rect bound pollutes the present owner's state.
+	UINT prev_sc_count = 1;
+	D3D11_RECT prev_sc = {};
+	ctx->RSGetScissorRects(&prev_sc_count, &prev_sc);
 	D3D11_RECT sc = { vp_x, vp_y, vp_x + (int32_t)vp_w, vp_y + (int32_t)vp_h };
 	ctx->RSSetScissorRects(1, &sc);
 	ctx->OMSetRenderTargets(1, &rtv, nullptr);
@@ -1243,6 +1248,10 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 
 	ID3D11ShaderResourceView *null_srvs[4] = {nullptr, nullptr, nullptr, nullptr};
 	ctx->PSSetShaderResources(0, 4, null_srvs);
+
+	// prev_sc_count == 0 when nothing was bound → clears the scissor array,
+	// i.e. exactly the state we found.
+	ctx->RSSetScissorRects(prev_sc_count, &prev_sc);
 
 	back_buffer->Release();
 	rtv_res->Release();
@@ -2071,9 +2080,14 @@ leia_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_h
 	// enable_transparency only (re-)creates when bg_compose_enabled is false,
 	// so release first; on failure it falls back to chroma-key exactly as it
 	// does at session start.
+	// Pass the session's present ownership through rather than a hard-coded
+	// false (#160): in client-present mode enable_transparency must take its
+	// early-return (no ck_enabled, no WGC, no WDA_EXCLUDEFROMCAPTURE on the
+	// client's window). Unreachable in that mode today — bg_compose_enabled is
+	// never true there — but the literal was an armed trap.
 	if (ldp->bg_compose_enabled) {
 		compose_release_resources(ldp); // clears bg_compose_enabled
-		leia_dp_d3d11_enable_transparency(ldp, true /* transparent */, false /* client_presents */);
+		leia_dp_d3d11_enable_transparency(ldp, true /* transparent */, ldp->client_present_mode);
 	}
 
 	U_LOG_W("Leia D3D11 DP: re-bound to hwnd=%p (no weaver recreate)", (void *)hwnd);
