@@ -523,6 +523,15 @@ leiasr_d3d12_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+	// #169: refuse to build a weaver out of SR client DLLs that no longer match
+	// the installed platform — the vendor runtime access-violates on it, and
+	// the runtime's STALE-driven DP recreate would turn that into a crash loop.
+	// A fresh process is never blocked (nothing SR mapped yet reads as
+	// "undeterminable", which the probe reports as a match).
+	if (!leia_sr_liveness_weaver_create_allowed()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
 	leiasr_d3d12 *sr = new leiasr_d3d12;
 	sr->device = static_cast<ID3D12Device *>(d3d12_device);
 	sr->command_queue = static_cast<ID3D12CommandQueue *>(d3d12_command_queue);
@@ -1059,6 +1068,25 @@ leiasr_d3d12_poll_backend_state(struct leiasr_d3d12 *leiasr)
 	void *const v2 = v2_instance_of(leiasr);
 	const uint64_t gen = leia_sr_liveness_platform_generation_ex(v2);
 
+	// #169: taken BEFORE the "platform down" / "generation changed"
+	// early-returns below — an upgrade trips both of those, so after them this
+	// check was dead code on the only path that needs it. STALE, not DEGRADED:
+	// this arm cannot rebuild in place at all, and across an upgrade nothing in
+	// this process could anyway (Windows never swaps a mapped image), so a
+	// weaver create here would fault inside the vendor runtime exactly as the
+	// D3D11 reconnect did. See leia_sr_d3d11.cpp's poll for the full reasoning.
+	if (!leia_sr_liveness_client_matches_platform()) {
+		if (!leiasr->warned_client_skew) {
+			leiasr->warned_client_skew = true;
+			U_LOG_W("SR platform was UPGRADED while this process was running (D3D12 arm) — the "
+			        "OLD SR client DLLs are still mapped, so no weaver can be built here "
+			        "safely (leia-plugin#169). Reporting STALE; RESTART the DisplayXR "
+			        "service, which is the only way to map the new libraries.");
+		}
+		return LEIA_SR_BACKEND_STALE;
+	}
+	leiasr->warned_client_skew = false;
+
 	if (gen == 0) {
 		// Platform down. The weaver keeps weaving on the last known eye
 		// positions, which beats no picture — do not tear anything down; the
@@ -1103,15 +1131,9 @@ leiasr_d3d12_poll_backend_state(struct leiasr_d3d12 *leiasr)
 		return LEIA_SR_BACKEND_STALE;
 	}
 
-	if (!leia_sr_liveness_client_matches_platform()) {
-		if (!leiasr->warned_client_skew) {
-			leiasr->warned_client_skew = true;
-			U_LOG_W("SR client DLLs mapped in this process predate the installed SR platform "
-			        "(D3D12 arm) — restart the DisplayXR service to load the new ones");
-		}
-		return LEIA_SR_BACKEND_DEGRADED;
-	}
-	leiasr->warned_client_skew = false;
+	// The skew check that used to sit here is now the first thing after the
+	// generation read — see the #169 block above for why its old position was
+	// dead code on an upgrade.
 
 	return LEIA_SR_BACKEND_OK;
 }
