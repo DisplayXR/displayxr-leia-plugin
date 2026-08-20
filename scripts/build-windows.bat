@@ -38,14 +38,16 @@ set SR_TAG=1.35.0.2011
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: SR v2 C99 SDK pin (landing set; see the release notes on this tag).
 :: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml.
-:: DO NOT move this pin to a release-candidate-lineage SDK yet (#158). Those cuts
-:: carry srInstanceGetConnectionState / srGetPlatformInstanceId but SHIP NO sr/sr_vk.h,
-:: because the Vulkan work (ST-5520/5660) is still unmerged on that lineage -- leia_sr.cpp
-:: and leia_vk_weaver_v2.cpp then fail with C1083 and Vulkan v2 weaving would be lost.
-:: Move the pin only to a cut that has BOTH sr_vk.h and the connection-state symbols;
-:: DXR_LEIA_HAS_SR_CONNECTION_STATE stays off until then and the SCM probe carries it.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1450
-set SR_V2_DIR=simulatedreality-SDK-1.37.0+1450.2bd551714b-win64-Release
+:: RESOLVED (#158): 1490 is the converged cut -- its dispatch table is IDENTICAL to the
+:: shipped (super) lineage's, giving a strict prefix chain main < 1450 < 1490, so lineage
+:: no longer matters for ABI and DXR_LEIA_HAS_SR_CONNECTION_STATE is now ON in CI/release.
+:: Before EVER moving this pin again, run the acceptance test: extract slot DECLARATIONS
+:: (grep -a -oE '\(SR_CALL \*pfn[A-Za-z0-9_]+\)' include/sr/sr_loader.h -- a token grep
+:: counts a comment's pfnWeaverGetACTMode as a phantom slot) and require that the new
+:: table APPENDS ONLY: every shared index must hold the same function. An insertion
+:: shifts indices and mis-dispatches SILENTLY, since only the index is checked.
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1490
+set SR_V2_DIR=simulatedreality-SDK-1.37.0+1490.d3272356fb-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
