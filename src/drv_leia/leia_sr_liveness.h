@@ -141,27 +141,68 @@ bool
 leia_sr_liveness_connection_is_dead(void *sr_instance_v2);
 
 /*!
- * One-shot per-generation check: do the SR client DLLs MAPPED in this process
- * match the SR platform installed on disk?
+ * Do the SR client DLLs MAPPED in this process match the SR platform installed
+ * on disk?
  *
  * After an SR platform upgrade a long-lived process keeps the OLD client DLLs
- * mapped (Windows does not swap a loaded image), so a reconnect gives it a
- * fresh connection driven through the old client libraries. Within a patch
- * train that is usually fine, but it is a real skew and it explains otherwise
- * baffling behaviour, so it is worth one loud line.
+ * mapped (Windows does not swap a loaded image), so anything it builds
+ * afterwards is old client code driven against a new platform. That is not
+ * merely untidy: it access-violates inside the vendor runtime
+ * (leia-plugin#169), so as of #169 this is a GATE, not just a tripwire — see
+ * leia_sr_liveness_weaver_create_allowed().
  *
  * @return true when matched, or when the answer cannot be determined (nothing
- *         mapped yet, no version resource, a failed query) — this is a
- *         tripwire, not a gate, and must never be the reason something is
- *         refused. false ONLY on a positive mismatch.
+ *         mapped yet, no version resource, a failed query). false ONLY on a
+ *         positive mismatch. Undeterminable must never read as a mismatch: a
+ *         fresh process has nothing SR mapped, and refusing there would break
+ *         every start-up.
  *
- * Result is cached per generation token; the CALLER is responsible for logging
- * on state edges (this function never logs).
+ * Caching (#169). Keyed on the generation token AND bounded to ~1 s, because
+ * generation alone is not a sufficient key for a gate: throughout an upgrade
+ * the platform is DOWN, so the token is a constant 0 for the whole window in
+ * which the installer swaps the files, and a verdict computed at the START of
+ * that window ("matches" — nothing replaced yet) would stay pinned right
+ * through the moment the decision is made. A positive mismatch additionally
+ * LATCHES for the process lifetime: it is irreversible by construction, and
+ * latching stops a transient undeterminable read (a locked file mid-install
+ * answers "cannot tell") from talking the gate back open.
+ *
+ * Never logs — the CALLER owns the state-edge WARN.
  *
  * @ingroup drv_leia
  */
 bool
 leia_sr_liveness_client_matches_platform(void);
+
+/*!
+ * #169 gate: may a weaver be CREATED in this process right now?
+ *
+ * False when the SR platform was upgraded underneath this process. Nothing
+ * in-process can fix that — the old client DLLs stay mapped until the process
+ * exits — so the only remedy is a restart of the DisplayXR service, and the
+ * only safe action here is to not call into the vendor at all.
+ *
+ * Every weaver create path must ask, not just the in-place reconnect: the
+ * runtime answers a STALE backend by destroying the display processor and
+ * creating a fresh one (displayxr-runtime#1064), and a fresh DP in the SAME
+ * process still has the old DLLs mapped — so the recreate would make exactly
+ * the vendor call that access-violated. Without this gate it becomes a crash
+ * loop; with it, a create-refusal the runtime already handles ("create failed —
+ * keeping the current one", plus a ~2 Hz backoff) and the panel flat-blits
+ * until the service is restarted.
+ *
+ * Emits ONE process-wide `U_LOG_W` the first time it refuses — process-wide
+ * because the condition is, and because the runtime's recreate loop would
+ * otherwise turn a per-instance flag into a log storm. Callers just check the
+ * bool.
+ *
+ * @return true when a create may proceed (including every undeterminable case
+ *         — see leia_sr_liveness_client_matches_platform()).
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_sr_liveness_weaver_create_allowed(void);
 
 #ifdef __cplusplus
 }
