@@ -1423,6 +1423,34 @@ compose_ensure_pipeline(leia_dp_cnsdk *impl, VkFormat fmt)
 	return true;
 }
 
+// `debug.dxr.leia.bgdebug=1`: the compose pass outputs the BACKGROUND ONLY
+// across the whole tile and the post-weave alpha gate is skipped. Both tiles
+// then carry identical, zero-disparity content, so `adb exec-out screencap` of
+// the woven panel reads back as the backdrop image itself — which is what turns
+// "is the backdrop arriving, and is it mapped the way the producer sent it?"
+// into a one-glance check rather than a squint at the de-occlusion band (#174).
+// Same knob as the Linux DP's DXR_LEIA_BG_DEBUG. Cached: __system_property_get
+// isn't free and a mid-session flip would race in-flight frames.
+static bool
+bg_debug_enabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = 0;
+#ifdef XRT_OS_ANDROID
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.leia.bgdebug", buf) > 0 && buf[0] == '1') {
+			cached = 1;
+		}
+#endif
+		if (cached == 1) {
+			U_LOG_W("Leia CNSDK DP: bg-debug ON — compose outputs the backdrop only,"
+			        " alpha gate skipped (#174)");
+		}
+	}
+	return cached == 1;
+}
+
 // Composite the tiled atlas OVER the bound backdrop into an opaque
 // intermediate and return its view for CNSDK to interlace. VK_NULL_HANDLE ⟹
 // caller weaves the raw atlas (today's live alpha-gate behaviour): transparency
@@ -1511,7 +1539,7 @@ compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w,
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = 0u; // no Local2D under-layer on Android yet (#491)
-	push.pad = 0u;
+	push.pad = bg_debug_enabled() ? 1u : 0u;
 	vk->vkCmdPushConstants(cmd, impl->cmp_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
@@ -2028,7 +2056,9 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// so SurfaceFlinger shows the live screen through the transparent regions.
 	// Gated on the session transparency flag + a 2x1 multiview grid (the only
 	// layout the alpha-gate UV math handles; the mono 1x1 path returned above).
-	if (impl->transparent_bg_enabled && tile_columns == 2 && tile_rows == 1) {
+	// bg-debug wants the raw composed backdrop on the panel, so it must not be
+	// punched through by the gate (#174).
+	if (impl->transparent_bg_enabled && tile_columns == 2 && tile_rows == 1 && !bg_debug_enabled()) {
 		// The gate runs over the WHOLE target: inside the canvas band it
 		// reconstructs the woven view-select alpha; outside it punches fully
 		// transparent (clearing whatever CNSDK left beyond its viewport). When

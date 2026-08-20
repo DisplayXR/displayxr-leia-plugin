@@ -11,14 +11,15 @@
 // every tile; per-eye parallax comes from the atlas content, not the
 // background.
 //
-// ANDROID COPY (runtime#1073 T0). Byte-identical to ../drv_leia/shaders/
-// compose_under_bg.frag — per-backend shader copies are this repo's convention
-// (see drv_leia_linux/shaders). Android has no desktop capture, so the DP binds
-// the runtime-supplied backdrop (base DP slot 16 `set_background_2d`) to
-// binding 1 with bg_uv = (0,0)-(1,1), binds it again to the unused binding 2
-// to keep the descriptor set complete, and pushes has_backdrop = 0. Keeping the
-// file identical means a T1/T2 producer (MediaProjection / vendor
-// captureDisplay) that DOES have a monitor-space sub-rect drops straight in.
+// ANDROID COPY (runtime#1073). Per-backend shader copies are this repo's
+// convention (see drv_leia_linux/shaders); this one is the Windows copy plus
+// the Linux copy's bg-only debug branch (#174). The DP binds the backdrop the
+// runtime hands it (base DP slot 16 `set_background_2d`) to binding 1, binds it
+// again to the unused binding 2 to keep the descriptor set complete, and pushes
+// has_backdrop = 0. bg_uv_origin/extent stay (0,0)-(1,1) at every tier: slot 16
+// promises a backdrop already in canvas space, and runtime#174 made the T2
+// receiver crop its whole-panel capture down to the canvas rather than pushing
+// a sub-rect down here — so this shader needs no notion of producer tier.
 
 #version 450
 
@@ -49,6 +50,19 @@ void main()
 	vec2 tile_local = fract(in_uv * vec2(pc.tile_count));
 	vec2 bg_uv = pc.bg_uv_origin + tile_local * pc.bg_uv_extent;
 	vec3 b = textureLod(bg, bg_uv, 0.0).rgb;
+
+	// debug.dxr.leia.bgdebug=1 (pc.pad==1): output the background ONLY across
+	// the whole tile, and the caller skips the post-weave alpha gate. Both
+	// tiles then carry identical, zero-disparity content, so a plain
+	// `adb exec-out screencap` of the woven panel reads back as the background
+	// image itself — which is what makes "is the backdrop arriving, and is it
+	// oriented the way the producer sent it?" a one-glance check instead of a
+	// squint at the de-occlusion band (#174). Same knob as the Linux DP's
+	// DXR_LEIA_BG_DEBUG.
+	if (pc.pad == 1u) {
+		out_color = vec4(b, 1.0);
+		return;
+	}
 
 	// #491 part 3 — the backdrop is a flat z=0 layer covering the window client
 	// area, so sample it at the same per-tile window-local UV as the desktop.
