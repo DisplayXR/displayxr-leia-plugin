@@ -662,16 +662,6 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 bool
 create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 {
-	// #169: the single choke point every create runs through — the sync
-	// create, the #144 async worker, and the #158 reconnect worker. If the SR
-	// platform was upgraded under this process the mapped client DLLs are
-	// stale and the vendor runtime access-violates on the create, so refuse
-	// before calling into it. Never fires in a fresh process (nothing SR is
-	// mapped yet, which the probe reports as "undeterminable" = allowed).
-	if (!leia_sr_liveness_weaver_create_allowed()) {
-		return false;
-	}
-
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leia_sr_api_selected() == LEIA_SR_API_V2) {
 		// Deliberately NOT falling back to v1 on failure.
@@ -1105,15 +1095,6 @@ reconnect_worker_body(leiasr_d3d11 *sr, double max_time)
 bool
 arm_reconnect(leiasr_d3d11 *sr, const char *reason)
 {
-	// #169 backstop. The poll already refuses to reach here across a version
-	// skew, but a reconnect TEARS THE WEAVER DOWN before it rebuilds, so a
-	// future detector arming one on a skewed process would trade an untracked
-	// picture for no picture at all (create_weaver_attempt would then refuse
-	// the rebuild). Cheap to make that structurally impossible.
-	if (!leia_sr_liveness_weaver_create_allowed()) {
-		return false;
-	}
-
 	int expected = LEIASR_ASYNC_READY;
 	if (!sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_PENDING, std::memory_order_acq_rel)) {
 		return false;
@@ -1178,15 +1159,6 @@ leiasr_d3d11_create_async(double max_time,
 {
 	if (d3d11_device == nullptr || d3d11_context == nullptr) {
 		U_LOG_E("D3D11 device or context is null");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	// #169: create_weaver_attempt refuses this too, but the worker cannot fail
-	// the CALLER — this entry point would already have answered XRT_SUCCESS,
-	// and the runtime would have published the new DP and retired the old
-	// (still-weaving) one before the worker discovered the skew. Fail
-	// synchronously so the runtime keeps the DP it has.
-	if (!leia_sr_liveness_weaver_create_allowed()) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
@@ -2196,48 +2168,33 @@ leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr)
 	 * #169: the client/platform version verdict is taken HERE, ahead of the
 	 * "platform down" and "generation changed" early-returns below.
 	 *
-	 * In #162 it sat after them, which made it dead code on the only path that
-	 * needs it: an upgrade takes the platform down (gen == 0) and brings it
+	 * In #162 it sat AFTER them, which made it unreachable on the only path it
+	 * describes: an upgrade takes the platform down (gen == 0) and brings it
 	 * back under a new identity (generation changed), so one of those two
-	 * always returned first. It logged nothing at all while the service
-	 * crashed.
+	 * always returned first and the log said nothing at all about the upgrade.
+	 * Computing it up here is purely so it can be LOGGED where it happens.
 	 *
-	 * The distinction this encodes:
-	 *   - platform RESTART, same version → the mapped client DLLs still match,
-	 *     the in-place reconnect below is correct, and stays untouched.
-	 *   - platform UPGRADE underneath us → the mapped client DLLs are stale.
-	 *     Reconnecting builds a fresh weaver out of old client code against a
-	 *     new platform, and the vendor runtime access-violates (#169). No
-	 *     in-process action can replace a mapped DLL, so the honest answer is
-	 *     STALE ("recreate me"), not DEGRADED (which promises self-healing).
-	 *
-	 * Nothing is torn down HERE — the weaver keeps weaving on its last eye
-	 * positions for as long as it is kept. Losing tracking, or even dropping to
-	 * a flat blit, beats taking the service down, which is the whole point.
-	 *
-	 * What the runtime does with STALE is its business, and it is not gentle:
-	 * pipeline_dp_health_poll forces a recreate, and the forced path RETIRES
-	 * THE DP FIRST (one live weaver per HWND — displayxr-runtime
-	 * comp_d3d11_service.cpp). So under the service the picture does fall back
-	 * to flat blit until someone restarts it. The gate still has to hold on the
-	 * other side of that: the fresh DP is created in the SAME process, with the
-	 * same stale DLLs mapped, so its first create would make exactly the vendor
-	 * call that access-violated — create_weaver_attempt refuses it, which turns
-	 * a crash loop into a quiet 2 Hz create-refusal the runtime already backs
-	 * off from.
+	 * TELEMETRY ONLY — it deliberately does not change the verdict, and must
+	 * not start to. The skew across an upgrade is TRANSIENT and heals through
+	 * exactly the in-place reconnect below: two real 1491 -> 1494 upgrades under
+	 * a live service reconnected successfully (10.4 s and 33.3 s) and left the
+	 * same process running with the NEW SR images mapped. The #169 crash that
+	 * first prompted a gate here was a race against the installer's
+	 * file-replacement window (vendor-confirmed) — a partially swapped DLL set,
+	 * not a durable skew — and the create-retry loop this reconnect already runs
+	 * (5 s between attempts) is the correct mitigation: the retry succeeded
+	 * there too. Blocking would forbid a mechanism that demonstrably works.
 	 */
 	if (!leia_sr_liveness_client_matches_platform()) {
 		if (!leiasr->warned_client_skew.exchange(true, std::memory_order_relaxed)) {
-			U_LOG_W("SR platform was UPGRADED while this process was running — refusing an "
-			        "in-place weaver reconnect (the OLD SR client DLLs are still mapped and "
-			        "reconnecting through them faults inside the vendor runtime, "
-			        "leia-plugin#169). Reporting STALE; tracking is gone until the DisplayXR "
-			        "service is RESTARTED, which is the only way to map the new libraries.");
+			U_LOG_W("SR platform was upgraded while this process was running — the mapped SR "
+			        "client DLLs no longer match the installed set. This is expected to clear "
+			        "once the weaver is rebuilt; if tracking does not come back after that, "
+			        "restart the DisplayXR service.");
 		}
-		leiasr->last_backend_state.store(LEIA_SR_BACKEND_STALE, std::memory_order_relaxed);
-		return LEIA_SR_BACKEND_STALE;
+	} else {
+		leiasr->warned_client_skew.store(false, std::memory_order_relaxed);
 	}
-	leiasr->warned_client_skew.store(false, std::memory_order_relaxed);
 
 	if (gen == 0) {
 		// SR platform is down. Deliberately do NOT tear the weaver down: it
@@ -2284,8 +2241,8 @@ leiasr_d3d11_poll_backend_state(struct leiasr_d3d11 *leiasr)
 	}
 
 	// The skew check that used to sit here is now taken up front, right after
-	// the generation read — see the #169 block above for why its old position
-	// was dead code on an upgrade.
+	// the generation read — see the #169 block above. It logs; it never
+	// changes the state reported from here.
 
 	leiasr->last_backend_state.store(LEIA_SR_BACKEND_OK, std::memory_order_relaxed);
 	return LEIA_SR_BACKEND_OK;

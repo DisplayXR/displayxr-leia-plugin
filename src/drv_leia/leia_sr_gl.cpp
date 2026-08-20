@@ -401,15 +401,6 @@ leiasr_gl_create(double max_time,
                   uint32_t view_height,
                   struct leiasr_gl **out)
 {
-	// #169: refuse to build a weaver out of SR client DLLs that no longer match
-	// the installed platform — the vendor runtime access-violates on it, and
-	// the runtime's STALE-driven DP recreate would turn that into a crash loop.
-	// A fresh process is never blocked (nothing SR mapped yet reads as
-	// "undeterminable", which the probe reports as a match).
-	if (!leia_sr_liveness_weaver_create_allowed()) {
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
 	leiasr_gl *sr = new leiasr_gl;
 	sr->view_width = view_width;
 	sr->view_height = view_height;
@@ -696,22 +687,23 @@ leiasr_gl_poll_backend_state(struct leiasr_gl *leiasr)
 
 	// #169: taken BEFORE the "platform down" / "generation changed"
 	// early-returns below — an upgrade trips both of those, so after them this
-	// check was dead code on the only path that needs it. STALE, not DEGRADED:
-	// this arm cannot rebuild in place at all, and across an upgrade nothing in
-	// this process could anyway (Windows never swaps a mapped image), so a
-	// weaver create here would fault inside the vendor runtime exactly as the
-	// D3D11 reconnect did. See leia_sr_d3d11.cpp's poll for the full reasoning.
+	// check never ran on the only path it describes. TELEMETRY ONLY: it logs
+	// the upgrade window and deliberately leaves the reported state alone. The
+	// skew is transient (it clears once a weaver is rebuilt on the new images),
+	// and the #169 crash it was briefly gated on was a race against the
+	// installer's file-replacement window, not a durable skew — see
+	// leia_sr_d3d11.cpp's poll for the full reasoning and the hardware evidence.
 	if (!leia_sr_liveness_client_matches_platform()) {
 		if (!leiasr->warned_client_skew) {
 			leiasr->warned_client_skew = true;
-			U_LOG_W("SR platform was UPGRADED while this process was running (GL arm) — the "
-			        "OLD SR client DLLs are still mapped, so no weaver can be built here "
-			        "safely (leia-plugin#169). Reporting STALE; RESTART the DisplayXR "
-			        "service, which is the only way to map the new libraries.");
+			U_LOG_W("SR platform was upgraded while this process was running (GL arm) — the "
+			        "mapped SR client DLLs no longer match the installed set. This is "
+			        "expected to clear once the weaver is rebuilt; if tracking does not come "
+			        "back after that, restart the DisplayXR service.");
 		}
-		return LEIA_SR_BACKEND_STALE;
+	} else {
+		leiasr->warned_client_skew = false;
 	}
-	leiasr->warned_client_skew = false;
 
 	if (gen == 0) {
 		// Platform down. The weaver keeps weaving on the last known eye
@@ -757,9 +749,9 @@ leiasr_gl_poll_backend_state(struct leiasr_gl *leiasr)
 		return LEIA_SR_BACKEND_STALE;
 	}
 
-	// The skew check that used to sit here is now the first thing after the
-	// generation read — see the #169 block above for why its old position was
-	// dead code on an upgrade.
+	// The skew check that used to sit here is now taken right after the
+	// generation read — see the #169 block above. It logs; it never changes
+	// the state reported from here.
 
 	return LEIA_SR_BACKEND_OK;
 }
