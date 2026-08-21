@@ -340,7 +340,31 @@ w_weave(leiasr_gl *sr)
 		return;
 	}
 #endif
-	sr->weaver->weave();
+	/*
+	 * v1 throws as routine internal control flow, and the caller above us is
+	 * the runtime's C compositor, which cannot catch. An exception escaping a
+	 * per-frame display-processor method is std::terminate -- the whole app, or
+	 * the whole service, gone with no WER record. Every other SR SDK call in
+	 * this file is already wrapped; weave() was the one that was not.
+	 *
+	 * Dropping the frame is the right degradation: the target keeps whatever was
+	 * last presented, and the next frame retries. The log is deliberately NOT
+	 * per-frame -- a throwing weaver throws every frame, and a per-frame U_LOG
+	 * would bury the log it is supposed to help you read.
+	 *
+	 * The v2 branch above needs no guard: srWeaverWeave catches internally
+	 * (SR_CATCH_ALL in the SR runtime) and reports through SrResult instead.
+	 */
+	try {
+		sr->weaver->weave();
+	} catch (...) {
+		static uint64_t throws;
+		if ((throws++ % 600) == 0) {
+			U_LOG_E("SR GL v1 weave() threw -- frame not woven (throw #%llu; "
+			        "logged 1-in-600 to stay off the per-frame path)",
+			        (unsigned long long)throws);
+		}
+	}
 }
 
 bool
