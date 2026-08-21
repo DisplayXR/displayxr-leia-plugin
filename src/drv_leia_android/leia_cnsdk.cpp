@@ -1627,7 +1627,7 @@ leia_cnsdk_set_window_screen_rect(
 	U_LOG_W("HW_DBG_CNSDK: window screen rect %d,%d %ux%u display %d (#150/#1033)", x, y, w, h, display_id);
 }
 
-extern "C" void
+extern "C" bool
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
                  VkPhysicalDevice physDev,
@@ -1643,12 +1643,14 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  int32_t vp_x,
                  int32_t vp_y,
                  uint32_t vp_w,
-                 uint32_t vp_h)
+                 uint32_t vp_h,
+                 VkSemaphore wait_sem,
+                 VkSemaphore signal_sem)
 {
 	(void)device; (void)physDev; (void)targetFmt;
 
 	if (cnsdk == NULL || cnsdk->interlacer == NULL) {
-		return;
+		return false;
 	}
 
 	// Live 2D/3D A-B toggle for verifying the weave on the panel.
@@ -1735,7 +1737,26 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 
 	DXR_HW_DBG_ONCE("weave: first do_post_process atlas=%ux%u target=%ux%u",
 	                atlas_width, atlas_height, w, h);
+	// runtime#1073 L11 — hand CNSDK the caller's GPU dependencies instead of
+	// pre-synchronising on the CPU.
+	//
+	//   wait_sem   → `imageAvailableSemaphore`. CNSDK stores it and attaches it
+	//                to the submit whose command buffer samples the source views
+	//                (interlacer.cpp DoPostProcess → ApplyInterlacing →
+	//                CRendererVulkan::Apply2DEffect, applied at `currentPass ==
+	//                0`). Our single-layer atlas setup takes exactly that path:
+	//                `mLayerCount == 1` skips layer compositing, so the interlace
+	//                pass IS pass 0 and the wait is honoured on the submit that
+	//                reads the atlas. Verified against CNSDK main.
+	//   signal_sem → `renderFinishedSemaphore`, signalled by the final pass
+	//                (interlace when the debug GUI is hidden, which is always
+	//                here). Lets the post-weave alpha gate order itself after the
+	//                weave without a device-wide idle.
+	//
+	// Both are optional: NULL keeps the pre-L11 "caller already synchronised"
+	// behaviour, which is what the fallback paths still use.
 	leia_interlacer_vulkan_do_post_process(
 	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL,
-	    NULL, NULL, 0);
+	    wait_sem, signal_sem, 0);
+	return true;
 }

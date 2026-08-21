@@ -193,7 +193,29 @@ struct leia_dp_cnsdk
 	//! same queue the compositor submits its own frame work to — so it charges
 	//! the compose pass for every unrelated submission in flight. Waiting on
 	//! our own fence measured ~2 ms/frame cheaper on the NP02J.
+	//!
+	//! runtime#1073 L11: on the fast path the fence is no longer waited in the
+	//! frame that arms it — the compose→weave dependency moved onto the GPU (see
+	//! `cmp_done_sem`). It survives as the RECLAIM guard: the next compose waits
+	//! it before it may legally reuse this frame's one-shot command buffer and
+	//! the single descriptor set, and teardown waits it before destroying them.
 	VkFence cmp_fence;
+	//! True while `cmp_fence` is armed (submitted, not yet waited).
+	bool cmp_fence_armed;
+	//! The compose submit's one-shot command buffer, freed at the NEXT compose
+	//! (after `cmp_fence`) rather than inline — it may still be executing.
+	VkCommandBuffer cmp_cmd;
+	//! runtime#1073 L11 — compose → weave. Signalled by the compose submit,
+	//! consumed by CNSDK's self-submitting interlacer as its
+	//! `imageAvailableSemaphore`, so the weave's first pass cannot sample the
+	//! intermediate before the compose has written it. Replaces a CPU
+	//! `vkWaitForFences` that cost 2.9 ms/frame (IPC) / ~1.5 ms (in-process).
+	VkSemaphore cmp_done_sem;
+	//! runtime#1073 L11 — weave → alpha gate. CNSDK's `renderFinishedSemaphore`;
+	//! the post-weave gate waits it before reading the target. With the compose
+	//! wait gone the weave is genuinely in flight when the gate is recorded, so
+	//! this ordering has to be expressed rather than inferred from submit order.
+	VkSemaphore cmp_weave_sem;
 };
 
 inline leia_dp_cnsdk *
@@ -1040,10 +1062,69 @@ alpha_gate_get_fb(leia_dp_cnsdk *impl, uint32_t w, uint32_t h)
 //
 // Divergences from the Linux port, both forced by this DP being SELF-SUBMITTING
 // (the compositor hands us VK_NULL_HANDLE for cmd_buffer):
-//   1. own one-shot command buffer + submit + wait, like alpha_gate_run;
+//   1. own one-shot command buffer + submit, like alpha_gate_run (the wait that
+//      used to follow moved onto the GPU as a semaphore — runtime#1073 L11);
 //   2. the intermediate is created in the ATLAS's format, not a hardcoded
 //      R8G8B8A8_UNORM, so an sRGB atlas keeps its transfer function through the
 //      compose and CNSDK sees exactly the format it saw before.
+
+// Reclaim the previous compose submit: bounded wait on its fence, then release
+// the one-shot command buffer it owned. Since L11 the compose is no longer
+// CPU-waited in its own frame, so this is the single point that makes reuse and
+// teardown of the command buffer / descriptor set legal. Bounded (never
+// UINT64_MAX) per the workspace-stability rules — a lost GPU must surface as a
+// dropped compose, not a wedged render thread.
+static const uint64_t kComposeReclaimTimeoutNs = 1000000000ULL; // 1 s
+
+// Consume a binary semaphore that was signalled but whose intended waiter never
+// ran (runtime#1073 L11). A binary semaphore may not be signalled twice without
+// an intervening wait, so an abandoned signal would break EVERY later frame, not
+// just this one — an empty batch is the cheapest legal way to swallow it.
+// Off the happy path by construction; never per-frame.
+static void
+drain_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (sem == VK_NULL_HANDLE || vk == nullptr || vk->main_queue == nullptr) {
+		return;
+	}
+	U_LOG_W("compose-under: draining an unconsumed weave semaphore (chain broke this frame)");
+	VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.waitSemaphoreCount = 1;
+	si.pWaitSemaphores = &sem;
+	si.pWaitDstStageMask = &stage;
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+}
+
+static bool
+compose_reclaim(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr) {
+		return false;
+	}
+	bool ok = true;
+	if (impl->cmp_fence_armed && impl->cmp_fence != VK_NULL_HANDLE) {
+		VkResult res =
+		    vk->vkWaitForFences(vk->device, 1, &impl->cmp_fence, VK_TRUE, kComposeReclaimTimeoutNs);
+		if (res != VK_SUCCESS) {
+			// Lifecycle event, not per-frame: a compose that never completed
+			// means the whole pass is untrustworthy this frame.
+			U_LOG_W("compose-under: reclaim wait failed (%d) — skipping compose", res);
+			ok = false;
+		}
+		impl->cmp_fence_armed = false;
+	}
+	if (impl->cmp_cmd != VK_NULL_HANDLE && impl->cmd_pool != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &impl->cmp_cmd);
+		impl->cmp_cmd = VK_NULL_HANDLE;
+	}
+	return ok;
+}
 
 static void
 destroy_compose(leia_dp_cnsdk *impl)
@@ -1052,6 +1133,8 @@ destroy_compose(leia_dp_cnsdk *impl)
 	if (vk == nullptr) {
 		return;
 	}
+	// Everything below is in-flight-sensitive; drain first (L11).
+	compose_reclaim(impl);
 	if (impl->cmp_pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, impl->cmp_pipeline, nullptr);
 		impl->cmp_pipeline = VK_NULL_HANDLE;
@@ -1097,6 +1180,15 @@ destroy_compose(leia_dp_cnsdk *impl)
 		vk->vkDestroyFence(vk->device, impl->cmp_fence, nullptr);
 		impl->cmp_fence = VK_NULL_HANDLE;
 	}
+	if (impl->cmp_done_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, impl->cmp_done_sem, nullptr);
+		impl->cmp_done_sem = VK_NULL_HANDLE;
+	}
+	if (impl->cmp_weave_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, impl->cmp_weave_sem, nullptr);
+		impl->cmp_weave_sem = VK_NULL_HANDLE;
+	}
+	impl->cmp_fence_armed = false;
 	impl->cmp_fill_w = 0;
 	impl->cmp_fill_h = 0;
 	impl->cmp_fmt = VK_FORMAT_UNDEFINED;
@@ -1415,6 +1507,26 @@ compose_ensure_pipeline(leia_dp_cnsdk *impl, VkFormat fmt)
 			destroy_compose(impl);
 			return false;
 		}
+		impl->cmp_fence_armed = false;
+	}
+
+	{
+		// runtime#1073 L11: the two links of the on-GPU chain
+		// compose -> weave -> alpha gate. Binary (one-shot) semaphores are
+		// safe with a single in-flight compose because the gate drains the
+		// queue at the end of every composed frame; the fast path is gated on
+		// exactly that (see compose_pre_weave's `frame_drains`).
+		VkSemaphoreCreateInfo sci = {};
+		sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		res = vk->vkCreateSemaphore(vk->device, &sci, nullptr, &impl->cmp_done_sem);
+		if (res == VK_SUCCESS) {
+			res = vk->vkCreateSemaphore(vk->device, &sci, nullptr, &impl->cmp_weave_sem);
+		}
+		if (res != VK_SUCCESS) {
+			U_LOG_W("compose-under: semaphore create failed: %d", res);
+			destroy_compose(impl);
+			return false;
+		}
 	}
 
 	impl->cmp_fmt = fmt;
@@ -1457,14 +1569,24 @@ bg_debug_enabled()
 // off, no backdrop bound, or any setup failure.
 static VkImageView
 compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w, uint32_t atlas_h,
-                  uint32_t tile_columns, uint32_t tile_rows, VkFormat atlas_fmt)
+                  uint32_t tile_columns, uint32_t tile_rows, VkFormat atlas_fmt, bool frame_drains,
+                  VkSemaphore *out_wait_sem)
 {
 	DXR_ATRACE("dxr_dp:compose_pre_weave");
 	struct vk_bundle *vk = impl->vk;
+	*out_wait_sem = VK_NULL_HANDLE;
 	if (!impl->transparent_bg_enabled || impl->bg2d_view == VK_NULL_HANDLE) {
 		return VK_NULL_HANDLE;
 	}
 	if (vk == nullptr || vk->main_queue == nullptr || impl->cmd_pool == VK_NULL_HANDLE) {
+		return VK_NULL_HANDLE;
+	}
+	// Release last frame's command buffer and make the single descriptor set
+	// writable again. In the steady state the fence is long signalled, so this
+	// costs nothing — it is the cost the CPU used to pay INSIDE the frame. It
+	// runs BEFORE the ensure_* calls because a format/size change tears the
+	// intermediate down, and that must not happen under an in-flight compose.
+	if (!compose_reclaim(impl)) {
 		return VK_NULL_HANDLE;
 	}
 	if (!compose_ensure_pipeline(impl, atlas_fmt) || !compose_ensure_fill(impl, atlas_w, atlas_h, atlas_fmt)) {
@@ -1550,32 +1672,67 @@ compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w,
 	vk->vkCmdEndRenderPass(cmd);
 	vk->vkEndCommandBuffer(cmd);
 
+	// runtime#1073 L11 — express the compose→weave dependency ON THE GPU.
+	//
+	// CNSDK's `do_post_process` submits the interlace pass itself, and its
+	// `imageAvailableSemaphore` IS a real wait: the interlacer stores it and
+	// hands it to the submit whose command buffer samples the source views
+	// (leia/sdk/interlacer.cpp DoPostProcess → ApplyInterlacing →
+	// CRendererVulkan::Apply2DEffect, honoured at `currentPass == 0`). So the
+	// old comment here — "CNSDK exposes no wait-semaphore hook" — was wrong; the
+	// hook existed and was being passed NULL. Signalling it instead of blocking
+	// the render thread on `vkWaitForFences` is the whole of L11.
+	//
+	// The fence is still armed, but nobody waits it this frame: it is the
+	// reclaim guard for the NEXT compose (see compose_reclaim).
+	//
+	// FALLBACK: the fast path needs the queue to be drained once per composed
+	// frame, because a single intermediate image + a single descriptor set are
+	// reused every frame and only the drain keeps frame N+1's compose from
+	// overwriting what frame N's weave is still reading. The post-weave alpha
+	// gate provides exactly that drain — so when it will NOT run (bg-debug, or a
+	// tile layout the gate doesn't handle) we keep the pre-L11 synchronous wait
+	// rather than trade a measured stall for an unproven race.
+	const bool gpu_sync = frame_drains && impl->cmp_done_sem != VK_NULL_HANDLE;
+
 	VkSubmitInfo si = {};
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
+	if (gpu_sync) {
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = &impl->cmp_done_sem;
+	}
 	vk->vkResetFences(vk->device, 1, &impl->cmp_fence);
 	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, impl->cmp_fence);
 	if (res == VK_SUCCESS) {
-		// CNSDK submits the weave on its own queue right after this returns, so
-		// the intermediate has to be FINISHED, not merely queued — and CNSDK
-		// exposes no wait-semaphore hook to express that as a GPU dependency.
-		// Wait on OUR fence, not the queue: vkQueueWaitIdle would also drain the
-		// compositor's unrelated frame submissions on the same queue.
-		vk->vkWaitForFences(vk->device, 1, &impl->cmp_fence, VK_TRUE, UINT64_MAX);
-	}
-	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
-	if (res != VK_SUCCESS) {
+		impl->cmp_fence_armed = true;
+		impl->cmp_cmd = cmd; // freed at the next reclaim, never while in flight
+		if (gpu_sync) {
+			*out_wait_sem = impl->cmp_done_sem;
+		} else {
+			// Pre-L11 behaviour. Wait on OUR fence, not the queue:
+			// vkQueueWaitIdle would also drain the compositor's unrelated
+			// frame submissions on the same queue.
+			vk->vkWaitForFences(vk->device, 1, &impl->cmp_fence, VK_TRUE,
+			                    kComposeReclaimTimeoutNs);
+		}
+	} else {
+		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
 		U_LOG_W("compose-under: submit failed: %d", res);
 		return VK_NULL_HANDLE;
 	}
 
 	{
-		// Cost accounting: the fence wait makes wall time here a fair proxy for
-		// the pass's GPU cost, which is the number that decides whether T0 can
-		// ever be on by default. Throttled to one line per 300 composed frames
-		// (never per-frame — that is log bloat, and it would perturb what it
-		// measures).
+		// Cost accounting: what this measures is the CPU time the render thread
+		// spends in the pass — which is the number that decides whether T0 can
+		// ever be on by default. Before L11 it also included a fence wait for
+		// the pass's GPU completion (2.9 ms/frame IPC, ~1.5 ms in-process); on
+		// the `gpu_sync` path there is no wait left to include, so the figure is
+		// record + submit only and the GPU cost has moved off the critical path
+		// into the weave's own wait. Throttled to one line per 300 composed
+		// frames (never per-frame — that is log bloat, and it would perturb what
+		// it measures).
 		static int64_t accum_ns = 0;
 		static uint32_t frames = 0;
 		static bool logged_first = false;
@@ -1588,8 +1745,9 @@ compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w,
 			        atlas_w, atlas_h, tile_columns, tile_rows, impl->bg2d_w, impl->bg2d_h);
 		}
 		if (frames >= 300u) {
-			U_LOG_W("COMPOSE_COST: %.3f ms/frame over %u frames (atlas %ux%u)",
-			        (double)accum_ns / (double)frames / 1.0e6, frames, atlas_w, atlas_h);
+			U_LOG_W("COMPOSE_COST: %.3f ms/frame CPU over %u frames (atlas %ux%u, gpu_sync=%d)",
+			        (double)accum_ns / (double)frames / 1.0e6, frames, atlas_w, atlas_h,
+			        (int)gpu_sync);
 			accum_ns = 0;
 			frames = 0;
 		}
@@ -1645,7 +1803,15 @@ alpha_gate_mode()
 // Post-weave alpha-gate executor. Self-submits (the weave already submitted on
 // its own command buffer). target_image is in COLOR_ATTACHMENT_OPTIMAL on entry
 // and on exit.
-void
+//
+// `weave_done_sem` (runtime#1073 L11) is CNSDK's `renderFinishedSemaphore` when
+// the weave was chained on-GPU, else VK_NULL_HANDLE. It must be WAITED here:
+// with the compose's CPU stall gone the weave is genuinely still in flight when
+// this runs, so "submitted later on the same queue" no longer implies "ordered
+// after". Returns false without submitting if the gate could not run — the
+// caller then has to drain the semaphore itself, because a binary semaphore
+// left signalled would corrupt the next frame.
+bool
 alpha_gate_run(leia_dp_cnsdk *impl,
                VkImage target_image,
                VkImageView atlas_view,
@@ -1658,22 +1824,23 @@ alpha_gate_run(leia_dp_cnsdk *impl,
                int32_t canvas_offset_y,
                uint32_t canvas_width,
                uint32_t canvas_height,
-               bool flattened)
+               bool flattened,
+               VkSemaphore weave_done_sem)
 {
 	DXR_ATRACE("dxr_dp:alpha_gate_run");
 	struct vk_bundle *vk = impl->vk;
 	if (vk->main_queue == nullptr) {
-		return;
+		return false;
 	}
 	if (!alpha_gate_ensure_pipeline(impl, target_format)) {
-		return;
+		return false;
 	}
 	if (!alpha_gate_ensure_strip(impl, w, h, target_format)) {
-		return;
+		return false;
 	}
 	VkFramebuffer fb = alpha_gate_get_fb(impl, w, h);
 	if (fb == VK_NULL_HANDLE) {
-		return;
+		return false;
 	}
 
 	// Always-on diagnostic, re-logged whenever the geometry changes (e.g. on a
@@ -1689,12 +1856,21 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		}
 	}
 
-	// The CNSDK weave self-submitted (possibly on its own queue); drain ALL
-	// queues so its color-attachment writes to target_image are complete +
-	// visible before we copy/sample it. A full device idle is the simplest
-	// correct fence (the mono path + destroy use the same hammer); replacing it
-	// with a weave-completion semaphore is a future optimization.
-	vk->vkDeviceWaitIdle(vk->device);
+	// The CNSDK weave self-submitted (possibly on its own queue), and its
+	// color-attachment writes to target_image must be complete + visible before
+	// we copy/sample it.
+	//
+	// runtime#1073 L11 took the "future optimization" this comment used to
+	// promise: when the weave was chained on-GPU we hold its
+	// `renderFinishedSemaphore` and express the dependency as a wait on THIS
+	// submit instead of idling the device from the render thread. Cross-queue is
+	// fine — a binary semaphore is device-scoped. The vkDeviceWaitIdle hammer
+	// survives only for the un-chained fallback (bg-debug / unhandled tile
+	// layout), where nothing else orders the weave against this pass.
+	const bool gate_waits_weave = weave_done_sem != VK_NULL_HANDLE;
+	if (!gate_waits_weave) {
+		vk->vkDeviceWaitIdle(vk->device);
+	}
 
 	// Descriptors: 0 = strip copy (woven backbuffer), 1 = original premultiplied
 	// atlas, 2 = dummy backdrop (= strip view; has_backdrop pushed 0 — no Local2D
@@ -1729,7 +1905,7 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 	cbai.commandBufferCount = 1;
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	if (vk->vkAllocateCommandBuffers(vk->device, &cbai, &cmd) != VK_SUCCESS) {
-		return;
+		return false;
 	}
 	VkCommandBufferBeginInfo bi = {};
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1841,15 +2017,30 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 	vk->vkCmdEndRenderPass(cmd);
 
 	vk->vkEndCommandBuffer(cmd);
+	// ALL_COMMANDS, not TRANSFER: the batch opens with a barrier whose source
+	// scope is the weave's COLOR_ATTACHMENT_OUTPUT writes, and the semaphore wait
+	// has to cover that barrier, not just the transfer that follows it. The gate
+	// is one pass — there is nothing here for a narrower stage to overlap with.
+	const VkPipelineStageFlags weave_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	VkSubmitInfo si = {};
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
-	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+	if (gate_waits_weave) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = &weave_done_sem;
+		si.pWaitDstStageMask = &weave_wait_stage;
+	}
+	// The queue drain stays: xrEndFrame must see the target ready, and it is
+	// also what keeps ONE compose in flight — the invariant the L11 fast path is
+	// gated on (single intermediate image + single descriptor set).
+	const bool submitted = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+	if (submitted) {
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
 	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
 	DXR_HW_DBG_ONCE("alpha_gate_run: first gated frame (%ux%u tiles=%ux%u)", w, h, tile_columns, tile_rows);
+	return submitted;
 }
 
 // #568: session transparency enable (the VK/Android DP variant's appended slot).
@@ -2025,32 +2216,57 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// nothing changes — when transparency is off, no backdrop is bound, or the
 	// pass fails to build. The ORIGINAL atlas_view is still what the gate keys
 	// on below: that is what carries the app's per-view alpha.
+	//
+	// runtime#1073 L11: whether the post-weave alpha gate will run decides
+	// whether the compose→weave→gate chain can be expressed on the GPU. The gate
+	// is what drains the queue once per frame, and that drain is the invariant
+	// that lets a single intermediate image, a single descriptor set and a pair
+	// of one-shot binary semaphores be reused every frame. Compute it here, on
+	// exactly the same terms as the call below, and hand it to the compose.
+	const bool gate_will_run = impl->transparent_bg_enabled && tile_columns == 2 && tile_rows == 1 &&
+	                           !bg_debug_enabled();
+
 	VkImageView weave_atlas_view = atlas_view;
 	VkImage weave_atlas_image = (VkImage)(uintptr_t)atlas_image;
+	VkSemaphore compose_done_sem = VK_NULL_HANDLE;
 	VkImageView composed = compose_pre_weave(impl, atlas_view, atlas_w, atlas_h, tile_columns, tile_rows,
-	                                         (VkFormat)view_format);
+	                                         (VkFormat)view_format, gate_will_run, &compose_done_sem);
 	const bool did_compose = composed != VK_NULL_HANDLE;
 	if (did_compose) {
 		weave_atlas_view = composed;
 		weave_atlas_image = impl->cmp_fill_img;
 	}
+	// Only chain the weave→gate link when the weave itself is chained; the two
+	// stand or fall together, and a signalled-but-never-waited binary semaphore
+	// would poison the next frame.
+	VkSemaphore weave_done_sem =
+	    (compose_done_sem != VK_NULL_HANDLE) ? impl->cmp_weave_sem : VK_NULL_HANDLE;
 
-	leia_cnsdk_weave(impl->cnsdk,
-	                 impl->vk->device,
-	                 impl->vk->physical_device,
-	                 weave_atlas_image,
-	                 weave_atlas_view,
-	                 atlas_w,
-	                 atlas_h,
-	                 (VkFormat)target_format,
-	                 target_width,
-	                 target_height,
-	                 dest_fb,
-	                 (VkImage)(uintptr_t)target_image,
-	                 canvas_subrect ? canvas_offset_x : 0,
-	                 canvas_subrect ? canvas_offset_y : 0,
-	                 canvas_subrect ? canvas_width    : 0u,
-	                 canvas_subrect ? canvas_height   : 0u);
+	const bool wove = leia_cnsdk_weave(impl->cnsdk,
+	                                   impl->vk->device,
+	                                   impl->vk->physical_device,
+	                                   weave_atlas_image,
+	                                   weave_atlas_view,
+	                                   atlas_w,
+	                                   atlas_h,
+	                                   (VkFormat)target_format,
+	                                   target_width,
+	                                   target_height,
+	                                   dest_fb,
+	                                   (VkImage)(uintptr_t)target_image,
+	                                   canvas_subrect ? canvas_offset_x : 0,
+	                                   canvas_subrect ? canvas_offset_y : 0,
+	                                   canvas_subrect ? canvas_width    : 0u,
+	                                   canvas_subrect ? canvas_height   : 0u,
+	                                   compose_done_sem,
+	                                   weave_done_sem);
+	if (!wove) {
+		// Can't normally happen — the interlacer was checked ready above — but a
+		// binary semaphore that was signalled and never waited is unrecoverable
+		// next frame, so drain both rather than assume.
+		drain_semaphore(impl, compose_done_sem);
+		weave_done_sem = VK_NULL_HANDLE;
+	}
 
 	// #568: the weave interlaced into opaque RGB — reconstruct per-pixel alpha
 	// so SurfaceFlinger shows the live screen through the transparent regions.
@@ -2058,18 +2274,27 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// layout the alpha-gate UV math handles; the mono 1x1 path returned above).
 	// bg-debug wants the raw composed backdrop on the panel, so it must not be
 	// punched through by the gate (#174).
-	if (impl->transparent_bg_enabled && tile_columns == 2 && tile_rows == 1 && !bg_debug_enabled()) {
+	if (gate_will_run) {
 		// The gate runs over the WHOLE target: inside the canvas band it
 		// reconstructs the woven view-select alpha; outside it punches fully
 		// transparent (clearing whatever CNSDK left beyond its viewport). When
 		// there is no sub-rect it passes 0s → the gate treats it as full-target.
-		alpha_gate_run(impl, (VkImage)(uintptr_t)target_image, atlas_view, target_width,
-		               target_height, tile_columns, tile_rows, (VkFormat)target_format,
-		               canvas_subrect ? canvas_offset_x : 0,
-		               canvas_subrect ? canvas_offset_y : 0,
-		               canvas_subrect ? canvas_width    : 0u,
-		               canvas_subrect ? canvas_height   : 0u,
-		               did_compose);
+		if (!alpha_gate_run(impl, (VkImage)(uintptr_t)target_image, atlas_view, target_width,
+		                    target_height, tile_columns, tile_rows, (VkFormat)target_format,
+		                    canvas_subrect ? canvas_offset_x : 0,
+		                    canvas_subrect ? canvas_offset_y : 0,
+		                    canvas_subrect ? canvas_width    : 0u,
+		                    canvas_subrect ? canvas_height   : 0u,
+		                    did_compose, weave_done_sem)) {
+			// The gate bailed (pipeline/strip/framebuffer setup failure). The
+			// weave already signalled, so consume it here or the next frame
+			// signals an already-signalled binary semaphore.
+			drain_semaphore(impl, weave_done_sem);
+		}
+	} else {
+		// Not chained in this configuration, so nothing to drain — but assert
+		// the invariant rather than trust it.
+		drain_semaphore(impl, weave_done_sem);
 	}
 }
 
