@@ -163,6 +163,16 @@ struct leia_dp_cnsdk
 	} ag_fb_cache[8];
 	uint32_t ag_fb_count;
 
+	// Last target image-set generation we flushed the two framebuffer caches
+	// for (runtime#1073 rotation fix). The compositor bumps its generation on
+	// every `comp_vk_native_target_resize` and reports it through the appended
+	// VK-variant slot `notify_target_recreated`; both caches above key on a
+	// bare compositor-owned VkImageView, and Adreno RECYCLES view handles, so
+	// without this a subset of the new swapchain images alias framebuffers
+	// built over DESTROYED views forever (measured: ~1 frame in 3 goes
+	// dark/blank after a rotation, and never heals). 0 = nothing flushed yet.
+	uint32_t target_generation;
+
 	// --- Pre-weave compose-under-bg (runtime#1073 T0) --------------------
 	// The alpha-gate above is a palliative: it reconstructs ONE alpha per pixel
 	// after the weave has already assigned R/G/B to different views, so a mixed
@@ -2406,6 +2416,116 @@ set_eye_tracking_mode_cnsdk(struct xrt_display_processor *xdp, uint32_t mode)
 	}
 }
 
+// KILL-SWITCH for the target-recreate flush below. `debug.dxr.leia.recreate_flush=0`
+// restores the pre-fix (buggy but known) behaviour: no flush, stale framebuffers
+// survive a rotation. Default ON. Cached like every other knob here —
+// __system_property_get isn't free and a mid-session flip would race in-flight
+// frames.
+static bool
+recreate_flush_enabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = 1; // default ON
+#ifdef XRT_OS_ANDROID
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.leia.recreate_flush", buf) > 0 && buf[0] == '0') {
+			cached = 0;
+		}
+#endif
+		if (cached == 0) {
+			U_LOG_W("Leia CNSDK DP: debug.dxr.leia.recreate_flush=0 — target-recreate cache "
+			        "flush DISABLED (pre-fix behaviour: stale fbs survive a rotation)");
+		}
+	}
+	return cached == 1;
+}
+
+// The compositor recreated its target image set (device rotation rebuilt the
+// swapchain via comp_vk_native_target_resize; also the OUT_OF_DATE acquire path).
+// Both of our framebuffer caches key entries on the compositor's VkImageView —
+// and Adreno recycles freed view handles, so an entry can match on the bare
+// handle while wrapping a DESTROYED view, which renders garbage (or nothing)
+// into that swapchain image forever. `weave_fb_cache` has neither a dims guard
+// nor a generation key and only flushes when FULL, so a partial view-set churn
+// leaves aliased entries indefinitely; `ag_fb_cache`'s dims guard only catches
+// the orientation-swapping subset. Drop both wholesale and let process_atlas
+// rebuild them on demand over the fresh views.
+//
+// The compositor vkDeviceWaitIdle()s as part of the target rebuild and calls
+// this under its own lock (see comp_vk_native_compositor.c, the
+// dp_notified_target_generation block), so the old framebuffers are NOT in
+// flight and destroying them synchronously here is safe — same contract the
+// Windows VK DP relies on for its strip-fb cache (#602).
+static void
+notify_target_recreated_cnsdk(struct xrt_display_processor_vk *xdp, uint32_t generation)
+{
+	leia_dp_cnsdk *impl = as_impl(&xdp->base);
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr) {
+		return;
+	}
+	if (generation == impl->target_generation) {
+		return; // already flushed for this generation — idempotent.
+	}
+	impl->target_generation = generation;
+
+	if (!recreate_flush_enabled()) {
+		U_LOG_W("Leia CNSDK DP: target images recreated (gen %u) — flush SUPPRESSED by "
+		        "debug.dxr.leia.recreate_flush=0",
+		        generation);
+		return;
+	}
+
+	// OWNERSHIP: both caches BORROW the key view (the compositor created it and
+	// destroys it on resize — that is the whole bug) and OWN only the
+	// VkFramebuffer built over it. So destroy the fb and nothing else. The
+	// Windows DP destroys the view too because its ck_strip_fbs mints its own;
+	// doing that here would be a double-free.
+	const uint32_t weave_n = impl->weave_fb_count;
+	for (uint32_t i = 0; i < impl->weave_fb_count; i++) {
+		if (impl->weave_fb_cache[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, impl->weave_fb_cache[i].fb, nullptr);
+		}
+		impl->weave_fb_cache[i] = {};
+	}
+	impl->weave_fb_count = 0;
+
+	const uint32_t ag_n = impl->ag_fb_count;
+	for (uint32_t i = 0; i < impl->ag_fb_count; i++) {
+		if (impl->ag_fb_cache[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, impl->ag_fb_cache[i].fb, nullptr);
+		}
+		impl->ag_fb_cache[i] = {};
+	}
+	impl->ag_fb_count = 0;
+
+	// The stale key itself: the compositor re-publishes this every frame before
+	// process_atlas, but clearing it makes a MISSED publish fail safe (skip the
+	// weave) instead of building a fresh framebuffer over a destroyed view.
+	impl->pending_target_view = VK_NULL_HANDLE;
+
+	// L11 compose→weave sync state. `compose_reclaim` is the bounded (1 s, never
+	// UINT64_MAX) wait that clears `cmp_fence_armed` and frees the one-shot
+	// compose command buffer; it no-ops when the compose pipeline was never
+	// created (every handle VK_NULL_HANDLE, cmp_fence_armed false).
+	//
+	// Deliberately NOT calling drain_semaphore() here: cmp_done_sem /
+	// cmp_weave_sem are balanced WITHIN a single process_atlas — every branch
+	// that signals one either hands it to a waiter or drains it before
+	// returning — so there is no cross-frame pending signal to swallow, and no
+	// armed-flag that could tell us if there were. Submitting an empty
+	// wait-batch on an UNSIGNALLED binary semaphore would block the following
+	// vkQueueWaitIdle forever, which is exactly the unbounded wait the
+	// workspace-stability rules forbid.
+	const bool had_fence = impl->cmp_fence_armed;
+	compose_reclaim(impl);
+
+	U_LOG_W("Leia CNSDK DP: target images recreated (gen %u) — flushed %u weave fb + %u alpha-gate fb, "
+	        "cleared pending target view, compose fence %s",
+	        generation, weave_n, ag_n, had_fence ? "reclaimed" : "idle");
+}
+
 void
 destroy_impl(struct xrt_display_processor *xdp)
 {
@@ -2482,6 +2602,12 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->dp_vk.base.set_eye_tracking_mode = set_eye_tracking_mode_cnsdk; // #522
 	impl->dp_vk.base.destroy = destroy_impl;
 	impl->dp_vk.set_transparent_background = set_transparent_background_cnsdk; // #568 (variant slot)
+	// Rotation fix: appended VK-variant slot, already inside the struct_size
+	// reported above (sizeof(struct xrt_display_processor_vk)), so the runtime's
+	// optional-slot bounds check in xrt_display_processor_vk_notify_target_recreated
+	// sees it as present. Without it the fb caches keep framebuffers over views
+	// the compositor destroyed on the resize (Adreno recycles the handles).
+	impl->dp_vk.notify_target_recreated = notify_target_recreated_cnsdk;
 	// runtime#1073 T0: base slot 16 — the compose-under background seam. Already
 	// inside struct_size (it is a BASE slot and we report
 	// sizeof(xrt_display_processor_vk)), so no ABI bump — ADR-020 clean.
