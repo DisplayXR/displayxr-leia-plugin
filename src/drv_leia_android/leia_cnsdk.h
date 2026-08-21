@@ -271,8 +271,20 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
  * sub-rect of the target — the CNSDK weaver folds vpX/vpY into its phase math
  * so the lenticular alignment stays correct for an offset band. Pass 0,0,0,0
  * to fill the whole target (the pre-zone behavior).
+ *
+ * @param wait_sem   Optional binary semaphore the interlacer waits before it
+ *                   samples the atlas (runtime#1073 L11). Pass VK_NULL_HANDLE
+ *                   when the caller has already synchronised on the CPU.
+ * @param signal_sem Optional binary semaphore the interlacer signals when the
+ *                   weave has finished writing the target. VK_NULL_HANDLE if
+ *                   the caller does not chain anything after it.
+ *
+ * @return true if the weave was submitted — i.e. `wait_sem` was consumed and
+ *         `signal_sem` will be signalled. false means neither happened, and a
+ *         caller that passed binary semaphores MUST drain them itself before
+ *         the next frame re-signals them.
  */
-void
+bool
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
                  VkPhysicalDevice physDev,
@@ -288,7 +300,9 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  int32_t vp_x,
                  int32_t vp_y,
                  uint32_t vp_w,
-                 uint32_t vp_h);
+                 uint32_t vp_h,
+                 VkSemaphore wait_sem,
+                 VkSemaphore signal_sem);
 
 /*!
  * Report this window's rectangle on the panel (runtime#1033 / #150, ADR-036 D6).
