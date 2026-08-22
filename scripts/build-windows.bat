@@ -46,8 +46,8 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: counts a comment's pfnWeaverGetACTMode as a phantom slot) and require that the new
 :: table APPENDS ONLY: every shared index must hold the same function. An insertion
 :: shifts indices and mis-dispatches SILENTLY, since only the index is checked.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1494
-set SR_V2_DIR=simulatedreality-SDK-1.37.0+1494.812c51044c-win64-Release
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1502
+set SR_V2_DIR=LeiaSR-SDK-1.37.0+1502.1b85d46d17-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
@@ -224,7 +224,7 @@ REM Optional SR v2 (C99) SDK, kept as a SEPARATE root from LEIASR_SDKROOT
 REM because the two SDKs are independent drops and the migration needs both
 REM present at once. Unset simply builds the v1-only plug-in, which is the
 REM shipping configuration until a win64 v2 drop is generally available.
-REM   set LEIASR_V2_SDKROOT=C:\path\to\simulatedreality-SDK-...-win64-Release
+REM   set LEIASR_V2_SDKROOT=C:\path\to\LeiaSR-SDK-...-win64-Release
 if not "%LEIASR_V2_SDKROOT%"=="" (
     set CMAKE_ARGS=!CMAKE_ARGS! -DLEIASR_V2_SDKROOT="%LEIASR_V2_SDKROOT%"
     echo Building WITH the SR v2 C API ^(LEIASR_V2_SDKROOT set^).
