@@ -35,7 +35,7 @@ set(LEIA_SOURCES
 # Platform cannot fail to load this plug-in; leia_sr_api_select.cpp simply
 # resolves to the v1 path. That property is what makes the dual-path safe.
 #
-# Point LEIASR_V2_SDKROOT at an extracted simulatedreality-SDK-*-win64 tree.
+# Point LEIASR_V2_SDKROOT at an extracted LeiaSR-SDK-*-win64 tree.
 # Absent => DXR_LEIA_HAS_SR_V2 undefined => v2 compiles out entirely and the
 # plug-in builds exactly as it does today against the C++-only SDK.
 set(LEIA_SR_V2_AVAILABLE FALSE)
