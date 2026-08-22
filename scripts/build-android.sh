@@ -31,7 +31,7 @@
 #
 # Optional env (auto-detected with defaults):
 #   ANDROID_NDK_VERSION   — NDK to use (default: 26.3.11579264)
-#   CNSDK_ROOT            — extracted CNSDK 0.7.28 release tree
+#   CNSDK_ROOT            — extracted CNSDK >= 0.10.62 Android SDK tree
 #                            (default: <runtime checkout>/cnsdk)
 #   DXR_RUNTIME_SOURCE_DIR — local runtime checkout
 #                            (default: ../displayxr-runtime; legacy
@@ -106,8 +106,10 @@ echo "Runtime: ${DXR_RUNTIME_SOURCE_DIR}"
 : "${CNSDK_ROOT:=${DXR_RUNTIME_SOURCE_DIR}/cnsdk}"
 if [ ! -f "${CNSDK_ROOT}/share/cmake/CNSDK/CNSDKConfig.cmake" ]; then
     echo "ERROR: CNSDK_ROOT=${CNSDK_ROOT} missing share/cmake/CNSDK/CNSDKConfig.cmake."
-    echo "  Extract CNSDK 0.7.28 release zip and set CNSDK_ROOT to the extracted dir."
-    echo "  Source: https://github.com/LeiaInc/leiainc.github.io/tree/master/CNSDK/cnsdk-android-0.7.28.zip"
+    echo "  Extract a CNSDK >= 0.10.62 Android SDK tree and set CNSDK_ROOT to it."
+    echo "  It must contain share/cmake/CNSDK/CNSDKConfig.cmake and lib/arm64-v8a/libleiaCore-loader.so."
+    echo "  (>= 0.10.62 carries leia_core_set_device_orientation(); older builds run, but the"
+    echo "   #1079 mid-session rotation fix is inert without it.)"
     exit 1
 fi
 echo "CNSDK:  ${CNSDK_ROOT}"
