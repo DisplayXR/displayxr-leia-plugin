@@ -25,6 +25,7 @@
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
 #include <sys/system_properties.h>
+#include <dlfcn.h> // #1079: late-bind leia_core_set_device_orientation()
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 #include <android/trace.h>
 #endif
@@ -186,6 +187,15 @@ struct leia_cnsdk
 	// up rather than retrying every frame. Read + written only by the
 	// render thread (no concurrent access; no atomic needed).
 	bool interlacer_init_failed{false};
+
+	// Edge latch for sync_device_orientation() (#1079). Holds the last
+	// (panel truth, core-reported) pair we acted on, so the WARN fires once per
+	// distinct disagreement and the vendor setter is called only when the pair
+	// moves — never per frame. -2 = "nothing observed yet" (distinct from the
+	// -1 that means "could not determine"). Written from the face-read path,
+	// reset from the window-rect path, hence atomic.
+	std::atomic<int> orient_last_truth{-2};
+	std::atomic<int> orient_last_core{-2};
 
 	// Window rect on the panel (runtime#1033 / #150, ADR-036 D6). The runtime's
 	// per-window compositor instance reports where THIS window sits on screen —
@@ -1164,18 +1174,23 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
  * the panel's — which is exactly why the OOP route was never affected and the
  * in-process route was.
  *
- * There is no client-side fix: the adjustment is applied per PROCESS (a
- * `Context.createDisplayContext()` Context was measured to make no difference on
- * an NP02J), and CNSDK exposes no orientation setter — only
- * `leia_core_get_orientation()`. The real fix belongs in CNSDK:
- * `getRealOrientation()` must use `Display.getRealMetrics()` (or
- * `WindowManager.getMaximumWindowMetrics()`), which is window-independent,
- * and/or CNSDK should expose `leia_core_set_device_orientation()`.
+ * The adjustment is applied per PROCESS (a `Context.createDisplayContext()`
+ * Context was measured to make no difference on an NP02J), so the shape of the
+ * Context we hand CNSDK cannot fix it. What CAN: CNSDK 0.10.62 added
+ * `leia_core_set_device_orientation()` (CNSDK #716) — an escape hatch for a host
+ * that already knows the panel's true orientation. We are exactly that host:
+ * this function computes the truth the same way CNSDK does, but from
+ * `getRealMetrics()`, which is window-INdependent.
  *
- * Until then this tripwire turns a silent, baffling failure ("tracking just
- * doesn't work in a floating window") into one greppable WARN. It computes the
- * TRUE orientation the same way CNSDK does but from `getRealMetrics()`, and logs
- * only when the two disagree, and only when the disagreement changes.
+ * `sync_device_orientation()` below closes the loop — it WARNs (so a regression
+ * stays greppable) and then CORRECTS, handing the truth to the core. That also
+ * fixes the second, worse half of the bug: the core's own auto-detect never
+ * updates MID-SESSION in our topologies, because its OrientationHelper listener
+ * rides a Context (the class-host / runtime-package Context) that receives no
+ * configuration updates. So before this, a device rotated while an app was
+ * running left the core pinned to its LAUNCH-time orientation until relaunch —
+ * the interlacer wove at the wrong rotation and the head-tracking service hunted
+ * for a face in the wrong frame.
  */
 static int
 true_device_orientation_android(JavaVM *vm, jobject ctx)
@@ -1266,9 +1281,88 @@ true_device_orientation_android(JavaVM *vm, jobject ctx)
 	return result;
 }
 
-//! Log once per distinct disagreement. See true_device_orientation_android().
+typedef void (*leia_set_device_orientation_fn)(struct leia_core *, int /* enum leia_orientation */);
+
+/*!
+ * Late-bind `leia_core_set_device_orientation()` (CNSDK #716, introduced 0.10.62).
+ *
+ * It has to be `dlsym`, not a direct call. The plug-in links
+ * `libleiaCore-loader.so` as a hard `DT_NEEDED`, and on a pre-0.10.62 loader the
+ * symbol does not exist AT ALL — so a direct reference is an undefined-symbol
+ * error at plug-in link time, and the plug-in would no longer build against the
+ * CNSDK the tree is currently pinned to. `LEIA_CORE_FUNC_IS_AVAILABLE`, CNSDK's
+ * own guard for this, lives in the loader's private `vtable.hpp` and is not
+ * shipped in the SDK, so we cannot borrow it either. A symbol lookup is the
+ * equivalent guard on our side of the boundary: present ⟹ call it, absent ⟹
+ * no-op plus one WARN.
+ *
+ * Note the loader-vs-impl split matters here. The loader (this APK's jniLibs)
+ * exports the thunk; the impl (`libleiaCore-impl.so`, loaded out of the
+ * on-device display-config service) provides the vtable slot. CNSDK's thunk
+ * already handles "new loader, old impl" by checking the slot's INTRODUCED_IN
+ * against the impl's vtable version and returning silently. So the only case we
+ * have to handle is "old loader", which is precisely what dlsym detects.
+ */
+static leia_set_device_orientation_fn
+resolve_set_device_orientation(void)
+{
+	// Magic-static: the initializer runs exactly once, thread-safely.
+	static leia_set_device_orientation_fn fn = []() -> leia_set_device_orientation_fn {
+		static const char *kSym = "leia_core_set_device_orientation";
+
+		// Look the symbol up in the loader BY NAME rather than trusting
+		// RTLD_DEFAULT. This plug-in is itself dlopen'd by the runtime, and
+		// libleiaCore-loader.so is only a DT_NEEDED of ours — on bionic that puts
+		// it in our LOCAL group, which RTLD_DEFAULT (the global group) does not
+		// search. Re-dlopen'ing by soname just returns a handle to the copy
+		// already mapped for us; NOLOAD first so we can never accidentally pull in
+		// a second one. dlclose is safe immediately — our own DT_NEEDED reference
+		// keeps the library mapped for the life of the process.
+		void *h = dlopen("libleiaCore-loader.so", RTLD_NOW | RTLD_NOLOAD);
+		if (h == nullptr) {
+			h = dlopen("libleiaCore-loader.so", RTLD_NOW);
+		}
+		auto f = h != nullptr ? (leia_set_device_orientation_fn)dlsym(h, kSym) : nullptr;
+		if (f == nullptr) {
+			f = (leia_set_device_orientation_fn)dlsym(RTLD_DEFAULT, kSym);
+		}
+		if (h != nullptr) {
+			dlclose(h);
+		}
+		if (f == nullptr) {
+			U_LOG_W("ORIENTATION (#1079): this CNSDK loader does not export "
+			        "leia_core_set_device_orientation() (added in CNSDK 0.10.62). The core's "
+			        "orientation cannot be corrected, so a MID-SESSION rotation will leave it on "
+			        "the launch-time orientation until the app is relaunched. Fix: build and ship "
+			        "the APK against a CNSDK >= 0.10.62 (libleiaCore-loader.so in jniLibs).");
+		}
+		return f;
+	}();
+	return fn;
+}
+
+/*!
+ * Hand the panel's true orientation to the CNSDK core when the two disagree.
+ * See true_device_orientation_android() for why they disagree and why we are the
+ * ones who know better.
+ *
+ * WARN-then-correct, not correct-silently: the WARN is the #1079 tripwire and
+ * stays so a regression (or a stale CNSDK) is greppable, but it is edge-latched
+ * on the (truth, core) pair so a persistent disagreement logs once, not per
+ * frame. The vendor call is on the same latch — it fires when the pair moves,
+ * which is exactly once per rotation.
+ *
+ * Deliberately NOT released on teardown. Passing LEIA_ORIENTATION_UNSPECIFIED
+ * would hand auto-detection back, but (a) the override lives on the leia_core,
+ * which leia_cnsdk_destroy() releases microseconds later, so there is no state
+ * to restore; (b) destroy is the fragile path — it already carries a 2 s
+ * watchdog because CNSDK can deadlock there — and this would add one more vendor
+ * call to it for no gain; and (c) re-enabling auto-detect on the way out could
+ * push a WRONG orientation to the head-tracking service, which is shared across
+ * processes and outlives us. Leaving the override set is both cheaper and safer.
+ */
 static void
-check_orientation_tripwire(struct leia_cnsdk *cnsdk)
+sync_device_orientation(struct leia_cnsdk *cnsdk)
 {
 	if (cnsdk == nullptr || cnsdk->core == nullptr) {
 		return;
@@ -1285,24 +1379,45 @@ check_orientation_tripwire(struct leia_cnsdk *cnsdk)
 	}
 	const int core_says = (int)leia_core_get_orientation(cnsdk->core);
 
-	static int last_truth = -2, last_core = -2;
-	if (truth == last_truth && core_says == last_core) {
+	if (truth == cnsdk->orient_last_truth.load(std::memory_order_relaxed) &&
+	    core_says == cnsdk->orient_last_core.load(std::memory_order_relaxed)) {
 		return;
 	}
-	last_truth = truth;
-	last_core = core_says;
+	cnsdk->orient_last_truth.store(truth, std::memory_order_relaxed);
+	cnsdk->orient_last_core.store(core_says, std::memory_order_relaxed);
 	if (truth == core_says) {
 		return;
 	}
 	U_LOG_W("ORIENTATION MISMATCH (#1079): CNSDK core reports %d but the PANEL is %d. "
 	        "CNSDK derives this from Display.getMetrics(), which is window-adjusted in an "
 	        "app's own process, so a portrait-shaped freeform/split window on a landscape "
-	        "panel (or vice-versa) reads wrong. Consequence: the head-tracking service is "
-	        "told the wrong orientation, its face detector logs 'could not find a face', and "
-	        "with no viewer the weave reads FLAT. Out-of-process (debug.dxr.force_ipc 1) is "
-	        "unaffected. Vendor fix: OrientationHelper.getRealOrientation() must use "
-	        "Display.getRealMetrics().",
+	        "panel (or vice-versa) reads wrong; and its OrientationHelper listener rides a "
+	        "Context that gets no config updates in our topologies, so it never follows a "
+	        "MID-SESSION rotation either. Consequence: the head-tracking service is told the "
+	        "wrong orientation, its face detector logs 'could not find a face', and with no "
+	        "viewer the weave reads FLAT. Correcting it now.",
 	        core_says, truth);
+
+	leia_set_device_orientation_fn set_orientation = resolve_set_device_orientation();
+	if (set_orientation == nullptr) {
+		return; // already WARNed once, in the resolver
+	}
+	set_orientation(cnsdk->core, truth);
+
+	// Read back: the CNSDK thunk returns silently when the on-device impl is
+	// older than the slot, so a successful call is not proof the value landed.
+	const int now_says = (int)leia_core_get_orientation(cnsdk->core);
+	cnsdk->orient_last_core.store(now_says, std::memory_order_relaxed);
+	if (now_says == truth) {
+		U_LOG_W("ORIENTATION CORRECTED (#1079): set_device_orientation(%d) took; core now "
+		        "agrees with the panel. Head tracking should re-acquire.",
+		        truth);
+	} else {
+		U_LOG_W("ORIENTATION NOT CORRECTED (#1079): set_device_orientation(%d) returned but "
+		        "the core still reports %d — the display-config service's libleiaCore-impl.so "
+		        "is probably older than CNSDK 0.10.62.",
+		        truth, now_says);
+	}
 }
 #endif // XRT_OS_ANDROID
 
@@ -1323,9 +1438,13 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	// posePosition (a fallback for when the core face is empty). The diagnostic is
 	// U_LOG_W (WARN) on purpose — aux INFO is dropped from the Android hot path.
 #ifdef XRT_OS_ANDROID
-	// #1079 tripwire: a wrong core orientation is THE reason face detection dies
-	// in a floating window, so check it right where we read the face.
-	check_orientation_tripwire(cnsdk);
+	// #1079: a wrong core orientation is THE reason face detection dies in a
+	// floating window (and after a mid-session rotation), so check-and-correct it
+	// right where we read the face. This is the one call site that reliably has a
+	// JNI-attached thread — the weave thread often does not — and it runs every
+	// frame, so the correction lands within a frame of the rotation. Edge-latched
+	// internally: no WARN and no vendor call unless the truth actually moved.
+	sync_device_orientation(cnsdk);
 #endif
 
 	bool lst_ok = cnsdk->listener_face_valid.load(std::memory_order_acquire);
@@ -1623,6 +1742,17 @@ leia_cnsdk_set_window_screen_rect(
 	cnsdk->window_screen_h.store((int32_t)h, std::memory_order_relaxed);
 	cnsdk->window_display_id.store(display_id, std::memory_order_relaxed);
 	cnsdk->have_window_rect.store(true, std::memory_order_release);
+
+	// #1079: a rotation always moves this rect, so use it to re-arm the
+	// orientation check. Resetting the latch (rather than syncing here) is
+	// deliberate: this runs on the weave thread, which is usually not attached to
+	// the JVM, so true_device_orientation_android() would just return -1. The
+	// next face read re-evaluates from scratch on a thread that can do the JNI.
+	// Cheap and idempotent — the enclosing early-return means we only get here
+	// when the rect genuinely changed.
+	cnsdk->orient_last_truth.store(-2, std::memory_order_relaxed);
+	cnsdk->orient_last_core.store(-2, std::memory_order_relaxed);
+
 	// Lifecycle event (a window moved or resized), never per frame.
 	U_LOG_W("HW_DBG_CNSDK: window screen rect %d,%d %ux%u display %d (#150/#1033)", x, y, w, h, display_id);
 }

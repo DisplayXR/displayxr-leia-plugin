@@ -28,17 +28,26 @@ endif()
 #   ${CNSDK_ROOT}/share/cmake/CNSDK/CNSDKConfig.cmake
 #   ${CNSDK_ROOT}/lib/<ABI>/libleiaSDK-faceTrackingInApp.so
 #
-# CI / dev set CNSDK_ROOT to the extracted release tree. Pinned to
-# CNSDK 0.7.28 for the POC.
+# CI / dev set CNSDK_ROOT to the extracted release tree.
+#
+# VERSION: 0.10.x is required (the loader architecture below); 0.7.28, which
+# these notes used to name, is long dead — it fails on device with "Missing
+# required service: InterlacingService". >= 0.10.62 is wanted, because that is
+# where leia_core_set_device_orientation() landed (CNSDK #716) and without it
+# the #1079 orientation correction in leia_cnsdk.cpp is inert: a MID-SESSION
+# rotation leaves the core on its launch-time orientation. The plug-in still
+# BUILDS against anything 0.10.x — the call is dlsym'd precisely so it can —
+# so this is a warning, not an error.
+set(DXR_CNSDK_MIN_VERSION "0.10.62")
 
 if(NOT DEFINED CNSDK_ROOT)
     if(DEFINED ENV{CNSDK_ROOT})
         set(CNSDK_ROOT "$ENV{CNSDK_ROOT}")
     else()
         message(FATAL_ERROR
-            "CNSDK_ROOT not set. Extract CNSDK 0.7.28 and set "
-            "CNSDK_ROOT (CMake var or env var) to the extracted dir. "
-            "Source: https://github.com/LeiaInc/leiainc.github.io/tree/master/CNSDK/cnsdk-android-0.7.28.zip")
+            "CNSDK_ROOT not set. Extract a CNSDK >= ${DXR_CNSDK_MIN_VERSION} Android SDK tree "
+            "and set CNSDK_ROOT (CMake var or env var) to the extracted dir. "
+            "It must contain share/cmake/CNSDK/CNSDKConfig.cmake and lib/<ABI>/libleiaCore-loader.so.")
     endif()
 endif()
 # Android NDK toolchain defaults CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY,
@@ -50,6 +59,20 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 list(APPEND CMAKE_PREFIX_PATH "${CNSDK_ROOT}")
 find_package(CNSDK CONFIG REQUIRED)
 message(STATUS "Leia CNSDK at ${CNSDK_ROOT}")
+
+# Surface a too-old SDK at CONFIGURE time. Otherwise the only symptom is a
+# single runtime WARN on device, hours later, once someone rotates the pad.
+# CNSDKConfigVersion.cmake carries the version; find_package leaves it in
+# CNSDK_VERSION.
+if(CNSDK_VERSION AND CNSDK_VERSION VERSION_LESS DXR_CNSDK_MIN_VERSION)
+    message(WARNING
+        "CNSDK ${CNSDK_VERSION} at ${CNSDK_ROOT} is older than ${DXR_CNSDK_MIN_VERSION}. "
+        "The plug-in will build and run, but leia_core_set_device_orientation() "
+        "(CNSDK #716) is missing from libleiaCore-loader.so, so the #1079 orientation "
+        "correction is INERT: a mid-session rotation leaves the CNSDK core on its "
+        "launch-time orientation, the interlacer weaves at the wrong rotation, and face "
+        "tracking does not recover until the app is relaunched.")
+endif()
 
 # CNSDK 0.10.x uses a loader architecture: CNSDK::leiaCore (umbrella) links
 # the loader .so (libleiaCore-loader.so) which carries the public C-ABI +
