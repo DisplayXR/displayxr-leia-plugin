@@ -151,8 +151,6 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	(void)inst;
 	(void)xdev;
 
-	(void)out_info->struct_size; /* v1: see sim_display plug-in's note. */
-
 	bool any_populated = false;
 
 	/*
@@ -161,9 +159,7 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	 * scale factor stored in xrt_system_compositor_info.
 	 */
 	uint32_t sr_w = 0, sr_h = 0, nat_w = 0, nat_h = 0;
-	float refresh = 0.0f;
-	if (leiasr_query_recommended_view_dimensions(5.0, &sr_w, &sr_h, &refresh, &nat_w, &nat_h) && nat_w > 0 &&
-	    nat_h > 0) {
+	if (leiasr_query_recommended_view_dimensions(5.0, &sr_w, &sr_h, &nat_w, &nat_h) && nat_w > 0 && nat_h > 0) {
 		out_info->display_pixel_width = nat_w;
 		out_info->display_pixel_height = nat_h;
 		out_info->recommended_view_scale_x = (float)sr_w / (float)nat_w;
@@ -180,6 +176,28 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 		out_info->nominal_viewer_y_m = dims.nominal_y_m;
 		out_info->nominal_viewer_z_m = dims.nominal_z_m;
 		any_populated = true;
+	}
+
+	/*
+	 * Refresh rate (#185). The Windows arm queried this and then threw it
+	 * away, leaving refresh_mhz at 0 = "unknown" — while the Android and Linux
+	 * arms both publish it. It drives xrWaitFrame pacing on the null-compositor
+	 * path, so an unpublished real value is a real loss, and on a 165 Hz panel
+	 * "unknown" is what the runtime falls back from.
+	 *
+	 * Sourced from the probe, which reads the monitor the SR display is
+	 * actually on. Append-only field: only write it if the runtime's struct is
+	 * new enough to have it (same guard the Linux arm uses).
+	 */
+	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
+		struct leiasr_probe_result probe;
+		/* Cached + idempotent; create_device has always run it first, but
+		 * this removes the ordering assumption rather than documenting it. */
+		(void)leiasr_probe_display(LEIA_PLUGIN_SR_PROBE_TIMEOUT_S);
+		if (leiasr_get_probe_results(&probe) && probe.hw_found && probe.refresh_hz > 0.0f) {
+			out_info->refresh_mhz = (uint32_t)(probe.refresh_hz * 1000.0f + 0.5f);
+			any_populated = true;
+		}
 	}
 
 	/* EDID screen position — cached by probe(), zero if not available. */
