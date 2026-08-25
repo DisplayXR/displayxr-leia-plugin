@@ -140,32 +140,88 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
  *
  */
 
+/*!
+ * How long `leia_hmd_create` waits for the SR runtime to describe the panel.
+ * Matches the plug-in's own probe timeout. Paid once per process (the probe
+ * caches), and only when nothing has probed yet.
+ */
+#define LEIA_HMD_SR_PROBE_TIMEOUT_S 2.0
+
 struct xrt_device *
 leia_hmd_create(void)
 {
-	// Default values — used when SR SDK is not available.
-	int pixel_w = 3840;
-	int pixel_h = 2160;
-	float refresh_hz = 60.0f;
-	float display_w_m = 0.344f;
-	float display_h_m = 0.194f;
-	float nominal_z = 0.65f;
+	/*
+	 * LAST-RESORT geometry (#185). These are the reference 15.5" panel's
+	 * numbers, and they are wrong on every other panel — a 27" display gets a
+	 * 15.5" FOV, 15.5" eye offsets and a 15.5" split-side-by-side view config,
+	 * because everything below is computed from them. They exist only so a
+	 * device can still be created when nothing can be measured, and reaching
+	 * them is reported as the fault it is, never silently.
+	 */
+	const int fallback_pixel_w = 3840;
+	const int fallback_pixel_h = 2160;
+	const float fallback_display_w_m = 0.344f;
+	const float fallback_display_h_m = 0.194f;
+	const float fallback_nominal_z = 0.65f;
 
-	// Use cached probe results from leiasr_probe_display() if available.
+	int pixel_w = fallback_pixel_w;
+	int pixel_h = fallback_pixel_h;
+	float refresh_hz = 0.0f; // 0 == not measured; only ever logged.
+	float display_w_m = fallback_display_w_m;
+	float display_h_m = fallback_display_h_m;
+	float nominal_z = fallback_nominal_z;
+	bool size_measured = false;
+	bool pixels_measured = false;
+
+	/*
+	 * Ask the SR runtime for the panel's real geometry.
+	 *
+	 * `leiasr_probe_display` is cached and idempotent, so calling it here is
+	 * free on the paths that already ran it. Calling it is the point: the
+	 * plug-in's probe() only runs it on an EDID-table MISS, so on the common
+	 * path — the table matched, which is every supported panel — the cache was
+	 * empty and this function silently built the device from the constants
+	 * above. Reading a cache someone else may never have filled is not asking.
+	 */
 	{
 		struct leiasr_probe_result probe;
+		(void)leiasr_probe_display(LEIA_HMD_SR_PROBE_TIMEOUT_S);
 		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
-			pixel_w = (int)probe.pixel_w;
-			pixel_h = (int)probe.pixel_h;
+			/*
+			 * Field by field, and only when the probe actually measured
+			 * it. A probe that found the hardware but could not read one
+			 * property reports 0 for it; copying that 0 in wholesale
+			 * would turn a missing measurement into a zero-sized panel.
+			 */
+			if (probe.pixel_w > 0 && probe.pixel_h > 0) {
+				pixel_w = (int)probe.pixel_w;
+				pixel_h = (int)probe.pixel_h;
+				pixels_measured = true;
+			}
+			if (probe.display_w_m > 0.0f && probe.display_h_m > 0.0f) {
+				display_w_m = probe.display_w_m;
+				display_h_m = probe.display_h_m;
+				size_measured = true;
+			}
 			if (probe.refresh_hz > 0.0f) {
 				refresh_hz = probe.refresh_hz;
 			}
-			display_w_m = probe.display_w_m;
-			display_h_m = probe.display_h_m;
 			if (probe.nominal_z_m > 0.0f) {
 				nominal_z = probe.nominal_z_m;
 			}
 		}
+	}
+
+	if (!size_measured) {
+		U_LOG_E("Leia: PHYSICAL PANEL SIZE NOT MEASURED — falling back to the reference %.3fx%.3f m "
+		        "(15.5\"). FOV, eye offsets and the view config are computed from this, so they are "
+		        "wrong unless this really is a 15.5\" panel. Cause: the SR runtime reported no "
+		        "physical size (SR service down, or the display config has none).",
+		        (double)fallback_display_w_m, (double)fallback_display_h_m);
+	}
+	if (!pixels_measured) {
+		U_LOG_W("Leia: panel resolution not measured — falling back to %dx%d", fallback_pixel_w,
+		        fallback_pixel_h);
 	}
 
 	enum u_device_alloc_flags flags =
@@ -295,10 +351,18 @@ leia_hmd_create(void)
 	u_var_add_f32(hmd, &hmd->nominal_z_m, "nominal_z_m");
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
-	U_LOG_W("Created Leia 3D display: %dx%d px, %.3fx%.3f m, nominal Z=%.2f m, %.1f Hz",
-	        pixel_w, pixel_h, display_w_m, display_h_m, nominal_z, refresh_hz);
+	// Say where each number came from. This line is what a bug report quotes,
+	// and it previously read as measured hardware truth while printing
+	// compiled-in constants (#185).
+	U_LOG_W("Created Leia 3D display: %dx%d px [%s], %.4fx%.4f m [%s], nominal Z=%.2f m, %.1f Hz [%s]", pixel_w,
+	        pixel_h, pixels_measured ? "measured" : "FALLBACK", (double)display_w_m, (double)display_h_m,
+	        size_measured ? "measured" : "FALLBACK", (double)nominal_z, (double)refresh_hz,
+	        refresh_hz > 0.0f ? "measured" : "unknown");
 
-	(void)refresh_hz; // Logged above; will be used for frame timing later.
+	// Logged above only. The value the RUNTIME acts on travels via
+	// get_display_info -> xrt_plugin_display_info::refresh_mhz, read from the
+	// same probe cache (#185) rather than from this local.
+	(void)refresh_hz;
 
 	return &hmd->base;
 }

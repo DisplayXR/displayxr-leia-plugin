@@ -268,17 +268,23 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
                                               uint32_t *out_height);
 
 /*!
- * Query recommended view texture dimensions and display refresh rate from SR
- * display without creating a weaver.
+ * Query recommended view texture dimensions from the SR display without
+ * creating a weaver.
  *
  * This is a standalone function that can be called early during initialization
  * to get the recommended dimensions before creating swapchains. It creates a
  * temporary SR context, queries the display, and cleans up.
  *
+ * Refresh rate is deliberately NOT returned here (#185). This function used to
+ * answer it with `EnumDisplaySettingsW(nullptr, ...)` — the PRIMARY monitor, not
+ * the SR one — giving a second, wrong implementation of a question
+ * `leiasr_probe_display()` already answers correctly from the SR display's own
+ * rect. Two implementations of one fact is how they come to disagree; read the
+ * probe's `refresh_hz` instead.
+ *
  * @param max_time Maximum time in seconds to wait for SR to become ready.
  * @param[out] out_width Recommended width per view (single eye).
  * @param[out] out_height Recommended height per view.
- * @param[out] out_refresh_rate_hz Display refresh rate in Hz (NULL to skip).
  * @param[out] out_native_width Native display width in pixels (NULL to skip).
  * @param[out] out_native_height Native display height in pixels (NULL to skip).
  * @return true if valid dimensions were obtained, false otherwise.
@@ -289,7 +295,6 @@ bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
                                           uint32_t *out_height,
-                                          float *out_refresh_rate_hz,
                                           uint32_t *out_native_width,
                                           uint32_t *out_native_height);
 

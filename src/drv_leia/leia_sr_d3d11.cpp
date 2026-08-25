@@ -1860,7 +1860,6 @@ bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
                                           uint32_t *out_height,
-                                          float *out_refresh_rate_hz,
                                           uint32_t *out_native_width,
                                           uint32_t *out_native_height)
 {
@@ -1924,20 +1923,9 @@ leiasr_query_recommended_view_dimensions(double max_time,
 							U_LOG_I("SR query: native display dimensions %ux%u",
 							        (uint32_t)native_width, (uint32_t)native_height);
 
-							// Query monitor refresh rate via Win32
-							if (out_refresh_rate_hz != nullptr) {
-								DEVMODEW dm = {};
-								dm.dmSize = sizeof(dm);
-								if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
-								    dm.dmDisplayFrequency > 1) {
-									*out_refresh_rate_hz = (float)dm.dmDisplayFrequency;
-									U_LOG_I("SR query: display refresh rate %.0f Hz",
-									        *out_refresh_rate_hz);
-								} else {
-									*out_refresh_rate_hz = 60.0f;
-									U_LOG_W("Could not query display refresh rate, defaulting to 60 Hz");
-								}
-							}
+							// Refresh rate is the probe's job (#185) — it reads
+							// the monitor the SR display is actually on. The
+							// version that lived here read the PRIMARY monitor.
 						}
 						break;
 					}
