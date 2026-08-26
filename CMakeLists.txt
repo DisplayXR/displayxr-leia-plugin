@@ -129,6 +129,26 @@ set(DXR_RUNTIME_GIT_TAG "v2.8.0" CACHE STRING
 set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
+# Android carries its own pin too. It currently holds the SAME value as the
+# Windows tag -- the point is not that it differs today, it is that the Android
+# arm can move independently without dragging the Windows installer's derived
+# MIN_RUNTIME_VERSION with it.
+#
+# FLOOR IS v2.7.2. That is the first tag carrying BOTH
+# XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT (runtime#1037 / ADR-036 D2) and
+# XRT_DP_VK_HAS_WINDOW_SCREEN_RECT (runtime#1033), which src/drv_leia_android
+# compiles against. Both are #ifdef-guarded, so an older pin still COMPILES --
+# it just silently ships a plug-in whose CNSDK DexClassLoader cannot reach the
+# runtime APK's com.leia.* glue. That failure is a black screen on device, not
+# a build error, which is why build-android.yml also asserts the guard actually
+# compiled IN by reading a witness string back out of the .so.
+#
+# The _ANDROID suffix is invisible to the runtime's scripts/check_plugin_abi.py
+# regex (DXR_RUNTIME_GIT_TAG\s+") because \s+ cannot match an underscore --
+# the same reason _LINUX above is already safe.
+set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.8.0" CACHE STRING
+    "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
+
 if(DXR_RUNTIME_SOURCE_DIR)
     message(STATUS "Using local runtime checkout: ${DXR_RUNTIME_SOURCE_DIR}")
     add_subdirectory("${DXR_RUNTIME_SOURCE_DIR}" runtime-build EXCLUDE_FROM_ALL)
@@ -141,6 +161,16 @@ else()
                 "Runtime ${_dxr_runtime_ref} predates usable Linux support (first complete in v1.28.0). "
                 "Set DXR_RUNTIME_GIT_TAG_LINUX to a Linux-capable ref, or point DXR_RUNTIME_SOURCE_DIR "
                 "at a local runtime checkout.")
+        endif()
+    elseif(ANDROID)
+        set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_ANDROID}")
+        string(REGEX REPLACE "^v" "" _dxr_android_ver "${_dxr_runtime_ref}")
+        if(_dxr_android_ver MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+           AND _dxr_android_ver VERSION_LESS "2.7.2")
+            message(FATAL_ERROR
+                "Runtime ${_dxr_runtime_ref} predates the Android class-host Context slot "
+                "(runtime#1037, first tagged v2.7.2). Set DXR_RUNTIME_GIT_TAG_ANDROID to v2.7.2 "
+                "or newer, or point DXR_RUNTIME_SOURCE_DIR at a local runtime checkout.")
         endif()
     else()
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG}")

@@ -21,28 +21,34 @@ APK's `jniLibs/<ABI>/` (single-vendor mode); multi-APK discovery is v2
 
 ## Build
 
+Use the script — it resolves the NDK toolchain, ninja, `CNSDK_ROOT`,
+`DXR_RUNTIME_SOURCE_DIR` and `Eigen3_DIR`, all of which drift across
+machines:
+
 ```bash
-# CNSDK 0.7.28 extracted somewhere on disk:
-export CNSDK_ROOT=/path/to/cnsdk
+export CNSDK_ROOT=/path/to/cnsdk      # extracted CNSDK 0.10.54+ android tree
+./scripts/build-android.sh            # -> libdxrp050_leia_cnsdk.so
+./scripts/build-android.sh install-runtime-jnilibs   # + copy into the runtime APK
+```
 
-# Configure for arm64-v8a Android via the NDK toolchain:
-cmake -S . -B build-android \
-    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-    -DANDROID_ABI=arm64-v8a \
-    -DANDROID_PLATFORM=android-29 \
-    -G Ninja
+CNSDK is a **build-time dependency only**. The plug-in links the loader
+shim (`CNSDK::leiaCore` → `libleiaCore-loader.so`), which at runtime
+`dlopen`s `libleiaCore-impl.so` out of the **on-device** package — the
+same shape as the Windows arm building against the SR SDK while the SR
+runtime is installed separately.
 
-cmake --build build-android --target dxrp050_leia_cnsdk
+Get it from the private LeiaInc repo (the public `leiainc.github.io`
+copy is 0.7.28 and no longer works — 0.10.x moved to the loader
+architecture this plug-in compiles against):
+
+```bash
+gh release download <tag> -R LeiaInc/CNSDK -p 'cnsdk-android-*.zip'
 ```
 
 Output: `build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so`.
 
-Copy that into your runtime APK's
-`src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a/` before
-running `./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug`.
-
-(End-to-end multi-module Gradle integration is a follow-up — see the
-top-level repo README's "Android — POC build flow" section.)
+CI builds the same thing on every PR and attaches it to `v*` releases —
+see [`.github/workflows/build-android.yml`](../../.github/workflows/build-android.yml).
 
 ## CNSDK convention assumptions
 
@@ -54,7 +60,7 @@ for the symptom-→-fix table.
 
 ## Status
 
-POC — not yet validated on a Lume Pad. Compiles clean on the host.
-First hardware install is gated on Lume Pad arrival; bring-up plan
-lives in the runtime repo at
-`docs/getting-started/android-bringup-checklist.md`.
+Shipping. Validated on Lume Pad-class hardware and, since the panel
+geometry moved off compiled-in constants, on non-Lume-Pad panels too
+(measured on a 1080x2400 OLED phone). Built by CI on every PR and
+attached to `v*` releases.

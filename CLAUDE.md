@@ -58,7 +58,11 @@ ABI from the runtime headers it was built against:
   re-pin to the tag at the coupled release). **Linux carries its own pin**
   (`DXR_RUNTIME_GIT_TAG_LINUX`) because the Windows tag can predate runtime
   Linux support; `build-linux.yml`'s rule-5 self-check keeps it equal to that
-  workflow's `RUNTIME_REF`.
+  workflow's `RUNTIME_REF`. **Android likewise**
+  (`DXR_RUNTIME_GIT_TAG_ANDROID`, floor `v2.7.2`, kept equal to
+  `build-android.yml`'s `RUNTIME_REF_ANDROID`) — it holds the same value as the
+  Windows pin today; the point is that it can move independently without
+  dragging the Windows installer's derived `MIN_RUNTIME_VERSION` with it.
 - That ref's `xrt_plugin.h` defines `XRT_PLUGIN_API_VERSION_CURRENT`.
 - `src/drv_leia/leia_plugin.c::xrtPluginNegotiate` reports that value.
 - The runtime's loader (`target_plugin_loader.c`) **rejects** plug-ins reporting an ABI major different from the runtime's current ABI (ADR-020 rule 3).
@@ -120,6 +124,30 @@ Needs a local runtime checkout (default `../displayxr-runtime`, or set
 `DXR_RUNTIME_SOURCE_DIR`). Deps = the apt list in
 `.github/workflows/build-linux.yml`. CI builds on Ubuntu 22.04/24.04/26.04
 containers and asserts single-export + discovery + ABI-green selftest.
+
+### Android (CNSDK)
+```bash
+export CNSDK_ROOT=/path/to/cnsdk     # extracted CNSDK 0.10.54+ android tree
+./scripts/build-android.sh                          # -> libdxrp050_leia_cnsdk.so
+./scripts/build-android.sh install-runtime-jnilibs  # + drop into the runtime APK
+```
+Plain CMake + NDK (no gradle here), arm64-v8a only. Needs an NDK
+(`ANDROID_NDK_HOME`, or an SDK containing `ndk/<ANDROID_NDK_VERSION>/`) and a
+local runtime checkout. **CNSDK is a build-time dependency only** — the plug-in
+links the loader shim `libleiaCore-loader.so`, which at runtime `dlopen`s
+`libleiaCore-impl.so` out of the *on-device* package, exactly as the Windows arm
+build-depends on the SR SDK while the SR runtime is installed separately. Fetch
+it with `gh release download <tag> -R LeiaInc/CNSDK -p 'cnsdk-android-*.zip'`;
+the public `leiainc.github.io` copy is 0.7.28 and no longer works.
+
+CI (`build-android.yml`) builds it on every PR and attaches it to `v*` releases.
+It asserts single-export, the exact DT_NEEDED closure, and — because an
+under-pinned runtime *compiles fine* and only fails on device — an ABI witness
+string read back out of the `.so`.
+
+**Never publish CNSDK material.** Leia's Creator Toolkit licence permits
+distribution "as incorporated into your Products" (§3) but forbids distributing
+it standalone (§4b), so releases carry only our own `libdxrp050_leia_cnsdk.so`.
 
 ### Local-build override of the runtime pin
 If you're testing against a yet-unreleased runtime ABI:
