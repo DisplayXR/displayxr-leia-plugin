@@ -14,6 +14,12 @@
  */
 
 #include "leia_interface.h"
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+/* #187: live SR display queries, used when the probe cache is empty (the common
+ * case -- see leia_hmd_create). Guarded because this file is shared with the
+ * Linux arm (src/drv_leia_linux), which has no SR SDK. */
+#include "leia_sr_d3d11.h"
+#endif
 
 #include "xrt/xrt_device.h"
 
@@ -140,6 +146,11 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
  *
  */
 
+//! #187: seconds to wait for the live SR geometry query when the probe cache is
+//! empty. Short on purpose -- SR is already warm by the time a device is created,
+//! so this is a bounded safety net, not a blocking probe.
+#define LEIA_DEVICE_SR_QUERY_TIMEOUT_S 2.0
+
 struct xrt_device *
 leia_hmd_create(void)
 {
@@ -151,7 +162,22 @@ leia_hmd_create(void)
 	float display_h_m = 0.194f;
 	float nominal_z = 0.65f;
 
-	// Use cached probe results from leiasr_probe_display() if available.
+	/*
+	 * Where the real geometry comes from.
+	 *
+	 * #187: the probe cache below is populated ONLY by leiasr_probe_display(),
+	 * which leia_plugin_probe() calls only when the EDID table MISSES. A panel
+	 * that is IN the table -- the common case -- therefore left this cache empty
+	 * and the device kept the hardcoded 4K defaults above forever. Harmless on a
+	 * 3840x2160 panel, where they happen to be right; on an 8K panel the device
+	 * reported half the size in both axes, which also roughly halves the FOV
+	 * derived from it below (atan(0.172/0.65)=14.8deg vs 28.2deg).
+	 *
+	 * So: prefer the cache when it has something, then fall back to the same live
+	 * SR queries leia_plugin_get_display_info() already uses -- which are correct
+	 * on every panel -- and only then to the hardcoded defaults.
+	 */
+	const char *geom_src = "hardcoded defaults";
 	{
 		struct leiasr_probe_result probe;
 		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
@@ -165,7 +191,37 @@ leia_hmd_create(void)
 			if (probe.nominal_z_m > 0.0f) {
 				nominal_z = probe.nominal_z_m;
 			}
+			geom_src = "SR probe cache";
 		}
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+		else {
+			/* The SR context is already warm by here (the plug-in's probe and
+			 * get_display_info both run first), so these resolve from cached SR
+			 * state rather than paying the full timeout. */
+			uint32_t nat_w = 0, nat_h = 0, view_w = 0, view_h = 0;
+			float hz = 0.0f;
+			bool got_px = leiasr_query_recommended_view_dimensions(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, &view_w,
+			                                                       &view_h, &hz, &nat_w, &nat_h);
+			if (got_px && nat_w > 0 && nat_h > 0) {
+				pixel_w = (int)nat_w;
+				pixel_h = (int)nat_h;
+				if (hz > 0.0f) {
+					refresh_hz = hz;
+				}
+				geom_src = "live SR query";
+			}
+			struct leiasr_display_dimensions dims = {0};
+			if (leiasr_static_get_display_dimensions(&dims) && dims.valid && dims.width_m > 0.0f &&
+			    dims.height_m > 0.0f) {
+				display_w_m = dims.width_m;
+				display_h_m = dims.height_m;
+				if (dims.nominal_z_m > 0.0f) {
+					nominal_z = dims.nominal_z_m;
+				}
+				geom_src = "live SR query";
+			}
+		}
+#endif
 	}
 
 	enum u_device_alloc_flags flags =
@@ -295,8 +351,8 @@ leia_hmd_create(void)
 	u_var_add_f32(hmd, &hmd->nominal_z_m, "nominal_z_m");
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
-	U_LOG_W("Created Leia 3D display: %dx%d px, %.3fx%.3f m, nominal Z=%.2f m, %.1f Hz",
-	        pixel_w, pixel_h, display_w_m, display_h_m, nominal_z, refresh_hz);
+	U_LOG_W("Created Leia 3D display: %dx%d px, %.4fx%.4f m, nominal Z=%.2f m, %.1f Hz (geometry from %s)",
+	        pixel_w, pixel_h, display_w_m, display_h_m, nominal_z, refresh_hz, geom_src);
 
 	(void)refresh_hz; // Logged above; will be used for frame timing later.
 
