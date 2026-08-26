@@ -6,7 +6,13 @@ init order, thread affinity, and undocumented behaviors that took
 trial-and-error to figure out. Read this before changing CNSDK call
 sites — most of these constraints aren't in the CNSDK headers.
 
-Sourced from CNSDK 0.7.28 headers + the current plug-in implementation.
+Sourced from CNSDK headers + the current plug-in implementation.
+
+> **Version note.** This surface was first catalogued against 0.7.28; the
+> plug-in now requires **0.10.54+** (the loader architecture — see
+> `src/drv_leia_android/CMakeLists.txt`). Where a row below cites 0.7.28 as
+> the "pinned to" version it is recording when that entry was catalogued,
+> not a supported SDK. Re-baselining the table on 0.10.6x is outstanding.
 Bump the version note here when we move CNSDK.
 
 ## Init / teardown order

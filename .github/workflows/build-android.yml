@@ -1,0 +1,329 @@
+# Android CI for the Leia plug-in's CNSDK arm (src/drv_leia_android).
+#
+# No gradle in this repo: plain CMake + NDK, arm64-v8a only, producing
+# libdxrp050_leia_cnsdk.so. The runtime is added as a CMake subdirectory
+# (root CMakeLists.txt), so this job needs the runtime's Android build
+# prereqs too -- glslangValidator (cmake/SPIR-V.cmake) and an
+# Eigen3Config.cmake.
+#
+# What this leg proves:
+#   1. The .so builds against the pinned runtime's ABI headers on the NDK the
+#      runtime APK itself uses (r26d / 26.3.11579264).
+#   2. Single-export discipline: exactly xrtPluginNegotiate in .dynsym
+#      (llvm twin of build-linux.yml's `nm -D` assertion, ADR-019).
+#   3. Load-closure discipline: DT_NEEDED is exactly the 7 expected entries.
+#      The NEGATIVE matters most -- libleiaSDK-jni.so must NOT be DT_NEEDED
+#      (it is dlopen'd from the Java/service side; a hard link-time dependency
+#      makes the plug-in unloadable in-process).
+#   4. ABI witness: the plugin ABI major and the class-host-Context guard are
+#      read back OUT OF THE BINARY and compared against the pinned runtime's
+#      header. The failure mode here is silent-compile, not fail-compile, so a
+#      text-only pin check is not sufficient.
+#
+# CNSDK is a BUILD-TIME dependency only: the plug-in links the loader shim
+# (CNSDK::leiaCore -> libleiaCore-loader.so), which at runtime dlopens
+# libleiaCore-impl.so out of the ON-DEVICE package. Same shape as the Windows
+# arm build-depending on the SR SDK while the SR runtime is installed
+# separately.
+#
+# It is fetched from a release of the PRIVATE LeiaInc/CNSDK repo using the
+# LEIALOFT_GITHUB_TOKEN secret. Fork PRs have no secret -> the job soft-skips
+# green (the same have_sdk shape as build-linux.yml's Deb job).
+#
+# LICENCE: Leia's Creator Toolkit licence permits distributing these materials
+# "as incorporated into your Products" (s3) but forbids distributing them
+# standalone to third parties (s4b). So the CNSDK zip, libleiaCore-loader.so,
+# libleiaSDK-jni.so and the AAR are NEVER published as release assets here.
+# Only our own libdxrp050_leia_cnsdk.so ships.
+
+name: Build Android
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # release-asset attach on v* tags
+
+env:
+  # ADR-020 rule 5, Android track. MUST equal CMakeLists.txt's
+  # DXR_RUNTIME_GIT_TAG_ANDROID (rule-5 self-check below). Floor is v2.7.2 --
+  # the first tag with XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT (runtime#1037)
+  # and XRT_DP_VK_HAS_WINDOW_SCREEN_RECT (runtime#1033).
+  RUNTIME_REF_ANDROID: v2.8.0
+  # NDK the runtime APK is built with (displayxr-runtime build-android.yml +
+  # gradle.properties). Bump together, or the plug-in links against a different
+  # libc++/sysroot than the APK it gets dropped into.
+  NDK_VERSION: r26d
+  ANDROID_ABI: arm64-v8a
+  ANDROID_PLATFORM: android-29
+  # CNSDK release on the private LeiaInc/CNSDK repo. The asset name embeds a
+  # build suffix (cnsdk-android-<ver>+<n>.<sha>.zip) so it is matched by glob,
+  # never by literal name.
+  CNSDK_TAG: v0.10.61
+
+jobs:
+  Android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plug-in
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe -> the iface .version (#47)
+
+      # Rule-5 (ADR-020), Android track. Twin of build-linux.yml's check.
+      # The _ANDROID suffix is what keeps this grep -- and the runtime's
+      # scripts/check_plugin_abi.py regex `DXR_RUNTIME_GIT_TAG\s+"` -- from
+      # colliding with the Windows pin, exactly as _LINUX does today.
+      - name: Rule-5 Android pin self-check
+        run: |
+          tag=$(grep -oP 'set\(DXR_RUNTIME_GIT_TAG_ANDROID\s+"\K[^"]+' CMakeLists.txt | head -1)
+          if [ -z "$tag" ]; then
+            echo "::error::DXR_RUNTIME_GIT_TAG_ANDROID not found in CMakeLists.txt"
+            exit 1
+          fi
+          if [ "$tag" != "$RUNTIME_REF_ANDROID" ]; then
+            echo "::error::Android runtime pin drift: CMakeLists.txt has '$tag', workflow has '$RUNTIME_REF_ANDROID'"
+            exit 1
+          fi
+          echo "Pin OK: $tag"
+
+      - name: Checkout runtime @ ${{ env.RUNTIME_REF_ANDROID }}
+        uses: actions/checkout@v4
+        with:
+          repository: DisplayXR/displayxr-runtime
+          ref: ${{ env.RUNTIME_REF_ANDROID }}
+          path: displayxr-runtime
+          fetch-depth: 1
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update -qq
+          # glslang-tools : glslangValidator, required by the runtime's
+          #   cmake/SPIR-V.cmake find_program. The NDK toolchain sets
+          #   CMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER, i.e. host PATH, so a
+          #   host glslang is the correct one.
+          # libeigen3-dev : ships /usr/share/eigen3/cmake/Eigen3Config.cmake.
+          #   Eigen is header-only, so the host package cross-compiles fine.
+          # ninja-build   : this repo has no Android SDK cmake/ dir to borrow
+          #   ninja from.
+          sudo apt-get install -y -qq glslang-tools libeigen3-dev ninja-build unzip
+          glslangValidator --version | head -1
+          test -f /usr/share/eigen3/cmake/Eigen3Config.cmake
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      # Soft-skip gate. `secrets` is not usable in a job-level `if:`, so the
+      # check lives in a run step and publishes an output -- the same shape as
+      # build-linux.yml's Deb job (steps.sdk.outputs.have_sdk).
+      #
+      # Fork PR (no secret) -> have_sdk=no, later steps skip, job green.
+      # Canonical repo -> secret present; any download failure is a HARD error,
+      # never a silent skip. A tag with no attached .so is worse than a red
+      # build.
+      - name: Fetch CNSDK (private LeiaInc/CNSDK release)
+        id: cnsdk
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::LEIALOFT_GITHUB_TOKEN absent (fork PR?) — skipping the Android build. Add the secret to DisplayXR/displayxr-leia-plugin to enable it."
+            echo "have_sdk=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p _cnsdk_zip _cnsdk
+          # Glob, not a literal: the asset name embeds a build suffix.
+          if ! gh release download "$CNSDK_TAG" -R LeiaInc/CNSDK \
+                 -p 'cnsdk-android-*.zip' -D _cnsdk_zip; then
+            echo "::error::Could not download cnsdk-android-*.zip from LeiaInc/CNSDK@$CNSDK_TAG. Check the tag, the asset name, and that LEIALOFT_GITHUB_TOKEN can read LeiaInc/CNSDK."
+            exit 1
+          fi
+          zip=$(ls _cnsdk_zip/cnsdk-android-*.zip | head -1)
+          echo "CNSDK zip: $(basename "$zip")"
+          unzip -q "$zip" -d _cnsdk
+          # Derive CNSDK_ROOT from the config file so the zip's top-level
+          # layout (flat vs nested) does not matter -- the same trick
+          # build-linux.yml uses for the SR SDK.
+          cfg=$(find _cnsdk -name CNSDKConfig.cmake | head -1)
+          if [ -z "$cfg" ]; then
+            echo "::error::CNSDK unpacked but share/cmake/CNSDK/CNSDKConfig.cmake not found — layout changed."
+            exit 1
+          fi
+          root=$(cd "$(dirname "$cfg")/../../.." && pwd)
+          test -f "$root/lib/$ANDROID_ABI/libleiaCore-loader.so" \
+            || { echo "::error::$root/lib/$ANDROID_ABI/libleiaCore-loader.so missing"; exit 1; }
+          echo "CNSDK_ROOT=$root" >> "$GITHUB_ENV"
+          echo "CNSDK_VERSION=$(cat "$root/VERSION.txt" 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+          echo "have_sdk=yes" >> "$GITHUB_OUTPUT"
+          echo "CNSDK_ROOT=$root ($(cat "$root/VERSION.txt" 2>/dev/null || echo unknown))"
+
+      - name: Build libdxrp050_leia_cnsdk.so
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          DXR_RUNTIME_SOURCE_DIR: ${{ github.workspace }}/displayxr-runtime
+          EIGEN3_DIR: /usr/share/eigen3/cmake
+          NINJA: /usr/bin/ninja
+          CMAKE_BUILD_TYPE: RelWithDebInfo
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/build-android.sh
+          ls -l build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+
+      - name: Assert single export (ADR-019)
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        env:
+          NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+          # llvm-nm twin of build-linux.yml's `nm -D --defined-only`. Host
+          # binutils cannot read an aarch64-android ELF reliably; the NDK's can.
+          syms=$("$NDK_BIN/llvm-nm" -D --defined-only "$SO" | awk 'NF {print $NF}')
+          if [ "$syms" != "xrtPluginNegotiate" ]; then
+            echo "::error::unexpected exports from $SO:"
+            "$NDK_BIN/llvm-nm" -D --defined-only "$SO"
+            exit 1
+          fi
+          echo "OK: only xrtPluginNegotiate exported"
+
+      - name: Assert DT_NEEDED closure
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        env:
+          NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          # The Android twin of build-linux.yml's `ldd -r`. You cannot run an
+          # aarch64-android loader on an x86 runner, so instead of binding
+          # symbols we assert the LOAD CLOSURE is exactly what the device will
+          # have present. Every entry either ships in the runtime APK's jniLibs
+          # (libleiaCore-loader) or is a platform library.
+          #
+          # The negative is the important one: libleiaSDK-jni.so must NOT be
+          # DT_NEEDED, and libc++_shared.so must not appear (ANDROID_STL is
+          # pinned to c++_static so we never drop an extra .so into someone
+          # else's APK).
+          SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+          got=$("$NDK_BIN/llvm-readelf" -d "$SO" \
+                 | awk -F'[][]' '/\(NEEDED\)/ {print $2}' | sort)
+          want=$(printf '%s\n' liblog.so libandroid.so libvulkan.so \
+                   libleiaCore-loader.so libm.so libdl.so libc.so | sort)
+          if [ "$got" != "$want" ]; then
+            echo "::error::DT_NEEDED closure drift."
+            diff <(echo "$want") <(echo "$got") || true
+            exit 1
+          fi
+          echo "OK: DT_NEEDED == liblog libandroid libvulkan libleiaCore-loader libm libdl libc"
+
+      - name: Assert compiled-in ABI (artifact-level)
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        env:
+          NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          # scripts/check_plugin_abi.py (runtime side) is a TEXT tool: it reads
+          # CMakeLists + headers, cannot look inside a .so, and only knows the
+          # Windows key DXR_RUNTIME_GIT_TAG. So the Android track asserts on the
+          # BINARY. leia_plugin_android.c bakes a greppable witness built from
+          # the very macros it compiled against; resolve the same macros out of
+          # the pinned runtime's header and demand an exact match.
+          H=displayxr-runtime/src/xrt/include/xrt/xrt_plugin.h
+          alias=$(grep -oP '^\s*#\s*define\s+XRT_PLUGIN_API_VERSION_CURRENT\s+\K\S+' "$H")
+          if [[ "$alias" =~ ^[0-9]+$ ]]; then
+            want="$alias"
+          else
+            want=$(grep -oP "^\s*#\s*define\s+${alias}\s+\K[0-9]+" "$H")
+          fi
+          test -n "$want" || { echo "::error::could not resolve XRT_PLUGIN_API_VERSION_CURRENT from $H"; exit 1; }
+
+          SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+          expect="DXR_PLUGIN_ABI=${want};CLASS_HOST_CTX=1"
+          if ! "$NDK_BIN/llvm-strings" -a "$SO" | grep -qxF "$expect"; then
+            echo "::error::ABI witness mismatch. Expected '$expect' (from $RUNTIME_REF_ANDROID headers). Found:"
+            "$NDK_BIN/llvm-strings" -a "$SO" | grep -F 'DXR_PLUGIN_ABI=' || echo "  (no witness at all — is leia_plugin_android.c's dxr_plugin_abi_marker present?)"
+            echo "CLASS_HOST_CTX=0 means XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT was NOT defined: the runtime pin predates v2.7.2 (runtime#1037), so the plug-in silently shipped without the class-host Context and CNSDK's DexClassLoader cannot reach the runtime APK's com.leia.* glue."
+            exit 1
+          fi
+          echo "PASS: plug-in reports plugin ABI v$want and the class-host Context slot compiled in."
+
+      - name: Package release tarball
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        id: pkg
+        env:
+          NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+        run: |
+          set -euo pipefail
+          SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+          VER=$(git describe --tags --always --dirty)
+          OUT="displayxr-leia-cnsdk-${VER}-android-${ANDROID_ABI}"
+          mkdir -p "dist/$OUT/$ANDROID_ABI"
+          # The BASENAME is load-bearing: the runtime's target_plugin_loader.c
+          # enumerates jniLibs for libdxrp<NNN>_<id>.so, so the .so must keep
+          # its exact name. Versioning goes on the TARBALL, not the .so.
+          cp "$SO" "dist/$OUT/$ANDROID_ABI/"
+          {
+            echo "plugin_tag=${VER}"
+            echo "runtime_pin=${RUNTIME_REF_ANDROID}"
+            echo "plugin_abi=$("$NDK_BIN/llvm-strings" -a "$SO" | grep -oP 'DXR_PLUGIN_ABI=\K[0-9]+')"
+            echo "cnsdk_build_dependency=${CNSDK_VERSION}"
+            echo "ndk=${NDK_VERSION}"
+            echo "abi=${ANDROID_ABI}  min_sdk=${ANDROID_PLATFORM}"
+            echo "dt_needed=liblog,libandroid,libvulkan,libleiaCore-loader,libm,libdl,libc"
+            echo ""
+            echo "Drop ${ANDROID_ABI}/libdxrp050_leia_cnsdk.so into the runtime APK's"
+            echo "src/xrt/targets/openxr_android/src/main/jniLibs/${ANDROID_ABI}/."
+            echo ""
+            echo "libleiaCore-loader.so, libleiaSDK-jni.so and sdk-<ver>.aar are NOT"
+            echo "included here: they come from your own CNSDK tree (cnsdk.dir in the"
+            echo "runtime's local.properties). CNSDK is a build-time dependency; the"
+            echo "real core (libleiaCore-impl.so) is loaded from the on-device package."
+          } > "dist/$OUT/MANIFEST.txt"
+          cp LICENSE NOTICE "dist/$OUT/"
+          tar -C dist -czf "dist/${OUT}.tar.gz" "$OUT"
+          # Paranoid licence assertion: no CNSDK byte may ever leave this job.
+          # Structural already (we copy one file by explicit path), but a future
+          # refactor of this step must not be able to break it quietly.
+          if tar -tzf "dist/${OUT}.tar.gz" | grep -Ei 'leiacore|leiasdk|\.aar$'; then
+            echo "::error::CNSDK material found in the release tarball — licence violation (s4b). Refusing to publish."
+            exit 1
+          fi
+          echo "tarball=dist/${OUT}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -lh "dist/${OUT}.tar.gz"
+
+      - name: Upload CI artifact
+        if: steps.cnsdk.outputs.have_sdk == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisplayXR-Leia-CNSDK-android-${{ env.ANDROID_ABI }}
+          # Raw .so too, so `gh run download` gives a debuggable binary without
+          # having to untar.
+          path: |
+            dist/*.tar.gz
+            build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
+          if-no-files-found: error
+
+      # NOTE: no generate_release_notes here. build-windows.yml owns that flag
+      # exclusively in this repo -- the action folds it into `body` and appends
+      # on update, so a second flagged workflow duplicates the notes.
+      - name: Attach .so tarball to the GitHub Release (tags only)
+        if: steps.cnsdk.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+
+      # No DispatchVersionsBump: build-windows.yml owns it and the .so rides the
+      # same versions.json[leia_plugin] tag -- same policy as build-linux.yml.
+      - name: CNSDK unavailable — job skipped
+        if: steps.cnsdk.outputs.have_sdk != 'yes'
+        run: echo "have_sdk=no; Android build skipped (no LEIALOFT_GITHUB_TOKEN). Reporting success."
