@@ -1845,8 +1845,37 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 			        vp_x, vp_y, vp_w, vp_h, sp_x, sp_y, (int)zonephase, w, h);
 		}
 	} else {
+		// browser#165: CNSDK converts the viewport screen position to GL
+		// bottom-origin panel coords (interlacer.cpp: origin_gl_y = panel_h -
+		// vp_h - y), but this API is documented to take Android top-left screen
+		// pixels. For a NATURAL-orientation (portrait) window that does not span
+		// the panel, passing the top-anchored y therefore lands the interlace
+		// pattern with a constant (panel_h - vp_h)-row phase offset — a uniform,
+		// head-position-independent double image (LPD-20W) or inverted views
+		// (NP02J), and no error at fullscreen where the offset is zero.
+		// Pre-apply the inverse so the pattern anchors where the calibration
+		// did. Landscape (rotated-from-natural) windows go through CNSDK's
+		// rotation compensation and weave correctly with the top-anchored y —
+		// verified on device — so only portrait is corrected.
+		int32_t sp_y = win_y;
+		if (h > w) {
+			uint32_t pw = 0, ph = 0;
+			if (leia_cnsdk_get_display_metrics(cnsdk, NULL, NULL, &pw, &ph) && pw != 0 && ph != 0) {
+				const uint32_t panel_long = pw > ph ? pw : ph;
+				if (h < panel_long) {
+					sp_y = (int32_t)panel_long - (int32_t)h - win_y;
+					static bool sp_logged = false;
+					if (!sp_logged) {
+						sp_logged = true;
+						U_LOG_W("HW_DBG_CNSDK: #165 portrait window y %d -> bottom-origin %d "
+						        "(panel_h %u, vp_h %u)",
+						        win_y, sp_y, panel_long, h);
+					}
+				}
+			}
+		}
 		leia_interlacer_set_viewport(cnsdk->interlacer, 0, 0, (int32_t)w, (int32_t)h);
-		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, win_x, win_y);
+		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, win_x, sp_y);
 		// One WARN per distinct window phase — the line the side-by-side PoC greps
 		// to prove each satellite weaves at its own origin. Never per frame.
 		static int32_t last_wx = INT32_MIN, last_wy = INT32_MIN;
