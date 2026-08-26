@@ -336,11 +336,19 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
  * "v2 (C99)" marker assertion build-windows.yml makes with dumpbin.
  *
  * static + hidden visibility, so it never enters .dynsym and the single-export
- * assertion still passes. `used` keeps it past dead-strip.
+ * assertion still passes.
+ *
+ * `used` alone is NOT enough and this was verified the hard way: it stops the
+ * COMPILER discarding an unreferenced symbol, but the NDK toolchain appends
+ * -Wl,--gc-sections for RELEASE / RELWITHDEBINFO / MINSIZEREL
+ * (android-legacy.toolchain.cmake), and the LINKER then collects the section.
+ * A debug build keeps the marker and a release build silently drops it, which
+ * is the worst shape of bug for a CI assertion. `retain` emits SHF_GNU_RETAIN
+ * (clang >= 13; NDK 26 ships clang 17) which --gc-sections honours.
  */
 #define DXR_ABI_STR2(x) #x
 #define DXR_ABI_STR(x) DXR_ABI_STR2(x)
-__attribute__((used)) static const char dxr_plugin_abi_marker[] =
+__attribute__((used, retain)) static const char dxr_plugin_abi_marker[] =
     "DXR_PLUGIN_ABI=" DXR_ABI_STR(XRT_PLUGIN_API_VERSION_CURRENT)
 #ifdef XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT
     ";CLASS_HOST_CTX=1";
