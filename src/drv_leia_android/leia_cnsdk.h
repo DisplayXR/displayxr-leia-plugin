@@ -67,6 +67,16 @@ void
 leia_cnsdk_set_host_class_context_accessor(void *(*get_class_host_context)(void));
 
 /*!
+ * Panel size in pixels from Android's `Display.getRealMetrics()`, in the
+ * device's NATURAL orientation. Needs no CNSDK — usable before the CNSDK
+ * worker has cached the device config.
+ *
+ * @return true and fills the outputs, false when they cannot be determined.
+ */
+bool
+leia_cnsdk_get_android_panel_px(uint32_t *out_w, uint32_t *out_h, float *out_w_m, float *out_h_m);
+
+/*!
  * Read all `debug.dxr.leia.*` calibration setprops and log them.
  *
  * Idempotent (cached after first call). Safe to call from the plug-in

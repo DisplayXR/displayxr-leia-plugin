@@ -139,13 +139,42 @@ leia_android_hmd_create(void)
 	// get_tracked_pose directly. Mirrors sim_display_device.c.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 
-	// Lume Pad 2 default panel + viewing distance. CNSDK fills these
-	// in lazily on first DP query once the async core init completes.
+	// Panel geometry. CNSDK is NOT up yet at xrCreateInstance (its core init is
+	// async and completes ~80 ms later, on this same thread, so we cannot wait),
+	// so ask Android directly -- Display.getRealMetrics() is window-independent
+	// and needs no SDK. The Lume Pad 2 numbers below remain only as a last
+	// resort.
+	//
+	// Getting this wrong is not cosmetic: the compositor sizes the atlas from
+	// these dims and then presents into the real surface, so on any panel that
+	// is not a Lume Pad 2 everything lands outside the visible area -- a black
+	// screen with working audio. Measured on a 1080x2400 phone, 2026-08-26.
+	//
+	// display_* are reported LONG-EDGE-FIRST (the Lume Pad baseline is natural
+	// portrait 1600x2560 but reported 2560x1600), so normalise to (max, min).
+	uint32_t nat_w = 0, nat_h = 0;
+	float nat_w_m = 0.0f, nat_h_m = 0.0f;
+	uint32_t panel_w = 2560, panel_h = 1600;
+	float panel_w_m = 0.235f, panel_h_m = 0.147f;
+	if (leia_cnsdk_get_android_panel_px(&nat_w, &nat_h, &nat_w_m, &nat_h_m) && nat_w > 0 && nat_h > 0) {
+		const bool swap = nat_h > nat_w;
+		panel_w = swap ? nat_h : nat_w;
+		panel_h = swap ? nat_w : nat_h;
+		if (nat_w_m > 0.0f && nat_h_m > 0.0f) {
+			panel_w_m = swap ? nat_h_m : nat_w_m;
+			panel_h_m = swap ? nat_w_m : nat_h_m;
+		}
+		U_LOG_W("Leia Android: panel from Display.getRealMetrics() = %ux%u px, %.4fx%.4f m",
+		        panel_w, panel_h, (double)panel_w_m, (double)panel_h_m);
+	} else {
+		U_LOG_W("Leia Android: getRealMetrics() unavailable — falling back to Lume Pad 2 defaults");
+	}
+
 	struct u_device_simple_info info = {
-	    .display.w_pixels = 2560,
-	    .display.h_pixels = 1600,
-	    .display.w_meters = 0.235f,
-	    .display.h_meters = 0.147f,
+	    .display.w_pixels = panel_w,
+	    .display.h_pixels = panel_h,
+	    .display.w_meters = panel_w_m,
+	    .display.h_meters = panel_h_m,
 	    .lens_horizontal_separation_meters = 0.063f,
 	    .lens_vertical_position_meters = 0.0735f,
 	    .fov = {85.0f * (float)M_PI / 180.0f,
@@ -258,8 +287,28 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	// get_display_dimensions / get_display_pixel_info read it lazily,
 	// so these baseline values keep the runtime usable while the
 	// CNSDK core is still booting.
+	// Ask Android for the real panel; the Lume Pad 2 numbers are the last resort.
+	// This is the value the runtime sizes the ATLAS from, so a wrong answer here
+	// puts every rendered pixel outside the visible surface (black screen, audio
+	// fine). getRealMetrics() is window-independent and needs no CNSDK, which
+	// matters because the CNSDK core is still booting at this point.
+	uint32_t di_nat_w = 0, di_nat_h = 0;
+	float di_nat_w_m = 0.0f, di_nat_h_m = 0.0f;
 	out_info->display_pixel_width = 2560;
 	out_info->display_pixel_height = 1600;
+	out_info->display_width_m = 0.235f;
+	out_info->display_height_m = 0.147f;
+	if (leia_cnsdk_get_android_panel_px(&di_nat_w, &di_nat_h, &di_nat_w_m, &di_nat_h_m) && di_nat_w > 0 &&
+	    di_nat_h > 0) {
+		// Reported long-edge-first, matching the Lume Pad baseline convention.
+		const bool di_swap = di_nat_h > di_nat_w;
+		out_info->display_pixel_width = di_swap ? di_nat_h : di_nat_w;
+		out_info->display_pixel_height = di_swap ? di_nat_w : di_nat_h;
+		if (di_nat_w_m > 0.0f && di_nat_h_m > 0.0f) {
+			out_info->display_width_m = di_swap ? di_nat_h_m : di_nat_w_m;
+			out_info->display_height_m = di_swap ? di_nat_w_m : di_nat_h_m;
+		}
+	}
 	// #518: 3D per-view scale = tile ÷ panel (device baseline; ~0.75x0.75 for nubia),
 	// in the reported display orientation. Replaces the old hardcoded 1.0x1.0, which
 	// over-rendered each eye. target_instance.c prefers this iface-supplied value.
@@ -267,8 +316,6 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 	                        LEIA_BASELINE_TILE_W_NAT, LEIA_BASELINE_TILE_H_NAT,
 	                        LEIA_NATURAL_IS_LANDSCAPE, &out_info->recommended_view_scale_x,
 	                        &out_info->recommended_view_scale_y);
-	out_info->display_width_m = 0.235f;
-	out_info->display_height_m = 0.147f;
 	out_info->nominal_viewer_x_m = 0.0f;
 	out_info->nominal_viewer_y_m = 0.0f;
 	out_info->nominal_viewer_z_m = 0.50f;
