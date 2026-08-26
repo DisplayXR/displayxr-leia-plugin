@@ -1266,6 +1266,128 @@ true_device_orientation_android(JavaVM *vm, jobject ctx)
 	return result;
 }
 
+/*!
+ * Panel size in pixels from `Display.getRealMetrics()`, in the device's NATURAL
+ * orientation (long edge = height when the device is naturally portrait).
+ *
+ * Why this exists: the display-processor is asked for panel geometry during
+ * `xrt_instance_create_system`, which happens ~80 ms BEFORE the CNSDK worker
+ * caches the real device metrics — so the CNSDK path always missed and the DP
+ * fell back to compiled-in Lume Pad 2 constants (2560x1600). On any other panel
+ * the compositor then sized its atlas for a display that isn't there and
+ * presented into a smaller surface, so nothing was visible: a black screen with
+ * working audio. Measured on a 1080x2400 phone, 2026-08-26.
+ *
+ * `getRealMetrics()` is window-independent (unlike the Context's own metrics,
+ * see true_device_orientation_android above), so it is correct for a floating
+ * window too, and it needs no CNSDK — which is the point.
+ *
+ * @return true and fills the outputs, or false when they cannot be determined.
+ */
+static bool
+android_panel_px(JavaVM *vm, jobject ctx, uint32_t *out_w, uint32_t *out_h, float *out_w_m, float *out_h_m)
+{
+	if (vm == nullptr || ctx == nullptr || out_w == nullptr || out_h == nullptr) {
+		return false;
+	}
+	JNIEnv *env = nullptr;
+	if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK || env == nullptr) {
+		return false;
+	}
+	bool ok = false;
+
+	jclass ctx_cls = env->FindClass("android/content/Context");
+	jmethodID get_service =
+	    ctx_cls != nullptr
+	        ? env->GetMethodID(ctx_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;")
+	        : nullptr;
+	if (get_service != nullptr) {
+		jstring name = env->NewStringUTF("window");
+		jobject wm = env->CallObjectMethod(ctx, get_service, name);
+		env->DeleteLocalRef(name);
+		if (wm != nullptr && !env->ExceptionCheck()) {
+			jclass wm_cls = env->FindClass("android/view/WindowManager");
+			jmethodID get_disp =
+			    wm_cls != nullptr ? env->GetMethodID(wm_cls, "getDefaultDisplay", "()Landroid/view/Display;")
+			                      : nullptr;
+			jobject disp = get_disp != nullptr ? env->CallObjectMethod(wm, get_disp) : nullptr;
+			if (disp != nullptr && !env->ExceptionCheck()) {
+				jclass disp_cls = env->GetObjectClass(disp);
+				jclass dm_cls = env->FindClass("android/util/DisplayMetrics");
+				jmethodID get_real =
+				    disp_cls != nullptr && dm_cls != nullptr
+				        ? env->GetMethodID(disp_cls, "getRealMetrics", "(Landroid/util/DisplayMetrics;)V")
+				        : nullptr;
+				jmethodID get_rot =
+				    disp_cls != nullptr ? env->GetMethodID(disp_cls, "getRotation", "()I") : nullptr;
+				jmethodID dm_ctor = dm_cls != nullptr ? env->GetMethodID(dm_cls, "<init>", "()V") : nullptr;
+				if (get_real != nullptr && get_rot != nullptr && dm_ctor != nullptr) {
+					jobject dm = env->NewObject(dm_cls, dm_ctor);
+					env->CallVoidMethod(disp, get_real, dm);
+					jfieldID w_fid = env->GetFieldID(dm_cls, "widthPixels", "I");
+					jfieldID h_fid = env->GetFieldID(dm_cls, "heightPixels", "I");
+					jint rot = env->CallIntMethod(disp, get_rot);
+					if (!env->ExceptionCheck() && w_fid != nullptr && h_fid != nullptr) {
+						jint w = env->GetIntField(dm, w_fid);
+						jint h = env->GetIntField(dm, h_fid);
+						// getRealMetrics() reports the CURRENT rotation. Undo it so the
+						// caller always sees the natural-orientation panel, which is what
+						// CNSDK's PANEL_RESOLUTION_PX reports and what the atlas is sized
+						// against.
+						if (rot == 1 || rot == 3) {
+							jint t = w;
+							w = h;
+							h = t;
+						}
+						if (w > 0 && h > 0) {
+							*out_w = (uint32_t)w;
+							*out_h = (uint32_t)h;
+							// Physical size from the real DPI, so Kooima gets the panel
+							// it is actually drawing on rather than a Lume Pad's.
+							if (out_w_m != nullptr && out_h_m != nullptr) {
+								jfieldID xdpi_fid = env->GetFieldID(dm_cls, "xdpi", "F");
+								jfieldID ydpi_fid = env->GetFieldID(dm_cls, "ydpi", "F");
+								if (xdpi_fid != nullptr && ydpi_fid != nullptr) {
+									float xdpi = env->GetFloatField(dm, xdpi_fid);
+									float ydpi = env->GetFloatField(dm, ydpi_fid);
+									if (xdpi > 1.0f && ydpi > 1.0f) {
+										*out_w_m = (float)w / xdpi * 0.0254f;
+										*out_h_m = (float)h / ydpi * 0.0254f;
+									}
+								} else {
+									env->ExceptionClear();
+								}
+							}
+							ok = true;
+						}
+					} else {
+						env->ExceptionClear();
+					}
+					if (dm != nullptr) {
+						env->DeleteLocalRef(dm);
+					}
+				} else {
+					env->ExceptionClear();
+				}
+				env->DeleteLocalRef(disp);
+			}
+			env->DeleteLocalRef(wm);
+		} else {
+			env->ExceptionClear();
+		}
+	}
+	return ok;
+}
+
+extern "C" bool
+leia_cnsdk_get_android_panel_px(uint32_t *out_w, uint32_t *out_h, float *out_w_m, float *out_h_m)
+{
+	void *vm = g_host_get_android_vm != nullptr ? g_host_get_android_vm() : (void *)android_globals_get_vm();
+	void *ctx = g_host_get_android_activity != nullptr ? g_host_get_android_activity()
+	                                                   : android_globals_get_activity();
+	return android_panel_px((JavaVM *)vm, (jobject)ctx, out_w, out_h, out_w_m, out_h_m);
+}
+
 //! Log once per distinct disagreement. See true_device_orientation_android().
 static void
 check_orientation_tripwire(struct leia_cnsdk *cnsdk)

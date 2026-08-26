@@ -2419,6 +2419,16 @@ get_display_pixel_info_default(struct xrt_display_processor *xdp,
 		return true;
 	}
 
+	// CNSDK is not up yet (it initialises ~80 ms after xrt_instance_create_system,
+	// on this same thread, so we cannot wait for it here). Ask Android directly
+	// rather than assuming a Lume Pad: getRealMetrics() is window-independent and
+	// needs no SDK. Getting this wrong sizes the atlas for a panel that is not
+	// there and presents into a smaller surface -- a black screen with working
+	// audio. Measured on a 1080x2400 phone, 2026-08-26.
+	if (leia_cnsdk_get_android_panel_px(out_pixel_width, out_pixel_height, nullptr, nullptr)) {
+		return true;
+	}
+
 	*out_pixel_width = kDefaultDisplayPixelW;
 	*out_pixel_height = kDefaultDisplayPixelH;
 	return true;
