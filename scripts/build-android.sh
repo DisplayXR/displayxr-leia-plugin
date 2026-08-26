@@ -52,9 +52,10 @@
 #                            runtime APK first" precondition is gone.
 #   NINJA                 — ninja binary. Default: search the SDK's cmake/ dir,
 #                            then PATH. CI has /usr/bin/ninja and no SDK.
-#   CMAKE_BUILD_TYPE      — default RelWithDebInfo. The configure step used to
-#                            pass nothing, so a shipped .so had no optimisation
-#                            and no NDEBUG.
+#   CMAKE_BUILD_TYPE      — default Debug, PINNED, see #195. RelWithDebInfo
+#                            SIGSEGVs on device (vulkan.adreno.so, first
+#                            vkCreateRenderPass). Do NOT raise this default
+#                            until #195 is fixed.
 #   ANDROID_ABI           — default arm64-v8a.
 #   ANDROID_PLATFORM      — default android-29 (matches the runtime's minSdk).
 #   ANDROID_STL           — default c++_static. Pinned deliberately: a shared
@@ -216,10 +217,28 @@ if [ ! -f build-android/CMakeCache.txt ]; then
     # libc++_shared.so to DT_NEEDED, i.e. drops an extra .so into whichever APK
     # this plug-in is bundled into. --exclude-libs,ALL (see the drv_leia_android
     # CMakeLists) already keeps the static STL out of .dynsym.
+    #
+    # CMAKE_BUILD_TYPE IS PINNED TO Debug ON PURPOSE (#195). This script passed
+    # NO build type at all until 2026-08-26, so every Android plug-in ever built
+    # was effectively -O0 / no NDEBUG / no --gc-sections, and ALL on-device
+    # validation this plug-in has had was in that configuration. Setting it to
+    # RelWithDebInfo -- correct in principle, a shipped .so should not be -O0 --
+    # immediately exposed a latent defect: SIGSEGV in vulkan.adreno.so at the
+    # first vkCreateRenderPass (ensure_weave_rp_and_depth), on the first
+    # weave-ready frame, reproduced in-process AND out-of-process on LPD-20W.
+    #
+    # -Wl,--no-gc-sections does NOT help -- measured, so section GC is
+    # exonerated and the defect lives in the -O2/-DNDEBUG codegen half (UB, most
+    # likely upstream of the fault site given inlining).
+    #
+    # So Debug is the status quo ante and the only configuration verified
+    # weaving on hardware. DO NOT raise this default to fix the "ships
+    # unoptimised" wart until #195 is closed: an unoptimised weaver is a much
+    # cheaper problem than one that crashes every weave client at startup.
     cmake -S . -B build-android -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
         -DCMAKE_MAKE_PROGRAM="${NINJA}" \
-        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-RelWithDebInfo}" \
+        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
         -DANDROID_ABI="${ANDROID_ABI:-arm64-v8a}" \
         -DANDROID_PLATFORM="${ANDROID_PLATFORM:-android-29}" \
         -DANDROID_STL="${ANDROID_STL:-c++_static}" \
