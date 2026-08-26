@@ -48,50 +48,18 @@ struct leia_android_hmd
 };
 
 // #518: per-view (tile) 3D scale baseline for the Lume Pad 2 / nubia NP02J golden
-// config, in the device NATURAL (portrait) orientation: panel 1600x2560, tile
-// (VIEW_RESOLUTION_PX) 1200x1920 → view_scale 0.75x0.75. The rendering modes +
-// display_info are set at xrCreateInstance, BEFORE the async CNSDK device config is
-// available, so a fixed-device baseline is used; the worker reads the live
-// VIEW_RESOLUTION_PX and logs it so the baseline can be confirmed on-device. Panel +
-// tile are device-intrinsic, so the baseline matches the hardware.
-#define LEIA_BASELINE_PANEL_W_NAT 1600
-#define LEIA_BASELINE_PANEL_H_NAT 2560
-#define LEIA_BASELINE_TILE_W_NAT  1200
-#define LEIA_BASELINE_TILE_H_NAT  1920
-#define LEIA_NATURAL_IS_LANDSCAPE false // nubia/Lume Pad 2 natural orientation = portrait
-
-/*!
- * Per-view 3D view_scale = tile ÷ panel, expressed in the SAME orientation as the
- * reported display dims. tile/panel come from CNSDK in the device NATURAL orientation;
- * if the reported display orientation differs, the tile axes are swapped first. For the
- * (symmetric) nubia the result is 0.75x0.75 either way. Clamped to (0,1] (no supersample
- * for now). #518.
- */
-static void
-leia_compute_view_scale(uint32_t display_w,
-                        uint32_t display_h,
-                        uint32_t tile_w_nat,
-                        uint32_t tile_h_nat,
-                        bool natural_is_landscape,
-                        float *out_sx,
-                        float *out_sy)
-{
-	uint32_t tw = tile_w_nat, th = tile_h_nat;
-	bool display_landscape = display_w >= display_h;
-	if (display_landscape != natural_is_landscape) {
-		uint32_t tmp = tw;
-		tw = th;
-		th = tmp;
-	}
-	float sx = (display_w > 0 && tw > 0) ? (float)tw / (float)display_w : 1.0f;
-	float sy = (display_h > 0 && th > 0) ? (float)th / (float)display_h : 1.0f;
-	if (sx <= 0.0f || sx > 1.0f)
-		sx = 1.0f;
-	if (sy <= 0.0f || sy > 1.0f)
-		sy = 1.0f;
-	*out_sx = sx;
-	*out_sy = sy;
-}
+// config: panel 1600x2560, tile (VIEW_RESOLUTION_PX) 1200x1920 -> 0.75 on BOTH
+// axes. The rendering modes + display_info are set at xrCreateInstance, BEFORE the
+// async CNSDK device config is available, so a fixed baseline is needed; the worker
+// reads the live VIEW_RESOLUTION_PX and logs it so the baseline can be confirmed
+// on-device.
+//
+// The baseline is carried as a RATIO, not as the golden tile's pixel dims. The tile
+// is device-intrinsic, so tile pixels from one panel are meaningless on another: on
+// the 1080x2400 LPD-20W phone the old tile-pixel math produced 0.80x1.00 and sized
+// the atlas from a tile belonging to a different display. The ratio is orientation-
+// symmetric, so it also needs no natural-orientation correction.
+#define LEIA_BASELINE_TILE_RATIO 0.75f
 
 static void
 leia_android_hmd_destroy(struct xrt_device *xdev)
@@ -189,10 +157,7 @@ leia_android_hmd_create(void)
 	// across BOTH orientations (the app swapchain is never recreated on rotation).
 	// The 3D scale uses the device baseline (panel/tile are fixed per device); the
 	// worker logs the live VIEW_RESOLUTION_PX to confirm it.
-	float scale3d_x = 1.0f, scale3d_y = 1.0f;
-	leia_compute_view_scale(info.display.w_pixels, info.display.h_pixels,
-	                        LEIA_BASELINE_TILE_W_NAT, LEIA_BASELINE_TILE_H_NAT,
-	                        LEIA_NATURAL_IS_LANDSCAPE, &scale3d_x, &scale3d_y);
+	float scale3d_x = LEIA_BASELINE_TILE_RATIO, scale3d_y = LEIA_BASELINE_TILE_RATIO;
 
 	hmd->base.rendering_mode_count = 2;
 
@@ -309,13 +274,11 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 			out_info->display_height_m = di_swap ? di_nat_w_m : di_nat_h_m;
 		}
 	}
-	// #518: 3D per-view scale = tile ÷ panel (device baseline; ~0.75x0.75 for nubia),
-	// in the reported display orientation. Replaces the old hardcoded 1.0x1.0, which
+	// #518: 3D per-view scale = tile ÷ panel (device baseline, see
+	// LEIA_BASELINE_TILE_RATIO). Replaces the old hardcoded 1.0x1.0, which
 	// over-rendered each eye. target_instance.c prefers this iface-supplied value.
-	leia_compute_view_scale(out_info->display_pixel_width, out_info->display_pixel_height,
-	                        LEIA_BASELINE_TILE_W_NAT, LEIA_BASELINE_TILE_H_NAT,
-	                        LEIA_NATURAL_IS_LANDSCAPE, &out_info->recommended_view_scale_x,
-	                        &out_info->recommended_view_scale_y);
+	out_info->recommended_view_scale_x = LEIA_BASELINE_TILE_RATIO;
+	out_info->recommended_view_scale_y = LEIA_BASELINE_TILE_RATIO;
 	out_info->nominal_viewer_x_m = 0.0f;
 	out_info->nominal_viewer_y_m = 0.0f;
 	out_info->nominal_viewer_z_m = 0.50f;
