@@ -123,6 +123,9 @@ struct leia_dp_cnsdk
 		VkFramebuffer fb;   //!< Owned.
 	} weave_fb_cache[8];
 	uint32_t weave_fb_count;
+	// Last target-image generation we flushed the view-keyed caches for
+	// (runtime #602 notify_target_recreated). See notify_target_recreated_cnsdk.
+	uint32_t target_generation;
 
 	// --- Transparent-background alpha-gate (#568) ------------------------
 	// The CNSDK weave destroys per-pixel alpha (it interlaces into opaque
@@ -587,6 +590,50 @@ get_or_create_weave_fb(leia_dp_cnsdk *impl)
 }
 
 // Compositor hands us the color view for the next process_atlas target.
+// The compositor rebuilt its swapchain (Android surface republish on a
+// background→resume cycle, rotation, OUT_OF_DATE). Every entry in the two
+// view-keyed framebuffer caches now wraps a DESTROYED swapchain image -- and
+// the borrowed VkImageView handle that keys them is recycled by the driver for
+// the NEW images, so a lookup can HIT a stale framebuffer instead of missing.
+// Weaving into it lands on a dead image for that swapchain slot while the other
+// slots weave correctly: the panel alternates good/garbage frame by frame,
+// which reads as the left and right views mixing rapidly. It only ever
+// self-corrected when the 8-entry cache overflowed (the third recreate), which
+// is exactly the flicker/flicker/clean pattern reported from the field.
+//
+// The Windows and Linux arms already flush on this notification; this arm
+// never filled the slot, so the runtime's guarded dispatch silently skipped it.
+// The compositor drains the device before notifying and holds its lock, so
+// destroying the framebuffers synchronously here is safe (the views are
+// borrowed and stay untouched). Idempotent per generation.
+static void
+notify_target_recreated_cnsdk(struct xrt_display_processor_vk *xdp, uint32_t generation)
+{
+	leia_dp_cnsdk *impl = as_impl(&xdp->base);
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr || generation == impl->target_generation) {
+		return;
+	}
+	impl->target_generation = generation;
+	for (uint32_t i = 0; i < impl->weave_fb_count; i++) {
+		if (impl->weave_fb_cache[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, impl->weave_fb_cache[i].fb, nullptr);
+		}
+		impl->weave_fb_cache[i] = {};
+	}
+	impl->weave_fb_count = 0;
+	for (uint32_t i = 0; i < impl->ag_fb_count; i++) {
+		if (impl->ag_fb_cache[i].fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, impl->ag_fb_cache[i].fb, nullptr);
+		}
+		impl->ag_fb_cache[i] = {};
+	}
+	impl->ag_fb_count = 0;
+	impl->pending_target_view = VK_NULL_HANDLE;  // belongs to the old image set
+	U_LOG_W("Leia CNSDK DP: target images recreated (gen %u) — weave/alpha-gate fb caches flushed",
+	        generation);
+}
+
 void
 set_target_color_view_cnsdk(struct xrt_display_processor *xdp, VkImageView color_view)
 {
@@ -2482,6 +2529,10 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->dp_vk.base.set_eye_tracking_mode = set_eye_tracking_mode_cnsdk; // #522
 	impl->dp_vk.base.destroy = destroy_impl;
 	impl->dp_vk.set_transparent_background = set_transparent_background_cnsdk; // #568 (variant slot)
+	// runtime#602 recreate notification (variant slot, inside struct_size above).
+	// Without it the view-keyed fb caches survive a swapchain recreate and can
+	// hit a recycled handle -- see notify_target_recreated_cnsdk.
+	impl->dp_vk.notify_target_recreated = notify_target_recreated_cnsdk;
 	// runtime#1073 T0: base slot 16 — the compose-under background seam. Already
 	// inside struct_size (it is a BASE slot and we report
 	// sizeof(xrt_display_processor_vk)), so no ABI bump — ADR-020 clean.
