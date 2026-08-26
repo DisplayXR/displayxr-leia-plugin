@@ -318,6 +318,36 @@ leia_plugin_android_get_display_info(struct xrt_plugin_instance *inst,
 #define DXR_PLUGIN_GIT_DESC "unknown"
 #endif
 
+/*
+ * CI artifact-level ABI witness (.github/workflows/build-android.yml).
+ *
+ * XRT_PLUGIN_API_VERSION_CURRENT is an integer constant: it compiles to an
+ * immediate inside xrtPluginNegotiate and cannot be recovered from the .so.
+ * The runtime's scripts/check_plugin_abi.py is a text tool over CMakeLists +
+ * headers and cannot inspect a binary either. So bake the two compile-time
+ * facts that matter into .rodata as a literal, where `llvm-strings | grep -x`
+ * reads them back OUT OF THE SHIPPED BINARY.
+ *
+ * This exists because the failure mode here is silent-compile, not
+ * fail-compile: every Android-relevant runtime feature sits behind an #ifdef
+ * or a struct_size gate (the ADR-020 append-only contract working as
+ * designed), so an under-pinned runtime yields a GREEN BUILD and a plug-in
+ * missing capability — which shows up on device as a black screen. Twin of the
+ * "v2 (C99)" marker assertion build-windows.yml makes with dumpbin.
+ *
+ * static + hidden visibility, so it never enters .dynsym and the single-export
+ * assertion still passes. `used` keeps it past dead-strip.
+ */
+#define DXR_ABI_STR2(x) #x
+#define DXR_ABI_STR(x) DXR_ABI_STR2(x)
+__attribute__((used)) static const char dxr_plugin_abi_marker[] =
+    "DXR_PLUGIN_ABI=" DXR_ABI_STR(XRT_PLUGIN_API_VERSION_CURRENT)
+#ifdef XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT
+    ";CLASS_HOST_CTX=1";
+#else
+    ";CLASS_HOST_CTX=0";
+#endif
+
 static struct xrt_plugin_iface g_leia_android_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,

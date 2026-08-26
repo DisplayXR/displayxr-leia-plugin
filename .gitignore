@@ -31,3 +31,9 @@ simulatedreality-SDK-*/
 
 # Installer artifacts (built into _package/)
 DisplayXRLeiaSRSetup-*.exe
+
+# Android CI scratch: fetched CNSDK tree + packaged release artifacts.
+# CNSDK is NEVER committed or republished (Creator Toolkit licence s4b).
+_cnsdk/
+_cnsdk_zip/
+dist/
