@@ -67,7 +67,15 @@ env:
   # CNSDK release on the private LeiaInc/CNSDK repo. The asset name embeds a
   # build suffix (cnsdk-android-<ver>+<n>.<sha>.zip) so it is matched by glob,
   # never by literal name.
-  CNSDK_TAG: v0.10.61
+  # v0.10.62 is the FLOOR, not a preference (#1232 / runtime#1226 chain).
+  # 0.10.61 and earlier derive the device orientation from Display.getMetrics(),
+  # which is window-adjusted inside an app's own process — so a core hosted in a
+  # non-fullscreen window concludes the wrong orientation, and that value feeds
+  # leia_interlacer::GetTransforms' deviceRotationAngle. The viewport-to-panel
+  # mapping is then wrong and the DP's weave framebuffer is built with extents
+  # that disagree, faulting inside vkCreateFramebuffer. Fixed by CNSDK #716
+  # (getRealMetrics), first published in v0.10.62.
+  CNSDK_TAG: v0.10.62
 
 jobs:
   Android:

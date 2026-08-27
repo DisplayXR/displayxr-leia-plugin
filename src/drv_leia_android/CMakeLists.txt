@@ -58,15 +58,17 @@ list(APPEND CMAKE_PREFIX_PATH "${CNSDK_ROOT}")
 # 0.7.28 is rejected (7 < 10), 0.10.54+ accepted. Cheaper and more accurate
 # than parsing VERSION.txt, which is only the fallback below for zips that
 # ever ship without it.
-find_package(CNSDK 0.10.54 CONFIG REQUIRED)
+find_package(CNSDK 0.10.62 CONFIG REQUIRED)
 if(EXISTS "${CNSDK_ROOT}/VERSION.txt")
     file(READ "${CNSDK_ROOT}/VERSION.txt" _cnsdk_ver)
     string(STRIP "${_cnsdk_ver}" _cnsdk_ver)
-    if(_cnsdk_ver VERSION_LESS "0.10.54")
+    if(_cnsdk_ver VERSION_LESS "0.10.62")
         message(FATAL_ERROR
             "CNSDK ${_cnsdk_ver} at ${CNSDK_ROOT} is too old. The loader "
-            "architecture (CNSDK::leiaCore -> libleiaCore-loader.so) and the "
-            "in-service face-tracking runtime both need 0.10.54+.")
+            "architecture needs 0.10.54+, and the window-independent device-orientation "
+            "detection (CNSDK #716) needs 0.10.62+ — without it a core hosted in a "
+            "non-fullscreen window mis-detects orientation and the DP's weave "
+            "framebuffer faults inside vkCreateFramebuffer.")
     endif()
     message(STATUS "Leia CNSDK ${_cnsdk_ver} at ${CNSDK_ROOT}")
 else()
