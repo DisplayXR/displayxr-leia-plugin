@@ -43,17 +43,62 @@ endif()
 # Android .so is hand-dropped into the runtime's untracked jniLibs, so a
 # stale binary is otherwise invisible (it cost a debugging session when a
 # pre-#522 .so silently reported MANAGED-only eye tracking).
+# List uncommitted files so a FATAL below can say WHAT was dirty rather than
+# just that something was -- the v2.6.3 investigation had to infer it.
 execute_process(
-    COMMAND git describe --tags --always --dirty
+    COMMAND git status --porcelain
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    OUTPUT_VARIABLE DXR_PLUGIN_GIT_DESC
+    OUTPUT_VARIABLE DXR_PLUGIN_DIRTY_FILES
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
 )
-if(NOT DXR_PLUGIN_GIT_DESC)
-    set(DXR_PLUGIN_GIT_DESC "v${PROJECT_VERSION}")
+#
+# OVERRIDE (#203). A caller that KNOWS the identity may supply it via the
+# `DXR_PLUGIN_GIT_DESC` environment variable, and we take it verbatim.
+#
+# This exists because the release path cannot use `git describe` here: the
+# signing runner patches this file's `VERSION` line from the tag *before*
+# configuring, so by the time CMake runs the tree is legitimately modified and
+# `--dirty` fires on a build that IS the tag. That shipped as `v2.6.3-dirty` --
+# an identity that cannot be traced to a commit, which is the one job this
+# field has. The runner now captures the describe BEFORE patching and passes it
+# in here.
+if(DEFINED ENV{DXR_PLUGIN_GIT_DESC} AND NOT "$ENV{DXR_PLUGIN_GIT_DESC}" STREQUAL "")
+    set(DXR_PLUGIN_GIT_DESC "$ENV{DXR_PLUGIN_GIT_DESC}")
+    message(STATUS "Plug-in version (iface .version): ${DXR_PLUGIN_GIT_DESC} [from DXR_PLUGIN_GIT_DESC]")
+else()
+    execute_process(
+        COMMAND git describe --tags --always --dirty
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE DXR_PLUGIN_GIT_DESC
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT DXR_PLUGIN_GIT_DESC)
+        set(DXR_PLUGIN_GIT_DESC "v${PROJECT_VERSION}")
+    endif()
+    message(STATUS "Plug-in version (iface .version): ${DXR_PLUGIN_GIT_DESC}")
 endif()
-message(STATUS "Plug-in version (iface .version): ${DXR_PLUGIN_GIT_DESC}")
+
+# FAIL CLOSED on a release build (#203). A dirty identity is normal and useful
+# locally, so it is only a warning there -- but a released artifact whose
+# version says "does not correspond to any commit" is not shippable, and the
+# v2.6.3 one survived CI, a signing run, a bundle build and an install without
+# anyone reading the string. `DXR_RELEASE_BUILD=1` is set by the signing runner.
+if(DXR_PLUGIN_GIT_DESC MATCHES "-dirty$")
+    if(DEFINED ENV{DXR_RELEASE_BUILD} AND NOT "$ENV{DXR_RELEASE_BUILD}" STREQUAL "0")
+        message(FATAL_ERROR
+            "refusing to build a RELEASE from a dirty tree: plug-in identity would ship as "
+            "'${DXR_PLUGIN_GIT_DESC}', which cannot be traced to a commit (#203). Either build "
+            "from a clean checkout, or pass the true identity in DXR_PLUGIN_GIT_DESC. "
+            "Uncommitted changes:
+${DXR_PLUGIN_DIRTY_FILES}")
+    else()
+        message(WARNING
+            "plug-in identity is '${DXR_PLUGIN_GIT_DESC}' -- this build does not correspond to "
+            "any commit. Fine for local work; it must never reach a release (#203).")
+    endif()
+endif()
 
 # --- Runtime dependency -------------------------------------------------
 #
