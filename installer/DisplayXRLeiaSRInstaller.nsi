@@ -82,7 +82,7 @@ Name "DisplayXR Leia SR Plug-in ${VERSION}"
 	OutFile "$%TEMP%\DisplayXRLeiaSR_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXRLeiaSRSetup-${VERSION}.${BUILD_NUM}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXRLeiaSRSetup-${VERSION}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Plugins\LeiaSR"
