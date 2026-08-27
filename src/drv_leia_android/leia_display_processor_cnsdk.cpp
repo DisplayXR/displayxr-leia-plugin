@@ -2168,6 +2168,15 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 
 	leia_dp_cnsdk *impl = as_impl(xdp);
 
+	// #201: the tracking watchdog is cycling core pause/resume to recover a
+	// lost frame subscription. CNSDK state is mid-teardown; running the
+	// interlacer now throws (observed: terminate()/__emutls SIGSEGV on this
+	// thread). Skip the weave — same undefined-target semantics as the
+	// interlacer-readiness gate below, for at most a few frames.
+	if (impl->cnsdk != nullptr && leia_cnsdk_is_tracking_cycling(impl->cnsdk)) {
+		return;
+	}
+
 	if (tile_columns == 1 && tile_rows == 1) {
 		// Mono / 2D mode: no interlacing needed. Atlas IS the final
 		// image; blit it directly to the target so we still produce

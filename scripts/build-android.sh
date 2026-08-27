@@ -52,10 +52,11 @@
 #                            runtime APK first" precondition is gone.
 #   NINJA                 — ninja binary. Default: search the SDK's cmake/ dir,
 #                            then PATH. CI has /usr/bin/ninja and no SDK.
-#   CMAKE_BUILD_TYPE      — default Debug, PINNED, see #195. RelWithDebInfo
-#                            SIGSEGVs on device (vulkan.adreno.so, first
-#                            vkCreateRenderPass). Do NOT raise this default
-#                            until #195 is fixed.
+#   CMAKE_BUILD_TYPE      — default RelWithDebInfo, matching the runtime's
+#                            release config. #195's crash was runtime#1243's
+#                            NDEBUG/vk_bundle ABI skew (a Debug-vs-Release
+#                            pairing), NOT a codegen defect — the build type
+#                            must MATCH the runtime, never pin Debug.
 #   ANDROID_ABI           — default arm64-v8a.
 #   ANDROID_PLATFORM      — default android-29 (matches the runtime's minSdk).
 #   ANDROID_STL           — default c++_static. Pinned deliberately: a shared
@@ -218,27 +219,20 @@ if [ ! -f build-android/CMakeCache.txt ]; then
     # this plug-in is bundled into. --exclude-libs,ALL (see the drv_leia_android
     # CMakeLists) already keeps the static STL out of .dynsym.
     #
-    # CMAKE_BUILD_TYPE IS PINNED TO Debug ON PURPOSE (#195). This script passed
-    # NO build type at all until 2026-08-26, so every Android plug-in ever built
-    # was effectively -O0 / no NDEBUG / no --gc-sections, and ALL on-device
-    # validation this plug-in has had was in that configuration. Setting it to
-    # RelWithDebInfo -- correct in principle, a shipped .so should not be -O0 --
-    # immediately exposed a latent defect: SIGSEGV in vulkan.adreno.so at the
-    # first vkCreateRenderPass (ensure_weave_rp_and_depth), on the first
-    # weave-ready frame, reproduced in-process AND out-of-process on LPD-20W.
-    #
-    # -Wl,--no-gc-sections does NOT help -- measured, so section GC is
-    # exonerated and the defect lives in the -O2/-DNDEBUG codegen half (UB, most
-    # likely upstream of the fault site given inlining).
-    #
-    # So Debug is the status quo ante and the only configuration verified
-    # weaving on hardware. DO NOT raise this default to fix the "ships
-    # unoptimised" wart until #195 is closed: an unoptimised weaver is a much
-    # cheaper problem than one that crashes every weave client at startup.
+    # CMAKE_BUILD_TYPE defaults to RelWithDebInfo to MATCH the runtime's
+    # release config. History: #195 pinned Debug believing RelWithDebInfo had a
+    # codegen defect (SIGSEGV at the first vkCreateRenderPass). runtime#1243
+    # proved the real cause: os_mutex's #ifndef NDEBUG fields skew vk_bundle's
+    # function table two slots between Debug and Release compiles — the crash
+    # was the CONFIG PAIRING, not the optimizer. A RelWithDebInfo plug-in on a
+    # Release runtime weaves correctly (hardware-verified 2026-08-27), and the
+    # runtime loader now refuses mismatched pairings outright (#1244). The rule:
+    # the plug-in's build type must match the runtime's; never pin Debug for a
+    # shipping artifact.
     cmake -S . -B build-android -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
         -DCMAKE_MAKE_PROGRAM="${NINJA}" \
-        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
+        -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-RelWithDebInfo}" \
         -DANDROID_ABI="${ANDROID_ABI:-arm64-v8a}" \
         -DANDROID_PLATFORM="${ANDROID_PLATFORM:-android-29}" \
         -DANDROID_STL="${ANDROID_STL:-c++_static}" \

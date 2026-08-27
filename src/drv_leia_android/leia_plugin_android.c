@@ -23,6 +23,7 @@
  */
 
 #include "xrt/xrt_plugin.h"
+#include "vk/vk_helpers.h" // sizeof(struct vk_bundle) fingerprint (#1243)
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_device.h"
 
@@ -369,6 +370,9 @@ static struct xrt_plugin_iface g_leia_android_iface = {
     .create_device = leia_plugin_android_create_device,
 
     .create_dp_vk = leia_dp_factory_cnsdk,
+    /* #1243/#1244: vk_bundle ABI fingerprint — loader refuses mismatched pairings. */
+    .vk_bundle_abi_size = (uint32_t)sizeof(struct vk_bundle),
+    .vk_bundle_fn_table_offset = (uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr),
     .create_dp_d3d11 = NULL,
     .create_dp_d3d12 = NULL,
     .create_dp_gl = NULL,

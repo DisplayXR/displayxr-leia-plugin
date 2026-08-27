@@ -144,6 +144,14 @@ struct leia_cnsdk
 	// read on the render thread — atomics give cross-thread visibility. The
 	// listener is OWNED by leia_core once set, so we never release it ourselves.
 	struct leia_headtracking_frame_listener *frame_listener{nullptr};
+	// #201 watchdog state: tracking_cycling gates the weave while the
+	// watchdog cycles core pause/resume (CNSDK throws if the weave runs
+	// mid-teardown — observed as terminate()/emutls SIGSEGV on the repaint
+	// thread); lifecycle_paused stops the watchdog once the app itself
+	// pauses (its own resume will redo the handshake anyway).
+	std::atomic<bool> tracking_cycling{false};
+	std::atomic<bool> lifecycle_paused{false};
+
 	std::atomic<bool> listener_face_valid{false};
 	std::atomic<int> listener_miss_count{0};
 	// Monotonic timestamp of the LAST frame-listener invocation — stamped on
@@ -640,6 +648,80 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// reconciles NoFaceMode accordingly (replacing the bootstrap force-3D). If no
 	// explicit request arrived, the default MANAGED now engages vendor auto-2D.
 	apply_eye_tracking_mode(cnsdk);
+
+	// Phase 3 (#201): tracking watchdog. The CNSDK HTS client DROPS messages
+	// sent before its binder connection to the head-tracking service is up
+	// ("[HTS-Client] Failed to send message ...: not connected") and never
+	// replays them on connect. When the dropped message is the frame-
+	// subscription handshake, this session runs face-less for its entire
+	// life — the engine tracks, other clients get frames, this one gets
+	// none → viewer (0,0,0) → zero-IPD Kooima → woven MONO ("stuck in 2D").
+	// 100%-reproducible on swipe-close→relaunch (the fresh process's
+	// handshake always races its own connect). Detection is trivial thanks
+	// to the liveness clock (#152 L-c): listener_frame_ns is stamped on
+	// EVERY delivered frame, so "still 0 well after start" == subscribed
+	// nothing. Remedy: bounce start_face_tracking — by then the connection
+	// is up, so the re-sent handshake lands. Bounded attempts; exits the
+	// moment a frame arrives or shutdown is requested.
+	// Wait ~2 s for the first frame; if none, cycle; after each cycle allow
+	// ~5 s for the replayed handshake + service round-trip (measured: frames
+	// can arrive several seconds after the cycle).
+	auto wait_for_frames = [&](int ticks_50ms) -> bool {
+		for (int i = 0; i < ticks_50ms; i++) {
+			if (cnsdk->shutting_down.load(std::memory_order_acquire) ||
+			    cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
+				return true; // stop the watchdog either way
+			}
+			if (cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0) {
+				return true;
+			}
+			std::this_thread::sleep_for(50ms);
+		}
+		return cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0;
+	};
+	if (wait_for_frames(40)) { // ~2 s: the healthy path
+		return;
+	}
+	for (int attempt = 1; attempt <= 3; attempt++) {
+		if (cnsdk->shutting_down.load(std::memory_order_acquire) ||
+		    cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
+			return; // app paused/quitting; its own resume redoes the handshake
+		}
+		// start_face_tracking(false/true) does NOT replay the dropped
+		// subscription handshake (measured — 3 bounces, still 0 frames).
+		// The core on_pause/on_resume cycle is the path the user-visible
+		// minimize/refocus workaround takes, and it reliably restores the
+		// frame stream. Call the CNSDK core functions directly (NOT the
+		// plug-in's leia_cnsdk_on_pause wrapper) so the lens-preference
+		// refcount is untouched — no visible 2D blink. Activity-lifecycle
+		// API is only safe with a real Activity (in-process); never in a
+		// service context. tracking_cycling gates process_atlas_weave for
+		// the duration: CNSDK throws if the weave runs mid-teardown
+		// (observed: terminate()/__emutls SIGSEGV on the repaint thread).
+		if (!cnsdk->host_is_activity) {
+			U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames and no Activity "
+			        "(service context) — cannot cycle, session stays untracked");
+			return;
+		}
+		U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames after start — frame "
+		        "subscription likely lost pre-connect (leia-plugin#201); cycling "
+		        "core pause/resume to replay the handshake (attempt %d/3)", attempt);
+		cnsdk->tracking_cycling.store(true, std::memory_order_release);
+		std::this_thread::sleep_for(100ms); // let an in-flight weave drain
+		leia_core_on_pause(cnsdk->core);
+		std::this_thread::sleep_for(150ms);
+		leia_core_on_resume(cnsdk->core);
+		cnsdk->tracking_cycling.store(false, std::memory_order_release);
+		if (wait_for_frames(100)) { // ~5 s post-cycle
+			if (cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0) {
+				U_LOG_W("HW_DBG_CNSDK: tracking watchdog: frames flowing after "
+				        "cycle %d — recovered", attempt);
+			}
+			return;
+		}
+	}
+	U_LOG_W("HW_DBG_CNSDK: tracking watchdog: still no frames after 3 cycles — "
+	        "giving up (session weaves untracked/mono until next app resume)");
 }
 
 } // namespace
@@ -936,6 +1018,9 @@ leia_cnsdk_is_initialized(struct leia_cnsdk *cnsdk)
 extern "C" void
 leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 {
+	if (cnsdk != NULL) {
+		cnsdk->lifecycle_paused.store(true, std::memory_order_relaxed);
+	}
 	if (cnsdk == NULL || cnsdk->core == NULL) {
 		return;
 	}
@@ -981,6 +1066,9 @@ leia_cnsdk_on_pause(struct leia_cnsdk *cnsdk)
 extern "C" void
 leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
 {
+	if (cnsdk != NULL) {
+		cnsdk->lifecycle_paused.store(false, std::memory_order_relaxed);
+	}
 	if (cnsdk == NULL || cnsdk->core == NULL) {
 		return;
 	}
@@ -1001,6 +1089,12 @@ leia_cnsdk_on_resume(struct leia_cnsdk *cnsdk)
 	}
 	DXR_HW_DBG("on_resume: forwarding to leia_core_on_resume");
 	leia_core_on_resume(cnsdk->core);
+}
+
+extern "C" bool
+leia_cnsdk_is_tracking_cycling(struct leia_cnsdk *cnsdk)
+{
+	return cnsdk != NULL && cnsdk->tracking_cycling.load(std::memory_order_acquire);
 }
 
 extern "C" void

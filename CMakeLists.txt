@@ -119,7 +119,7 @@ endif()
 # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.8.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.14.6" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin: the Windows/Android tag predates runtime
 # Linux support entirely (scripts/build_linux.sh first shipped in
@@ -146,7 +146,7 @@ set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
 # The _ANDROID suffix is invisible to the runtime's scripts/check_plugin_abi.py
 # regex (DXR_RUNTIME_GIT_TAG\s+") because \s+ cannot match an underscore --
 # the same reason _LINUX above is already safe.
-set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.8.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.14.6" CACHE STRING
     "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
 
 if(DXR_RUNTIME_SOURCE_DIR)
