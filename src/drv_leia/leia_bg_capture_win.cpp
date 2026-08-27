@@ -11,6 +11,8 @@
 #include "util/u_logging.h"
 
 #include <atomic>
+#include <vector>
+#include <wchar.h>
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -502,38 +504,117 @@ leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 	// the adapter that OWNS the captured monitor's output and WARN loudly on
 	// a mismatch. Detection only; the session must be placed on the scanout
 	// adapter (DXR_VK_FORCE_GPU / DXR_D3D_FORCE_GPU).
+	//
+	// Resolution order matters, and getting it wrong inverts the verdict.
+	// The DXGI output walk alone is NOT authoritative on a hybrid box: a
+	// render-only discrete adapter also enumerates the panel's output, so the
+	// walk can name the dGPU as the scanout owner when the iGPU actually
+	// drives the panel. Under the #918 weave-on-scanout split the capture
+	// device is deliberately placed ON the scanout adapter — so the weak walk
+	// reported a CROSS-ADAPTER mismatch precisely when placement was CORRECT,
+	// and told the user to move the session to where it already was.
+	//
+	// Ask the OS display-config database first, exactly as the runtime's own
+	// getScanoutAdapter() does (aux/d3d/d3d_scanout_helpers.cpp):
+	// DISPLAYCONFIG_PATH_SOURCE_INFO::adapterId is the same LUID space as
+	// DXGI_ADAPTER_DESC::AdapterLuid. Keep the output walk as the fallback for
+	// when no active display path matches.
 	{
-		ComPtr<IDXGIFactory1> fac;
-		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
-			bool found = false;
-			for (UINT a = 0; !found; ++a) {
-				ComPtr<IDXGIAdapter1> ad;
-				if (fac->EnumAdapters1(a, ad.GetAddressOf()) != S_OK) break;
-				for (UINT o = 0;; ++o) {
-					ComPtr<IDXGIOutput> out;
-					if (ad->EnumOutputs(o, out.GetAddressOf()) != S_OK) break;
-					DXGI_OUTPUT_DESC od = {};
-					if (SUCCEEDED(out->GetDesc(&od)) && od.Monitor == monitor) {
-						DXGI_ADAPTER_DESC1 adsc = {};
-						ad->GetDesc1(&adsc);
-						const uint64_t scanout_luid =
-						    ((uint64_t)(uint32_t)adsc.AdapterLuid.HighPart << 32) |
-						    (uint32_t)adsc.AdapterLuid.LowPart;
-						if (scanout_luid != c->adapter_luid) {
-							U_LOG_W(
-							    "leia_bg_capture: CROSS-ADAPTER CAPTURE — session/capture "
-							    "adapter 0x%016llx but the monitor is scanned out by "
-							    "0x%016llx (%ls). WGC will deliver black/no frames; "
-							    "transparent content will break. Place the session on the "
-							    "scanout adapter (DXR_VK_FORCE_GPU / DXR_D3D_FORCE_GPU).",
-							    (unsigned long long)c->adapter_luid,
-							    (unsigned long long)scanout_luid, adsc.Description);
+		uint64_t scanout_luid = 0;
+		const wchar_t *scanout_name = nullptr;
+		DXGI_ADAPTER_DESC1 scanout_desc = {};
+		bool resolved = false;
+
+		// Primary: the display-config database, keyed by GDI device name.
+		MONITORINFOEXW mi_sc = {};
+		mi_sc.cbSize = sizeof(mi_sc);
+		LUID path_luid = {};
+		bool have_path_luid = false;
+		if (GetMonitorInfoW(monitor, &mi_sc)) {
+			UINT32 path_count = 0, mode_count = 0;
+			if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) ==
+			    ERROR_SUCCESS) {
+				std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+				std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+				if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count,
+				                       modes.data(), nullptr) == ERROR_SUCCESS) {
+					paths.resize(path_count);
+					for (const DISPLAYCONFIG_PATH_INFO &p : paths) {
+						DISPLAYCONFIG_SOURCE_DEVICE_NAME sdn = {};
+						sdn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+						sdn.header.size = sizeof(sdn);
+						sdn.header.adapterId = p.sourceInfo.adapterId;
+						sdn.header.id = p.sourceInfo.id;
+						if (DisplayConfigGetDeviceInfo(&sdn.header) != ERROR_SUCCESS) {
+							continue;
 						}
-						found = true;
-						break;
+						if (wcscmp(sdn.viewGdiDeviceName, mi_sc.szDevice) == 0) {
+							path_luid = p.sourceInfo.adapterId;
+							have_path_luid = true;
+							break;
+						}
 					}
 				}
 			}
+		}
+
+		ComPtr<IDXGIFactory1> fac;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
+			if (have_path_luid) {
+				for (UINT a = 0; !resolved; ++a) {
+					ComPtr<IDXGIAdapter1> ad;
+					if (fac->EnumAdapters1(a, ad.GetAddressOf()) != S_OK) break;
+					DXGI_ADAPTER_DESC1 adsc = {};
+					if (FAILED(ad->GetDesc1(&adsc))) continue;
+					if (adsc.AdapterLuid.HighPart == path_luid.HighPart &&
+					    adsc.AdapterLuid.LowPart == path_luid.LowPart) {
+						scanout_desc = adsc;
+						scanout_luid = ((uint64_t)(uint32_t)adsc.AdapterLuid.HighPart << 32) |
+						               (uint32_t)adsc.AdapterLuid.LowPart;
+						scanout_name = scanout_desc.Description;
+						resolved = true;
+					}
+				}
+			}
+
+			// Fallback: the output walk. Weaker (see above), but it is the
+			// only answer available when no active display path matches.
+			if (!resolved) {
+				for (UINT a = 0; !resolved; ++a) {
+					ComPtr<IDXGIAdapter1> ad;
+					if (fac->EnumAdapters1(a, ad.GetAddressOf()) != S_OK) break;
+					for (UINT o = 0;; ++o) {
+						ComPtr<IDXGIOutput> out;
+						if (ad->EnumOutputs(o, out.GetAddressOf()) != S_OK) break;
+						DXGI_OUTPUT_DESC od = {};
+						if (SUCCEEDED(out->GetDesc(&od)) && od.Monitor == monitor) {
+							DXGI_ADAPTER_DESC1 adsc = {};
+							ad->GetDesc1(&adsc);
+							scanout_desc = adsc;
+							scanout_luid =
+							    ((uint64_t)(uint32_t)adsc.AdapterLuid.HighPart << 32) |
+							    (uint32_t)adsc.AdapterLuid.LowPart;
+							scanout_name = scanout_desc.Description;
+							resolved = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		if (resolved && scanout_luid != c->adapter_luid) {
+			U_LOG_W("leia_bg_capture: CROSS-ADAPTER CAPTURE — session/capture "
+			        "adapter 0x%016llx but the monitor is scanned out by "
+			        "0x%016llx (%ls). WGC will deliver black/no frames; "
+			        "transparent content will break. Place the session on the "
+			        "scanout adapter (DXR_VK_FORCE_GPU / DXR_D3D_FORCE_GPU).",
+			        (unsigned long long)c->adapter_luid, (unsigned long long)scanout_luid,
+			        scanout_name ? scanout_name : L"<unknown>");
+		} else if (resolved) {
+			U_LOG_I("leia_bg_capture: capture adapter matches the panel's scanout adapter "
+			        "0x%016llx (%ls).",
+			        (unsigned long long)scanout_luid, scanout_name ? scanout_name : L"<unknown>");
 		}
 	}
 	return c;
