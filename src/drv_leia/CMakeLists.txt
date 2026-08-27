@@ -250,7 +250,11 @@ if(WIN32)
     # pulled in by the Vulkan weaver-ABI probe, but only when
     # LEIA_SR_VULKAN_AVAILABLE -- the liveness probe is unconditional, so the
     # link must be too (a Vulkan-less configure would otherwise fail to link).
-    target_link_libraries(DisplayXR-LeiaSR PRIVATE advapi32 version)
+    # user32 for the bg-capture scanout resolve (GetMonitorInfoW plus the
+    # display-config trio GetDisplayConfigBufferSizes / QueryDisplayConfig /
+    # DisplayConfigGetDeviceInfo). It already resolved transitively, but the
+    # dependency is real and is now load-bearing — name it.
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE advapi32 version user32)
 endif()
 
 if(LEIA_SR_V2_AVAILABLE)
