@@ -190,7 +190,7 @@ jobs:
           # defect is in the -O2/-DNDEBUG codegen. Debug is the configuration
           # every prior on-device validation used. Raising this ships a runtime
           # that crashes every weave client at startup.
-          CMAKE_BUILD_TYPE: Debug
+          CMAKE_BUILD_TYPE: RelWithDebInfo
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/build-android.sh

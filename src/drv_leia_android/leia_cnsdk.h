@@ -341,6 +341,14 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
  * @param display_id  Android `Display.getDisplayId()`; -1 = unknown. Recorded
  *                    only — CNSDK has no multi-display concept yet (L6).
  */
+/*!
+ * True while the #201 tracking watchdog is cycling core pause/resume to
+ * recover a lost frame subscription. The VK DP skips the weave for these few
+ * frames — CNSDK throws if the interlacer runs mid-teardown.
+ */
+bool
+leia_cnsdk_is_tracking_cycling(struct leia_cnsdk *cnsdk);
+
 void
 leia_cnsdk_set_window_screen_rect(
     struct leia_cnsdk *cnsdk, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id);
