@@ -1951,19 +1951,33 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		// did. Landscape (rotated-from-natural) windows go through CNSDK's
 		// rotation compensation and weave correctly with the top-anchored y —
 		// verified on device — so only portrait is corrected.
+		// browser#173: the conversion is NOT portrait-specific. CNSDK derives
+		// origin_gl_y = panel_h - vp_h - y in whatever orientation is current, so
+		// ANY window shorter than the panel's height IN THE CURRENT ORIENTATION
+		// needs the inverse pre-applied — landscape included. The old
+		// `if (h > w)` guard only ran in portrait, and its "landscape verified on
+		// device" note was misleading: every landscape case tested was FULLSCREEN,
+		// where the offset is identically zero, so the guard was never exercised.
+		// On a landscape tablet with a 60px status bar (NP02J: 2560x1540 surface
+		// on a 2560x1600 panel) the phase landed 60 rows off — soft, crosstalky
+		// 3D that looked "almost right". Use the panel dimension along the
+		// window's height axis: portrait -> long side, landscape -> short side.
 		int32_t sp_y = win_y;
-		if (h > w) {
+		{
 			uint32_t pw = 0, ph = 0;
 			if (leia_cnsdk_get_display_metrics(cnsdk, NULL, NULL, &pw, &ph) && pw != 0 && ph != 0) {
 				const uint32_t panel_long = pw > ph ? pw : ph;
-				if (h < panel_long) {
-					sp_y = (int32_t)panel_long - (int32_t)h - win_y;
-					static bool sp_logged = false;
-					if (!sp_logged) {
-						sp_logged = true;
-						U_LOG_W("HW_DBG_CNSDK: #165 portrait window y %d -> bottom-origin %d "
-						        "(panel_h %u, vp_h %u)",
-						        win_y, sp_y, panel_long, h);
+				const uint32_t panel_short = pw > ph ? ph : pw;
+				const uint32_t panel_h_now = (h > w) ? panel_long : panel_short;
+				if (h < panel_h_now) {
+					sp_y = (int32_t)panel_h_now - (int32_t)h - win_y;
+					static int32_t sp_last = INT32_MIN;
+					if (sp_y != sp_last) {
+						sp_last = sp_y;
+						U_LOG_W("HW_DBG_CNSDK: #165/#173 %s window y %d -> bottom-origin %d "
+						        "(panel_h_now %u, vp_h %u)",
+						        (h > w) ? "portrait" : "landscape", win_y, sp_y,
+						        panel_h_now, h);
 					}
 				}
 			}
