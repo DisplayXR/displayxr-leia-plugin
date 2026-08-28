@@ -128,13 +128,17 @@ struct leiasr
 	// 2026-05-08, "Simplify Vulkan weaver"). Do not remove this block on that
 	// premise.
 	//
-	// WHAT IS STILL MISSING: real late latching in VK. At v1.37.1
-	// enableLateLatching() is `/*Not implemented*/` and isLateLatchingEnabled()
-	// returns false. Work exists on the LeiaSR branch
-	// `ST-5520-Add-Late-Latching-in-Vulkan` (~190 commits ahead of v1.37.1, last
-	// touched 2026-07-22) but has not shipped in a release. WHEN that lands,
-	// revisit this block: late latching samples the pose at submit time and
-	// makes most of this horizon estimate unnecessary.
+	// LATE LATCHING STATUS (verified against the pinned SDK's exact source,
+	// 2026-08-28): VK late latching IS implemented in the tree our v2 pin
+	// (LeiaSR-SDK-1.37.0+1502.1b85d46d17) was built from — vkweaver's weave()
+	// back-patches in-flight frames' geometry, and it defaults ON
+	// (WeaverBaseImpl: lateLatchingEnabled = !GetLateLatchingForceOff()),
+	// contradicting sr_weaver.h's "disabled by default" doc. It requires
+	// weaveSubmitted() after every weave — which this plug-in wires and the
+	// runtime calls — but its benefit is currently dormant because the
+	// runtime fence-waits synchronously (<=1 frame ever in flight; runtime
+	// #837 deferred present is what would arm it). The horizon estimate
+	// below therefore still carries the whole prediction today.
 	//
 	// Motion-to-photon is structurally ADDITIVE, not a single multiplier:
 	//     horizon = N_buffered * frame_interval  +  T_display
@@ -159,6 +163,16 @@ struct leiasr
 	// REPLACES the heuristic: exact per-path, per-panel-Hz horizon.
 	uint64_t measured_r_us = 0;
 	uint64_t measured_seen_ns = 0;
+
+	// #206: per-weave FORWARD horizon from the runtime's vsync-locked vblank
+	// grid (xrt_display_processor_vk set_predicted_scanout). When fresh it
+	// outranks BOTH paths below and is fed RAW — no EMA (a smoothed estimate
+	// of a non-constant quantity is the failure mode it replaces) and no
+	// deadband (setLatency is a plain store in the SDK; a deadband would
+	// quantise the very signal).
+	uint64_t forward_horizon_us = 0;
+	uint64_t forward_seen_ns = 0;
+	bool     forward_logged = false;
 	double   measured_ema_us = 0.0;
 
 	// --- #158 SR platform restart detection -------------------------------
@@ -791,6 +805,18 @@ leiasr_set_frame_timing(struct leiasr *leiasr,
 }
 
 void
+leiasr_set_predicted_scanout(struct leiasr *leiasr, uint64_t predicted_weave_to_scanout_ns)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+	leiasr->forward_horizon_us = predicted_weave_to_scanout_ns / 1000;
+	if (predicted_weave_to_scanout_ns > 0) {
+		leiasr->forward_seen_ns = os_monotonic_get_ns();
+	}
+}
+
+void
 leiasr_weave(struct leiasr *leiasr,
              VkCommandBuffer commandBuffer,
              VkImageView leftImageView,
@@ -874,6 +900,36 @@ leiasr_weave(struct leiasr *leiasr,
 			}
 		}
 		leiasr->prev_weave_ns = now_ns;
+
+		// #206: the runtime's per-weave FORWARD horizon outranks everything
+		// below. It is exact for THIS weave (next-vblank arithmetic on the
+		// vsync-locked grid), so it is fed RAW: no EMA and no deadband —
+		// under variable cadence those turned an exact quantity into ±ms of
+		// per-weave error, which the SR predictor extrapolates undamped
+		// (leia#206). Freshness gate 100 ms: the runtime recomputes it per
+		// weave, so anything older means the feed stopped (grid lost) and
+		// the retrospective paths below take back over.
+		const bool forward_fresh = leiasr->forward_horizon_us > 0 &&
+		                           (now_ns - leiasr->forward_seen_ns) < 100ULL * 1000 * 1000;
+		if (forward_fresh) {
+			uint64_t latency_us = leiasr->forward_horizon_us;
+			if (latency_us < leiasr->latency_min_us) {
+				latency_us = leiasr->latency_min_us;
+			}
+			if (latency_us > leiasr->latency_max_us) {
+				latency_us = leiasr->latency_max_us;
+			}
+			leiasr->weaver_ops->set_latency(leiasr->weaver, latency_us);
+			leiasr->last_set_latency_us = latency_us;
+			if (!leiasr->forward_logged) {
+				leiasr->forward_logged = true;
+				U_LOG_W("Leia VK weave latency: #206 FORWARD per-weave horizon engaged "
+				        "(%llu us this weave; raw, no smoothing, no deadband)",
+				        (unsigned long long)latency_us);
+			}
+			leiasr->weaver_ops->weave(leiasr->weaver);
+			return;
+		}
 
 		// Prefer the runtime's MEASURED weave→scanout residual (timing
 		// feedback loop) when fresh; the additive heuristic

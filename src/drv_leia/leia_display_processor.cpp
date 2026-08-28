@@ -1913,6 +1913,16 @@ leia_dp_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
+static void
+leia_dp_vk_set_predicted_scanout(struct xrt_display_processor_vk *xdp,
+                                 uint64_t predicted_weave_to_scanout_ns)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	leiasr_set_predicted_scanout(ldp->leiasr, predicted_weave_to_scanout_ns);
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_BACKEND_STATE
 /*!
  * #158: report the SR backend's health to the runtime.
@@ -2134,6 +2144,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
 #endif
+#ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
+	ldp->base.set_predicted_scanout = leia_dp_vk_set_predicted_scanout; // #206 per-weave forward horizon (appended VK-variant slot)
+#endif
 #ifdef XRT_DP_VK_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
 #endif
@@ -2249,6 +2262,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 #endif
 #ifdef XRT_DP_VK_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_vk_set_frame_timing; // weave-latency timing loop (appended VK-variant slot)
+#endif
+#ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
+	ldp->base.set_predicted_scanout = leia_dp_vk_set_predicted_scanout; // #206 per-weave forward horizon (appended VK-variant slot)
 #endif
 #ifdef XRT_DP_VK_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
