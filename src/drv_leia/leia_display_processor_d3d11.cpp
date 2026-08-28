@@ -2032,6 +2032,15 @@ leia_dp_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 *xdp,
 }
 #endif
 
+#ifdef XRT_DP_D3D11_HAS_PREDICTED_SCANOUT
+static void
+leia_dp_d3d11_set_predicted_scanout(struct xrt_display_processor_d3d11 *xdp,
+                                    uint64_t predicted_weave_to_scanout_ns)
+{
+	leiasr_d3d11_set_predicted_scanout(leia_dp_d3d11(xdp)->leiasr, predicted_weave_to_scanout_ns);
+}
+#endif
+
 #ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
 /*
  * runtime#1008 (slot 20) — re-bind this DP to another window without
@@ -2208,6 +2217,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	U_LOG_W("Leia D3D11 DP: set_frame_timing slot WIRED (struct_size=%u)", ldp->base.struct_size);
 #else
 	U_LOG_W("Leia D3D11 DP: set_frame_timing NOT COMPILED (old runtime headers)");
+#endif
+#ifdef XRT_DP_D3D11_HAS_PREDICTED_SCANOUT
+	ldp->base.set_predicted_scanout = leia_dp_d3d11_set_predicted_scanout; // #206 per-weave forward horizon (slot 23)
 #endif
 #ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
 	ldp->base.set_window = leia_dp_d3d11_set_window; // runtime#1008 focus re-bind (slot 20)

@@ -2463,6 +2463,15 @@ leia_dp_d3d12_set_frame_timing(struct xrt_display_processor_d3d12 *xdp,
 }
 #endif
 
+#ifdef XRT_DP_D3D12_HAS_PREDICTED_SCANOUT
+static void
+leia_dp_d3d12_set_predicted_scanout(struct xrt_display_processor_d3d12 *xdp,
+                                    uint64_t predicted_weave_to_scanout_ns)
+{
+	leiasr_d3d12_set_predicted_scanout(leia_dp_d3d12(xdp)->leiasr, predicted_weave_to_scanout_ns);
+}
+#endif
+
 static void
 leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
@@ -2636,6 +2645,9 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.set_shared_texture_present = leia_dp_d3d12_set_shared_texture_present; // #68
 #ifdef XRT_DP_D3D12_HAS_FRAME_TIMING
 	ldp->base.set_frame_timing = leia_dp_d3d12_set_frame_timing; // weave-latency timing loop (slot 19)
+#endif
+#ifdef XRT_DP_D3D12_HAS_PREDICTED_SCANOUT
+	ldp->base.set_predicted_scanout = leia_dp_d3d12_set_predicted_scanout; // #206 per-weave forward horizon (slot 22)
 #endif
 #ifdef XRT_DP_D3D12_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_d3d12_get_backend_state; // #158 SR restart detection

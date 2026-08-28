@@ -146,6 +146,13 @@ struct leiasr_d3d11
 	uint64_t measured_seen_ns = 0;
 	double   measured_ema_us = 0.0;
 
+	// #206: per-weave FORWARD horizon from the runtime's vsync-locked vblank
+	// grid (set_predicted_scanout). When fresh it outranks both paths below
+	// and is fed RAW — no EMA, no deadband (see the VK arm's note).
+	uint64_t forward_horizon_us = 0;
+	uint64_t forward_seen_ns = 0;
+	bool     forward_logged = false;
+
 	// --- #144 async weaver creation/destruction --------------------------
 	// SR context + weaver creation blocks for seconds (SR-service retry
 	// loops, correction-texture PNG loads from disk, senses start) and the
@@ -1324,6 +1331,22 @@ leiasr_d3d11_set_frame_timing(struct leiasr_d3d11 *leiasr,
 }
 
 void
+leiasr_d3d11_set_predicted_scanout(struct leiasr_d3d11 *leiasr, uint64_t predicted_weave_to_scanout_ns)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+	// #144: same async-creation guard as set_frame_timing.
+	if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+		return;
+	}
+	leiasr->forward_horizon_us = predicted_weave_to_scanout_ns / 1000;
+	if (predicted_weave_to_scanout_ns > 0) {
+		leiasr->forward_seen_ns = os_monotonic_get_ns();
+	}
+}
+
+void
 leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 {
 	if (leiasr == nullptr || !w_ready(leiasr)) {
@@ -1352,11 +1375,34 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 		}
 		leiasr->prev_weave_ns = now_ns;
 
+		// #206: the runtime's per-weave FORWARD horizon outranks everything
+		// below — exact for THIS weave, fed RAW (no EMA, no deadband; a
+		// smoothed estimate of a non-constant quantity is the failure mode
+		// this replaces). Freshness 100 ms: the runtime recomputes per
+		// weave, so older means the feed stopped (grid lost).
+		const bool forward_fresh = leiasr->forward_horizon_us > 0 &&
+		                           (now_ns - leiasr->forward_seen_ns) < 100ULL * 1000 * 1000;
 		// Prefer the runtime's MEASURED weave→scanout residual (timing
 		// feedback loop) when fresh; heuristic only as fallback.
 		const bool measured_fresh = leiasr->measured_r_us > 0 &&
 		                            (now_ns - leiasr->measured_seen_ns) < 250ULL * 1000 * 1000;
-		if (measured_fresh || leiasr->ema_interval_ns > 0.0) {
+		if (forward_fresh) {
+			uint64_t latency_us = leiasr->forward_horizon_us;
+			if (latency_us < leiasr->latency_min_us) {
+				latency_us = leiasr->latency_min_us;
+			}
+			if (latency_us > leiasr->latency_max_us) {
+				latency_us = leiasr->latency_max_us;
+			}
+			w_set_latency(leiasr, latency_us);
+			leiasr->last_set_latency_us = latency_us;
+			if (!leiasr->forward_logged) {
+				leiasr->forward_logged = true;
+				U_LOG_W("Leia D3D11 weave latency: #206 FORWARD per-weave horizon engaged "
+				        "(%llu us this weave; raw, no smoothing, no deadband)",
+				        (unsigned long long)latency_us);
+			}
+		} else if (measured_fresh || leiasr->ema_interval_ns > 0.0) {
 			double horizon_us;
 			if (measured_fresh) {
 				// One-shot lifecycle log: the horizon source flipped from

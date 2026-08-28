@@ -91,6 +91,16 @@ leiasr_set_frame_timing(struct leiasr *leiasr,
                         uint64_t weave_to_scanout_ns,
                         uint64_t frame_period_ns);
 
+/*!
+ * #206: the runtime's per-weave FORWARD weave→scanout horizon, from its
+ * vsync-locked vblank grid. When fresh (<100 ms) it outranks both the
+ * measured-residual and heuristic paths and is fed to setLatency RAW —
+ * no EMA, no deadband. 0 = unknown (grid lost) — retrospective paths
+ * take back over.
+ */
+void
+leiasr_set_predicted_scanout(struct leiasr *leiasr, uint64_t predicted_weave_to_scanout_ns);
+
 void
 leiasr_weave(struct leiasr *leiasr,
              VkCommandBuffer commandBuffer,
