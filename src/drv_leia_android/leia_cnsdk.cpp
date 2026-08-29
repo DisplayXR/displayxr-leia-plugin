@@ -1963,7 +1963,30 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		// 3D that looked "almost right". Use the panel dimension along the
 		// window's height axis: portrait -> long side, landscape -> short side.
 		int32_t sp_y = win_y;
-		{
+		// browser#128: a NONZERO reported y is a truthful origin from a client
+		// that measures its own surface (the browser's Java geometry feed,
+		// View.getLocationOnScreen on the compositor SurfaceView). CNSDK's
+		// bottom-origin conversion then needs NO pre-applied inverse — the
+		// top-anchored y is exactly what the API documents, so sp_y = win_y.
+		// The inverse below exists ONLY to compensate clients that report 0
+		// while actually sitting below a top inset (#165/#173 — two bugs
+		// cancelling; measured on NP02J: truthful y=60 with the inverse still
+		// applied anchors 60 rows off, bottom-origin 0 where 60 is correct).
+		// A truthful y=0 window whose height fills the panel is unaffected
+		// either way (the h < panel guard below), and a truthful y=0 window
+		// with only a BOTTOM inset keeps the old compensation — wrong there,
+		// but that case was equally wrong before this change, and
+		// debug.dxr.leia.origin_compat=0 force-trusts the report for a stack
+		// known to send truthful origins.
+		const bool trust_origin =
+		    (win_y != 0) || !prop_override("debug.dxr.leia.origin_compat", true);
+		if (trust_origin) {
+			static int32_t trust_last = INT32_MIN;
+			if (win_y != trust_last) {
+				trust_last = win_y;
+				U_LOG_W("HW_DBG_CNSDK: #128 trusting reported origin y=%d (no inverse)", win_y);
+			}
+		} else {
 			uint32_t pw = 0, ph = 0;
 			if (leia_cnsdk_get_display_metrics(cnsdk, NULL, NULL, &pw, &ph) && pw != 0 && ph != 0) {
 				const uint32_t panel_long = pw > ph ? pw : ph;
