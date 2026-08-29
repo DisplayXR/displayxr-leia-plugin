@@ -2361,10 +2361,22 @@ is_self_submitting_true(struct xrt_display_processor *xdp)
 	return true;
 }
 
-// Try to fetch CNSDK's predicted face position and derive L/R eyes from
-// it (face X ± IPD/2). Falls back to a hardcoded IPD-only stub if face
-// tracking isn't running yet (CNSDK core still async-initializing, or
-// no face lock).
+// Report the viewer's two eye positions to the runtime, which builds one
+// off-axis Kooima frustum per eye from them.
+//
+// Preferred source is CNSDK's real eye PAIR (leia_cnsdk_get_primary_eyes).
+// The fallback derives the pair from the face point as centre ± IPD/2 on X,
+// which is correct only for an upright head: the eye VECTOR is then a constant,
+// so head ROLL is discarded — the pair keeps the full horizontal disparity when
+// it should be d·cosθ, and has none of the vertical disparity it should have at
+// d·sinθ. That was the whole of the Android look-around-on-roll defect, and the
+// Windows arm never had it because the SR SDK returns two real eye points.
+// The fallback still runs when no pair is available at all (CNSDK core still
+// async-initializing, no face lock, or an SDK without the per-eye entry points),
+// and it is the only path before tracking starts.
+//
+// `debug.dxr.leia.lookaround_eyes=0` forces the old fixed-horizontal synthesis
+// for a live A/B on device.
 bool
 get_predicted_eye_positions_ipd(struct xrt_display_processor *xdp,
                                  struct xrt_eye_positions *out_eye_pos)
@@ -2372,20 +2384,35 @@ get_predicted_eye_positions_ipd(struct xrt_display_processor *xdp,
 	leia_dp_cnsdk *impl = as_impl(xdp);
 
 	bool tracked = false;
+	bool have_pair = false;
+	float l[3] = {0, 0, 0};
+	float r[3] = {0, 0, 0};
 	float fx = 0.0f, fy = 0.0f, fz = kEyeViewerDistM;
-	if (impl->cnsdk != nullptr) {
-		if (leia_cnsdk_ensure_face_tracking_started(impl->cnsdk) &&
-		    leia_cnsdk_get_primary_face(impl->cnsdk, &fx, &fy, &fz)) {
+
+	if (impl->cnsdk != nullptr && leia_cnsdk_ensure_face_tracking_started(impl->cnsdk)) {
+		if (leia_cnsdk_use_lookaround_eyes() && leia_cnsdk_get_primary_eyes(impl->cnsdk, l, r)) {
+			have_pair = true;
+			tracked = true;
+		} else if (leia_cnsdk_get_primary_face(impl->cnsdk, &fx, &fy, &fz)) {
 			tracked = true;
 		}
 	}
 
-	out_eye_pos->eyes[0].x = fx - kIpdHalfM;
-	out_eye_pos->eyes[0].y = fy;
-	out_eye_pos->eyes[0].z = fz;
-	out_eye_pos->eyes[1].x = fx + kIpdHalfM;
-	out_eye_pos->eyes[1].y = fy;
-	out_eye_pos->eyes[1].z = fz;
+	if (have_pair) {
+		out_eye_pos->eyes[0].x = l[0];
+		out_eye_pos->eyes[0].y = l[1];
+		out_eye_pos->eyes[0].z = l[2];
+		out_eye_pos->eyes[1].x = r[0];
+		out_eye_pos->eyes[1].y = r[1];
+		out_eye_pos->eyes[1].z = r[2];
+	} else {
+		out_eye_pos->eyes[0].x = fx - kIpdHalfM;
+		out_eye_pos->eyes[0].y = fy;
+		out_eye_pos->eyes[0].z = fz;
+		out_eye_pos->eyes[1].x = fx + kIpdHalfM;
+		out_eye_pos->eyes[1].y = fy;
+		out_eye_pos->eyes[1].z = fz;
+	}
 	out_eye_pos->count = 2;
 	out_eye_pos->valid = true;
 	out_eye_pos->is_tracking = tracked;

@@ -246,6 +246,48 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_z);
 
 /*!
+ * Fetch the viewer's two EYE positions, not just the face centre.
+ *
+ * The reason this exists alongside @ref leia_cnsdk_get_primary_face: a face
+ * point alone forces the DP to synthesize the pair as centre ± (IPD/2, 0, 0),
+ * a constant HORIZONTAL vector. That silently discards head ROLL — roll your
+ * head and the true eyes rotate about the face centre, so the synthesized pair
+ * keeps the full horizontal disparity and has zero vertical disparity, and the
+ * runtime's per-eye Kooima frustums are built from the wrong geometry. The
+ * Windows arm never had this problem because the SR SDK hands back two real
+ * eye points; this restores parity on Android.
+ *
+ * Positions are in meters relative to the **display center**, expressed in the
+ * CURRENT held orientation — the same frame and units as
+ * @ref leia_cnsdk_get_primary_face, so the two are directly comparable.
+ * `out_left` is the VIEWER's left eye (more negative display X).
+ *
+ * Four sources are tried in preference order: CNSDK's experimental
+ * `leia_core_get_lookaround_eyes` (the pair the Unity/LeiaViewer path uses),
+ * `leia_core_get_non_predicted_eyes`, the frame listener's deprojected
+ * `eyePoints`, and finally the listener's face point combined with its reported
+ * head-roll angle. Returns false when none is available, and the caller should
+ * then fall back to its own synthesis.
+ *
+ * @param[out] out_left   Left-eye xyz (meters, display-relative). 3 floats.
+ * @param[out] out_right  Right-eye xyz (meters, display-relative). 3 floats.
+ * @return true if a real eye PAIR was produced.
+ */
+bool
+leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float out_right[3]);
+
+/*!
+ * Kill switch for @ref leia_cnsdk_get_primary_eyes, read from
+ * `debug.dxr.leia.lookaround_eyes` (default ON) and cached.
+ *
+ * Setting it to 0 restores the legacy fixed-horizontal eye pair, so the roll
+ * behaviour can be A/B'd live on a device without a rebuild. Lives here rather
+ * than in the DP because the sysprop helpers are private to leia_cnsdk.cpp.
+ */
+bool
+leia_cnsdk_use_lookaround_eyes(void);
+
+/*!
  * Perform CNSDK Vulkan interlacing on an SBS atlas.
  *
  * Atlas mode: pass the runtime's pre-composited SBS atlas image+view

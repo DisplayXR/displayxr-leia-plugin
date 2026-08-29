@@ -15,6 +15,7 @@
 
 // CNSDK 0.10.x headers (relocated from leia/sdk/ → leia/core/ vs 0.7.28).
 #include <leia/core/core.h>
+#include <leia/core/experimental.h>
 #include <leia/core/faceTracking.h>
 #include <leia/core/interlacer.vulkan.h>
 #include <leia/core/library.h>
@@ -32,6 +33,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 
@@ -164,6 +166,53 @@ struct leia_cnsdk
 	std::atomic<float> listener_face_x_mm{0.0f};
 	std::atomic<float> listener_face_y_mm{0.0f};
 	std::atomic<float> listener_face_z_mm{0.0f};
+
+	// #ROLL: per-EYE data from the same listener frame, cached alongside the
+	// face point above and written under the same listener_face_valid release.
+	//
+	// Two independent roll carriers, because on this hardware the core's own
+	// face accessors come back empty (see the pred=0 note above) and the
+	// listener is the only live source:
+	//   - listener_eyes_*: leia_headtracking_raw_face::eyePoints[2], the
+	//     DEPROJECTED per-eye camera-space points. Real eye geometry, so roll
+	//     is carried exactly. listener_eyes_valid says whether this frame had
+	//     them (raw faces can be absent while detected faces are present).
+	//   - listener_roll_rad: leia_headtracking_detected_face::poseAngle.z, the
+	//     head roll. Enough to orient a synthetic IPD vector when eyePoints
+	//     are unavailable. listener_roll_valid gates it.
+	// Both are CAMERA-space quantities (image Y down), lifted/flipped where
+	// they are consumed, exactly like the face point.
+	std::atomic<bool> listener_eyes_valid{false};
+	std::atomic<float> listener_eye_l_x_mm{0.0f};
+	std::atomic<float> listener_eye_l_y_mm{0.0f};
+	std::atomic<float> listener_eye_l_z_mm{0.0f};
+	std::atomic<float> listener_eye_r_x_mm{0.0f};
+	std::atomic<float> listener_eye_r_y_mm{0.0f};
+	std::atomic<float> listener_eye_r_z_mm{0.0f};
+	std::atomic<bool> listener_roll_valid{false};
+	std::atomic<float> listener_roll_rad{0.0f};
+
+	// #ROLL: CNSDK experimental per-eye accessors, resolved once at library
+	// load (leia_get_experimental_api is a plain library-level lookup, so it
+	// needs no initialized core). Either may stay null on an SDK that dropped
+	// them — every consumer null-checks. These are what the Unity/LeiaViewer
+	// path consumes (libleiaSDK-jni exports getLookaroundEyes over the same
+	// entry point), and they are the ONLY sources that carry the eye vector
+	// rather than a bare face point.
+	leia_core_get_lookaround_eyes fn_lookaround_eyes{nullptr};
+	leia_core_get_non_predicted_eyes fn_nonpred_eyes{nullptr};
+
+	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
+	// not document whether they return mm (like get_primary_face) or meters,
+	// and guessing wrong is a 1000x IPD error, so the first plausible pair
+	// decides it from the measured separation. 0 = undecided, 1 = mm,
+	// 2 = meters. eyes_unit_candidate/_run accumulate the consecutive-agreement
+	// run that must be reached before latching — the reported separation is
+	// noisy during acquisition, and a single stray sample must not decide the
+	// scale for the session. Render-thread only.
+	int eyes_unit{0};
+	int eyes_unit_candidate{0};
+	int eyes_unit_run{0};
 
 	// Cached display metrics. Populated by the worker thread alongside
 	// the camera-center snapshot; the atomic flag gives the render
@@ -422,6 +471,11 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 	// faces; fall back to the tracking result for other devices/modes.
 	bool got = false;
 	float px = 0.0f, py = 0.0f, pz = 0.0f;
+	// #ROLL: head roll, carried alongside the face point. The detected face's
+	// poseAngle is the only rotation the service publishes on this hardware, and
+	// without it a synthesized eye pair can only ever be horizontal.
+	bool got_roll = false;
+	float roll_rad = 0.0f;
 	struct leia_headtracking_detected_faces detected = {};
 	if (cnsdk != nullptr &&
 	    leia_headtracking_frame_get_detected_faces(frame, &detected) ==
@@ -430,6 +484,10 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 		px = detected.faces[0].posePosition.x;
 		py = detected.faces[0].posePosition.y;
 		pz = detected.faces[0].posePosition.z;
+		// poseAngle is "head rotation in radians, left handed" (CNSDK
+		// headTracking/common/types.h). z is the roll about the view axis.
+		roll_rad = detected.faces[0].poseAngle.z;
+		got_roll = std::isfinite(roll_rad);
 		got = true;
 	} else if (cnsdk != nullptr) {
 		struct leia_headtracking_tracking_result tracked = {};
@@ -439,7 +497,43 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 			px = tracked.faces[0].point.pos.x;
 			py = tracked.faces[0].point.pos.y;
 			pz = tracked.faces[0].point.pos.z;
+			roll_rad = tracked.faces[0].angle.z;
+			got_roll = std::isfinite(roll_rad);
 			got = true;
+		}
+	}
+
+	// #ROLL: the deprojected per-EYE points, when the service publishes them.
+	// This is the best roll carrier available on the listener path — real eye
+	// geometry rather than a point plus an angle — so it is preferred over the
+	// poseAngle above wherever both are present. Raw faces are an independent
+	// getter from detected faces and can be absent while detected faces are
+	// populated, hence its own validity flag.
+	bool got_eyes = false;
+	float lx = 0.0f, ly = 0.0f, lz = 0.0f, rx = 0.0f, ry = 0.0f, rz = 0.0f;
+	struct leia_headtracking_raw_faces raw = {};
+	if (cnsdk != nullptr &&
+	    leia_headtracking_frame_get_raw_faces(frame, &raw) == kLeiaHeadTrackingStatusSuccess &&
+	    raw.numFaces > 0) {
+		lx = raw.faces[0].eyePoints[0].x;
+		ly = raw.faces[0].eyePoints[0].y;
+		lz = raw.faces[0].eyePoints[0].z;
+		rx = raw.faces[0].eyePoints[1].x;
+		ry = raw.faces[0].eyePoints[1].y;
+		rz = raw.faces[0].eyePoints[1].z;
+		// Same plausibility band as the face gate, plus a separation sanity
+		// check: a degenerate pair (both eyes at one point, or metres apart)
+		// is worse than the synthetic fallback, so reject rather than serve it.
+		const float sep = sqrtf((lx - rx) * (lx - rx) + (ly - ry) * (ly - ry) + (lz - rz) * (lz - rz));
+		got_eyes = std::isfinite(sep) && sep > 30.0f && sep < 100.0f && lz > 150.0f && lz < 2000.0f &&
+		           rz > 150.0f && rz < 2000.0f;
+		if (!got_eyes) {
+			static int eyerej = 0;
+			if ((eyerej++ % 120) == 0) {
+				U_LOG_W("HW_EYES: rejected implausible eyePoints L=(%.0f,%.0f,%.0f) "
+				        "R=(%.0f,%.0f,%.0f) sep=%.1f mm",
+				        lx, ly, lz, rx, ry, rz, sep);
+			}
 		}
 	}
 
@@ -462,6 +556,19 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 		cnsdk->listener_face_x_mm.store(px, std::memory_order_relaxed);
 		cnsdk->listener_face_y_mm.store(py, std::memory_order_relaxed);
 		cnsdk->listener_face_z_mm.store(pz, std::memory_order_relaxed);
+		// #ROLL: publish the eye pair / roll under the SAME release as the face
+		// point, so a reader that sees a fresh face never pairs it with stale
+		// eye geometry. Each carries its own validity flag because either can be
+		// absent on a frame whose face point is fine.
+		cnsdk->listener_eye_l_x_mm.store(lx, std::memory_order_relaxed);
+		cnsdk->listener_eye_l_y_mm.store(ly, std::memory_order_relaxed);
+		cnsdk->listener_eye_l_z_mm.store(lz, std::memory_order_relaxed);
+		cnsdk->listener_eye_r_x_mm.store(rx, std::memory_order_relaxed);
+		cnsdk->listener_eye_r_y_mm.store(ry, std::memory_order_relaxed);
+		cnsdk->listener_eye_r_z_mm.store(rz, std::memory_order_relaxed);
+		cnsdk->listener_eyes_valid.store(got_eyes, std::memory_order_relaxed);
+		cnsdk->listener_roll_rad.store(roll_rad, std::memory_order_relaxed);
+		cnsdk->listener_roll_valid.store(got_roll, std::memory_order_relaxed);
 		cnsdk->listener_face_valid.store(true, std::memory_order_release);
 		cnsdk->listener_miss_count.store(0, std::memory_order_relaxed);
 	} else if (cnsdk != nullptr) {
@@ -472,6 +579,8 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 		// stays smooth instead of flickering to the static fallback.
 		const int misses = cnsdk->listener_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
 		if (misses > 90) {
+			cnsdk->listener_eyes_valid.store(false, std::memory_order_relaxed);
+			cnsdk->listener_roll_valid.store(false, std::memory_order_relaxed);
 			cnsdk->listener_face_valid.store(false, std::memory_order_release);
 		}
 	}
@@ -810,6 +919,22 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+	// #ROLL: resolve the experimental per-EYE accessors up front. These are the
+	// only CNSDK entry points that report an eye VECTOR rather than a bare face
+	// point, and without one the DP has to synthesize a fixed horizontal pair —
+	// which silently discards head ROLL and is exactly the look-around defect
+	// this addresses. leia_get_experimental_api is a library-level lookup, so it
+	// works here, before any core exists. A null result is not an error: every
+	// consumer falls back, and the resolution is logged once so a bug report
+	// says which sources this build actually had.
+	leia_core_get_lookaround_eyes fn_lookaround =
+	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_lookaround_eyes);
+	leia_core_get_non_predicted_eyes fn_nonpred_eyes =
+	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_non_predicted_eyes);
+	U_LOG_W("HW_EYES: experimental per-eye API — lookaround=%s non_predicted=%s",
+	        fn_lookaround != nullptr ? "OK" : "MISSING",
+	        fn_nonpred_eyes != nullptr ? "OK" : "MISSING");
+
 #ifdef XRT_OS_ANDROID
 	// LOXR-730/733: register the host Activity for orientation tracking so the
 	// core's orientation auto-detect follows the real device orientation across
@@ -902,6 +1027,8 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	auto *cnsdk = new struct leia_cnsdk();
 	cnsdk->lib = lib;
 	cnsdk->core = core;
+	cnsdk->fn_lookaround_eyes = fn_lookaround;
+	cnsdk->fn_nonpred_eyes = fn_nonpred_eyes;
 #ifdef XRT_OS_ANDROID
 	// Same gate as limit_orientations above: Activity-typed CNSDK calls
 	// (leia_core_on_pause/on_resume) are only safe with a real Activity.
@@ -1482,6 +1609,59 @@ leia_cnsdk_get_android_panel_px(uint32_t *out_w, uint32_t *out_h, float *out_w_m
 	return android_panel_px((JavaVM *)vm, (jobject)ctx, out_w, out_h, out_w_m, out_h_m);
 }
 
+/*!
+ * Re-express a display-center point (meters) from the display's NATURAL
+ * orientation frame into the CURRENT held orientation, then apply the residual
+ * per-device calibration overrides.
+ *
+ * CNSDK's faces and eye points arrive in the natural-orientation frame (that's
+ * the frame it weaves in); our look-around output must be in the held one.
+ *
+ * GetRelativeClockwiseAngle(natural, current) is how far the DEVICE FRAME
+ * actively turned from natural to current. But we're re-expressing a fixed
+ * point's COORDINATES from the natural frame into the current frame, which is
+ * the INVERSE (passive) rotation: when a frame turns clockwise by θ, a fixed
+ * point's coords in it turn counter-clockwise by θ. So we rotate by
+ * GetRelativeClockwiseAngle(current, natural) = (natural - current) steps, each
+ * step 90°. z (depth) is orientation-invariant.
+ *
+ * #ROLL: factored out of leia_cnsdk_get_primary_face so the per-eye path runs
+ * the IDENTICAL transform. Applying it to BOTH eye points (rather than to a
+ * centre plus a separately-rotated offset) is what keeps the eye VECTOR correct
+ * through a device rotation — the vector is just the difference of two points
+ * that both went through the same map.
+ *
+ * @param[in,out] pos    xyz in meters, rewritten in place.
+ * @param[out]    steps  Optional: the 90° step count applied, for logging.
+ */
+static void
+orient_display_point(struct leia_cnsdk *cnsdk, float pos[3], int *out_steps)
+{
+	const int natural = cnsdk->natural_orientation.load(std::memory_order_relaxed);
+	const enum leia_orientation cur = leia_core_get_orientation(cnsdk->core);
+	int steps = 0;
+	if (natural >= 0 && (int)cur >= 0) {
+		steps = (((natural - (int)cur) % 4) + 4) % 4; // inverse: (natural - current), × 90°
+	}
+	switch (steps) {
+	case 1: { float t = pos[0]; pos[0] = -pos[1]; pos[1] = t; break; }  //  90°: (-y,  x)
+	case 2: { pos[0] = -pos[0]; pos[1] = -pos[1]; break; }              // 180°: (-x, -y)
+	case 3: { float t = pos[0]; pos[0] = pos[1]; pos[1] = -t; break; }  // 270°: ( y, -x)
+	default: break;                                                     //   0°: ( x,  y)
+	}
+
+	// Residual per-device calibration overrides (all default OFF — the rotation
+	// above is the principled mapping). Applied after the rotation.
+	if (prop_override("debug.dxr.leia.face_swap_xy", false)) { float t = pos[0]; pos[0] = pos[1]; pos[1] = t; }
+	if (prop_override("debug.dxr.leia.face_flip_x", false))  { pos[0] = -pos[0]; }
+	if (prop_override("debug.dxr.leia.face_flip_y", false))  { pos[1] = -pos[1]; }
+	if (prop_override("debug.dxr.leia.face_flip_z", false))  { pos[2] = -pos[2]; }
+
+	if (out_steps != NULL) {
+		*out_steps = steps;
+	}
+}
+
 //! Log once per distinct disagreement. See true_device_orientation_android().
 static void
 check_orientation_tripwire(struct leia_cnsdk *cnsdk)
@@ -1669,41 +1849,21 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	float pos_y_m = position[1] / 1000.0f;
 	float pos_z_m = position[2] / 1000.0f;
 
-	// The predicted/non-predicted faces arrive in the display's NATURAL
-	// orientation frame (that's the frame CNSDK weaves in). Our look-around face
-	// must be expressed in the CURRENT held orientation.
-	//
-	// GetRelativeClockwiseAngle(natural, current) is how far the DEVICE FRAME
-	// actively turned from natural to current. But we're re-expressing a fixed
-	// point's COORDINATES from the natural frame into the current frame, which is
-	// the INVERSE (passive) rotation: when a frame turns clockwise by θ, a fixed
-	// point's coords in it turn counter-clockwise by θ. So we rotate by
-	// GetRelativeClockwiseAngle(current, natural) = (natural - current) steps,
-	// each step 90°. z (depth) is orientation-invariant.
-	const int natural = cnsdk->natural_orientation.load(std::memory_order_relaxed);
-	const enum leia_orientation cur = leia_core_get_orientation(cnsdk->core);
+	// Re-express into the CURRENT held orientation + apply the calibration
+	// overrides. Shared with the per-eye path so an eye pair and the face point
+	// can never disagree about the frame they are in (#ROLL).
 	int steps = 0;
-	if (natural >= 0 && (int)cur >= 0) {
-		steps = (((natural - (int)cur) % 4) + 4) % 4; // inverse: (natural - current), × 90°
-	}
-	switch (steps) {
-	case 1: { float t = pos_x_m; pos_x_m = -pos_y_m; pos_y_m = t; break; }  //  90°: (-y,  x)
-	case 2: { pos_x_m = -pos_x_m; pos_y_m = -pos_y_m; break; }              // 180°: (-x, -y)
-	case 3: { float t = pos_x_m; pos_x_m = pos_y_m; pos_y_m = -t; break; }  // 270°: ( y, -x)
-	default: break;                                                        //   0°: ( x,  y)
-	}
-
-	// Residual per-device calibration overrides (all default OFF — the rotation
-	// above is the principled mapping). Applied after the rotation.
-	if (prop_override("debug.dxr.leia.face_swap_xy", false)) { float t = pos_x_m; pos_x_m = pos_y_m; pos_y_m = t; }
-	if (prop_override("debug.dxr.leia.face_flip_x", false))  { pos_x_m = -pos_x_m; }
-	if (prop_override("debug.dxr.leia.face_flip_y", false))  { pos_y_m = -pos_y_m; }
-	if (prop_override("debug.dxr.leia.face_flip_z", false))  { pos_z_m = -pos_z_m; }
+	float pos[3] = {pos_x_m, pos_y_m, pos_z_m};
+	orient_display_point(cnsdk, pos, &steps);
+	pos_x_m = pos[0];
+	pos_y_m = pos[1];
+	pos_z_m = pos[2];
 
 	static int oridbg = 0;
 	if ((oridbg++ % 120) == 0) {
 		U_LOG_W("HW_ORI: natural=%d current=%d steps=%d -> face=(%.3f,%.3f,%.3f)m",
-		        natural, (int)cur, steps, pos_x_m, pos_y_m, pos_z_m);
+		        cnsdk->natural_orientation.load(std::memory_order_relaxed),
+		        (int)leia_core_get_orientation(cnsdk->core), steps, pos_x_m, pos_y_m, pos_z_m);
 	}
 
 	(void)used_nonpred;
@@ -1711,6 +1871,240 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	if (out_x != NULL) { *out_x = pos_x_m; }
 	if (out_y != NULL) { *out_y = pos_y_m; }
 	if (out_z != NULL) { *out_z = pos_z_m; }
+	return true;
+}
+
+/*
+ * #ROLL: per-EYE readout.
+ *
+ * leia_cnsdk_get_primary_face returns a POINT, so the DP had to synthesize the
+ * eye pair as point ± (IPD/2, 0, 0) — a constant horizontal vector. That is
+ * correct only for a perfectly upright head: roll the head and the true eyes
+ * rotate about the face centre, so the rendered pair keeps the full horizontal
+ * disparity (should be d·cosθ) and drops the vertical disparity entirely
+ * (should be d·sinθ). The runtime's Kooima builds a genuine per-eye off-axis
+ * frustum from whatever points it is handed, so the whole defect is here.
+ *
+ * Sources, in preference order — each returns the eye pair in display-center
+ * millimetres, in the NATURAL orientation frame (the same contract as the face
+ * accessors), and the caller orients both points together:
+ *   1. leia_core_get_lookaround_eyes    — experimental; the pair the Unity /
+ *      LeiaViewer path consumes (libleiaSDK-jni exports getLookaroundEyes over
+ *      this entry point), i.e. the reference implementation of "correct".
+ *   2. leia_core_get_non_predicted_eyes — experimental; the per-eye twin of the
+ *      non-predicted face this file already prefers for look-around.
+ *   3. listener eyePoints               — deprojected per-eye points from the
+ *      frame listener, camera-space (lifted here exactly as the face is).
+ *   4. listener face + poseAngle roll   — a point plus a roll angle: synthesize
+ *      the pair, but ORIENT the IPD vector instead of forcing it horizontal.
+ * Falls through to `false` if none is available, and the DP then keeps today's
+ * fixed-horizontal behaviour.
+ *
+ * Sources 1–2 matter on hardware where the core's own accessors are live;
+ * 3–4 matter on the NP02J, where LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE leaves
+ * the core's faces empty and the listener is the only source at all (see the
+ * pred=0 note earlier in this file). Without 3–4 this fix would be a no-op on
+ * exactly the device it was reported against.
+ */
+extern "C" bool
+leia_cnsdk_use_lookaround_eyes(void)
+{
+	// Re-read periodically rather than latching at first use: this is the A/B
+	// switch for the roll fix, and the whole point is to flip it against a LIVE
+	// scene and watch the same head movement change. Latching it would force a
+	// service restart per flip, which loses the side-by-side. Throttled to every
+	// 30th call (~0.5 s at 60 Hz) so the property read stays off the hot path,
+	// and only a CHANGE is logged.
+	static std::atomic<int> cached{-1};
+	static std::atomic<int> throttle{0};
+	int v = cached.load(std::memory_order_acquire);
+	if (v < 0 || (throttle.fetch_add(1, std::memory_order_relaxed) % 30) == 0) {
+		const int fresh = get_prop_bool("debug.dxr.leia.lookaround_eyes", true) ? 1 : 0;
+		if (fresh != v) {
+			U_LOG_W("HW_EYES: per-eye look-around %s (debug.dxr.leia.lookaround_eyes)",
+			        fresh ? "ENABLED" : "DISABLED — using the legacy fixed-horizontal pair");
+			cached.store(fresh, std::memory_order_release);
+		}
+		v = fresh;
+	}
+	return v != 0;
+}
+
+extern "C" bool
+leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float out_right[3])
+{
+	if (cnsdk == NULL || cnsdk->core == NULL || out_left == NULL || out_right == NULL ||
+	    !cnsdk->face_tracking_started.load(std::memory_order_acquire)) {
+		return false;
+	}
+
+	float l[3] = {0, 0, 0};
+	float r[3] = {0, 0, 0};
+	const char *src = NULL;
+
+	// --- 1 + 2: the experimental core accessors --------------------------------
+	struct leia_float_slice ls = {l, 3};
+	struct leia_float_slice rs = {r, 3};
+	if (cnsdk->fn_lookaround_eyes != nullptr && cnsdk->fn_lookaround_eyes(cnsdk->core, ls, rs)) {
+		src = "lookaround";
+	} else if (cnsdk->fn_nonpred_eyes != nullptr && cnsdk->fn_nonpred_eyes(cnsdk->core, ls, rs)) {
+		src = "non_predicted";
+	}
+
+	// Unit auto-detect. core.h documents neither mm nor metres for these two,
+	// and guessing wrong is a 1000x IPD error — instantly visible but easy to
+	// misdiagnose. Decide from the measured separation (a human IPD is ~50-75,
+	// so mm reads ~65 and metres reads ~0.065). Everything below is millimetres.
+	//
+	// NOT decided from one frame. Measured on the NP02J, the reported separation
+	// is noisy during acquisition — 6.5 and 30.5 were both observed on single
+	// frames whose steady state is 61 — and a transient landing in the METRES
+	// band (two momentarily-coincident eye points) would latch a 1000x error for
+	// the whole session. So require several CONSECUTIVE frames to agree on the
+	// same band before latching; a disagreeing sample resets the run. Until the
+	// unit is settled the pair is refused and the caller falls through to the
+	// next source, which is the honest state rather than a guessed scale.
+	if (src != NULL) {
+		const float sep = sqrtf((l[0] - r[0]) * (l[0] - r[0]) + (l[1] - r[1]) * (l[1] - r[1]) +
+		                        (l[2] - r[2]) * (l[2] - r[2]));
+		if (cnsdk->eyes_unit == 0 && std::isfinite(sep)) {
+			const int band = (sep > 30.0f && sep < 100.0f)     ? 1   // mm
+			                 : (sep > 0.030f && sep < 0.100f) ? 2   // meters
+			                                                  : 0;
+			if (band != 0 && band == cnsdk->eyes_unit_candidate) {
+				if (++cnsdk->eyes_unit_run >= 10) {
+					cnsdk->eyes_unit = band;
+					U_LOG_W("HW_EYES: %s eyes report in %s (separation %.4f, "
+					        "%d consecutive agreeing samples) — latched",
+					        src, band == 1 ? "MILLIMETRES" : "METRES", sep,
+					        cnsdk->eyes_unit_run);
+				}
+			} else {
+				cnsdk->eyes_unit_candidate = band;
+				cnsdk->eyes_unit_run = band != 0 ? 1 : 0;
+			}
+		}
+		if (cnsdk->eyes_unit == 0) {
+			static int unitrej = 0;
+			if ((unitrej++ % 120) == 0) {
+				U_LOG_W("HW_EYES: %s eyes separation %.4f — units not settled yet, "
+				        "falling through to the next source",
+				        src, sep);
+			}
+			src = NULL;
+		} else {
+			if (cnsdk->eyes_unit == 2) {
+				for (int i = 0; i < 3; i++) { l[i] *= 1000.0f; r[i] *= 1000.0f; }
+			}
+			// Per-frame gate, applied AFTER the unit is known. The same
+			// acquisition noise that made single-sample latching unsafe can
+			// still emit an occasional degenerate pair mid-session; serving one
+			// collapses the stereo for a frame. Reject it and let the next
+			// source answer instead.
+			const float sep_mm = cnsdk->eyes_unit == 2 ? sep * 1000.0f : sep;
+			if (!(sep_mm > 30.0f && sep_mm < 100.0f)) {
+				static int seprej = 0;
+				if ((seprej++ % 120) == 0) {
+					U_LOG_W("HW_EYES: %s eyes transient separation %.1f mm — rejecting "
+					        "this frame",
+					        src, sep_mm);
+				}
+				src = NULL;
+			}
+		}
+	}
+
+	// --- 3: the frame listener's deprojected eye points ------------------------
+	// Camera space -> display-center, the SAME lift the face fallback applies
+	// (flip the image-down Y, then translate by the camera's own offset). Kept
+	// bit-identical to that path on purpose: any divergence would show up as the
+	// eye pair and the face centre disagreeing, which is worse than either.
+	if (src == NULL && cnsdk->listener_face_valid.load(std::memory_order_acquire) &&
+	    cnsdk->listener_eyes_valid.load(std::memory_order_relaxed)) {
+		l[0] = cnsdk->listener_eye_l_x_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_x_m * 1000.0f;
+		l[1] = -cnsdk->listener_eye_l_y_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_y_m * 1000.0f;
+		l[2] = cnsdk->listener_eye_l_z_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_z_m * 1000.0f;
+		r[0] = cnsdk->listener_eye_r_x_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_x_m * 1000.0f;
+		r[1] = -cnsdk->listener_eye_r_y_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_y_m * 1000.0f;
+		r[2] = cnsdk->listener_eye_r_z_mm.load(std::memory_order_relaxed) +
+		       cnsdk->camera_center_z_m * 1000.0f;
+		src = "listener_eyepoints";
+	}
+
+	// --- 4: listener face point + head roll ------------------------------------
+	// Not a real eye measurement, but it carries the one thing the current code
+	// throws away. Orient a nominal IPD vector by the reported roll instead of
+	// pinning it to +X.
+	//
+	// Sign: poseAngle is left-handed and camera-space, and we flip the camera's
+	// image-down Y into display Y-up above — a handedness flip about the view
+	// axis, which negates the roll. debug.dxr.leia.roll_sign inverts it again if
+	// a device disagrees, and the applied angle is logged so it can be read off
+	// rather than guessed at.
+	if (src == NULL && cnsdk->listener_face_valid.load(std::memory_order_acquire) &&
+	    cnsdk->listener_roll_valid.load(std::memory_order_relaxed)) {
+		const float fx = cnsdk->listener_face_x_mm.load(std::memory_order_relaxed) +
+		                 cnsdk->camera_center_x_m * 1000.0f;
+		const float fy = -cnsdk->listener_face_y_mm.load(std::memory_order_relaxed) +
+		                 cnsdk->camera_center_y_m * 1000.0f;
+		const float fz = cnsdk->listener_face_z_mm.load(std::memory_order_relaxed) +
+		                 cnsdk->camera_center_z_m * 1000.0f;
+		const float sign = prop_override("debug.dxr.leia.roll_sign", false) ? 1.0f : -1.0f;
+		const float roll = sign * cnsdk->listener_roll_rad.load(std::memory_order_relaxed);
+		const float half_ipd_mm = 32.5f;
+		const float dx = half_ipd_mm * cosf(roll);
+		const float dy = half_ipd_mm * sinf(roll);
+		l[0] = fx - dx; l[1] = fy - dy; l[2] = fz;
+		r[0] = fx + dx; r[1] = fy + dy; r[2] = fz;
+		src = "listener_roll";
+
+		static int rolldbg = 0;
+		if ((rolldbg++ % 120) == 0) {
+			U_LOG_W("HW_EYES: synthesized from face + roll %.1f deg (sign %+.0f)",
+			        roll * 57.2958f, sign);
+		}
+	}
+
+	if (src == NULL) {
+		return false;
+	}
+
+	// mm -> m, then orient BOTH points through the identical map. Rotating the
+	// two points (rather than a centre plus an offset) is what carries the eye
+	// vector correctly through a device rotation.
+	for (int i = 0; i < 3; i++) {
+		out_left[i] = l[i] / 1000.0f;
+		out_right[i] = r[i] / 1000.0f;
+	}
+	orient_display_point(cnsdk, out_left, NULL);
+	orient_display_point(cnsdk, out_right, NULL);
+
+	// L/R assignment is CNSDK's, and "left" could mean the viewer's left eye or
+	// the left one as the camera sees it — a mirror flip that would invert the
+	// stereo. The runtime's convention is eyes[0] = viewer's left = more negative
+	// display X, so assert that here and let a device that disagrees be fixed
+	// without a rebuild.
+	if (prop_override("debug.dxr.leia.eyes_swap_lr", false)) {
+		for (int i = 0; i < 3; i++) {
+			const float t = out_left[i];
+			out_left[i] = out_right[i];
+			out_right[i] = t;
+		}
+	}
+
+	static int eyedbg = 0;
+	if ((eyedbg++ % 120) == 0) {
+		const float dx = out_right[0] - out_left[0];
+		const float dy = out_right[1] - out_left[1];
+		U_LOG_W("HW_EYES: src=%s L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f) roll=%.1f deg", src,
+		        out_left[0], out_left[1], out_left[2], out_right[0], out_right[1], out_right[2],
+		        atan2f(dy, dx) * 57.2958f);
+	}
 	return true;
 }
 
