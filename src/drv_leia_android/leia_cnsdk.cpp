@@ -2080,6 +2080,17 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 	// axis, which negates the roll. debug.dxr.leia.roll_sign inverts it again if
 	// a device disagrees, and the applied angle is logged so it can be read off
 	// rather than guessed at.
+	// The synthetic OFFSET must NOT be rotated by orient_display_point: the
+	// detector's poseAngle.z is already display-relative (measured on NP02J:
+	// a level head in LANDSCAPE reports poseAngle.z ~ 0, while the camera
+	// frame is portrait-natural), so constructing the offset in camera space
+	// and then orienting the pair applied the display rotation TWICE —
+	// field-measured as roll=105.5 deg (= 15.5 applied + 90 landscape) on a
+	// level head. Only the face CENTRE is a camera-space point; the pair is
+	// therefore assembled AFTER orientation: centre oriented like every other
+	// camera point, offset applied directly in display space.
+	float tier4_dx_mm = 0.0f, tier4_dy_mm = 0.0f;
+	bool tier4_display_offset = false;
 	if (src == NULL && cnsdk->listener_face_valid.load(std::memory_order_acquire) &&
 	    cnsdk->listener_roll_valid.load(std::memory_order_relaxed)) {
 		const float fx = cnsdk->listener_face_x_mm.load(std::memory_order_relaxed) +
@@ -2091,15 +2102,17 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 		const float sign = prop_override("debug.dxr.leia.roll_sign", false) ? 1.0f : -1.0f;
 		const float roll = sign * cnsdk->listener_roll_rad.load(std::memory_order_relaxed);
 		const float half_ipd_mm = 32.5f;
-		const float dx = half_ipd_mm * cosf(roll);
-		const float dy = half_ipd_mm * sinf(roll);
-		l[0] = fx - dx; l[1] = fy - dy; l[2] = fz;
-		r[0] = fx + dx; r[1] = fy + dy; r[2] = fz;
+		tier4_dx_mm = half_ipd_mm * cosf(roll);
+		tier4_dy_mm = half_ipd_mm * sinf(roll);
+		tier4_display_offset = true;
+		// Both slots carry the CENTRE; the offset lands after orientation.
+		l[0] = fx; l[1] = fy; l[2] = fz;
+		r[0] = fx; r[1] = fy; r[2] = fz;
 		src = "listener_roll";
 
 		static int rolldbg = 0;
 		if ((rolldbg++ % 120) == 0) {
-			U_LOG_W("HW_EYES: synthesized from face + roll %.1f deg (sign %+.0f)",
+			U_LOG_W("HW_EYES: synthesized from face + roll %.1f deg (sign %+.0f, display-space offset)",
 			        roll * 57.2958f, sign);
 		}
 	}
@@ -2117,6 +2130,12 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 	}
 	orient_display_point(cnsdk, out_left, NULL);
 	orient_display_point(cnsdk, out_right, NULL);
+	if (tier4_display_offset) {
+		out_left[0] -= tier4_dx_mm / 1000.0f;
+		out_left[1] -= tier4_dy_mm / 1000.0f;
+		out_right[0] += tier4_dx_mm / 1000.0f;
+		out_right[1] += tier4_dy_mm / 1000.0f;
+	}
 
 	// L/R assignment is CNSDK's, and "left" could mean the viewer's left eye or
 	// the left one as the camera sees it — a mirror flip that would invert the
