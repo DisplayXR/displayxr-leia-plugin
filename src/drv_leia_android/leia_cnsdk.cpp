@@ -214,6 +214,18 @@ struct leia_cnsdk
 	int eyes_unit_candidate{0};
 	int eyes_unit_run{0};
 
+	// #211: the last GOOD tier-1/2 pair (post unit-scale, millimetres,
+	// pre-orientation) and when it was served. A single absent/rejected
+	// lookaround frame otherwise falls through to a lower tier for that one
+	// frame — a visible stereo-geometry pop (field-measured storm on NP02J
+	// minutes after v2.6.7). Holding the last pair for up to the freshness
+	// window smooths one-frame dropouts; a genuinely stale pair still falls
+	// through, which stays the honest state. Same 100 ms freshness convention
+	// as the #206 forward-horizon work (two staleness policies must agree).
+	float eyes_held_l[3]{0, 0, 0};
+	float eyes_held_r[3]{0, 0, 0};
+	int64_t eyes_held_ns{0};
+
 	// Cached display metrics. Populated by the worker thread alongside
 	// the camera-center snapshot; the atomic flag gives the render
 	// thread happens-before visibility on the float/int writes. Once
@@ -2010,8 +2022,30 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 					        src, sep_mm);
 				}
 				src = NULL;
+			} else {
+				// Good frame: remember it for the holdover below.
+				for (int i = 0; i < 3; i++) {
+					cnsdk->eyes_held_l[i] = l[i];
+					cnsdk->eyes_held_r[i] = r[i];
+				}
+				cnsdk->eyes_held_ns = os_monotonic_get_ns();
 			}
 		}
+	}
+
+	// --- 2b: holdover (#211). A bad or absent tier-1/2 frame within the
+	// freshness window repeats the last good pair instead of demoting the
+	// tier — a one-frame-old correct geometry beats a per-frame pop to the
+	// horizontal-synthesized pair and back. Only active once the unit has
+	// latched (there is no held pair before that, and the settling phase
+	// falling through to the lower tiers is the designed behaviour).
+	if (src == NULL && cnsdk->eyes_unit != 0 && cnsdk->eyes_held_ns != 0 &&
+	    (os_monotonic_get_ns() - cnsdk->eyes_held_ns) <= 100 * 1000 * 1000) {
+		for (int i = 0; i < 3; i++) {
+			l[i] = cnsdk->eyes_held_l[i];
+			r[i] = cnsdk->eyes_held_r[i];
+		}
+		src = "held";
 	}
 
 	// --- 3: the frame listener's deprojected eye points ------------------------
