@@ -1953,6 +1953,12 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 	float l[3] = {0, 0, 0};
 	float r[3] = {0, 0, 0};
 	const char *src = NULL;
+	// Tier 3's raw eyePoints[2] carry no documented L/R order (field-measured
+	// mirrored on NP02J: roll=-176.6 deg with a level head = the pair swapped),
+	// so that tier is re-ordered by display X after orientation. Not applied to
+	// the measured lookaround pair, whose labeling is the SDK's contract — and
+	// which a >90-degree roll would legitimately "invert".
+	bool tier3_order_by_x = false;
 
 	// --- 1 + 2: the experimental core accessors --------------------------------
 	struct leia_float_slice ls = {l, 3};
@@ -2068,6 +2074,7 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 		r[2] = cnsdk->listener_eye_r_z_mm.load(std::memory_order_relaxed) +
 		       cnsdk->camera_center_z_m * 1000.0f;
 		src = "listener_eyepoints";
+		tier3_order_by_x = true;
 	}
 
 	// --- 4: listener face point + head roll ------------------------------------
@@ -2130,6 +2137,13 @@ leia_cnsdk_get_primary_eyes(struct leia_cnsdk *cnsdk, float out_left[3], float o
 	}
 	orient_display_point(cnsdk, out_left, NULL);
 	orient_display_point(cnsdk, out_right, NULL);
+	if (tier3_order_by_x && out_right[0] < out_left[0]) {
+		for (int i = 0; i < 3; i++) {
+			const float t = out_left[i];
+			out_left[i] = out_right[i];
+			out_right[i] = t;
+		}
+	}
 	if (tier4_display_offset) {
 		out_left[0] -= tier4_dx_mm / 1000.0f;
 		out_left[1] -= tier4_dy_mm / 1000.0f;
