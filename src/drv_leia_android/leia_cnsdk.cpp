@@ -273,6 +273,9 @@ struct leia_cnsdk
 	std::atomic<int32_t> window_screen_y{0};
 	std::atomic<int32_t> window_screen_w{0};
 	std::atomic<int32_t> window_screen_h{0};
+	// Panel size in the CURRENT orientation, from the runtime (0 = not reported).
+	std::atomic<uint32_t> panel_now_w{0};
+	std::atomic<uint32_t> panel_now_h{0};
 	std::atomic<int32_t> window_display_id{-1};
 };
 
@@ -2304,6 +2307,21 @@ leia_cnsdk_set_window_screen_rect(
 	U_LOG_W("HW_DBG_CNSDK: window screen rect %d,%d %ux%u display %d (#150/#1033)", x, y, w, h, display_id);
 }
 
+extern "C" void
+leia_cnsdk_set_panel_size(struct leia_cnsdk *cnsdk, uint32_t panel_w, uint32_t panel_h, int32_t display_id)
+{
+	if (cnsdk == NULL || panel_w == 0 || panel_h == 0) {
+		return;
+	}
+	(void)display_id;
+	const uint32_t pw_old = cnsdk->panel_now_w.exchange(panel_w, std::memory_order_relaxed);
+	const uint32_t ph_old = cnsdk->panel_now_h.exchange(panel_h, std::memory_order_relaxed);
+	if (pw_old != panel_w || ph_old != panel_h) {
+		// Lifecycle event (first report, or a rotation), never per frame.
+		U_LOG_W("HW_DBG_CNSDK: panel size (current orientation) %ux%u", panel_w, panel_h);
+	}
+}
+
 extern "C" bool
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
@@ -2452,7 +2470,58 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 			if (leia_cnsdk_get_display_metrics(cnsdk, NULL, NULL, &pw, &ph) && pw != 0 && ph != 0) {
 				const uint32_t panel_long = pw > ph ? pw : ph;
 				const uint32_t panel_short = pw > ph ? ph : pw;
-				const uint32_t panel_h_now = (h > w) ? panel_long : panel_short;
+				/*
+				 * #173 follow-up: "which panel dimension is the height" is a
+				 * property of the PANEL's current orientation, NOT of the
+				 * window's aspect. Testing `h > w` asks the window, so a
+				 * portrait-SHAPED window on a landscape panel (NP02J: a
+				 * 1200x1600 window on a 2560x1600 panel) picked panel_long
+				 * 2560 and produced sp_y = 2560-1600-0 = 960 where the correct
+				 * value is 1600-1600-0 = 0. A 960-row vertical offset on a
+				 * SLANTED lenticular is a horizontal phase error, and it landed
+				 * on half a period: exactly inverted eyes. Fullscreen apps
+				 * (2560x1600, w > h) classified correctly and were unaffected,
+				 * which is why only windowed apps showed it.
+				 */
+				/*
+				 * CNSDK's metrics are ORIENTATION-INDEPENDENT (it reports the
+				 * native portrait panel, 1600x2560 on NP02J, even when the
+				 * device is in landscape), so neither pw/ph nor the window's
+				 * aspect can tell us which dimension is "height" right now.
+				 *
+				 * The window's own screen rect can: it must FIT the panel. A
+				 * window whose right edge exceeds panel_short cannot be on a
+				 * portrait panel, so the panel is landscape (and vice versa).
+				 * Avatar on NP02J is the case that exposed this: x=680 w=1200
+				 * -> right edge 1880 > 1600, so landscape, panel_h_now = 1600,
+				 * sp_y = 1600-1600-0 = 0. The window-aspect test said
+				 * "portrait" (1600 > 1200) and produced 960 instead.
+				 */
+				const uint32_t rt_panel_h = cnsdk->panel_now_h.load(std::memory_order_relaxed);
+				uint32_t panel_h_now;
+				if (rt_panel_h != 0) {
+					// Ground truth: the runtime reports the panel in the
+					// display's CURRENT orientation. Always prefer it.
+					panel_h_now = rt_panel_h;
+				} else if (win_x + (int32_t)w > (int32_t)panel_short) {
+					panel_h_now = panel_short; // too wide to be a portrait panel
+				} else if (win_y + (int32_t)h > (int32_t)panel_short) {
+					panel_h_now = panel_long; // too tall to be a landscape panel
+				} else {
+					// Older runtime with no panel-size slot AND a window small
+					// enough to fit either orientation. Nothing here can
+					// disambiguate, so keep the historical behaviour rather
+					// than invent a new guess.
+					panel_h_now = (h > w) ? panel_long : panel_short;
+				}
+				static bool pm_logged = false;
+				if (!pm_logged) {
+					pm_logged = true;
+					U_LOG_W("HW_DBG_CNSDK: #205fix cnsdk panel %ux%u (orientation-blind) win %ux%u at "
+					        "%d,%d -> panel_h_now %u (source: %s)",
+					        pw, ph, w, h, win_x, win_y, panel_h_now,
+					        rt_panel_h != 0 ? "runtime panel size" : "window-fit inference");
+				}
 				if (h < panel_h_now) {
 					sp_y = (int32_t)panel_h_now - (int32_t)h - win_y;
 					static int32_t sp_last = INT32_MIN;

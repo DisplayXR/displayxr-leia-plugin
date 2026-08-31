@@ -2134,6 +2134,25 @@ set_window_screen_rect_cnsdk(struct xrt_display_processor_vk *xdp,
 }
 #endif // XRT_DP_VK_HAS_WINDOW_SCREEN_RECT
 
+#ifdef XRT_DP_VK_HAS_PANEL_SIZE
+// LeiaSR#205 follow-up: the panel's size in the display's CURRENT orientation.
+// CNSDK's own metrics are orientation-blind (native portrait on NP02J even in
+// landscape), so this is the only reliable answer to "which panel dimension is
+// height right now" — which the bottom-origin phase conversion needs. Deriving
+// it from the window's aspect is wrong for any window whose shape disagrees
+// with the panel's, and lands the weave a half-period out (inverted eyes).
+static void
+set_panel_size_cnsdk(struct xrt_display_processor_vk *xdp, uint32_t panel_w, uint32_t panel_h, int32_t display_id)
+{
+	leia_dp_cnsdk *impl = reinterpret_cast<leia_dp_cnsdk *>(xdp); // dp_vk is at offset 0
+	if (impl == nullptr || impl->cnsdk == nullptr) {
+		return;
+	}
+	// Deduped inside (logs only on change) — this runs per frame.
+	leia_cnsdk_set_panel_size(impl->cnsdk, panel_w, panel_h, display_id);
+}
+#endif // XRT_DP_VK_HAS_PANEL_SIZE
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -2588,6 +2607,9 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	// covers this slot (it is sizeof(xrt_display_processor_vk)), so filling the
 	// pointer is all the runtime needs to discover it.
 	impl->dp_vk.set_window_screen_rect = set_window_screen_rect_cnsdk;
+#endif
+#ifdef XRT_DP_VK_HAS_PANEL_SIZE
+	impl->dp_vk.set_panel_size = set_panel_size_cnsdk;
 #endif
 
 	*out_xdp = &impl->dp_vk.base;
