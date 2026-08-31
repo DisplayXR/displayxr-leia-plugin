@@ -353,6 +353,16 @@ void
 leia_cnsdk_set_window_screen_rect(
     struct leia_cnsdk *cnsdk, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id);
 
+/*!
+ * Panel size in the display's CURRENT orientation, reported by the runtime.
+ *
+ * CNSDK's own metrics are orientation-blind (native portrait on NP02J), so this
+ * is the only reliable answer to "which panel dimension is height right now",
+ * which the bottom-origin phase conversion needs.
+ */
+void
+leia_cnsdk_set_panel_size(struct leia_cnsdk *cnsdk, uint32_t panel_w, uint32_t panel_h, int32_t display_id);
+
 #ifdef __cplusplus
 }
 #endif
