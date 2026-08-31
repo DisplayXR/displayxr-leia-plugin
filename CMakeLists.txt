@@ -191,7 +191,7 @@ set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
 # The _ANDROID suffix is invisible to the runtime's scripts/check_plugin_abi.py
 # regex (DXR_RUNTIME_GIT_TAG\s+") because \s+ cannot match an underscore --
 # the same reason _LINUX above is already safe.
-set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.14.6" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.15.3" CACHE STRING
     "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
 
 if(DXR_RUNTIME_SOURCE_DIR)
