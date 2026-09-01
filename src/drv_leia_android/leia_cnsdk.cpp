@@ -17,6 +17,11 @@
 #include <leia/core/core.h>
 #include <leia/core/experimental.h>
 #include <leia/core/faceTracking.h>
+// #206: we use `leia_interlacer_set_predicted_scanout_ns` and its _VERSION
+// guard from here. interlacer.vulkan.h does include it transitively, so this is
+// include-what-you-use rather than a fix — the feature guard resolves either
+// way (verified by preprocessing without it).
+#include <leia/core/interlacer.h>
 #include <leia/core/interlacer.vulkan.h>
 #include <leia/core/library.h>
 #include <leia/core/deviceConfig.h>
@@ -201,9 +206,14 @@ struct leia_cnsdk
 	// rather than a bare face point.
 	leia_core_get_lookaround_eyes fn_lookaround_eyes{nullptr};
 	// #206: experimental registry entry that takes the ABSOLUTE predicted
-	// scanout time. nullptr on a CNSDK without it -> we simply never publish
-	// and CNSDK keeps facePredictLatencyMs.
+	// scanout time. Guarded on CNSDK's own VERSION macro so this file still
+	// builds against a CNSDK that predates the API — same shape as the
+	// runtime's XRT_DP_VK_HAS_* convention. nullptr at runtime (API present at
+	// compile time, absent in the loaded library) is also fine: we simply never
+	// publish and CNSDK keeps facePredictLatencyMs.
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 	leia_interlacer_set_predicted_scanout_ns fn_set_predicted_scanout{nullptr};
+#endif
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes{nullptr};
 
 	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
@@ -953,8 +963,12 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes =
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_non_predicted_eyes);
 	// #206: the per-frame prediction horizon sink. Absent on older CNSDK.
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 	leia_interlacer_set_predicted_scanout_ns fn_scanout =
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_interlacer_set_predicted_scanout_ns);
+#else
+	void *fn_scanout = nullptr; // API predates this CNSDK
+#endif
 	U_LOG_W("HW_EYES: experimental API — lookaround=%s non_predicted=%s predicted_scanout=%s",
 	        fn_lookaround != nullptr ? "OK" : "MISSING",
 	        fn_nonpred_eyes != nullptr ? "OK" : "MISSING",
@@ -1053,7 +1067,9 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	cnsdk->lib = lib;
 	cnsdk->core = core;
 	cnsdk->fn_lookaround_eyes = fn_lookaround;
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 	cnsdk->fn_set_predicted_scanout = fn_scanout;
+#endif
 	cnsdk->fn_nonpred_eyes = fn_nonpred_eyes;
 #ifdef XRT_OS_ANDROID
 	// Same gate as limit_orientations above: Activity-typed CNSDK calls
@@ -2450,6 +2466,7 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		 * 0 = the runtime has no trusted measurement; publish nothing and let
 		 * CNSDK keep facePredictLatencyMs.
 		 */
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 		if (cnsdk->fn_set_predicted_scanout != nullptr) {
 			const uint64_t residual_ns =
 			    cnsdk->weave_to_scanout_ns.load(std::memory_order_relaxed);
@@ -2468,6 +2485,7 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 				}
 			}
 		}
+#endif
 		// #53 diagnostic: re-log whenever the band/phase changes (covers the live
 		// `debug.dxr.leia.zonephase` A/B toggle) — one WARN per distinct state.
 		static int32_t last_vpx = INT32_MIN, last_vpy = INT32_MIN;
