@@ -405,6 +405,18 @@ leia_cnsdk_set_window_screen_rect(
 void
 leia_cnsdk_set_panel_size(struct leia_cnsdk *cnsdk, uint32_t panel_w, uint32_t panel_h, int32_t display_id);
 
+/*!
+ * #206: the runtime's MEASURED weave->scanout residual, in ns (0 = unknown).
+ *
+ * A DURATION, not a timestamp. It is converted to CNSDK's absolute
+ * CLOCK_MONOTONIC target inside `leia_cnsdk_weave()` — AT the weave, never
+ * here — because any latency between the runtime publishing it and the weave
+ * happening would silently shorten the horizon, and a shortened horizon looks
+ * like an improved measurement while making prediction worse.
+ */
+void
+leia_cnsdk_set_predicted_scanout(struct leia_cnsdk *cnsdk, uint64_t weave_to_scanout_ns);
+
 #ifdef __cplusplus
 }
 #endif

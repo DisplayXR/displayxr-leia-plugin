@@ -2153,6 +2153,30 @@ set_panel_size_cnsdk(struct xrt_display_processor_vk *xdp, uint32_t panel_w, uin
 }
 #endif // XRT_DP_VK_HAS_PANEL_SIZE
 
+#ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
+/*
+ * #206: the runtime's MEASURED weave->scanout residual for THIS weave.
+ *
+ * This is the horizon the eye predictor must extrapolate to. Without it CNSDK
+ * falls back to a hardcoded `facePredictLatencyMs`, and that constant is not
+ * merely imprecise: the residual is bimodal on GPU governor state (p50 42.9 ms
+ * default vs 29.1 ms with the clock pinned, measured on NP02J), so a fixed 40 ms
+ * overshoots a pinned device by 11 ms and scores WORSE than not pinning at all.
+ * The runtime bounds the value to [0, 200] ms and publishes 0 when it has no
+ * trusted measurement, in which case CNSDK keeps its own heuristic.
+ */
+static void
+set_predicted_scanout_cnsdk(struct xrt_display_processor_vk *xdp, uint64_t predicted_weave_to_scanout_ns)
+{
+	leia_dp_cnsdk *impl = reinterpret_cast<leia_dp_cnsdk *>(xdp); // dp_vk is at offset 0
+	if (impl == nullptr || impl->cnsdk == nullptr) {
+		return;
+	}
+	// Runs per frame — the setter is a single relaxed store and logs nothing.
+	leia_cnsdk_set_predicted_scanout(impl->cnsdk, predicted_weave_to_scanout_ns);
+}
+#endif // XRT_DP_VK_HAS_PREDICTED_SCANOUT
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -2610,6 +2634,9 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 #endif
 #ifdef XRT_DP_VK_HAS_PANEL_SIZE
 	impl->dp_vk.set_panel_size = set_panel_size_cnsdk;
+#endif
+#ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
+	impl->dp_vk.set_predicted_scanout = set_predicted_scanout_cnsdk;
 #endif
 
 	*out_xdp = &impl->dp_vk.base;
