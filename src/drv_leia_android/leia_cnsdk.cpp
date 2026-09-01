@@ -2466,26 +2466,7 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		 * 0 = the runtime has no trusted measurement; publish nothing and let
 		 * CNSDK keep facePredictLatencyMs.
 		 */
-#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
-		if (cnsdk->fn_set_predicted_scanout != nullptr) {
-			const uint64_t residual_ns =
-			    cnsdk->weave_to_scanout_ns.load(std::memory_order_relaxed);
-			if (residual_ns != 0) {
-				const int64_t target_ns =
-				    (int64_t)os_monotonic_get_ns() + (int64_t)residual_ns;
-				cnsdk->fn_set_predicted_scanout(cnsdk->interlacer, target_ns);
-				// One WARN per distinct horizon in ms — a lifecycle-rate
-				// signal that the chain is live, never per frame.
-				static int64_t s_last_ms = INT64_MIN;
-				const int64_t ms = (int64_t)(residual_ns / 1000000ULL);
-				if (ms != s_last_ms) {
-					s_last_ms = ms;
-					U_LOG_W("#206: publishing predicted scanout horizon %lld ms to CNSDK",
-					        (long long)ms);
-				}
-			}
-		}
-#endif
+
 		// #53 diagnostic: re-log whenever the band/phase changes (covers the live
 		// `debug.dxr.leia.zonephase` A/B toggle) — one WARN per distinct state.
 		static int32_t last_vpx = INT32_MIN, last_vpy = INT32_MIN;
@@ -2622,6 +2603,48 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 			last_wx = win_x; last_wy = win_y;
 			U_LOG_W("HW_DBG_CNSDK: weave full-target screen-pos %d,%d target %ux%u (#150)",
 			        win_x, win_y, w, h);
+		}
+	}
+
+	{
+		/*
+		 * Compute and report the horizon INDEPENDENTLY of whether the
+		 * CNSDK sink exists. The publisher half of this chain (runtime
+		 * measures -> plug-in converts at weave time) is verifiable on a
+		 * STOCK core, where `fn_set_predicted_scanout` is null because the
+		 * experimental API is not in a shipping CNSDK yet.
+		 *
+		 * Gating the log on the sink made "the chain is broken" and "the
+		 * chain works but the core has no sink" produce identical output —
+		 * nothing — which is the silent-failure shape this whole feature
+		 * exists to remove. Now the log always names which case it is.
+		 */
+		const uint64_t residual_ns =
+		    cnsdk->weave_to_scanout_ns.load(std::memory_order_relaxed);
+		if (residual_ns != 0) {
+			const int64_t target_ns =
+			    (int64_t)os_monotonic_get_ns() + (int64_t)residual_ns;
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
+			if (cnsdk->fn_set_predicted_scanout != nullptr) {
+				cnsdk->fn_set_predicted_scanout(cnsdk->interlacer, target_ns);
+			}
+#endif
+			// One WARN per distinct horizon in ms — lifecycle-rate, never
+			// per frame.
+			static int64_t s_last_ms = INT64_MIN;
+			const int64_t ms = (int64_t)(residual_ns / 1000000ULL);
+			if (ms != s_last_ms) {
+				s_last_ms = ms;
+				U_LOG_W("#206: weave-time horizon %lld ms (target %lld) -> %s",
+				        (long long)ms, (long long)target_ns,
+#if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
+				        cnsdk->fn_set_predicted_scanout != nullptr
+#else
+				        false
+#endif
+				            ? "PUBLISHED to CNSDK"
+				            : "sink ABSENT (stock core; publisher half verified)");
+			}
 		}
 	}
 
