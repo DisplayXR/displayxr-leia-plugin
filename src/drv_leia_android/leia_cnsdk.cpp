@@ -200,6 +200,10 @@ struct leia_cnsdk
 	// entry point), and they are the ONLY sources that carry the eye vector
 	// rather than a bare face point.
 	leia_core_get_lookaround_eyes fn_lookaround_eyes{nullptr};
+	// #206: experimental registry entry that takes the ABSOLUTE predicted
+	// scanout time. nullptr on a CNSDK without it -> we simply never publish
+	// and CNSDK keeps facePredictLatencyMs.
+	leia_interlacer_set_predicted_scanout_ns fn_set_predicted_scanout{nullptr};
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes{nullptr};
 
 	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
@@ -276,6 +280,8 @@ struct leia_cnsdk
 	// Panel size in the CURRENT orientation, from the runtime (0 = not reported).
 	std::atomic<uint32_t> panel_now_w{0};
 	std::atomic<uint32_t> panel_now_h{0};
+	// #206: measured weave->scanout residual in ns (0 = unknown/untrusted).
+	std::atomic<uint64_t> weave_to_scanout_ns{0};
 	std::atomic<int32_t> window_display_id{-1};
 };
 
@@ -946,9 +952,13 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_lookaround_eyes);
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes =
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_non_predicted_eyes);
-	U_LOG_W("HW_EYES: experimental per-eye API — lookaround=%s non_predicted=%s",
+	// #206: the per-frame prediction horizon sink. Absent on older CNSDK.
+	leia_interlacer_set_predicted_scanout_ns fn_scanout =
+	    LEIA_GET_EXPERIMENTAL_API(lib, leia_interlacer_set_predicted_scanout_ns);
+	U_LOG_W("HW_EYES: experimental API — lookaround=%s non_predicted=%s predicted_scanout=%s",
 	        fn_lookaround != nullptr ? "OK" : "MISSING",
-	        fn_nonpred_eyes != nullptr ? "OK" : "MISSING");
+	        fn_nonpred_eyes != nullptr ? "OK" : "MISSING",
+	        fn_scanout != nullptr ? "OK" : "MISSING");
 
 #ifdef XRT_OS_ANDROID
 	// LOXR-730/733: register the host Activity for orientation tracking so the
@@ -1043,6 +1053,7 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	cnsdk->lib = lib;
 	cnsdk->core = core;
 	cnsdk->fn_lookaround_eyes = fn_lookaround;
+	cnsdk->fn_set_predicted_scanout = fn_scanout;
 	cnsdk->fn_nonpred_eyes = fn_nonpred_eyes;
 #ifdef XRT_OS_ANDROID
 	// Same gate as limit_orientations above: Activity-typed CNSDK calls
@@ -2322,6 +2333,17 @@ leia_cnsdk_set_panel_size(struct leia_cnsdk *cnsdk, uint32_t panel_w, uint32_t p
 	}
 }
 
+extern "C" void
+leia_cnsdk_set_predicted_scanout(struct leia_cnsdk *cnsdk, uint64_t weave_to_scanout_ns)
+{
+	if (cnsdk == NULL) {
+		return;
+	}
+	// Stored raw. The conversion to CNSDK's absolute monotonic target happens
+	// at the weave (see leia_cnsdk_weave), not here.
+	cnsdk->weave_to_scanout_ns.store(weave_to_scanout_ns, std::memory_order_relaxed);
+}
+
 extern "C" bool
 leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkDevice device,
@@ -2408,6 +2430,44 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		const int32_t sp_x = win_x + (zonephase ? vp_x : 0);
 		const int32_t sp_y = win_y + (zonephase ? vp_y : 0);
 		leia_interlacer_set_viewport_screen_position(cnsdk->interlacer, sp_x, sp_y);
+		/*
+		 * #206: publish the ABSOLUTE predicted scanout time for THIS weave.
+		 *
+		 * The runtime gives us a DURATION (the measured weave->scanout
+		 * residual). CNSDK wants an absolute CLOCK_MONOTONIC target, and
+		 * computes `delay = target - now` itself at the moment it fetches the
+		 * face. So the conversion must happen HERE, at the weave — not when
+		 * the runtime handed the duration over. Any latency between the two
+		 * would be subtracted from the horizon, and a shortened horizon looks
+		 * like a BETTER measurement while making prediction worse: the same
+		 * failure shape as predicting 40 ms ahead of a 29 ms reality.
+		 *
+		 * Delta form also means we need not reconcile clock domains: CNSDK's
+		 * face timestamps are CLOCK_BOOTTIME (~2h49m from CLOCK_MONOTONIC on
+		 * this pad), but the offset cancels in its own subtraction, so we
+		 * publish plain monotonic.
+		 *
+		 * 0 = the runtime has no trusted measurement; publish nothing and let
+		 * CNSDK keep facePredictLatencyMs.
+		 */
+		if (cnsdk->fn_set_predicted_scanout != nullptr) {
+			const uint64_t residual_ns =
+			    cnsdk->weave_to_scanout_ns.load(std::memory_order_relaxed);
+			if (residual_ns != 0) {
+				const int64_t target_ns =
+				    (int64_t)os_monotonic_get_ns() + (int64_t)residual_ns;
+				cnsdk->fn_set_predicted_scanout(cnsdk->interlacer, target_ns);
+				// One WARN per distinct horizon in ms — a lifecycle-rate
+				// signal that the chain is live, never per frame.
+				static int64_t s_last_ms = INT64_MIN;
+				const int64_t ms = (int64_t)(residual_ns / 1000000ULL);
+				if (ms != s_last_ms) {
+					s_last_ms = ms;
+					U_LOG_W("#206: publishing predicted scanout horizon %lld ms to CNSDK",
+					        (long long)ms);
+				}
+			}
+		}
 		// #53 diagnostic: re-log whenever the band/phase changes (covers the live
 		// `debug.dxr.leia.zonephase` A/B toggle) — one WARN per distinct state.
 		static int32_t last_vpx = INT32_MIN, last_vpy = INT32_MIN;
