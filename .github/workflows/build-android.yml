@@ -57,7 +57,7 @@ env:
   # DXR_RUNTIME_GIT_TAG_ANDROID (rule-5 self-check below). Floor is v2.7.2 --
   # the first tag with XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT (runtime#1037)
   # and XRT_DP_VK_HAS_WINDOW_SCREEN_RECT (runtime#1033).
-  RUNTIME_REF_ANDROID: v2.15.3
+  RUNTIME_REF_ANDROID: v2.16.0
   # NDK the runtime APK is built with (displayxr-runtime build-android.yml +
   # gradle.properties). Bump together, or the plug-in links against a different
   # libc++/sysroot than the APK it gets dropped into.
