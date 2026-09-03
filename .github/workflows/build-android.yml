@@ -75,7 +75,16 @@ env:
   # mapping is then wrong and the DP's weave framebuffer is built with extents
   # that disagree, faulting inside vkCreateFramebuffer. Fixed by CNSDK #716
   # (getRealMetrics), first published in v0.10.62.
-  CNSDK_TAG: v0.10.62
+  #
+  # 0.10.63 (#206): leia_interlacer_set_predicted_scanout_ns first exists here.
+  # The horizon consumer in leia_cnsdk.cpp is guarded on CNSDK's own VERSION
+  # macro, so building against an OLDER SDK compiles it out SILENTLY — the
+  # plug-in still builds, still loads, still reports v2.6.10, and forwards
+  # nothing. v2.6.10 shipped exactly that way: source correct, binary inert,
+  # every version number reading right. Raising this pin is what makes the
+  # release actually carry #206. Verify the built .so, never the tag:
+  #   strings libdxrp050_leia_cnsdk.so | grep -c leia_interlacer_set_predicted_scanout_ns
+  CNSDK_TAG: v0.10.63
 
 jobs:
   Android:
