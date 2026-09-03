@@ -33,6 +33,10 @@ setlocal enabledelayedexpansion
 set SCRIPT_DIR=%~dp0
 set REPO=%SCRIPT_DIR%..\
 set SR_TAG=1.35.0.2011
+:: Every sr-sdk-v* release (SR SDK zips, Vulkan weaver rescue DLLs) lives in
+:: Leia's PRIVATE artifact repo -- it is Leia SDK material and must not be
+:: publicly reachable. `gh auth status` must show an account with read access.
+set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
@@ -111,10 +115,11 @@ set SR_SDK_MARKER=%LEIASR_SDKROOT%\lib\cmake\srDirectX\srDirectXConfig.cmake
 set REPO_NOSLASH=%REPO:~0,-1%
 
 if not exist "%SR_SDK_MARKER%" (
-    echo === Downloading Leia SR SDK %SR_TAG% from this repo's release ===
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO_NOSLASH%"
+    echo === Downloading Leia SR SDK %SR_TAG% from %SR_SDK_REPO% ===
+    gh release download sr-sdk-v%SR_TAG% -R %SR_SDK_REPO% -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO_NOSLASH%"
     if %ERRORLEVEL% NEQ 0 (
-        echo ERROR: Failed to download SR SDK. Run: gh auth login
+        echo ERROR: Failed to download SR SDK from %SR_SDK_REPO%.
+        echo        Run: gh auth login ^(with an account that can read that private repo^)
         exit /b 1
     )
     powershell -Command "Expand-Archive -Path '%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip' -DestinationPath '%REPO_NOSLASH%' -Force"
@@ -127,9 +132,9 @@ if not exist "%SR_SDK_MARKER%" (
     echo === Downloading Vulkan weaver extras ===
     :: Legacy (pre-stamp) weaver — shipped for SR <= 1.34.x, which predates the
     :: ST-5318 subpixel pixel-stamp and needs the old vtable.
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
-    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.dll" -D "%LEIASR_SDKROOT%\bin"
+    gh release download sr-sdk-v%SR_TAG% -R %SR_SDK_REPO% -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
+    gh release download sr-sdk-v%SR_TAG% -R %SR_SDK_REPO% -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
+    gh release download sr-sdk-v%SR_TAG% -R %SR_SDK_REPO% -p "SimulatedRealityVulkanBeta.dll" -D "%LEIASR_SDKROOT%\bin"
 
     echo SR SDK ready.
 )
@@ -145,13 +150,13 @@ if not exist "%SR_SDK_MARKER%" (
 :: of silently skipping it and tripping the installer's FATAL_ERROR.
 if not exist "%LEIASR_SDKROOT%\bin\SimulatedRealityVulkan.dll" (
     echo === Downloading stamp-aware Vulkan weaver ^(%SR_VKSTAMP_TAG%^) ===
-    gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "%LEIASR_SDKROOT%\bin"
+    gh release download %SR_VKSTAMP_TAG% -R %SR_SDK_REPO% -p "SimulatedRealityVulkan.dll" -D "%LEIASR_SDKROOT%\bin"
     if !ERRORLEVEL! NEQ 0 (
         echo ERROR: Failed to download the stamp-aware weaver ^(%SR_VKSTAMP_TAG%^).
         echo        SR 1.36.x machines would ship broken. Aborting.
         exit /b 1
     )
-    gh release download %SR_VKSTAMP_TAG% -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "%LEIASR_SDKROOT%\lib"
+    gh release download %SR_VKSTAMP_TAG% -R %SR_SDK_REPO% -p "SimulatedRealityVulkan.lib" -D "%LEIASR_SDKROOT%\lib"
 )
 
 :: --- SR v2 C99 SDK (defines DXR_LEIA_HAS_SR_V2; v2 lazy-loads at runtime
@@ -163,7 +168,7 @@ if "%LEIASR_V2_SDKROOT%"=="" (
 )
 if not exist "%LEIASR_V2_SDKROOT%\lib\srSDK_loader.lib" (
     echo === Downloading SR v2 C99 SDK ^(%SR_V2_TAG%^) ===
-    gh release download %SR_V2_TAG% -R DisplayXR/displayxr-leia-plugin -p "%SR_V2_DIR%.zip" -D "%REPO_NOSLASH%"
+    gh release download %SR_V2_TAG% -R %SR_SDK_REPO% -p "%SR_V2_DIR%.zip" -D "%REPO_NOSLASH%"
     if !ERRORLEVEL! NEQ 0 (
         echo ERROR: Failed to download the SR v2 SDK ^(%SR_V2_TAG%^).
         exit /b 1

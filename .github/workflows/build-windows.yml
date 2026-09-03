@@ -56,11 +56,17 @@ jobs:
       # LeiaSR_runtime.dll and falls back to v1 on older SR Platforms.
       # This pin is the ST-5656-free LANDING SET (LeiaInc/LeiaSR run
       # 31577655173, test/sdk-v2-super @ 2bd551714), re-hosted as a release
-      # asset here because upstream ships the win64 v2 SDK only as a CI run
-      # artifact — there is no upstream release asset to point at. Replace
-      # with one when the SR v2 PRs land.
+      # asset on SR_SDK_REPO because upstream ships the win64 v2 SDK only as a
+      # CI run artifact — there is no upstream release asset to point at.
+      # Replace with one when the SR v2 PRs land.
       SR_V2_TAG: sr-sdk-v2-1.37.0.1502
       SR_V2_DIR: LeiaSR-SDK-1.37.0+1502.1b85d46d17-win64-Release
+      # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
+      # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
+      # Leia SDK material (some unreleased) and must not be publicly reachable.
+      # Read with LEIALOFT_GITHUB_TOKEN — the same secret the Android arm uses
+      # for LeiaInc/CNSDK. Fork PRs have no secret and cannot build this arm.
+      SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
       GH_TOKEN: ${{ github.token }}
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
@@ -115,25 +121,30 @@ jobs:
 
       - name: Download Simulated Reality SDK
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
         run: |
-          gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "LeiaSR-SDK-$env:SR_TAG-win64.zip" -D .
+          if (-not $env:GH_TOKEN) { throw "LEIALOFT_GITHUB_TOKEN is not set (fork PR?). The SR SDK is fetched from the private $env:SR_SDK_REPO release; this arm cannot build without it." }
+          gh release download sr-sdk-v$env:SR_TAG -R $env:SR_SDK_REPO -p "LeiaSR-SDK-$env:SR_TAG-win64.zip" -D .
           tar -xf "LeiaSR-SDK-$env:SR_TAG-win64.zip" -C .
-          gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
-          gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "vkweaver.h" -D "LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver"
+          gh release download sr-sdk-v$env:SR_TAG -R $env:SR_SDK_REPO -p "SimulatedRealityVulkanBeta.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
+          gh release download sr-sdk-v$env:SR_TAG -R $env:SR_SDK_REPO -p "vkweaver.h" -D "LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver"
           New-Item -ItemType Directory -Force "LeiaSR-SDK-$env:SR_TAG-win64/bin" | Out-Null
-          gh release download sr-sdk-v$env:SR_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkanBeta.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
+          gh release download sr-sdk-v$env:SR_TAG -R $env:SR_SDK_REPO -p "SimulatedRealityVulkanBeta.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
           # Stamp-aware (ST-5318) weaver, REQUIRED for SR 1.36.x: that core emits
           # the subpixel pixel-stamp but ships no Vulkan weaver, so the pre-stamp
           # DLL above renders a coloured replica there. Hard-fail rather than
           # silently packaging a build that is broken on 1.36 machines.
-          gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
+          gh release download $env:SR_VKSTAMP_TAG -R $env:SR_SDK_REPO -p "SimulatedRealityVulkan.dll" -D "LeiaSR-SDK-$env:SR_TAG-win64/bin"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download stamp-aware weaver ($env:SR_VKSTAMP_TAG)" }
-          gh release download $env:SR_VKSTAMP_TAG -R DisplayXR/displayxr-leia-plugin -p "SimulatedRealityVulkan.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
+          gh release download $env:SR_VKSTAMP_TAG -R $env:SR_SDK_REPO -p "SimulatedRealityVulkan.lib" -D "LeiaSR-SDK-$env:SR_TAG-win64/lib"
 
       - name: Download SR v2 C99 SDK
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
         run: |
-          gh release download $env:SR_V2_TAG -R DisplayXR/displayxr-leia-plugin -p "$env:SR_V2_DIR.zip" -D .
+          gh release download $env:SR_V2_TAG -R $env:SR_SDK_REPO -p "$env:SR_V2_DIR.zip" -D .
           if ($LASTEXITCODE -ne 0) { throw "Failed to download SR v2 SDK ($env:SR_V2_TAG)" }
           tar -xf "$env:SR_V2_DIR.zip" -C .
           # The two files the CMake gate keys on — fail here, not at configure.

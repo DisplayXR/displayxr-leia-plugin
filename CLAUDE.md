@@ -110,10 +110,18 @@ scripts\build-windows.bat build      REM plug-in DLL only
 scripts\build-windows.bat installer  REM NSIS installer (requires DLL built)
 ```
 
-Requires VS 2022 + Ninja + Vulkan SDK + GitHub CLI (the SR SDK is
-downloaded from a private GH release; `gh auth status` must show
-authenticated). On first run the script pulls the SR SDK at
-`SR_TAG` (set in `CMakeLists.txt`).
+Requires VS 2022 + Ninja + Vulkan SDK + GitHub CLI. **The SR SDK bits
+(SDK zips, the Vulkan weaver rescue DLLs, the Linux SDK) are Leia SDK
+material and live ONLY on the private
+`LeiaInc/SR-SDK-Windows-Releases-Internal-Public` release tags
+(`sr-sdk-v*`) — never re-host them on this public repo** (2026-09-03
+incident: an outside developer found the Linux SDK on a public release
+here). `gh auth status` must show an account that can read that repo; CI
+reads it with the `LEIALOFT_GITHUB_TOKEN` secret (same one the Android arm
+uses for `LeiaInc/CNSDK`), so fork PRs cannot build the Windows/Linux arms.
+On first run the script pulls the SR SDK at `SR_TAG` / `SR_VKSTAMP_TAG` /
+`SR_V2_TAG` (set in `scripts/build-windows.bat`; keep in sync with
+`build-windows.yml`).
 
 ### Linux (Track A — stub weaver)
 ```bash

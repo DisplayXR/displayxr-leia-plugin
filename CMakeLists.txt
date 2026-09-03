@@ -234,7 +234,7 @@ if(WIN32)
     if(NOT DEFINED ENV{LEIASR_SDKROOT})
         message(FATAL_ERROR
             "LEIASR_SDKROOT env var not set. Point at an extracted LeiaSR-SDK-*-win64 directory. "
-            "scripts/build-windows.bat fetches it from the sr-sdk-v* release on this repo.")
+            "scripts/build-windows.bat fetches it from the sr-sdk-v* release on LeiaInc/SR-SDK-Windows-Releases-Internal-Public (private).")
     endif()
     set(SR_PATH "$ENV{LEIASR_SDKROOT}")
     list(APPEND CMAKE_PREFIX_PATH "${SR_PATH}")
