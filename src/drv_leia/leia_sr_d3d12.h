@@ -210,6 +210,20 @@ bool
 leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d);
 
 /*!
+ * #215 — when enabled (default) request_display_mode posts the wish to a
+ * mailbox drained by a short-lived worker instead of calling the SR service
+ * synchronously on the caller's thread; the runtime calls it from the
+ * compositor frame path under its mutex.
+ *
+ * @param leiasr The D3D12 weaver instance.
+ * @param enabled false reverts to the old synchronous lens call.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d12_set_async_lens(struct leiasr_d3d12 *leiasr, bool enabled);
+
+/*!
  * Whether the per-client SR lens hint channel exists (the same gate as
  * @ref leiasr_d3d12_request_display_mode support). Used by the display-zones
  * DP path to advertise zone capability — zones drive the panel through the

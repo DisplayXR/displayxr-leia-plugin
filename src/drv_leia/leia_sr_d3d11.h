@@ -341,6 +341,20 @@ bool
 leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d);
 
 /*!
+ * #215 — when enabled (default) request_display_mode posts the wish to a
+ * mailbox drained by a short-lived worker instead of calling the SR service
+ * synchronously on the caller's thread; the runtime calls it from the
+ * compositor frame path under its mutex.
+ *
+ * @param leiasr The D3D11 weaver instance.
+ * @param enabled false reverts to the old synchronous lens call.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d11_set_async_lens(struct leiasr_d3d11 *leiasr, bool enabled);
+
+/*!
  * Check if the SR display supports 2D/3D mode switching.
  *
  * @param leiasr The D3D11 weaver instance.
