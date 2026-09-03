@@ -1,0 +1,18 @@
+name: tmp-token-probe
+on:
+  push:
+    branches: [chore/sr-sdk-private-mirror]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+    steps:
+      - run: |
+          echo "owner: $(gh api user -q '"\(.login) type=\(.type)"' 2>&1)"
+          echo "scopes: $(gh api -i user 2>/dev/null | grep -i '^x-oauth-scopes' || echo '(none header => fine-grained PAT or app token)')"
+          echo "prefix: $(printf '%s' "$GH_TOKEN" | cut -c1-11 | sed 's/./&/')"
+          for r in LeiaInc/CNSDK LeiaInc/SR-SDK-Windows-Releases-Internal-Public LeiaInc/LeiaSR; do
+            echo "$r: $(gh api repos/$r -q .full_name 2>&1 | head -1)"
+          done
+          echo "installations: $(gh api /user/installations -q '.installations[] | "\(.account.login)/\(.app_slug)"' 2>&1 | head -5 | tr '\n' ' ')"
