@@ -198,7 +198,7 @@ jobs:
   # VM (not a container) so sudo apt + softprops/action-gh-release work simply.
   #
   # GATED ON THE LINUX SDK ASSET EXISTING: until a LeiaSR-SDK-<SR_TAG>-linux64.*
-  # is uploaded to the sr-sdk-v<SR_TAG> release (produced by the LeiaSR Linux
+  # is uploaded to the sr-sdk-v<SR_TAG> release on SR_SDK_REPO (produced by the LeiaSR Linux
   # build — see runtime #781 / @George), the download soft-skips and this job is
   # a green no-op. It never blocks a PR.
   Deb:
@@ -208,6 +208,9 @@ jobs:
       # Linux srSDK is versioned like the SR runtime (1.37.0.x) and lives in its
       # own sr-sdk-v<SR_TAG> release with the LeiaSR-SDK-<SR_TAG>-linux64.* asset.
       SR_TAG: 1.37.0.41935
+      # Private Leia artifact repo hosting every sr-sdk-v* release (see
+      # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
+      SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
     steps:
       - name: Install dependencies
         run: |
@@ -240,20 +243,24 @@ jobs:
       - name: Download the Linux SR SDK from the sr-sdk release
         id: sdk
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
         run: |
           set -e
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::LEIALOFT_GITHUB_TOKEN absent (fork PR?) — the Linux SR SDK lives on the private $SR_SDK_REPO release; skipping the Track B .deb."
+            echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           # Try common tarball extensions; the LeiaSR Linux build decides the
           # exact name. Absent asset => soft-skip (the .deb path isn't live yet).
           got=""
           for ext in tar.gz tgz tar.xz zip; do
-            if gh release download "sr-sdk-v$SR_TAG" -R DisplayXR/displayxr-leia-plugin \
+            if gh release download "sr-sdk-v$SR_TAG" -R "$SR_SDK_REPO" \
                  -p "LeiaSR-SDK-$SR_TAG-linux64.$ext" -D . 2>/dev/null; then
               got="LeiaSR-SDK-$SR_TAG-linux64.$ext"; break
             fi
           done
           if [ -z "$got" ]; then
-            echo "::warning::No LeiaSR-SDK-$SR_TAG-linux64.* on the sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
+            echo "::warning::No LeiaSR-SDK-$SR_TAG-linux64.* on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
             echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
           mkdir -p _srsdk
