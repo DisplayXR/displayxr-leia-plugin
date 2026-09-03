@@ -357,6 +357,14 @@ struct leia_display_processor_d3d11_impl
 	//! lazily-allocated staging readback. The zone path deliberately does NOT
 	//! touch view_count — a partial-3D mask keeps the panel hint 3D while the
 	//! weave continues at the active rendering mode's view count.
+	//!
+	//! #215: that readback is NON-BLOCKING. The copy is issued on the first
+	//! publish of a generation and then polled with D3D11_MAP_FLAG_DO_NOT_WAIT
+	//! on the runtime's per-frame republish (the runtime republishes every
+	//! frame with the same seq — only the screen anchor differs — so no timer
+	//! is needed); the previous generation's verdict is carried until the new
+	//! one lands. Mapping with MapFlags 0 instead waits on the GPU on the
+	//! compositor thread, which cost ~180 ms per real mask change.
 	//! @{
 	uint64_t zone_eval_seq;        //!< Generation last content-evaluated.
 	bool zone_eval_valid;          //!< zone_eval_seq/zone_want_3d are valid.
@@ -365,6 +373,15 @@ struct leia_display_processor_d3d11_impl
 	bool zone_active;              //!< A publish is live (not cleared).
 	ID3D11Texture2D *zone_staging; //!< Readback scratch (mask-sized, R8).
 	uint32_t zone_staging_w, zone_staging_h;
+	bool zone_readback_pending;      //!< #215: a CopyResource is issued and not yet mapped.
+	uint64_t zone_readback_seq;      //!< Generation the in-flight copy belongs to.
+	LONGLONG zone_readback_t0_qpc;   //!< QPC at copy issue — reported once when it lands.
+	uint32_t zone_readback_polls;    //!< DO_NOT_WAIT map attempts for this generation.
+	//! #215 kill-switch: DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the
+	//! blocking map (and, via leiasr_d3d11_set_async_lens, the synchronous
+	//! lens hint). Default true — set explicitly at create, since the impl is
+	//! calloc'd and zero would mean "blocking".
+	bool async_zone_publish;
 	//! #68 — set by set_shared_texture_present (from the compositor's
 	//! has_shared_texture). A _texture app self-presents its shared texture's
 	//! canvas to its own window, so for a zones frame the canvas fills the window
@@ -1748,59 +1765,112 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 
 	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
 	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
-	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
-		if (ldp->zone_staging == nullptr || ldp->zone_staging_w != mask_width ||
-		    ldp->zone_staging_h != mask_height) {
-			if (ldp->zone_staging != nullptr) {
-				ldp->zone_staging->Release();
-				ldp->zone_staging = nullptr;
+	const bool need_eval = !ldp->zone_eval_valid || seq != ldp->zone_eval_seq;
+	if (need_eval) {
+		// Issue the copy once per generation; every later publish of the same
+		// seq only polls the map below. A mask resize mid-generation also
+		// re-issues — otherwise the scan below would read a stale-sized
+		// staging texture.
+		if (!ldp->zone_readback_pending || ldp->zone_readback_seq != seq ||
+		    ldp->zone_staging_w != mask_width || ldp->zone_staging_h != mask_height) {
+			if (ldp->zone_staging == nullptr || ldp->zone_staging_w != mask_width ||
+			    ldp->zone_staging_h != mask_height) {
+				if (ldp->zone_staging != nullptr) {
+					// Safe even with a copy still queued against it: D3D11
+					// holds its own reference for queued commands, so the
+					// texture outlives the Release until the GPU is done.
+					ldp->zone_staging->Release();
+					ldp->zone_staging = nullptr;
+				}
+				D3D11_TEXTURE2D_DESC td = {};
+				td.Width = mask_width;
+				td.Height = mask_height;
+				td.MipLevels = 1;
+				td.ArraySize = 1;
+				td.Format = DXGI_FORMAT_R8_UNORM; // the XR_DXR_local_3d_zone mask format
+				td.SampleDesc.Count = 1;
+				td.Usage = D3D11_USAGE_STAGING;
+				td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				if (ldp->device == nullptr ||
+				    FAILED(ldp->device->CreateTexture2D(&td, nullptr, &ldp->zone_staging))) {
+					ldp->zone_staging = nullptr;
+					return false; // can't evaluate — don't flip the lens blindly
+				}
+				ldp->zone_staging_w = mask_width;
+				ldp->zone_staging_h = mask_height;
 			}
-			D3D11_TEXTURE2D_DESC td = {};
-			td.Width = mask_width;
-			td.Height = mask_height;
-			td.MipLevels = 1;
-			td.ArraySize = 1;
-			td.Format = DXGI_FORMAT_R8_UNORM; // the XR_DXR_local_3d_zone mask format
-			td.SampleDesc.Count = 1;
-			td.Usage = D3D11_USAGE_STAGING;
-			td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-			if (ldp->device == nullptr || FAILED(ldp->device->CreateTexture2D(&td, nullptr, &ldp->zone_staging))) {
-				ldp->zone_staging = nullptr;
-				return false; // can't evaluate — don't flip the lens blindly
+
+			ID3D11Resource *res = nullptr;
+			srv->GetResource(&res);
+			if (res == nullptr) {
+				return false;
 			}
-			ldp->zone_staging_w = mask_width;
-			ldp->zone_staging_h = mask_height;
+			ctx->CopyResource(ldp->zone_staging, res);
+			res->Release();
+			// Submit it now. A copy left in the immediate context's command buffer
+			// is only flushed by the next Present, and a client that never reaches
+			// one would poll DO_NOT_WAIT forever; one Flush per generation is the
+			// documented companion of a non-blocking Map.
+			ctx->Flush();
+
+			ldp->zone_readback_pending = true;
+			ldp->zone_readback_seq = seq;
+			LARGE_INTEGER t0 = {};
+			QueryPerformanceCounter(&t0);
+			ldp->zone_readback_t0_qpc = t0.QuadPart;
+			ldp->zone_readback_polls = 0;
 		}
 
-		ID3D11Resource *res = nullptr;
-		srv->GetResource(&res);
-		if (res == nullptr) {
-			return false;
-		}
-		ctx->CopyResource(ldp->zone_staging, res);
-		res->Release();
-
+		ldp->zone_readback_polls++;
+		const UINT map_flags = ldp->async_zone_publish ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0;
 		D3D11_MAPPED_SUBRESOURCE mapped = {};
-		if (FAILED(ctx->Map(ldp->zone_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+		HRESULT hr = ctx->Map(ldp->zone_staging, 0, D3D11_MAP_READ, map_flags, &mapped);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			// Copy still in flight. This is a REQUEST API — acceptance, not
+			// completion. With a previous verdict we carry it (falling through
+			// to the edge below, which will not fire on an unchanged verdict);
+			// on the very first publish there is nothing to drive the lens
+			// with yet, so leave zone_active untouched and let the runtime's
+			// next per-frame republish poll again.
+			if (!ldp->zone_eval_valid) {
+				return true;
+			}
+		} else if (FAILED(hr)) {
+			ldp->zone_readback_pending = false;
 			return false;
-		}
-		bool any = false;
-		for (uint32_t y = 0; y < mask_height && !any; y++) {
-			const uint8_t *row = static_cast<const uint8_t *>(mapped.pData) + (size_t)y * mapped.RowPitch;
-			for (uint32_t x = 0; x < mask_width; x++) {
-				if (row[x] != 0) {
-					any = true;
-					break;
+		} else {
+			bool any = false;
+			for (uint32_t y = 0; y < mask_height && !any; y++) {
+				const uint8_t *row =
+				    static_cast<const uint8_t *>(mapped.pData) + (size_t)y * mapped.RowPitch;
+				for (uint32_t x = 0; x < mask_width; x++) {
+					if (row[x] != 0) {
+						any = true;
+						break;
+					}
 				}
 			}
-		}
-		ctx->Unmap(ldp->zone_staging, 0);
+			ctx->Unmap(ldp->zone_staging, 0);
 
-		ldp->zone_want_3d = any;
-		ldp->zone_eval_seq = seq;
-		ldp->zone_eval_valid = true;
-		U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
-		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+			ldp->zone_want_3d = any;
+			ldp->zone_eval_seq = seq;
+			ldp->zone_eval_valid = true;
+			ldp->zone_readback_pending = false;
+
+			LARGE_INTEGER t1 = {}, freq = {};
+			QueryPerformanceCounter(&t1);
+			QueryPerformanceFrequency(&freq);
+			const double ms = freq.QuadPart > 0
+			                      ? (double)(t1.QuadPart - ldp->zone_readback_t0_qpc) * 1000.0 /
+			                            (double)freq.QuadPart
+			                      : 0.0;
+			// Once per generation — not per frame.
+			U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
+			        "readback %.1f ms over %u poll%s%s)",
+			        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height, ms,
+			        ldp->zone_readback_polls, ldp->zone_readback_polls == 1 ? "" : "s",
+			        ldp->async_zone_publish ? "" : " [blocking]");
+		}
 	}
 
 	// Edge-triggered lens hint: flip only when the verdict changes (or on the
@@ -1836,6 +1906,9 @@ leia_dp_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
 	}
 	ldp->zone_active = false;
 	ldp->zone_eval_valid = false;
+	// #215: drop any in-flight readback with it — the next publish starts a
+	// fresh generation and re-issues its own copy.
+	ldp->zone_readback_pending = false;
 	return true;
 }
 
@@ -2370,6 +2443,19 @@ leia_dp_factory_d3d11(void *d3d11_device,
 	ldp->hwnd = static_cast<HWND>(window_handle);
 	ldp->view_count = 2;
 
+	// #215: the zone publish slot used to block the runtime's compositor
+	// thread for ~180 ms per real mask change — a synchronous GPU readback
+	// plus a synchronous SR-service round trip for the lens hint. Both are
+	// non-blocking by default; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts both for
+	// bisecting. Set after ldp->leiasr exists — the lens half lives there.
+	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
+	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
+	leiasr_d3d11_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
+	U_LOG_W("Leia D3D11 zone publish: %s (#215; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the "
+	        "blocking readback + synchronous lens hint)",
+	        ldp->async_zone_publish ? "non-blocking readback + async lens hint"
+	                                : "BLOCKING (kill-switch)");
+
 	// Compile blit shaders for 2D passthrough mode
 	if (!leia_dp_d3d11_init_blit(ldp)) {
 		U_LOG_W("Leia D3D11 DP: blit shader init failed — 2D mode will be unavailable");
@@ -2406,6 +2492,10 @@ leia_display_processor_d3d11_create(struct leiasr_d3d11 *leiasr,
 	leia_dp_d3d11_init_vtable(ldp);
 	ldp->leiasr = leiasr;
 	ldp->view_count = 2;
+	// #215: the impl is calloc'd, so the non-blocking default has to be
+	// written here too — zero would silently mean "blocking" on this path.
+	// No env read: the kill-switch is a factory-create knob.
+	ldp->async_zone_publish = true;
 	// Legacy path: no device reference, SBS rearrangement not available.
 	// Atlas must already be SBS.
 

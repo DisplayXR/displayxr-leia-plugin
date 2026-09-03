@@ -367,9 +367,23 @@ struct leia_display_processor_d3d12_impl
 	//! Unlike D3D11 (which gets an immediate context + SRV and reads back via
 	//! ctx->Map), the D3D12 publish slot hands us a bare ID3D12Resource* with no
 	//! context — so the verdict needs an OWNED readback pipeline (own allocator +
-	//! list + READBACK buffer + fence) run on @ref command_queue. It is
-	//! edge-triggered (once per generation), so the synchronous fence wait is
-	//! cheap.
+	//! list + READBACK buffer + fence) run on @ref command_queue.
+	//!
+	//! #215: that readback is NON-BLOCKING. The copy is issued on the first
+	//! publish of a generation and then polled with the fence's
+	//! GetCompletedValue() on the runtime's per-frame republish (the runtime
+	//! republishes every frame with the same seq — only the screen anchor
+	//! differs — so no timer is needed); the previous generation's verdict is
+	//! carried until the new one lands. Waiting on the fence event instead
+	//! parks the compositor thread on the GPU, which cost ~180 ms per real
+	//! mask change on the D3D11 arm.
+	//!
+	//! "A copy is in flight" is derived from the FENCE, never from a bool:
+	//! zone_fence != nullptr && zone_fence->GetCompletedValue() < zone_fence_value.
+	//! Resetting @ref zone_cmd_alloc while the GPU is still executing the
+	//! previously recorded list is undefined behaviour, so an issue must never
+	//! happen while a previous copy is in flight — and a fence-derived rule is
+	//! the one thing @ref leia_dp_d3d12_clear_local_zone_mask cannot forget.
 	//! @{
 	uint64_t zone_eval_seq;  //!< Generation last content-evaluated.
 	bool zone_eval_valid;    //!< zone_eval_seq/zone_want_3d are valid.
@@ -382,9 +396,29 @@ struct leia_display_processor_d3d12_impl
 	ID3D12Resource *zone_readback;             //!< HEAP_TYPE_READBACK buffer (mask-sized).
 	uint32_t zone_readback_w, zone_readback_h; //!< Dims the readback buffer was sized for.
 	uint32_t zone_readback_pitch;              //!< Aligned row pitch of the readback footprint.
-	ID3D12Fence *zone_fence;                   //!< Owned; gates the synchronous readback.
+	ID3D12Fence *zone_fence;                   //!< Owned; gates the readback.
 	HANDLE zone_fence_event;                   //!< Owned; CloseHandle in destroy.
 	uint64_t zone_fence_value;                 //!< Monotonic fence signal counter.
+	uint64_t zone_readback_seq;    //!< Generation the issued copy belongs to.
+	LONGLONG zone_readback_t0_qpc; //!< QPC at copy issue — reported once when it lands.
+	uint32_t zone_readback_polls;  //!< Poll attempts for this generation.
+	//! #215: an issue happened whose verdict has not been consumed yet. Set at
+	//! issue, cleared when LANDED is consumed or on FAILED. NOT the in-flight
+	//! flag — that one is fence-derived (see above).
+	bool zone_readback_armed;
+	//! #215: the mask the in-flight copy reads. D3D12 keeps NO reference for a
+	//! queued list, and the copy now outlives the publish call, so the runtime
+	//! could release/recreate the mask (resize) while the GPU still reads it.
+	//! AddRef'd at issue, released at the NEXT issue (guaranteed not in flight)
+	//! or at destroy after the drain.
+	ID3D12Resource *zone_readback_src;
+	//! #215 kill-switch: DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the blocking
+	//! fence wait (and, via leiasr_d3d12_set_async_lens, the synchronous lens
+	//! hint). Default true — set explicitly at create, since the impl is
+	//! calloc'd and zero would mean "blocking".
+	bool async_zone_publish;
+	bool zone_first_logged;   //!< one-shot: first publish reached the DP
+	bool zone_refused_logged; //!< one-shot: a publish was refused at the guard
 	//! @}
 
 	//! One-shot guard for a lost device. The per-frame resource creates (the
@@ -2060,21 +2094,57 @@ leia_dp_d3d12_get_local_zone_caps(struct xrt_display_processor_d3d12 *xdp, struc
 	return true;
 }
 
-// GPU→CPU readback of the R8 wish mask on the DP's OWN queue (D3D12 has no
-// immediate context like D3D11). Edge-triggered — runs once per mask generation,
-// so the synchronous fence wait is cheap. Returns false on any failure (caller
-// must NOT flip the lens on an unevaluated mask). On success *out_any reports the
-// 1×1 OR-collapse verdict (any non-zero pixel ⟹ 3D). The mask is borrowed and
-// arrives in PIXEL_SHADER_RESOURCE state (compositor contract) — restored before
-// return.
+//! #215: verdict of one readback poll.
+enum zone_rb_state
+{
+	ZONE_RB_PENDING = 0, //!< The copy is still executing — no verdict yet.
+	ZONE_RB_LANDED,      //!< Complete and scanned; *out_any holds the verdict.
+	ZONE_RB_FAILED,      //!< Map/wait failed — caller must NOT flip the lens.
+};
+
+// #215: is the readback copy still executing on the GPU? Derived from the
+// FENCE, never from a bool — zone_cmd_alloc->Reset() while the GPU is still
+// executing the list that allocator backs is undefined behaviour, and a bool
+// can be dropped behind our back (clear_local_zone_mask lands between an issue
+// and its land, and disarms). The fence cannot forget.
 static bool
-leia_dp_d3d12_zone_readback(struct leia_display_processor_d3d12_impl *ldp,
-                            ID3D12Resource *mask,
-                            uint32_t mask_width,
-                            uint32_t mask_height,
-                            bool *out_any)
+leia_dp_d3d12_zone_in_flight(struct leia_display_processor_d3d12_impl *ldp)
+{
+	return ldp->zone_fence != nullptr && ldp->zone_fence->GetCompletedValue() < ldp->zone_fence_value;
+}
+
+// GPU→CPU readback of the R8 wish mask on the DP's OWN queue (D3D12 has no
+// immediate context like D3D11) — ISSUE half (#215). Records the copy, executes
+// it and signals the fence, then returns WITHOUT waiting; the verdict is picked
+// up by leia_dp_d3d12_zone_readback_poll on this or a later publish of the same
+// generation. Returns false on any failure (caller must NOT flip the lens on an
+// unevaluated mask). The mask is borrowed and arrives in PIXEL_SHADER_RESOURCE
+// state (compositor contract) — restored by the second barrier below.
+//
+// PRECONDITION: no copy in flight (leia_dp_d3d12_zone_in_flight() false). The
+// zone_cmd_alloc->Reset() below would otherwise stomp a command list the GPU is
+// still executing.
+//
+// Both barriers are recorded on ldp->command_queue, which is the queue the
+// runtime's compositor hands the factory (its own output queue, d3d12_out_queue)
+// — so the COPY_SOURCE→PIXEL_SHADER_RESOURCE restore is GPU-ordered before any
+// later compositor submission that samples the mask. The async variant relies on
+// exactly that same-queue ordering, just as the old blocking one did: a DP
+// created on a FOREIGN queue would need a cross-queue fence here, not merely a
+// signal, because nothing else would order the restore against the compositor.
+static bool
+leia_dp_d3d12_zone_readback_issue(struct leia_display_processor_d3d12_impl *ldp,
+                                  ID3D12Resource *mask,
+                                  uint32_t mask_width,
+                                  uint32_t mask_height,
+                                  uint64_t seq)
 {
 	ID3D12Device *dev = ldp->device;
+	// Precondition (not in flight) makes this safe: the previous copy is done.
+	if (ldp->zone_readback_src != nullptr) {
+		ldp->zone_readback_src->Release();
+		ldp->zone_readback_src = nullptr;
+	}
 
 	// Lazy one-time allocator + list + fence + event.
 	if (ldp->zone_cmd_alloc == nullptr) {
@@ -2174,22 +2244,62 @@ leia_dp_d3d12_zone_readback(struct leia_display_processor_d3d12_impl *ldp,
 	if (FAILED(ldp->command_queue->Signal(ldp->zone_fence, signal))) {
 		return false;
 	}
-	if (ldp->zone_fence->GetCompletedValue() < signal) {
-		if (FAILED(ldp->zone_fence->SetEventOnCompletion(signal, ldp->zone_fence_event))) {
-			return false;
+
+	// Issued — no wait. The poll below is what turns this into a verdict; from
+	// here until then leia_dp_d3d12_zone_in_flight() reports true off the fence.
+	ldp->zone_readback_seq = seq;
+	mask->AddRef(); // held until the next issue or destroy — see zone_readback_src
+	ldp->zone_readback_src = mask;
+	LARGE_INTEGER t0 = {};
+	QueryPerformanceCounter(&t0);
+	ldp->zone_readback_t0_qpc = t0.QuadPart;
+	ldp->zone_readback_polls = 0;
+	ldp->zone_readback_armed = true;
+	return true;
+}
+
+// #215: POLL half — the CPU side of the copy leia_dp_d3d12_zone_readback_issue
+// put on the queue. PENDING while the fence has not caught up (unless
+// @p blocking, the kill-switch, which waits on the fence event exactly as the
+// old synchronous helper did). Once complete: Map + the 1×1 OR-collapse scan
+// (any non-zero pixel ⟹ 3D) + Unmap, and *out_any is the verdict.
+//
+// @p mask_width / @p mask_height MUST be the dims the copy was ISSUED with (the
+// caller passes zone_readback_w/h) — the mask can be resized while a copy is in
+// flight, and the readback buffer and its footprint belong to the issued one.
+static enum zone_rb_state
+leia_dp_d3d12_zone_readback_poll(struct leia_display_processor_d3d12_impl *ldp,
+                                 uint32_t mask_width,
+                                 uint32_t mask_height,
+                                 bool blocking,
+                                 bool *out_any)
+{
+	if (ldp->zone_readback == nullptr || ldp->zone_fence == nullptr) {
+		return ZONE_RB_FAILED;
+	}
+
+	if (leia_dp_d3d12_zone_in_flight(ldp)) {
+		if (!blocking) {
+			return ZONE_RB_PENDING;
+		}
+		// Kill-switch only: park the caller's thread on the GPU.
+		if (ldp->zone_fence_event == nullptr ||
+		    FAILED(ldp->zone_fence->SetEventOnCompletion(ldp->zone_fence_value, ldp->zone_fence_event))) {
+			return ZONE_RB_FAILED;
 		}
 		WaitForSingleObject(ldp->zone_fence_event, INFINITE);
 	}
 
-	// Map + any-nonzero over rows (pitch is the footprint's aligned RowPitch).
+	// Map + any-nonzero over rows (pitch is the footprint's aligned RowPitch,
+	// recorded when the readback buffer was sized for these dims).
 	void *mapped = nullptr;
-	D3D12_RANGE read_range = {0, (SIZE_T)total_bytes};
+	D3D12_RANGE read_range = {0, (SIZE_T)ldp->zone_readback_pitch * (SIZE_T)mask_height};
 	if (FAILED(ldp->zone_readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
-		return false;
+		return ZONE_RB_FAILED;
 	}
 	bool any = false;
 	for (uint32_t y = 0; y < mask_height && !any; y++) {
-		const uint8_t *row = static_cast<const uint8_t *>(mapped) + (size_t)y * fp.Footprint.RowPitch;
+		const uint8_t *row = static_cast<const uint8_t *>(mapped) + (size_t)y * ldp->zone_readback_pitch;
 		for (uint32_t x = 0; x < mask_width; x++) {
 			if (row[x] != 0) {
 				any = true;
@@ -2201,7 +2311,7 @@ leia_dp_d3d12_zone_readback(struct leia_display_processor_d3d12_impl *ldp,
 	ldp->zone_readback->Unmap(0, &no_write);
 
 	*out_any = any;
-	return true;
+	return ZONE_RB_LANDED;
 }
 
 static bool
@@ -2226,21 +2336,96 @@ leia_dp_d3d12_publish_local_zone_mask(struct xrt_display_processor_d3d12 *xdp,
 	ID3D12Resource *mask = static_cast<ID3D12Resource *>(mask_resource);
 	if (mask == nullptr || mask_width == 0 || mask_height == 0 || ldp->device == nullptr ||
 	    ldp->command_queue == nullptr) {
+		// One-shot: a publish that is refused here is invisible to the runtime
+		// (it does not log a false return), and "never evaluated" then reads
+		// like "never called".
+		if (!ldp->zone_refused_logged) {
+			ldp->zone_refused_logged = true;
+			U_LOG_W("SR D3D12 zone: publish REFUSED (mask %p %ux%u, device %p, queue %p) — lens hint untouched",
+			        (void *)mask, mask_width, mask_height, (void *)ldp->device, (void *)ldp->command_queue);
+		}
 		return false;
+	}
+	if (!ldp->zone_first_logged) {
+		ldp->zone_first_logged = true;
+		U_LOG_W("SR D3D12 zone: first publish (mask %ux%u, seq %llu, %s)", mask_width, mask_height,
+		        (unsigned long long)seq, ldp->async_zone_publish ? "non-blocking" : "blocking");
 	}
 
 	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
 	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
-	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
-		bool any = false;
-		if (!leia_dp_d3d12_zone_readback(ldp, mask, mask_width, mask_height, &any)) {
-			return false; // can't evaluate — don't flip the lens blindly
+	const bool need_eval = !ldp->zone_eval_valid || seq != ldp->zone_eval_seq;
+	if (need_eval) {
+		// #215: issue once, then poll on the runtime's per-frame republish of
+		// the same generation. In-flight is read off the FENCE, never a bool —
+		// see the zone_* block comment.
+		const bool in_flight = leia_dp_d3d12_zone_in_flight(ldp);
+		if (!ldp->zone_readback_armed) {
+			if (in_flight) {
+				// A previous generation's copy is still running (a clear
+				// disarmed us, or a resize re-issued): the allocator cannot be
+				// Reset yet. Carry on and poll it out on the next publish.
+			} else if (!leia_dp_d3d12_zone_readback_issue(ldp, mask, mask_width, mask_height, seq)) {
+				if (!ldp->zone_refused_logged) {
+					ldp->zone_refused_logged = true;
+					U_LOG_W("SR D3D12 zone: readback ISSUE failed for generation %llu — lens hint untouched",
+					        (unsigned long long)seq);
+				}
+				return false; // can't evaluate — don't flip the lens blindly
+			}
 		}
-		ldp->zone_want_3d = any;
-		ldp->zone_eval_seq = seq;
-		ldp->zone_eval_valid = true;
-		U_LOG_W("SR D3D12 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
-		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+
+		if (ldp->zone_readback_armed) {
+			ldp->zone_readback_polls++;
+			bool any = false;
+			// Scan at the dims the copy was ISSUED with — a mask resize while
+			// armed does not retarget the buffer under the in-flight copy.
+			switch (leia_dp_d3d12_zone_readback_poll(ldp, ldp->zone_readback_w, ldp->zone_readback_h,
+			                                         /*blocking=*/!ldp->async_zone_publish, &any)) {
+			case ZONE_RB_LANDED: {
+				ldp->zone_want_3d = any;
+				ldp->zone_eval_seq = ldp->zone_readback_seq;
+				ldp->zone_eval_valid = true;
+				ldp->zone_readback_armed = false;
+
+				LARGE_INTEGER t1 = {}, freq = {};
+				QueryPerformanceCounter(&t1);
+				QueryPerformanceFrequency(&freq);
+				const double ms = freq.QuadPart > 0
+				                      ? (double)(t1.QuadPart - ldp->zone_readback_t0_qpc) * 1000.0 /
+				                            (double)freq.QuadPart
+				                      : 0.0;
+				// Once per generation — not per frame.
+				U_LOG_W("SR D3D12 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
+				        "readback %.1f ms over %u poll%s%s)",
+				        (unsigned long long)ldp->zone_readback_seq, any ? "3D" : "2D",
+				        ldp->zone_readback_w, ldp->zone_readback_h, ms, ldp->zone_readback_polls,
+				        ldp->zone_readback_polls == 1 ? "" : "s",
+				        ldp->async_zone_publish ? "" : " [blocking]");
+				// If the runtime moved on to a newer generation while this one
+				// was in flight, the next publish's seq gate re-issues for it
+				// (zone_eval_seq != seq). Do NOT issue here — the list we just
+				// consumed is the one we would have to Reset.
+				break;
+			}
+			case ZONE_RB_PENDING:
+				// REQUEST API — acceptance, not completion. With a previous
+				// verdict we carry it (falling through to the edge below, which
+				// will not fire on an unchanged verdict); on the very first
+				// publish there is nothing to drive the lens with yet, so leave
+				// zone_active untouched and let the next republish poll again.
+				if (!ldp->zone_eval_valid) {
+					return true;
+				}
+				break;
+			case ZONE_RB_FAILED:
+				ldp->zone_readback_armed = false;
+				return false;
+			}
+		} else if (!ldp->zone_eval_valid) {
+			// In flight from a previous generation and no verdict ever landed.
+			return true;
+		}
 	}
 
 	// Edge-triggered lens hint: flip only when the verdict changes (or on the
@@ -2275,6 +2460,11 @@ leia_dp_d3d12_clear_local_zone_mask(struct xrt_display_processor_d3d12 *xdp)
 	}
 	ldp->zone_active = false;
 	ldp->zone_eval_valid = false;
+	// #215: forget the issued readback's verdict — the next publish starts a
+	// fresh generation. The COPY itself is not forgotten: in-flight is derived
+	// from the fence, so the next issue still refuses to Reset the allocator
+	// under a running list.
+	ldp->zone_readback_armed = false;
 	return true;
 }
 
@@ -2481,6 +2671,22 @@ leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 	ck_release_resources(ldp);
 
 	// #224 zone readback machinery.
+	// #215: with the readback made non-blocking, a copy can still be executing
+	// here — and unlike D3D11, D3D12 keeps NO reference to the resources an
+	// executing command list touches, so releasing the list/allocator/readback
+	// buffer under it is undefined behaviour. Drain the fence first. Bounded,
+	// not INFINITE: teardown must not wedge, and the only way this times out is
+	// a removed/hung device, where the objects below are moot anyway.
+	if (leia_dp_d3d12_zone_in_flight(ldp) && ldp->zone_fence_event != NULL &&
+	    SUCCEEDED(ldp->zone_fence->SetEventOnCompletion(ldp->zone_fence_value, ldp->zone_fence_event))) {
+		if (WaitForSingleObject(ldp->zone_fence_event, 200) != WAIT_OBJECT_0) {
+			U_LOG_W("Leia D3D12 DP: zone readback still in flight at destroy — releasing anyway");
+		}
+	}
+	if (ldp->zone_readback_src != NULL) {
+		ldp->zone_readback_src->Release();
+		ldp->zone_readback_src = NULL;
+	}
 	if (ldp->zone_readback != NULL) {
 		ldp->zone_readback->Release();
 	}
@@ -2662,6 +2868,19 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->hwnd = static_cast<HWND>(window_handle);
 	ldp->command_queue = static_cast<ID3D12CommandQueue *>(d3d12_command_queue);
 	ldp->view_count = 2;
+
+	// #215: the zone publish slot used to block the runtime's compositor
+	// thread for ~180 ms per real mask change — a synchronous GPU readback
+	// plus a synchronous SR-service round trip for the lens hint. Both are
+	// non-blocking by default; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts both for
+	// bisecting. Set after ldp->leiasr exists — the lens half lives there.
+	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
+	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
+	leiasr_d3d12_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
+	U_LOG_W("Leia D3D12 zone publish: %s (#215; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the "
+	        "blocking readback + synchronous lens hint)",
+	        ldp->async_zone_publish ? "non-blocking readback + async lens hint"
+	                                : "BLOCKING (kill-switch)");
 
 	// Init blit root signature and SRV heap for 2D passthrough mode
 	if (!leia_dp_d3d12_init_blit(ldp)) {
