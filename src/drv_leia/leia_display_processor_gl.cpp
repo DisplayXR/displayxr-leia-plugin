@@ -290,6 +290,23 @@ struct leia_display_processor_gl_impl
 	// texture name (R8), so the readback is an FBO-attach + glReadPixels (the GL
 	// analogue of D3D11's CopyResource-to-staging + Map).
 	//
+	// #215: that readback is NON-BLOCKING. glReadPixels into CLIENT memory is
+	// an implicit full-pipeline sync on the runtime's context, and the runtime
+	// calls publish from the compositor frame path — which cost ~180 ms per
+	// real mask change on the D3D11 arm. So the read now targets a
+	// GL_PIXEL_PACK_BUFFER (@ref zone_pbo), is fenced (@ref zone_fence), and is
+	// polled with a zero-timeout glClientWaitSync on the runtime's per-frame
+	// republish of the same generation (the runtime republishes every frame
+	// with the same seq — only the screen anchor differs — so no timer is
+	// needed); the previous generation's verdict is carried until the new one
+	// lands.
+	//
+	// "A read is in flight" is derived from the FENCE (@ref zone_fence != NULL),
+	// never from a bool: the PBO is that read's DESTINATION, so issuing a
+	// second read under a running one would stomp the buffer the driver is
+	// still filling — and a fence-derived rule is the one thing
+	// @ref leia_dp_gl_clear_local_zone_mask cannot forget.
+	//
 	bool zone_active;        //!< A mask is currently published (drives lens authority).
 	bool zone_want_3d;       //!< Latest evaluated verdict (any non-zero mask pixel).
 	bool zone_hint_3d;       //!< Last lens hint we issued (edge-trigger memo).
@@ -297,8 +314,33 @@ struct leia_display_processor_gl_impl
 	uint64_t zone_eval_seq;  //!< Generation of the last content evaluation.
 
 	GLuint zone_read_fbo;    //!< Dedicated FBO for attaching the mask tex to read it.
-	uint8_t *zone_buf;       //!< Reused CPU readback buffer (R8, zone_buf_w*zone_buf_h).
+	//! Reused CPU readback buffer (R8, zone_buf_w*zone_buf_h). #215: still in
+	//! use — it is the BLOCKING fallback's destination (kill-switch, or a
+	//! driver that never exposed the PBO/sync entry points).
+	uint8_t *zone_buf;
 	uint32_t zone_buf_w, zone_buf_h;
+
+	GLuint zone_pbo;   //!< #215 GL_PIXEL_PACK_BUFFER the async read targets. 0 ⟹ not created yet.
+	GLsync zone_fence; //!< #215 gates the async read. Non-NULL ⟹ a read is IN FLIGHT.
+	uint32_t zone_pbo_w, zone_pbo_h; //!< Dims @ref zone_pbo was sized (glBufferData) for.
+	uint64_t zone_readback_seq;      //!< Generation the issued read belongs to.
+	//! Dims the in-flight read was ISSUED with. The scan uses THESE, not the
+	//! publish call's — the mask can be resized while a read is in flight, and
+	//! the PBO's contents belong to the issued one.
+	uint32_t zone_readback_w, zone_readback_h;
+	LONGLONG zone_readback_t0_qpc; //!< QPC at issue — reported once when it lands.
+	uint32_t zone_readback_polls;  //!< Poll attempts for this generation.
+	//! #215: an issue happened whose verdict has not been consumed yet. Set at
+	//! issue, cleared when LANDED is consumed or on FAILED. NOT the in-flight
+	//! flag — that one is fence-derived (see above).
+	bool zone_readback_armed;
+	//! #215 kill-switch: DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the blocking
+	//! glReadPixels (and, via leiasr_gl_set_async_lens, the synchronous lens
+	//! hint). Default true — set explicitly at create, since the impl is
+	//! calloc'd and zero would mean "blocking".
+	bool async_zone_publish;
+	bool zone_first_logged;   //!< one-shot: first publish reached the DP
+	bool zone_refused_logged; //!< one-shot: a publish was refused at the guard
 };
 
 static inline struct leia_display_processor_gl_impl *
@@ -1435,6 +1477,238 @@ leia_dp_gl_get_local_zone_caps(struct xrt_display_processor_gl *xdp, struct xrt_
 	return true;
 }
 
+//! #215: verdict of one readback poll.
+enum zone_rb_state
+{
+	ZONE_RB_PENDING = 0, //!< The read is still executing — no verdict yet.
+	ZONE_RB_LANDED,      //!< Complete and scanned; *out_any holds the verdict.
+	ZONE_RB_FAILED,      //!< Wait/map failed — caller must NOT flip the lens.
+};
+
+// #215: are the PBO + fence entry points the non-blocking path needs actually
+// resolved? glad declares all of them, but leaves a pointer NULL when the
+// context the DP was created on is below the GL version that exports it (the
+// PBO half is GL 2.1/ARB_pixel_buffer_object, the sync half GL 3.2/ARB_sync).
+// A NULL here is not an error — it just means this box takes the blocking
+// fallback, which is the pre-#215 behaviour.
+static bool
+leia_dp_gl_zone_pbo_supported(void)
+{
+	return glGenBuffers != NULL && glBindBuffer != NULL && glBufferData != NULL &&
+	       glMapBufferRange != NULL && glUnmapBuffer != NULL && glFenceSync != NULL &&
+	       glClientWaitSync != NULL && glDeleteSync != NULL;
+}
+
+// #215: BLOCKING readback — the pre-#215 glReadPixels-into-client-memory path,
+// unchanged. Two callers reach it: DXR_LEIA_ASYNC_ZONE_PUBLISH=0 (the
+// kill-switch), and a driver where leia_dp_gl_zone_pbo_supported() is false.
+// glReadPixels into client memory is an implicit full-pipeline sync on the
+// runtime's context: the caller's thread pays for the GPU to catch up.
+static bool
+leia_dp_gl_zone_readback_blocking(struct leia_display_processor_gl_impl *ldp,
+                                  uint32_t mask_tex,
+                                  uint32_t mask_width,
+                                  uint32_t mask_height,
+                                  bool *out_any)
+{
+	const size_t need = (size_t)mask_width * mask_height;
+	if (ldp->zone_buf == nullptr || ldp->zone_buf_w != mask_width || ldp->zone_buf_h != mask_height) {
+		uint8_t *nb = (uint8_t *)realloc(ldp->zone_buf, need);
+		if (nb == nullptr) {
+			return false; // can't evaluate — don't flip the lens blindly
+		}
+		ldp->zone_buf = nb;
+		ldp->zone_buf_w = mask_width;
+		ldp->zone_buf_h = mask_height;
+	}
+	if (ldp->zone_read_fbo == 0) {
+		glGenFramebuffers(1, &ldp->zone_read_fbo);
+	}
+
+	// Attach the R8 mask to our read FBO and glReadPixels it. Restore the
+	// prior read-FBO binding so we don't perturb the runtime's GL state
+	// (publish runs on the runtime's context right after present composite).
+	GLint prev_read_fbo = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->zone_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_tex, 0);
+	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+		U_LOG_W("SR GL zone: mask FBO incomplete — can't evaluate");
+		return false; // mirror D3D11: don't flip on a failed readback
+	}
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	GLint prev_pack = 4;
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	glReadPixels(0, 0, (GLsizei)mask_width, (GLsizei)mask_height, GL_RED, GL_UNSIGNED_BYTE, ldp->zone_buf);
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+
+	bool any = false;
+	for (size_t i = 0; i < need; i++) {
+		if (ldp->zone_buf[i] != 0) {
+			any = true;
+			break;
+		}
+	}
+	*out_any = any;
+	return true;
+}
+
+// GPU→CPU readback of the R8 wish mask into a PIXEL_PACK buffer — ISSUE half
+// (#215). Records the read and a fence, flushes, and returns WITHOUT waiting;
+// the verdict is picked up by leia_dp_gl_zone_readback_poll on this or a later
+// publish of the same generation. Returns false on any failure (caller must NOT
+// flip the lens on an unevaluated mask).
+//
+// PRECONDITION: no read in flight (ldp->zone_fence == NULL). The PBO is the
+// READ's DESTINATION — issuing a second read into it while the driver is still
+// filling it for the first corrupts both, and glBufferData on a resize would
+// orphan the storage the in-flight read is writing.
+//
+// Everything this touches on the runtime's context is saved and restored: the
+// pixel-pack binding, the read-framebuffer binding and the pack alignment.
+static bool
+leia_dp_gl_zone_readback_issue(struct leia_display_processor_gl_impl *ldp,
+                               uint32_t mask_tex,
+                               uint32_t mask_width,
+                               uint32_t mask_height,
+                               uint64_t seq)
+{
+	if (ldp->zone_pbo == 0) {
+		glGenBuffers(1, &ldp->zone_pbo);
+		if (ldp->zone_pbo == 0) {
+			return false;
+		}
+	}
+	if (ldp->zone_read_fbo == 0) {
+		glGenFramebuffers(1, &ldp->zone_read_fbo);
+	}
+
+	GLint prev_pbo = 0, prev_read_fbo = 0, prev_pack = 4;
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pbo);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
+	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
+
+	// (Re)size the destination on a dims change only. Safe here and nowhere
+	// else: the precondition says nothing is reading into it.
+	if (ldp->zone_pbo_w != mask_width || ldp->zone_pbo_h != mask_height) {
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, ldp->zone_pbo);
+		glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)((size_t)mask_width * mask_height), NULL,
+		             GL_STREAM_READ);
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+		ldp->zone_pbo_w = mask_width;
+		ldp->zone_pbo_h = mask_height;
+	}
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->zone_read_fbo);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_tex, 0);
+	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+		U_LOG_W("SR GL zone: mask FBO incomplete (gen %llu) — can't evaluate",
+		        (unsigned long long)seq);
+		return false; // mirror D3D11: don't flip on a failed readback
+	}
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+	// With a buffer bound to GL_PIXEL_PACK_BUFFER the last argument is an
+	// OFFSET into it, not a client pointer — that is what makes the read
+	// asynchronous.
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, ldp->zone_pbo);
+	glReadPixels(0, 0, (GLsizei)mask_width, (GLsizei)mask_height, GL_RED, GL_UNSIGNED_BYTE, (void *)0);
+	ldp->zone_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	// The fence AND the read have to be SUBMITTED for a zero-timeout poll to
+	// ever succeed — a command sitting in the driver's unflushed buffer can
+	// never signal, so the poll would return PENDING forever. Same rationale as
+	// the D3D11 arm's Flush after the staging copy. (glClientWaitSync's
+	// GL_SYNC_FLUSH_COMMANDS_BIT would do it too, but only on a BLOCKING wait
+	// — which is exactly the thing this path exists to avoid.)
+	glFlush();
+
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
+
+	if (ldp->zone_fence == nullptr) {
+		return false; // no fence ⇒ nothing could ever poll this read out
+	}
+
+	// Issued — no wait. From here until the poll consumes it,
+	// ldp->zone_fence != NULL reports "in flight".
+	ldp->zone_readback_seq = seq;
+	ldp->zone_readback_w = mask_width;
+	ldp->zone_readback_h = mask_height;
+	LARGE_INTEGER t0 = {};
+	QueryPerformanceCounter(&t0);
+	ldp->zone_readback_t0_qpc = t0.QuadPart;
+	ldp->zone_readback_polls = 0;
+	ldp->zone_readback_armed = true;
+	return true;
+}
+
+// #215: POLL half — the CPU side of the read leia_dp_gl_zone_readback_issue put
+// on the context. PENDING while the fence has not signalled (unless @p blocking,
+// which waits up to 2 s). Once complete: map the PBO + the 1×1 OR-collapse scan
+// (any non-zero pixel ⟹ 3D) + unmap, and *out_any is the verdict.
+//
+// The scan uses zone_readback_w/h — the dims the read was ISSUED with — because
+// the mask can be resized while a read is in flight. Rows are tightly packed:
+// the issue set GL_PACK_ALIGNMENT to 1, so the stride is exactly the width.
+//
+// Every terminal outcome (LANDED and FAILED alike) deletes the fence and NULLs
+// it, which is what drops "in flight" back to false.
+static enum zone_rb_state
+leia_dp_gl_zone_readback_poll(struct leia_display_processor_gl_impl *ldp, bool blocking, bool *out_any)
+{
+	if (ldp->zone_fence == nullptr || ldp->zone_pbo == 0) {
+		return ZONE_RB_FAILED;
+	}
+
+	const GLenum r = glClientWaitSync(ldp->zone_fence, blocking ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
+	                                  blocking ? 2000000000ull : 0);
+	if (r == GL_TIMEOUT_EXPIRED && !blocking) {
+		return ZONE_RB_PENDING; // still executing — poll again next republish
+	}
+	if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
+		// A 2 s wait that expires is a hung/lost context, not a slow frame.
+		glDeleteSync(ldp->zone_fence);
+		ldp->zone_fence = nullptr;
+		return ZONE_RB_FAILED;
+	}
+
+	// GL_ALREADY_SIGNALED / GL_CONDITION_SATISFIED — the read has landed.
+	GLint prev_pbo = 0;
+	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prev_pbo);
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, ldp->zone_pbo);
+	const size_t need = (size_t)ldp->zone_readback_w * ldp->zone_readback_h;
+	const uint8_t *p =
+	    (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)need, GL_MAP_READ_BIT);
+	enum zone_rb_state state = ZONE_RB_FAILED;
+	if (p != nullptr) {
+		bool any = false;
+		for (size_t i = 0; i < need; i++) {
+			if (p[i] != 0) {
+				any = true;
+				break;
+			}
+		}
+		glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+		*out_any = any;
+		state = ZONE_RB_LANDED;
+	}
+	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+
+	glDeleteSync(ldp->zone_fence);
+	ldp->zone_fence = nullptr;
+	return state;
+}
+
 static bool
 leia_dp_gl_publish_local_zone_mask(struct xrt_display_processor_gl *xdp,
                                    uint32_t mask_tex,
@@ -1455,61 +1729,116 @@ leia_dp_gl_publish_local_zone_mask(struct xrt_display_processor_gl *xdp,
 
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 	if (mask_tex == 0 || mask_width == 0 || mask_height == 0) {
+		// One-shot: a publish that is refused here is invisible to the runtime
+		// (it does not log a false return), and "never evaluated" then reads
+		// like "never called".
+		if (!ldp->zone_refused_logged) {
+			ldp->zone_refused_logged = true;
+			U_LOG_W("SR GL zone: publish REFUSED (mask %u %ux%u) — lens hint untouched", mask_tex,
+			        mask_width, mask_height);
+		}
 		return false;
+	}
+
+	// #215: the non-blocking path needs BOTH the kill-switch armed and the
+	// PBO/sync entry points present; either missing takes the blocking one.
+	const bool async = ldp->async_zone_publish && leia_dp_gl_zone_pbo_supported();
+
+	if (!ldp->zone_first_logged) {
+		ldp->zone_first_logged = true;
+		U_LOG_W("SR GL zone: first publish (mask %ux%u, seq %llu, %s)", mask_width, mask_height,
+		        (unsigned long long)seq, async ? "non-blocking" : "blocking");
 	}
 
 	// Content evaluation, once per generation: any non-zero mask pixel ⟹ 3D
 	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
-	if (!ldp->zone_eval_valid || seq != ldp->zone_eval_seq) {
-		size_t need = (size_t)mask_width * mask_height;
-		if (ldp->zone_buf == nullptr || ldp->zone_buf_w != mask_width || ldp->zone_buf_h != mask_height) {
-			uint8_t *nb = (uint8_t *)realloc(ldp->zone_buf, need);
-			if (nb == nullptr) {
-				return false; // can't evaluate — don't flip the lens blindly
-			}
-			ldp->zone_buf = nb;
-			ldp->zone_buf_w = mask_width;
-			ldp->zone_buf_h = mask_height;
-		}
-		if (ldp->zone_read_fbo == 0) {
-			glGenFramebuffers(1, &ldp->zone_read_fbo);
-		}
-
-		// Attach the R8 mask to our read FBO and glReadPixels it. Restore the
-		// prior read-FBO binding so we don't perturb the runtime's GL state
-		// (publish runs on the runtime's context right after present composite).
-		GLint prev_read_fbo = 0;
-		glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->zone_read_fbo);
-		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mask_tex, 0);
-		if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-			glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
-			U_LOG_W("SR GL zone: mask FBO incomplete (gen %llu) — can't evaluate",
-			        (unsigned long long)seq);
-			return false; // mirror D3D11: don't flip on a failed readback
-		}
-		glReadBuffer(GL_COLOR_ATTACHMENT0);
-		GLint prev_pack = 4;
-		glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
-		glPixelStorei(GL_PACK_ALIGNMENT, 1);
-		glReadPixels(0, 0, (GLsizei)mask_width, (GLsizei)mask_height, GL_RED, GL_UNSIGNED_BYTE, ldp->zone_buf);
-		glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
-		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
-
+	const bool need_eval = !ldp->zone_eval_valid || seq != ldp->zone_eval_seq;
+	if (need_eval && !async) {
+		LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&t0);
 		bool any = false;
-		for (size_t i = 0; i < need; i++) {
-			if (ldp->zone_buf[i] != 0) {
-				any = true;
-				break;
-			}
+		if (!leia_dp_gl_zone_readback_blocking(ldp, mask_tex, mask_width, mask_height, &any)) {
+			return false; // can't evaluate — don't flip the lens blindly
 		}
+		QueryPerformanceCounter(&t1);
+		const double ms = freq.QuadPart > 0
+		                      ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+		                      : 0.0;
 		ldp->zone_want_3d = any;
 		ldp->zone_eval_seq = seq;
 		ldp->zone_eval_valid = true;
-		U_LOG_W("SR GL zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse)",
-		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height);
+		// Once per generation — not per frame.
+		U_LOG_W("SR GL zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
+		        "readback %.1f ms over 1 poll [blocking])",
+		        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height, ms);
+	} else if (need_eval) {
+		// #215: issue once, then poll on the runtime's per-frame republish of
+		// the same generation. In-flight is read off the FENCE, never a bool —
+		// see the zone_* block comment.
+		if (!ldp->zone_readback_armed) {
+			if (ldp->zone_fence != nullptr) {
+				// A previous generation's read is still executing (a clear
+				// disarmed us mid-flight): the PBO is its destination and
+				// cannot be re-targeted. Carry on and poll it out below.
+			} else if (!leia_dp_gl_zone_readback_issue(ldp, mask_tex, mask_width, mask_height, seq)) {
+				if (!ldp->zone_refused_logged) {
+					ldp->zone_refused_logged = true;
+					U_LOG_W("SR GL zone: readback ISSUE failed for generation %llu — lens hint "
+					        "untouched",
+					        (unsigned long long)seq);
+				}
+				return false; // can't evaluate — don't flip the lens blindly
+			}
+		}
+
+		if (ldp->zone_readback_armed) {
+			ldp->zone_readback_polls++;
+			bool any = false;
+			switch (leia_dp_gl_zone_readback_poll(ldp, /*blocking=*/false, &any)) {
+			case ZONE_RB_LANDED: {
+				ldp->zone_want_3d = any;
+				ldp->zone_eval_seq = ldp->zone_readback_seq;
+				ldp->zone_eval_valid = true;
+				ldp->zone_readback_armed = false;
+
+				LARGE_INTEGER t1 = {}, freq = {};
+				QueryPerformanceCounter(&t1);
+				QueryPerformanceFrequency(&freq);
+				const double ms = freq.QuadPart > 0
+				                      ? (double)(t1.QuadPart - ldp->zone_readback_t0_qpc) * 1000.0 /
+				                            (double)freq.QuadPart
+				                      : 0.0;
+				// Once per generation — not per frame.
+				U_LOG_W("SR GL zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
+				        "readback %.1f ms over %u poll%s)",
+				        (unsigned long long)ldp->zone_readback_seq, any ? "3D" : "2D",
+				        ldp->zone_readback_w, ldp->zone_readback_h, ms, ldp->zone_readback_polls,
+				        ldp->zone_readback_polls == 1 ? "" : "s");
+				// If the runtime moved on to a newer generation while this one
+				// was in flight, the next publish's seq gate re-issues for it
+				// (zone_eval_seq != seq). Do NOT issue here — nothing has
+				// consumed the frame this poll ran on yet.
+				break;
+			}
+			case ZONE_RB_PENDING:
+				// REQUEST API — acceptance, not completion. With a previous
+				// verdict we carry it (falling through to the edge below, which
+				// will not fire on an unchanged verdict); on the very first
+				// publish there is nothing to drive the lens with yet, so leave
+				// zone_active untouched and let the next republish poll again.
+				if (!ldp->zone_eval_valid) {
+					return true;
+				}
+				break;
+			case ZONE_RB_FAILED:
+				ldp->zone_readback_armed = false;
+				return false;
+			}
+		} else if (!ldp->zone_eval_valid) {
+			// In flight from a previous generation and no verdict ever landed.
+			return true;
+		}
 	}
 
 	// Edge-triggered lens hint: flip only when the verdict changes (or on the
@@ -1544,6 +1873,11 @@ leia_dp_gl_clear_local_zone_mask(struct xrt_display_processor_gl *xdp)
 	}
 	ldp->zone_active = false;
 	ldp->zone_eval_valid = false;
+	// #215: forget the issued readback's verdict — the next publish starts a
+	// fresh generation. The READ itself is not forgotten: in-flight is derived
+	// from the fence, so the next issue still refuses to re-target the PBO
+	// under a read the driver is still filling.
+	ldp->zone_readback_armed = false;
 	return true;
 }
 
@@ -1604,6 +1938,26 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 
 	if (ldp->read_fbo != 0) {
 		glDeleteFramebuffers(1, &ldp->read_fbo);
+	}
+	// #613 zone readback machinery.
+	// #215: with the readback made non-blocking, a read can still be executing
+	// here — and its destination, zone_pbo, is about to go away. Drain the
+	// fence first. Bounded (200 ms), not infinite: teardown must not wedge, and
+	// the only way this times out is a hung/lost context, where the objects
+	// below are moot anyway. A non-NULL fence proves the entry points resolved,
+	// so no pointer test is needed; the GL calls assume a current context, the
+	// same assumption the glDelete* calls around them have always made.
+	if (ldp->zone_fence != nullptr) {
+		const GLenum r = glClientWaitSync(ldp->zone_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 200000000ull);
+		if (r == GL_TIMEOUT_EXPIRED || r == GL_WAIT_FAILED) {
+			U_LOG_W("Leia GL DP: zone readback still in flight at destroy — releasing anyway");
+		}
+		glDeleteSync(ldp->zone_fence);
+		ldp->zone_fence = nullptr;
+	}
+	if (ldp->zone_pbo != 0) {
+		glDeleteBuffers(1, &ldp->zone_pbo);
+		ldp->zone_pbo = 0;
 	}
 	if (ldp->zone_read_fbo != 0) {
 		glDeleteFramebuffers(1, &ldp->zone_read_fbo);
@@ -1762,6 +2116,22 @@ leia_dp_factory_gl(void *window_handle,
 	ldp->leiasr = weaver;
 	ldp->view_count = 2;
 	ldp->hwnd = (HWND)window_handle; // retained for WGC compose-under-bg
+
+	// #215: the zone publish slot used to block the runtime's compositor
+	// thread for ~180 ms per real mask change — a synchronous GPU readback
+	// plus a synchronous SR-service round trip for the lens hint. Both are
+	// non-blocking by default; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts both for
+	// bisecting. Set after ldp->leiasr exists — the lens half lives there.
+	// GLAD is already loaded at this point (top of this factory), so the PBO
+	// half's availability is knowable here rather than at first publish.
+	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
+	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
+	leiasr_gl_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
+	U_LOG_W("Leia GL zone publish: %s (#215; DXR_LEIA_ASYNC_ZONE_PUBLISH=0 reverts to the "
+	        "blocking readback + synchronous lens hint; pbo=%s)",
+	        ldp->async_zone_publish ? "non-blocking readback + async lens hint"
+	                                : "BLOCKING (kill-switch)",
+	        leia_dp_gl_zone_pbo_supported() ? "available" : "MISSING — blocking readback");
 
 	*out_xdp = &ldp->base;
 

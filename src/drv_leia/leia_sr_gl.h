@@ -156,6 +156,20 @@ bool
 leiasr_gl_request_display_mode(struct leiasr_gl *leiasr, bool enable_3d);
 
 /*!
+ * #215 — when enabled (default) request_display_mode posts the wish to a
+ * mailbox drained by a short-lived worker instead of calling the SR service
+ * synchronously on the caller's thread; the runtime calls it from the
+ * compositor frame path under its mutex.
+ *
+ * @param leiasr The GL weaver instance.
+ * @param enabled false reverts to the old synchronous lens call.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_gl_set_async_lens(struct leiasr_gl *leiasr, bool enabled);
+
+/*!
  * Query hardware 3D display state from SR SwitchableLensHint.
  *
  * @param leiasr The GL weaver instance.

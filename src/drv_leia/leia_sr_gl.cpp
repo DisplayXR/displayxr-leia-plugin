@@ -27,7 +27,10 @@
 #include <windows.h>
 #include <sysinfoapi.h>
 
+#include <atomic>
 #include <cmath>
+#include <mutex>
+#include <thread>
 
 /*!
  * GL SR weaver instance.
@@ -77,6 +80,21 @@ struct leiasr_gl
 	bool warned_platform_down = false; //!< One-shot WARN edges: the poll runs at
 	bool warned_client_skew = false;   //!< ~1 Hz forever, so a plain log would be
 	bool warned_stale = false;         //!< per-frame-class bloat.
+
+	// --- #215 async lens hint ---------------------------------------------
+	// srLensEnable/disable (v2) and SwitchableLensHint::enable/disable (v1)
+	// are round trips to the SR service process — ~tens of ms, and the runtime
+	// calls request_display_mode from the compositor frame path under its own
+	// mutex. The wish goes into a mailbox drained by a short-lived worker
+	// instead: latest wish wins, so a burst of flips costs one SR call per
+	// value the worker actually observes, and the caller never blocks.
+	// (This struct is `new`-allocated in leiasr_gl_create, so the NSDMI
+	// defaults below really do apply — no calloc to zero them out.)
+	std::atomic<int> lens_mailbox{-1};         //!< latest wish wins: -1 none, 0 → 2D, 1 → 3D
+	std::atomic<bool> lens_worker_busy{false}; //!< a worker owns the mailbox right now
+	std::thread lens_thread;                   //!< the current/last worker, joined at destroy
+	std::mutex lens_thread_mtx;                //!< guards lens_thread (spawn vs join)
+	bool async_lens = true;                    //!< false ⟹ synchronous lens call (kill-switch)
 };
 
 namespace {
@@ -317,6 +335,82 @@ lens_is_enabled(leiasr_gl *sr)
 	return sr->lens_hint != nullptr && sr->lens_hint->isEnabled();
 }
 
+/*!
+ * #215: drain the lens mailbox on our own thread, then exit. Latest wish wins
+ * — a burst of flips collapses to however many values we actually observe.
+ *
+ * The whole body is wrapped in a catch-all: an exception escaping a
+ * std::thread body terminates the process, and the SR SDK throws as routine
+ * control flow.
+ *
+ * NOTE: unlike D3D11 there is no #158 in-place reconnect worker on this arm
+ * (a generation change is reported STALE and the DP is recreated), so the only
+ * other toucher of the SDK objects is destroy — and that joins this worker
+ * before it frees anything. lens_present() plus the try/catch still guards the
+ * window between a NULL-ing and our next call.
+ */
+void
+lens_worker_body(leiasr_gl *sr)
+{
+	try {
+		for (;;) {
+			int wish = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
+			while (wish >= 0) {
+				LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
+				QueryPerformanceFrequency(&freq);
+				QueryPerformanceCounter(&t0);
+				if (lens_present(sr)) {
+					try {
+						lens_set(sr, wish == 1);
+						QueryPerformanceCounter(&t1);
+						const double ms =
+						    freq.QuadPart > 0
+						        ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
+						              (double)freq.QuadPart
+						        : 0.0;
+						U_LOG_W("SR GL display mode switched to %s (async lens, SR call %.1f ms)",
+						        wish == 1 ? "3D" : "2D", ms);
+					} catch (...) {
+						U_LOG_E("Failed to switch SR GL display mode to %s (async lens)",
+						        wish == 1 ? "3D" : "2D");
+					}
+				}
+				wish = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
+			}
+
+			sr->lens_worker_busy.store(false, std::memory_order_release);
+
+			// Close the race: a wish posted after our last exchange and
+			// before busy dropped saw busy == true and did not spawn.
+			if (sr->lens_mailbox.load(std::memory_order_acquire) < 0) {
+				break;
+			}
+			if (sr->lens_worker_busy.exchange(true, std::memory_order_acq_rel)) {
+				break; // a poster took over — it owns the mailbox now
+			}
+		}
+	} catch (...) {
+		// Nothing may escape a thread body. Drop the claim so the next wish
+		// can spawn a replacement worker.
+		sr->lens_worker_busy.store(false, std::memory_order_release);
+		U_LOG_E("SR GL async lens worker aborted on an exception");
+	}
+}
+
+/*!
+ * #215: join whatever lens worker is still running and empty the mailbox.
+ * Bounded by one in-flight SR call.
+ */
+void
+lens_worker_join(leiasr_gl *sr)
+{
+	std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
+	if (sr->lens_thread.joinable()) {
+		sr->lens_thread.join();
+	}
+	sr->lens_mailbox.store(-1, std::memory_order_release);
+}
+
 void
 w_set_input_texture(leiasr_gl *sr)
 {
@@ -485,6 +579,13 @@ leiasr_gl_destroy(struct leiasr_gl **leiasr_ptr)
 
 	leiasr_gl *sr = *leiasr_ptr;
 
+	// #215: the async lens worker holds a raw sr pointer — it must be gone
+	// before the SDK objects it calls into are. Ahead of the v2 early-return
+	// below so BOTH teardown paths are covered. On the caller's thread, but
+	// bounded by one in-flight SR call (the mailbox is emptied, so the worker
+	// cannot pick up more work); this arm has no async destroy to hide it in.
+	lens_worker_join(sr);
+
 	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
 	sr->lens_hint = nullptr;
 
@@ -649,21 +750,82 @@ leiasr_gl_get_display_pixel_info(struct leiasr_gl *leiasr,
 	return true;
 }
 
+void
+leiasr_gl_set_async_lens(struct leiasr_gl *leiasr, bool enabled)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+
+	// Set once, at DP create, before any frame can call request_display_mode
+	// — so a plain store is enough; no reader can be in flight yet.
+	leiasr->async_lens = enabled;
+}
+
 bool
 leiasr_gl_request_display_mode(struct leiasr_gl *leiasr, bool enable_3d)
 {
-	if (leiasr == nullptr || !lens_present(leiasr)) {
+	if (leiasr == nullptr) {
 		return false;
 	}
 
-	try {
-		lens_set(leiasr, enable_3d);
-		U_LOG_W("SR GL display mode switched to %s", enable_3d ? "3D" : "2D");
-		return true;
-	} catch (...) {
-		U_LOG_E("Failed to switch SR GL display mode to %s", enable_3d ? "3D" : "2D");
+	if (!leiasr->async_lens) {
+		if (!lens_present(leiasr)) {
+			return false;
+		}
+
+		try {
+			LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
+			QueryPerformanceFrequency(&freq);
+			QueryPerformanceCounter(&t0);
+			lens_set(leiasr, enable_3d);
+			QueryPerformanceCounter(&t1);
+			const double ms = freq.QuadPart > 0
+			                      ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+			                      : 0.0;
+			// The caller's thread paid for this call — say how much (#215).
+			U_LOG_W("SR GL display mode switched to %s (sync lens, SR call %.1f ms)",
+			        enable_3d ? "3D" : "2D", ms);
+			return true;
+		} catch (...) {
+			U_LOG_E("Failed to switch SR GL display mode to %s", enable_3d ? "3D" : "2D");
+			return false;
+		}
+	}
+
+	// #215: the SR call is a round trip to the service process and the runtime
+	// gets here from the compositor frame path under its own mutex. Post the
+	// wish and let a short-lived worker make the call.
+	if (!lens_present(leiasr)) {
 		return false;
 	}
+
+	leiasr->lens_mailbox.store(enable_3d ? 1 : 0, std::memory_order_release);
+	if (!leiasr->lens_worker_busy.exchange(true, std::memory_order_acq_rel)) {
+		std::lock_guard<std::mutex> g(leiasr->lens_thread_mtx);
+		if (leiasr->lens_thread.joinable()) {
+			// The previous worker has already dropped busy → it is on its way
+			// out; the join is ~immediate.
+			leiasr->lens_thread.join();
+		}
+		try {
+			leiasr->lens_thread = std::thread([leiasr]() { lens_worker_body(leiasr); });
+		} catch (...) {
+			// Thread creation failed: fall back to synchronous, drop busy.
+			leiasr->lens_worker_busy.store(false, std::memory_order_release);
+			int wish = leiasr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
+			if (wish >= 0) {
+				try {
+					lens_set(leiasr, wish == 1);
+				} catch (...) {
+					return false;
+				}
+			}
+		}
+	}
+
+	U_LOG_W("SR GL display mode wish (%s) queued — async lens worker (#215)", enable_3d ? "3D" : "2D");
+	return true; // a request API — acceptance, not physical completion
 }
 
 bool
