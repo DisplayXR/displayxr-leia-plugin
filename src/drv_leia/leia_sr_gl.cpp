@@ -95,6 +95,9 @@ struct leiasr_gl
 	std::thread lens_thread;                   //!< the current/last worker, joined at destroy
 	std::mutex lens_thread_mtx;                //!< guards lens_thread (spawn vs join)
 	bool async_lens = true;                    //!< false ⟹ synchronous lens call (kill-switch)
+	//! runtime#939: set by lens_worker_join on the way to a destroy/reconnect so a
+	//! worker sitting in its 2D dwell applies at once instead of finishing the wait.
+	std::atomic<bool> lens_quit{false};
 };
 
 namespace {
@@ -336,6 +339,36 @@ lens_is_enabled(leiasr_gl *sr)
 }
 
 /*!
+ * runtime#939: how long the lens worker holds a 2D wish before applying it, so
+ * a 3D wish that follows within the window replaces it and the pair collapses
+ * to no lens movement at all. Every 3D->2D writer funnels through the mailbox
+ * (the runtime's mode request, its teardown failsafe, the zone-mask verdict), and
+ * a present-owner that has just been uncovered re-asks for 3D ~300 ms after a
+ * stale 2D was replayed on its behalf -- so without this the switchable lens
+ * went 3D -> 2D -> 3D on every focus trade against a second client (a visible
+ * blink), and the ~16 ms 3D -> 2D -> 3D churn on every 3D entry when the mask
+ * verdict races the app's own request. The window is deliberately SHORT: it
+ * coalesces those bursts and is imperceptible on a real 3D -> 2D transition
+ * (leaving a 3D page), which must still go flat promptly -- a long hold there
+ * is a regression, not a fix. 2D -> 3D is never held.
+ * DXR_LEIA_LENS_2D_DWELL_MS, default 75; 0
+ * applies 2D immediately (the pre-#939 behaviour).
+ */
+static int64_t
+lens_2d_dwell_ms()
+{
+	static int64_t ms = -1;
+	if (ms < 0) {
+		const char *e = std::getenv("DXR_LEIA_LENS_2D_DWELL_MS");
+		ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 75;
+		if (ms < 0) {
+			ms = 0;
+		}
+	}
+	return ms;
+}
+
+/*!
  * #215: drain the lens mailbox on our own thread, then exit. Latest wish wins
  * — a burst of flips collapses to however many values we actually observe.
  *
@@ -356,6 +389,32 @@ lens_worker_body(leiasr_gl *sr)
 		for (;;) {
 			int wish = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
 			while (wish >= 0) {
+				// runtime#939: a 2D wish waits out its dwell here; a 3D wish posted
+				// meanwhile replaces it (and is applied below -- a same-state SR
+				// call when the lens never left 3D, which the SR service treats as a
+				// no-op). A repeated 2D neither extends nor shortens the wait, and
+				// lens_quit (destroy / reconnect on the way) ends it at once.
+				if (wish == 0) {
+					const int64_t dwell_ms = lens_2d_dwell_ms();
+					if (dwell_ms > 0 && !sr->lens_quit.load(std::memory_order_acquire)) {
+						const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)dwell_ms;
+						bool superseded = false;
+						while (GetTickCount64() < deadline &&
+						       !sr->lens_quit.load(std::memory_order_acquire)) {
+							Sleep(5);
+							if (sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel) == 1) {
+								superseded = true;
+								break;
+							}
+						}
+						if (superseded) {
+							U_LOG_W("SR GL display mode: 2D wish withdrawn -- 3D re-asked inside the "
+							        "%lld ms dwell, the lens is not moved through 2D (runtime #939)",
+							        (long long)dwell_ms);
+							wish = 1;
+						}
+					}
+				}
 				LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
 				QueryPerformanceFrequency(&freq);
 				QueryPerformanceCounter(&t0);
@@ -404,10 +463,16 @@ lens_worker_body(leiasr_gl *sr)
 void
 lens_worker_join(leiasr_gl *sr)
 {
-	std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
-	if (sr->lens_thread.joinable()) {
-		sr->lens_thread.join();
+	// runtime#939: a worker in its 2D dwell applies at once and exits, so the
+	// join stays bounded by one SR call and a departing DP still lands its 2D.
+	sr->lens_quit.store(true, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
+		if (sr->lens_thread.joinable()) {
+			sr->lens_thread.join();
+		}
 	}
+	sr->lens_quit.store(false, std::memory_order_release);
 	sr->lens_mailbox.store(-1, std::memory_order_release);
 }
 

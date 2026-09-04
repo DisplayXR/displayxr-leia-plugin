@@ -227,6 +227,9 @@ struct leiasr_d3d11
 	std::thread lens_thread;                   //!< the current/last worker, joined at destroy
 	std::mutex lens_thread_mtx;                //!< guards lens_thread (spawn vs join)
 	bool async_lens = true;                    //!< false ⟹ synchronous lens call (kill-switch)
+	//! runtime#939: set by lens_worker_join on the way to a destroy/reconnect so a
+	//! worker sitting in its 2D dwell applies at once instead of finishing the wait.
+	std::atomic<bool> lens_quit{false};
 };
 
 namespace {
@@ -651,6 +654,36 @@ lens_is_enabled(leiasr_d3d11 *sr)
 }
 
 /*!
+ * runtime#939: how long the lens worker holds a 2D wish before applying it, so
+ * a 3D wish that follows within the window replaces it and the pair collapses
+ * to no lens movement at all. Every 3D->2D writer funnels through the mailbox
+ * (the runtime's mode request, its teardown failsafe, the zone-mask verdict), and
+ * a present-owner that has just been uncovered re-asks for 3D ~300 ms after a
+ * stale 2D was replayed on its behalf -- so without this the switchable lens
+ * went 3D -> 2D -> 3D on every focus trade against a second client (a visible
+ * blink), and the ~16 ms 3D -> 2D -> 3D churn on every 3D entry when the mask
+ * verdict races the app's own request. The window is deliberately SHORT: it
+ * coalesces those bursts and is imperceptible on a real 3D -> 2D transition
+ * (leaving a 3D page), which must still go flat promptly -- a long hold there
+ * is a regression, not a fix. 2D -> 3D is never held.
+ * DXR_LEIA_LENS_2D_DWELL_MS, default 75; 0
+ * applies 2D immediately (the pre-#939 behaviour).
+ */
+static int64_t
+lens_2d_dwell_ms()
+{
+	static int64_t ms = -1;
+	if (ms < 0) {
+		const char *e = std::getenv("DXR_LEIA_LENS_2D_DWELL_MS");
+		ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 75;
+		if (ms < 0) {
+			ms = 0;
+		}
+	}
+	return ms;
+}
+
+/*!
  * #215: drain the lens mailbox on our own thread, then exit. Latest wish wins
  * — a burst of flips collapses to however many values we actually observe.
  *
@@ -671,6 +704,32 @@ lens_worker_body(leiasr_d3d11 *sr)
 		for (;;) {
 			int wish = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
 			while (wish >= 0) {
+				// runtime#939: a 2D wish waits out its dwell here; a 3D wish posted
+				// meanwhile replaces it (and is applied below -- a same-state SR
+				// call when the lens never left 3D, which the SR service treats as a
+				// no-op). A repeated 2D neither extends nor shortens the wait, and
+				// lens_quit (destroy / reconnect on the way) ends it at once.
+				if (wish == 0) {
+					const int64_t dwell_ms = lens_2d_dwell_ms();
+					if (dwell_ms > 0 && !sr->lens_quit.load(std::memory_order_acquire)) {
+						const ULONGLONG deadline = GetTickCount64() + (ULONGLONG)dwell_ms;
+						bool superseded = false;
+						while (GetTickCount64() < deadline &&
+						       !sr->lens_quit.load(std::memory_order_acquire)) {
+							Sleep(5);
+							if (sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel) == 1) {
+								superseded = true;
+								break;
+							}
+						}
+						if (superseded) {
+							U_LOG_W("SR D3D11 display mode: 2D wish withdrawn -- 3D re-asked inside the "
+							        "%lld ms dwell, the lens is not moved through 2D (runtime #939)",
+							        (long long)dwell_ms);
+							wish = 1;
+						}
+					}
+				}
 				LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
 				QueryPerformanceFrequency(&freq);
 				QueryPerformanceCounter(&t0);
@@ -723,11 +782,51 @@ lens_worker_body(leiasr_d3d11 *sr)
 void
 lens_worker_join(leiasr_d3d11 *sr)
 {
-	std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
-	if (sr->lens_thread.joinable()) {
-		sr->lens_thread.join();
+	// runtime#939: a worker in its 2D dwell applies at once and exits, so the
+	// join stays bounded by one SR call and a departing DP still lands its 2D.
+	sr->lens_quit.store(true, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
+		if (sr->lens_thread.joinable()) {
+			sr->lens_thread.join();
+		}
 	}
+	sr->lens_quit.store(false, std::memory_order_release);
 	sr->lens_mailbox.store(-1, std::memory_order_release);
+}
+
+/*!
+ * #215 / runtime#939: post @p wish to the lens mailbox and make sure a worker
+ * is draining it. Falls back to a synchronous SR call if a thread cannot be
+ * created; returns false only when that fallback call itself failed.
+ */
+static bool
+lens_post(leiasr_d3d11 *sr, int wish)
+{
+	sr->lens_mailbox.store(wish, std::memory_order_release);
+	if (!sr->lens_worker_busy.exchange(true, std::memory_order_acq_rel)) {
+		std::lock_guard<std::mutex> g(sr->lens_thread_mtx);
+		if (sr->lens_thread.joinable()) {
+			// The previous worker has already dropped busy -> it is on its way
+			// out; the join is ~immediate.
+			sr->lens_thread.join();
+		}
+		try {
+			sr->lens_thread = std::thread([sr]() { lens_worker_body(sr); });
+		} catch (...) {
+			// Thread creation failed: fall back to synchronous, drop busy.
+			sr->lens_worker_busy.store(false, std::memory_order_release);
+			int w = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
+			if (w >= 0) {
+				try {
+					lens_set(sr, w == 1);
+				} catch (...) {
+					return false;
+				}
+			}
+		}
+	}
+	return true;
 }
 
 /*!
@@ -1097,7 +1196,15 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			// #158 seeds this from last_lens_wish before a reconnect, so
 			// a rebuilt weaver comes back in the mode the runtime asked for.
 			int wish = sr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
-			if (wish >= 0 && lens_present(sr)) {
+			if (wish == 0 && sr->async_lens && lens_present(sr)) {
+				// runtime#939: a 2D recorded while we were creating is usually a
+				// leaver's parting state (a fresh panel DP after a teardown); the
+				// survivor re-asks for 3D within ~300 ms. Through the mailbox it
+				// gets the same dwell as any other 2D instead of moving the lens.
+				(void)lens_post(sr, 0);
+				U_LOG_W("Leia D3D11 async weaver: recorded lens wish (2D) queued through the "
+				        "lens worker's dwell (runtime #939)");
+			} else if (wish >= 0 && lens_present(sr)) {
 				try {
 					lens_set(sr, wish == 1);
 					U_LOG_W("Leia D3D11 async weaver: applied recorded lens wish (%s)",
@@ -1130,6 +1237,10 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 				return;
 			}
 			// Destroyed while we were creating — tear down and free.
+			// runtime#939: the recorded-wish post just above may have spawned
+			// a lens worker (possibly sitting in its 2D dwell); join it before
+			// the SDK objects go, and before `delete` meets a joinable thread.
+			lens_worker_join(sr);
 			destroy_sdk_objects(sr);
 			delete sr;
 			return;
@@ -2321,28 +2432,8 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 		return false;
 	}
 
-	leiasr->lens_mailbox.store(enable_3d ? 1 : 0, std::memory_order_release);
-	if (!leiasr->lens_worker_busy.exchange(true, std::memory_order_acq_rel)) {
-		std::lock_guard<std::mutex> g(leiasr->lens_thread_mtx);
-		if (leiasr->lens_thread.joinable()) {
-			// The previous worker has already dropped busy → it is on its way
-			// out; the join is ~immediate.
-			leiasr->lens_thread.join();
-		}
-		try {
-			leiasr->lens_thread = std::thread([leiasr]() { lens_worker_body(leiasr); });
-		} catch (...) {
-			// Thread creation failed: fall back to synchronous, drop busy.
-			leiasr->lens_worker_busy.store(false, std::memory_order_release);
-			int wish = leiasr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
-			if (wish >= 0) {
-				try {
-					lens_set(leiasr, wish == 1);
-				} catch (...) {
-					return false;
-				}
-			}
-		}
+	if (!lens_post(leiasr, enable_3d ? 1 : 0)) {
+		return false;
 	}
 
 	U_LOG_W("SR D3D11 display mode wish (%s) queued — async lens worker (#215)",
