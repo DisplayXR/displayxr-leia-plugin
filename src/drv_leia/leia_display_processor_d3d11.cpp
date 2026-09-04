@@ -640,13 +640,31 @@ ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w
 	}
 	if (ldp->ck_strip_srv) { ldp->ck_strip_srv->Release(); ldp->ck_strip_srv = nullptr; }
 	if (ldp->ck_strip_tex) { ldp->ck_strip_tex->Release(); ldp->ck_strip_tex = nullptr; }
+	// runtime#939: the cache key must never describe a texture that is not
+	// there. It used to survive a failed create below, so the NEXT call with the
+	// old (w, h, fmt) took the early-return above onto a texture of the wrong
+	// format with a NULL SRV — the gate then sampled black for every frame
+	// until the DP was recreated (the browser's tile "stays black").
+	ldp->ck_strip_w = 0;
+	ldp->ck_strip_h = 0;
+	ldp->ck_strip_fmt = 0;
+
+	// A TYPELESS back buffer (the runtime's per-client atlas storage) cannot
+	// take a view with a NULL description; CopyResource accepts a typed
+	// sibling of the same family, so store the strip typed.
+	DXGI_FORMAT strip_fmt = fmt;
+	if (fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+		strip_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+	} else if (fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+		strip_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+	}
 
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = fmt;
+	td.Format = strip_fmt;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -658,7 +676,10 @@ ck_ensure_strip_source(struct leia_display_processor_d3d11_impl *ldp, uint32_t w
 	}
 	hr = ldp->device->CreateShaderResourceView(ldp->ck_strip_tex, nullptr, &ldp->ck_strip_srv);
 	if (FAILED(hr)) {
-		U_LOG_E("Leia D3D11 DP: ck strip SRV create failed: 0x%08x", (unsigned)hr);
+		U_LOG_E("Leia D3D11 DP: ck strip SRV create (%ux%u fmt=%u) failed: 0x%08x", w, h, (unsigned)fmt,
+		        (unsigned)hr);
+		ldp->ck_strip_tex->Release();
+		ldp->ck_strip_tex = nullptr;
 		return false;
 	}
 	ldp->ck_strip_w = w;
@@ -1169,6 +1190,28 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 
 	D3D11_TEXTURE2D_DESC bb_desc = {};
 	back_buffer->GetDesc(&bb_desc);
+	// runtime#939: the render target read back here is whatever is bound on
+	// the caller's immediate context RIGHT NOW. With a second client committing
+	// on another thread that was, on some frames, the OTHER client's atlas
+	// (3840x2160 TYPELESS) instead of our 3840x2040 output — gating the wrong
+	// texture and poisoning the strip cache. The runtime now serializes the
+	// context; this check makes sure the gate never trusts a foreign target
+	// again if some path still interleaves: skip the gate this frame.
+	if (target_width > 0 && target_height > 0 &&
+	    (bb_desc.Width != target_width || bb_desc.Height != target_height)) {
+		static uint32_t s_foreign_logged = 0;
+		if (s_foreign_logged < 8) {
+			s_foreign_logged++;
+			U_LOG_E("Leia D3D11 DP: alpha gate skipped — bound render target is %ux%u fmt=%u, not this "
+			        "DP's %ux%u target (another client's D3D sequence interleaved; runtime #939)",
+			        bb_desc.Width, bb_desc.Height, (unsigned)bb_desc.Format, target_width, target_height);
+		}
+		back_buffer->Release();
+		rtv_res->Release();
+		rtv->Release();
+		if (dsv) dsv->Release();
+		return;
+	}
 	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height, bb_desc.Format)) {
 		back_buffer->Release();
 		rtv_res->Release();
