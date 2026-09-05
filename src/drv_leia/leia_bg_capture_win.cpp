@@ -52,8 +52,6 @@ using IDxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfa
 static const UINT LEIA_BG_PREVIEW_MAX_DIM = 512;
 //! Minimum box-filter reduction, per the design brief (~4x ⟹ mip level 2).
 static const UINT LEIA_BG_PREVIEW_MIN_SHIFT = 2;
-//! A cached preview older than this is reported STALE (spec: > 1 s).
-static const ULONGLONG LEIA_BG_PREVIEW_STALE_MS = 1000;
 //! Below this the window is not worth previewing (and the mip chain degenerates).
 static const LONG LEIA_BG_PREVIEW_MIN_SRC = 8;
 
@@ -66,8 +64,7 @@ struct leia_bg_preview_slot
 {
 	ComPtr<ID3D11Texture2D> staging; //!< STAGING + CPU_ACCESS_READ, preview-sized.
 	UINT w = 0, h = 0;
-	UINT64 gen = 0;     //!< capture generation (signaled_value) these pixels came from.
-	ULONGLONG tick = 0; //!< GetTickCount64() when the copy was queued.
+	UINT64 gen = 0; //!< capture generation (signaled_value) these pixels came from.
 	bool pending = false;
 };
 #endif // LEIA_BG_CAPTURE_HAS_PREVIEW
@@ -131,7 +128,6 @@ struct leia_bg_capture
 	std::vector<uint8_t> preview_cpu; //!< latest read-back bytes, BGRA8 top-down, tightly packed.
 	uint32_t preview_cpu_w, preview_cpu_h, preview_cpu_stride;
 	UINT64 preview_cpu_gen;
-	ULONGLONG preview_cpu_tick;
 #endif
 };
 
@@ -466,7 +462,6 @@ preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, U
 	ctx->CopySubresourceRegion(wslot.staging.Get(), 0, 0, 0, 0, c->preview_mip_tex.Get(), c->preview_shift,
 	                           nullptr);
 	wslot.gen = gen;
-	wslot.tick = GetTickCount64();
 	wslot.pending = true;
 	// The copy must reach the GPU now so it is retired by the time the NEXT
 	// generation maps this slot.
@@ -502,7 +497,6 @@ preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, U
 	c->preview_cpu_h = rslot.h;
 	c->preview_cpu_stride = stride;
 	c->preview_cpu_gen = rslot.gen;
-	c->preview_cpu_tick = rslot.tick;
 }
 
 //! True when the runtime's struct_size covers @p field in full.
@@ -552,11 +546,24 @@ leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_
 		out->canvas_v1 = 1.0f;
 	}
 
+	// STALE = the source knows the preview no longer reflects the screen; an
+	// unchanged desktop is NOT stale — the capture only delivers on change.
+	//
+	// WGC hands us a frame only when the desktop CHANGES, so `generation` sitting
+	// still for minutes means "the background is exactly what you last saw", not
+	// "the capture died". Age is therefore NOT evidence of staleness, and reading
+	// it as such would re-clip a model over a perfectly quiet desktop once a
+	// second.
+	//
+	// The cases where the module POSITIVELY knows the cached bytes stopped
+	// describing the screen — the capture session closed or was recreated, the
+	// window crossed monitors, client-present mode — are all already covered by
+	// the `poll_ok` gate above, which returns false outright. So there is nothing
+	// left for this bit to report today and it is always 0. If a future path ever
+	// serves a cached preview it knows to be wrong (rather than refusing to serve
+	// one), set it here.
 	if (LEIA_BGP_FITS(out, flags)) {
-		const ULONGLONG now = GetTickCount64();
-		const bool stale =
-		    now > c->preview_cpu_tick && (now - c->preview_cpu_tick) > LEIA_BG_PREVIEW_STALE_MS;
-		out->flags = stale ? XRT_DP_BG_PREVIEW_STALE : 0u;
+		out->flags = 0u;
 	}
 	return true;
 }
