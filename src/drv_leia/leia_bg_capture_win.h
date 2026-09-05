@@ -152,8 +152,13 @@ bool leia_bg_capture_poll(struct leia_bg_capture *c,
  * window — the background source for the runtime's rear depth budget (#224).
  *
  * PIXELS ONLY. This module decides nothing perceptual: it reports the bytes,
- * the generation they came from, and whether they are stale. The runtime owns
- * the neutrality analysis and the policy.
+ * the generation they came from, and the STALE bit. The runtime owns the
+ * neutrality analysis and the policy.
+ *
+ * STALE = the source knows the preview no longer reflects the screen; an
+ * unchanged desktop is NOT stale — the capture only delivers on change, so a
+ * generation that has not moved for minutes means "the background is still
+ * exactly this". Age is not evidence.
  *
  * The preview is produced inside @ref leia_bg_capture_poll, once per capture
  * generation (<= 15 Hz), never per weave. This call is a cache read.
