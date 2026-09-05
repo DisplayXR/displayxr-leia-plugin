@@ -1943,6 +1943,25 @@ leia_dp_vk_get_backend_state(struct xrt_display_processor_vk *xdp, uint32_t *out
 }
 #endif
 
+/*
+ * #224 / runtime#1363 — rear depth budget background source. Pure forward to
+ * the shared WGC module (the preview is produced once there, per capture
+ * generation); no policy in vendor code. NULL bg_capture — non-Windows, or a
+ * DP that fell back to opaque — reports "no source", which is the spec.
+ */
+#if defined(XRT_DP_VK_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+static bool
+leia_dp_vk_get_background_preview(struct xrt_display_processor_vk *xdp,
+                                  struct xrt_dp_background_preview *out_preview)
+{
+	struct leia_display_processor *ldp = leia_display_processor(&xdp->base);
+	if (ldp == nullptr) {
+		return false;
+	}
+	return leia_bg_capture_get_preview(ldp->bg_capture, out_preview);
+}
+#endif
+
 static void
 leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool enabled, bool client_presents)
 {
@@ -2150,6 +2169,9 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 #ifdef XRT_DP_VK_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
 #endif
+#if defined(XRT_DP_VK_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+	ldp->base.get_background_preview = leia_dp_vk_get_background_preview; // #224 rear depth budget (appended VK-variant slot)
+#endif
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -2268,6 +2290,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 #endif
 #ifdef XRT_DP_VK_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_vk_get_backend_state; // #158 SR restart (appended VK-variant slot)
+#endif
+#if defined(XRT_DP_VK_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+	ldp->base.get_background_preview = leia_dp_vk_get_background_preview; // #224 rear depth budget (appended VK-variant slot)
 #endif
 
 	ldp->leiasr = leiasr;
