@@ -11,6 +11,8 @@
 #include "util/u_logging.h"
 
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 #include <vector>
 #include <wchar.h>
 
@@ -45,6 +47,31 @@ namespace WF = ABI::Windows::Foundation;
 // interop header.
 using IDxgiAccess = Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+//! Both preview dimensions must stay <= this (@ref xrt_dp_background_preview).
+static const UINT LEIA_BG_PREVIEW_MAX_DIM = 512;
+//! Minimum box-filter reduction, per the design brief (~4x ⟹ mip level 2).
+static const UINT LEIA_BG_PREVIEW_MIN_SHIFT = 2;
+//! A cached preview older than this is reported STALE (spec: > 1 s).
+static const ULONGLONG LEIA_BG_PREVIEW_STALE_MS = 1000;
+//! Below this the window is not worth previewing (and the mip chain degenerates).
+static const LONG LEIA_BG_PREVIEW_MIN_SRC = 8;
+
+/*!
+ * One half of the double-buffered readback. The producer writes slot N while
+ * the reader Maps slot N-1, so the Map never waits on GPU work still in flight
+ * — the whole reason there are two.
+ */
+struct leia_bg_preview_slot
+{
+	ComPtr<ID3D11Texture2D> staging; //!< STAGING + CPU_ACCESS_READ, preview-sized.
+	UINT w = 0, h = 0;
+	UINT64 gen = 0;     //!< capture generation (signaled_value) these pixels came from.
+	ULONGLONG tick = 0; //!< GetTickCount64() when the copy was queued.
+	bool pending = false;
+};
+#endif // LEIA_BG_CAPTURE_HAS_PREVIEW
+
 struct leia_bg_capture
 {
 	HWND hwnd;
@@ -78,6 +105,34 @@ struct leia_bg_capture
 	std::atomic<UINT64> signaled_value;
 
 	std::atomic<bool> has_frame;
+
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+	// ---- rear depth budget background preview (#224) ----------------------
+	// EVERYTHING below is touched from the compositor render thread ONLY:
+	// produced at the tail of leia_bg_capture_poll() (itself called from
+	// process_atlas → compose_run_pre_weave) and read by
+	// leia_bg_capture_get_preview(), which the runtime calls on that same
+	// thread right after process_atlas. Hence no atomics and no lock — the
+	// two std::atomic members above exist because the WGC frame pool is
+	// free-threaded, which none of this is.
+	bool preview_enabled;      //!< false ⟹ LEIA_DP_DISABLE_BG_PREVIEW armed.
+	bool preview_broken;       //!< one-shot: a D3D failure retired the producer.
+	bool preview_logged_ready; //!< one-shot init log.
+	bool poll_ok;              //!< verdict of the last leia_bg_capture_poll().
+
+	UINT preview_src_w, preview_src_h; //!< window rect the mip chain is sized for.
+	UINT preview_shift;                //!< mip level sampled == log2 of the reduction.
+	ComPtr<ID3D11Texture2D> preview_mip_tex;
+	ComPtr<ID3D11ShaderResourceView> preview_mip_srv;
+	leia_bg_preview_slot preview_slot[2];
+	uint32_t preview_write;      //!< slot index the NEXT produce writes into.
+	UINT64 preview_last_src_gen; //!< signaled_value at the last produce (throttle gate).
+
+	std::vector<uint8_t> preview_cpu; //!< latest read-back bytes, BGRA8 top-down, tightly packed.
+	uint32_t preview_cpu_w, preview_cpu_h, preview_cpu_stride;
+	UINT64 preview_cpu_gen;
+	ULONGLONG preview_cpu_tick;
+#endif
 };
 
 // ---------- helpers --------------------------------------------------------
@@ -237,6 +292,276 @@ create_shared_fence(ID3D11Device *dev, ID3D11Fence **out_fence, HANDLE *out_hand
 	}
 	return (*out_fence)->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, out_handle);
 }
+
+// ---------- background preview producer (#224) ------------------------------
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+
+static bool
+preview_env_disable()
+{
+	char buf[8];
+	DWORD n = GetEnvironmentVariableA("LEIA_DP_DISABLE_BG_PREVIEW", buf, sizeof(buf));
+	return n > 0 && n < sizeof(buf) && (buf[0] == '1' || buf[0] == 't' || buf[0] == 'T');
+}
+
+/*!
+ * How far to reduce: at least 4x (the brief's box filter), more when a 4K-wide
+ * window would still exceed the 512 px ceiling the runtime struct documents.
+ */
+static UINT
+preview_shift_for(UINT w, UINT h)
+{
+	UINT shift = LEIA_BG_PREVIEW_MIN_SHIFT;
+	while (shift < 12 && ((w >> shift) > LEIA_BG_PREVIEW_MAX_DIM || (h >> shift) > LEIA_BG_PREVIEW_MAX_DIM)) {
+		shift++;
+	}
+	return shift;
+}
+
+/*!
+ * (Re)build the mip chain + both staging slots for a window rect of @p src_w ×
+ * @p src_h. Cheap no-op while the window keeps its size; a resize rebuilds, and
+ * a resize is already the slow path.
+ */
+static bool
+preview_ensure_targets(struct leia_bg_capture *c, UINT src_w, UINT src_h)
+{
+	const UINT shift = preview_shift_for(src_w, src_h);
+	if (c->preview_mip_tex != nullptr && c->preview_src_w == src_w && c->preview_src_h == src_h &&
+	    c->preview_shift == shift) {
+		return true;
+	}
+
+	c->preview_mip_tex.Reset();
+	c->preview_mip_srv.Reset();
+	c->preview_slot[0] = leia_bg_preview_slot();
+	c->preview_slot[1] = leia_bg_preview_slot();
+	c->preview_write = 0;
+	c->preview_src_w = 0;
+	c->preview_src_h = 0;
+
+	ID3D11Device *dev = c->d3d11_device.Get();
+	if (dev == nullptr) {
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC md = {};
+	md.Width = src_w;
+	md.Height = src_h;
+	md.MipLevels = shift + 1;
+	md.ArraySize = 1;
+	md.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	md.SampleDesc.Count = 1;
+	md.Usage = D3D11_USAGE_DEFAULT;
+	// GenerateMips needs both binds plus the misc flag.
+	md.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	md.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+	if (FAILED(dev->CreateTexture2D(&md, nullptr, c->preview_mip_tex.GetAddressOf()))) {
+		return false;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+	vd.Format = md.Format;
+	vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	vd.Texture2D.MipLevels = md.MipLevels;
+	if (FAILED(dev->CreateShaderResourceView(c->preview_mip_tex.Get(), &vd, c->preview_mip_srv.GetAddressOf()))) {
+		return false;
+	}
+
+	const UINT pw = (src_w >> shift) != 0 ? (src_w >> shift) : 1u;
+	const UINT ph = (src_h >> shift) != 0 ? (src_h >> shift) : 1u;
+
+	D3D11_TEXTURE2D_DESC sd = {};
+	sd.Width = pw;
+	sd.Height = ph;
+	sd.MipLevels = 1;
+	sd.ArraySize = 1;
+	sd.Format = md.Format;
+	sd.SampleDesc.Count = 1;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	for (int i = 0; i < 2; i++) {
+		if (FAILED(dev->CreateTexture2D(&sd, nullptr, c->preview_slot[i].staging.GetAddressOf()))) {
+			return false;
+		}
+		c->preview_slot[i].w = pw;
+		c->preview_slot[i].h = ph;
+	}
+
+	c->preview_src_w = src_w;
+	c->preview_src_h = src_h;
+	c->preview_shift = shift;
+
+	if (!c->preview_logged_ready) {
+		c->preview_logged_ready = true;
+		U_LOG_W("leia_bg_capture: background preview ready — window %ux%u → %ux%u BGRA8 "
+		        "(1/%u box filter via mip %u, double-buffered staging readback, produced "
+		        "once per capture generation)",
+		        src_w, src_h, pw, ph, 1u << shift, shift);
+	}
+	return true;
+}
+
+/*!
+ * Produce one generation of preview. Called at the TAIL of
+ * leia_bg_capture_poll(), i.e. after this generation's CopyResource of the WGC
+ * frame into the monitor staging texture has been queued and after the window
+ * rect is known — and only when @ref leia_bg_capture::signaled_value advanced,
+ * so the cost is bounded by the capture throttle (<= 15 Hz), never per weave.
+ *
+ * Producing here rather than lazily in get_preview() is deliberate: the Map has
+ * to be kept off the critical path either way, and doing it here means it maps
+ * a slot whose copy was queued a FULL capture interval ago (>= ~66 ms) instead
+ * of one queued microseconds earlier in the same call. Lazy production would
+ * also have to re-derive the window rect and would run on the runtime's slot
+ * call, which happens at weave rate, not capture rate.
+ */
+static void
+preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, UINT64 gen)
+{
+	if (!c->preview_enabled || c->preview_broken) {
+		return;
+	}
+
+	// Clamp the window rect to the captured monitor texture.
+	if (rx < 0) {
+		rw += rx;
+		rx = 0;
+	}
+	if (ry < 0) {
+		rh += ry;
+		ry = 0;
+	}
+	if (rx + rw > (LONG)c->monitor_w) {
+		rw = (LONG)c->monitor_w - rx;
+	}
+	if (ry + rh > (LONG)c->monitor_h) {
+		rh = (LONG)c->monitor_h - ry;
+	}
+	if (rw < LEIA_BG_PREVIEW_MIN_SRC || rh < LEIA_BG_PREVIEW_MIN_SRC) {
+		return;
+	}
+
+	if (!preview_ensure_targets(c, (UINT)rw, (UINT)rh)) {
+		c->preview_broken = true;
+		U_LOG_W("leia_bg_capture: background preview targets could not be created — preview "
+		        "producer DISABLED; get_background_preview will report no source and the "
+		        "runtime keeps its clip-at-the-display-plane fallback");
+		return;
+	}
+
+	ID3D11DeviceContext *ctx = c->d3d11_context.Get();
+
+	// 1. window sub-rect of the just-captured monitor frame → mip 0.
+	D3D11_BOX box = {(UINT)rx, (UINT)ry, 0u, (UINT)(rx + rw), (UINT)(ry + rh), 1u};
+	ctx->CopySubresourceRegion(c->preview_mip_tex.Get(), 0, 0, 0, 0, c->staging_tex.Get(), 0, &box);
+
+	// 2. box-filter down. GenerateMips averages 2×2 per level, so mip `shift`
+	//    IS the 1/2^shift box filter the brief asks for — no shader source, no
+	//    d3dcompiler dependency in this module, no extra pipeline state.
+	ctx->GenerateMips(c->preview_mip_srv.Get());
+
+	// 3. the reduced level → this generation's staging slot.
+	leia_bg_preview_slot &wslot = c->preview_slot[c->preview_write];
+	ctx->CopySubresourceRegion(wslot.staging.Get(), 0, 0, 0, 0, c->preview_mip_tex.Get(), c->preview_shift,
+	                           nullptr);
+	wslot.gen = gen;
+	wslot.tick = GetTickCount64();
+	wslot.pending = true;
+	// The copy must reach the GPU now so it is retired by the time the NEXT
+	// generation maps this slot.
+	ctx->Flush();
+
+	// 4. Read back the OTHER slot — generation N-1, queued a full capture
+	//    interval ago. DO_NOT_WAIT so even a driver that has not retired it
+	//    costs nothing: the slot stays pending and is picked up next time.
+	leia_bg_preview_slot &rslot = c->preview_slot[c->preview_write ^ 1u];
+	c->preview_write ^= 1u;
+	if (!rslot.pending) {
+		return;
+	}
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	HRESULT hr = ctx->Map(rslot.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+	if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+		return; // keep it pending; next generation will get it
+	}
+	if (FAILED(hr)) {
+		rslot.pending = false;
+		return;
+	}
+	const uint32_t stride = rslot.w * 4u;
+	c->preview_cpu.resize((size_t)stride * rslot.h);
+	const uint8_t *src = (const uint8_t *)m.pData;
+	for (UINT y = 0; y < rslot.h; y++) {
+		memcpy(c->preview_cpu.data() + (size_t)y * stride, src + (size_t)y * m.RowPitch, stride);
+	}
+	ctx->Unmap(rslot.staging.Get(), 0);
+	rslot.pending = false;
+
+	c->preview_cpu_w = rslot.w;
+	c->preview_cpu_h = rslot.h;
+	c->preview_cpu_stride = stride;
+	c->preview_cpu_gen = rslot.gen;
+	c->preview_cpu_tick = rslot.tick;
+}
+
+//! True when the runtime's struct_size covers @p field in full.
+#define LEIA_BGP_FITS(out, field)                                                                                      \
+	((size_t)offsetof(struct xrt_dp_background_preview, field) + sizeof((out)->field) <= (size_t)(out)->struct_size)
+
+extern "C" bool
+leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_preview *out)
+{
+	if (c == nullptr || out == nullptr) {
+		return false;
+	}
+	if (!c->preview_enabled || c->preview_broken) {
+		return false;
+	}
+	// Capture off / no frame yet / cross-monitor drag — the last poll said so.
+	if (!c->poll_ok) {
+		return false;
+	}
+	if (c->preview_cpu.empty() || c->preview_cpu_w == 0 || c->preview_cpu_h == 0) {
+		return false;
+	}
+	// A runtime whose struct is too small to describe a buffer cannot be
+	// handed one; failing closed is always safe.
+	if (!LEIA_BGP_FITS(out, width) || !LEIA_BGP_FITS(out, height) || !LEIA_BGP_FITS(out, stride_bytes) ||
+	    !LEIA_BGP_FITS(out, bgra)) {
+		return false;
+	}
+
+	if (LEIA_BGP_FITS(out, generation)) {
+		out->generation = (uint32_t)c->preview_cpu_gen;
+	}
+	out->width = c->preview_cpu_w;
+	out->height = c->preview_cpu_h;
+	out->stride_bytes = c->preview_cpu_stride;
+	out->bgra = c->preview_cpu.data();
+
+	// The preview covers the window's CLIENT rect, which is the desktop region
+	// under the canvas for every app that fills its window — i.e. 0,0,1,1 per
+	// the spec. (A canvas sub-rect inside the window, the #131 compose remap,
+	// is not modelled here: the sub-rect is DP state, not capture state. A
+	// follow-up can plumb it through and narrow these UVs.)
+	if (LEIA_BGP_FITS(out, canvas_v1)) {
+		out->canvas_u0 = 0.0f;
+		out->canvas_v0 = 0.0f;
+		out->canvas_u1 = 1.0f;
+		out->canvas_v1 = 1.0f;
+	}
+
+	if (LEIA_BGP_FITS(out, flags)) {
+		const ULONGLONG now = GetTickCount64();
+		const bool stale =
+		    now > c->preview_cpu_tick && (now - c->preview_cpu_tick) > LEIA_BG_PREVIEW_STALE_MS;
+		out->flags = stale ? XRT_DP_BG_PREVIEW_STALE : 0u;
+	}
+	return true;
+}
+
+#endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
 // ---------- public API -----------------------------------------------------
 
@@ -492,6 +817,15 @@ leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 	c->shared_fence_handle = shared_fence_handle;
 	c->signaled_value = 0;
 	c->has_frame = false;
+
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+	c->preview_enabled = !preview_env_disable();
+	if (!c->preview_enabled) {
+		U_LOG_W("leia_bg_capture: LEIA_DP_DISABLE_BG_PREVIEW=1 ARMED — background preview "
+		        "producer off; get_background_preview reports no source and the rear depth "
+		        "budget stays at clip-at-the-display-plane");
+	}
+#endif
 
 	U_LOG_W("leia_bg_capture: ready (monitor=%ux%u, hwnd=0x%p, adapter_luid=0x%016llx)", monitor_w, monitor_h,
 	        hwnd, (unsigned long long)c->adapter_luid);
@@ -827,6 +1161,9 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 		out_bg_uv_origin[1] = 0;
 		out_bg_uv_extent[0] = 0;
 		out_bg_uv_extent[1] = 0;
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+		c->poll_ok = false;
+#endif
 		return false;
 	}
 	// Compositor's swap chain renders into the window's CLIENT area only —
@@ -837,11 +1174,17 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 	// titled-window and borderless cases.
 	RECT cr;
 	if (!GetClientRect(c->hwnd, &cr)) {
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+		c->poll_ok = false;
+#endif
 		return false;
 	}
 	POINT tl = {cr.left, cr.top};
 	POINT br = {cr.right, cr.bottom};
 	if (!ClientToScreen(c->hwnd, &tl) || !ClientToScreen(c->hwnd, &br)) {
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+		c->poll_ok = false;
+#endif
 		return false;
 	}
 	const float inv_w = 1.0f / (float)c->monitor_w;
@@ -851,7 +1194,25 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 	out_bg_uv_extent[0] = (float)(br.x - tl.x) * inv_w;
 	out_bg_uv_extent[1] = (float)(br.y - tl.y) * inv_h;
 
-	return c->has_frame.load(std::memory_order_acquire);
+	const bool ok = c->has_frame.load(std::memory_order_acquire);
+
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+	// #224 rear depth budget: produce one preview per CAPTURE generation, on
+	// the same throttle the WGC delivery already runs at (<= 15 Hz), never per
+	// weave. When the desktop is quiet signaled_value does not move and this
+	// costs a compare.
+	c->poll_ok = ok;
+	if (ok) {
+		const UINT64 gen = c->signaled_value.load(std::memory_order_acquire);
+		if (gen != c->preview_last_src_gen) {
+			c->preview_last_src_gen = gen;
+			preview_produce(c, tl.x - c->monitor_rect.left, tl.y - c->monitor_rect.top,
+			                br.x - tl.x, br.y - tl.y, gen);
+		}
+	}
+#endif
+
+	return ok;
 }
 
 extern "C" void

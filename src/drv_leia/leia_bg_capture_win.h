@@ -25,9 +25,26 @@
 
 #ifdef _WIN32
 
+#include "xrt/xrt_display_processor.h"
+
 #include <windows.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+/*
+ * leia-plugin#224 / runtime#1363 — rear depth budget, DP-side background
+ * source.
+ *
+ * The preview producer below compiles ONLY when the pinned runtime headers
+ * carry `struct xrt_dp_background_preview` (announced by XRT_DP_BG_PREVIEW_STALE,
+ * the same coupled-ABI-addition pattern as XRT_DP_D3D11_HAS_FRAME_TIMING). With
+ * an older pin the producer disappears entirely — zero cost — and every per-API
+ * `get_background_preview` slot stays NULL, which the runtime reads as "no
+ * source" and degrades to today's clip-at-the-display-plane behaviour.
+ */
+#ifdef XRT_DP_BG_PREVIEW_STALE
+#define LEIA_BG_CAPTURE_HAS_PREVIEW 1
+#endif
 
 struct ID3D11Device;
 struct ID3D11Texture2D;
@@ -128,6 +145,36 @@ bool leia_bg_capture_poll(struct leia_bg_capture *c,
                           float out_bg_uv_origin[2],
                           float out_bg_uv_extent[2],
                           uint64_t *out_fence_wait_value);
+
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
+/*!
+ * Hand back the latest downsampled CPU preview of the desktop under the app's
+ * window — the background source for the runtime's rear depth budget (#224).
+ *
+ * PIXELS ONLY. This module decides nothing perceptual: it reports the bytes,
+ * the generation they came from, and whether they are stale. The runtime owns
+ * the neutrality analysis and the policy.
+ *
+ * The preview is produced inside @ref leia_bg_capture_poll, once per capture
+ * generation (<= 15 Hz), never per weave. This call is a cache read.
+ *
+ * Threading: produced and read on the compositor render thread only —
+ * `process_atlas` → `leia_bg_capture_poll` produces, and the runtime calls the
+ * DP slot on that same thread right after `process_atlas`. No lock is taken and
+ * none is needed; adding one would misdescribe the model.
+ *
+ * @p out must be pre-set by the caller (the runtime uses
+ * @ref xrt_dp_background_preview_init); only fields inside its `struct_size`
+ * are written. @ref xrt_dp_background_preview::bgra is BORROWED — owned by this
+ * module and valid only until the next `process_atlas()` on the same DP.
+ *
+ * @return false when there is no source right now: capture disabled (env kill
+ *         switch or a producer failure), no captured frame yet, the last poll
+ *         failed (cross-monitor drag / client-present mode), or the runtime's
+ *         `struct_size` is too small to describe a buffer.
+ */
+bool leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_preview *out);
+#endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
 void leia_bg_capture_destroy(struct leia_bg_capture *c);
 
