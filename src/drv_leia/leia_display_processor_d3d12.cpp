@@ -2662,6 +2662,20 @@ leia_dp_d3d12_set_predicted_scanout(struct xrt_display_processor_d3d12 *xdp,
 }
 #endif
 
+/*
+ * #224 / runtime#1363 — rear depth budget background source. Pure forward to
+ * the shared WGC module (the preview is produced once there, per capture
+ * generation); no policy in vendor code. NULL bg_capture ⟹ no source.
+ */
+#if defined(XRT_DP_D3D12_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+static bool
+leia_dp_d3d12_get_background_preview(struct xrt_display_processor_d3d12 *xdp,
+                                     struct xrt_dp_background_preview *out_preview)
+{
+	return leia_bg_capture_get_preview(leia_dp_d3d12(xdp)->bg_capture, out_preview);
+}
+#endif
+
 static void
 leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
@@ -2857,6 +2871,9 @@ leia_dp_factory_d3d12(void *d3d12_device,
 #endif
 #ifdef XRT_DP_D3D12_HAS_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_d3d12_get_backend_state; // #158 SR restart detection
+#endif
+#if defined(XRT_DP_D3D12_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+	ldp->base.get_background_preview = leia_dp_d3d12_get_background_preview; // #224 rear depth budget (slot 23)
 #endif
 	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;

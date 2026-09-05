@@ -2157,6 +2157,24 @@ leia_dp_d3d11_set_predicted_scanout(struct xrt_display_processor_d3d11 *xdp,
 }
 #endif
 
+/*
+ * #224 / runtime#1363 slot 24 — rear depth budget background source.
+ *
+ * Pure forward to the shared WGC module: the preview is produced ONCE there,
+ * per capture generation, whichever API's DP owns the capture. No policy here —
+ * the runtime analyses the pixels and owns the rear-depth decision. With no WGC
+ * capture (client-present mode, chroma-key fallback, NULL hwnd) bg_capture is
+ * NULL and this reports "no source", which is the spec.
+ */
+#if defined(XRT_DP_D3D11_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+static bool
+leia_dp_d3d11_get_background_preview(struct xrt_display_processor_d3d11 *xdp,
+                                     struct xrt_dp_background_preview *out_preview)
+{
+	return leia_bg_capture_get_preview(leia_dp_d3d11(xdp)->bg_capture, out_preview);
+}
+#endif
+
 #ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
 /*
  * runtime#1008 (slot 20) — re-bind this DP to another window without
@@ -2336,6 +2354,12 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #endif
 #ifdef XRT_DP_D3D11_HAS_PREDICTED_SCANOUT
 	ldp->base.set_predicted_scanout = leia_dp_d3d11_set_predicted_scanout; // #206 per-weave forward horizon (slot 23)
+#endif
+#if defined(XRT_DP_D3D11_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
+	ldp->base.get_background_preview = leia_dp_d3d11_get_background_preview; // #224 rear depth budget (slot 24)
+	U_LOG_W("Leia D3D11 DP: get_background_preview slot WIRED (struct_size=%u)", ldp->base.struct_size);
+#else
+	U_LOG_W("Leia D3D11 DP: get_background_preview NOT COMPILED (old runtime headers)");
 #endif
 #ifdef DXR_LEIA_DP_D3D11_SET_WINDOW
 	ldp->base.set_window = leia_dp_d3d11_set_window; // runtime#1008 focus re-bind (slot 20)
