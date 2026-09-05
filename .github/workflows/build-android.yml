@@ -84,7 +84,12 @@ env:
   # every version number reading right. Raising this pin is what makes the
   # release actually carry #206. Verify the built .so, never the tag:
   #   strings libdxrp050_leia_cnsdk.so | grep -c leia_interlacer_set_predicted_scanout_ns
-  CNSDK_TAG: v0.10.63
+  # 0.10.66: K68 EVT device-service regenerated donopx 3.46x too large (don_mm vs
+  # donopx decided by device class, not magnitude), which parked the no-face
+  # phase gate outside normal viewing distance -> flat 2D with tracking alive.
+  # Two-file fix on top of 0.10.65; no API change. Loader/plug-in/impl are
+  # one version again from here.
+  CNSDK_TAG: v0.10.66
 
 jobs:
   Android:
