@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <cmath>
 #include <thread>
@@ -1198,10 +1199,19 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 		if (released->load(std::memory_order_acquire)) {
 			releaser.join();
 		} else {
+			// Per-process trip counter: every trip leaks one parked thread that
+			// still wakes at the predictor's noise-measurement rate (~1 Hz) and
+			// walks its sample buffers, plus one CNSDK Plugin classloader
+			// reference (numStrongReferences never decrements, so the impl .so
+			// can never be unloaded). Nothing is corrupted, but a long session
+			// with many relaunches degrades rather than fails — the count in
+			// the log is what makes that diagnosable from a bugreport.
+			static std::atomic<uint32_t> release_watchdog_trips{0};
+			const uint32_t trips = release_watchdog_trips.fetch_add(1, std::memory_order_relaxed) + 1;
 			U_LOG_W("HW_DBG_CNSDK: leia_core_release did not return within %lld ms "
-			        "(CNSDK predictor-thread join hang); detaching and LEAKING the "
-			        "core so xrDestroySession can return",
-			        (long long)kCoreReleaseTimeoutMs.count());
+			        "(CNSDK predictor-thread join hang, LeiaInc/CNSDK#730); detaching and "
+			        "LEAKING the core so xrDestroySession can return (trip %u in this process)",
+			        (long long)kCoreReleaseTimeoutMs.count(), trips);
 			releaser.detach();
 			core_released = false;
 		}
