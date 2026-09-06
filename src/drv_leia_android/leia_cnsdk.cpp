@@ -2536,47 +2536,48 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 			        vp_x, vp_y, vp_w, vp_h, sp_x, sp_y, (int)zonephase, w, h);
 		}
 	} else {
-		// browser#165: CNSDK converts the viewport screen position to GL
-		// bottom-origin panel coords (interlacer.cpp: origin_gl_y = panel_h -
-		// vp_h - y), but this API is documented to take Android top-left screen
-		// pixels. For a NATURAL-orientation (portrait) window that does not span
-		// the panel, passing the top-anchored y therefore lands the interlace
-		// pattern with a constant (panel_h - vp_h)-row phase offset — a uniform,
-		// head-position-independent double image (LPD-20W) or inverted views
-		// (NP02J), and no error at fullscreen where the offset is zero.
-		// Pre-apply the inverse so the pattern anchors where the calibration
-		// did. Landscape (rotated-from-natural) windows go through CNSDK's
-		// rotation compensation and weave correctly with the top-anchored y —
-		// verified on device — so only portrait is corrected.
-		// browser#173: the conversion is NOT portrait-specific. CNSDK derives
-		// origin_gl_y = panel_h - vp_h - y in whatever orientation is current, so
-		// ANY window shorter than the panel's height IN THE CURRENT ORIENTATION
-		// needs the inverse pre-applied — landscape included. The old
-		// `if (h > w)` guard only ran in portrait, and its "landscape verified on
-		// device" note was misleading: every landscape case tested was FULLSCREEN,
-		// where the offset is identically zero, so the guard was never exercised.
-		// On a landscape tablet with a 60px status bar (NP02J: 2560x1540 surface
-		// on a 2560x1600 panel) the phase landed 60 rows off — soft, crosstalky
-		// 3D that looked "almost right". Use the panel dimension along the
-		// window's height axis: portrait -> long side, landscape -> short side.
+		// Screen-position origin: what CNSDK actually wants, and the one case
+		// that still needs compensating.
+		//
+		// `leia_interlacer_set_viewport_screen_position` is documented to take
+		// ANDROID TOP-LEFT screen pixels in the CURRENT orientation, and CNSDK
+		// performs the bottom-origin conversion ITSELF — interlacer.cpp,
+		// "Convert to the shader space (GL convention)":
+		//     viewportOrigin.y = displayResNatural.y - viewportSize.y - viewportOrigin.y
+		// A published window rect must therefore be passed THROUGH unmodified.
+		// The zone branch above does exactly that (`sp_y = win_y + vp_y`, no
+		// inverse) and was eyeball-verified correct in freeform/inset windows
+		// (runtime#1074).
+		//
+		// #227: the pre-applied inverse below is consequently a DOUBLE conversion
+		// wherever the rect is truthful. Its one legitimate job is compensating a
+		// client that publishes NO rect while actually sitting under a top inset:
+		// we then default to (0,0), CNSDK anchors the pattern at the panel top,
+		// and the window really is `panel_h - h` rows lower — the "two bugs
+		// cancelling" case #165/#173 found on the browser's pre-geometry-feed
+		// builds. Keying the compensation on `win_y != 0` (browser#128, v2.6.6)
+		// narrowed it but kept it firing on a client that TRUTHFULLY reports y=0
+		// for a window shorter than the panel: a genuinely top-anchored window got
+		// anchored at the BOTTOM instead, a (panel_h - h)-row vertical offset =
+		// horizontal phase error on the slanted lenticular. Fullscreen and
+		// full-height windows never showed it (the `h < panel_h_now` guard below),
+		// which is why it survived this long.
+		//
+		// So the rule is about the PRESENCE of a rect, not its value: a published
+		// rect is authoritative whatever its y, zero included. The inverse
+		// survives only for rect-less clients — older runtimes, and out-of-process
+		// clients whose rect never crosses IPC (runtime#1090). Since runtime#1372
+		// the hosted MonadoView publishes its own rect too, so every in-process
+		// client is on the trusted path.
+		//
+		// A/B: `setprop debug.dxr.leia.origin_compat 0` switches the RECT-LESS
+		// path off as well — a client with no rect is then taken at its default
+		// (0,0) face value. 1 (the default) keeps the compensation there. Neither
+		// value affects a client that publishes a rect; that path is now trusted
+		// unconditionally.
 		int32_t sp_y = win_y;
-		// browser#128: a NONZERO reported y is a truthful origin from a client
-		// that measures its own surface (the browser's Java geometry feed,
-		// View.getLocationOnScreen on the compositor SurfaceView). CNSDK's
-		// bottom-origin conversion then needs NO pre-applied inverse — the
-		// top-anchored y is exactly what the API documents, so sp_y = win_y.
-		// The inverse below exists ONLY to compensate clients that report 0
-		// while actually sitting below a top inset (#165/#173 — two bugs
-		// cancelling; measured on NP02J: truthful y=60 with the inverse still
-		// applied anchors 60 rows off, bottom-origin 0 where 60 is correct).
-		// A truthful y=0 window whose height fills the panel is unaffected
-		// either way (the h < panel guard below), and a truthful y=0 window
-		// with only a BOTTOM inset keeps the old compensation — wrong there,
-		// but that case was equally wrong before this change, and
-		// debug.dxr.leia.origin_compat=0 force-trusts the report for a stack
-		// known to send truthful origins.
 		const bool trust_origin =
-		    (win_y != 0) || !prop_override("debug.dxr.leia.origin_compat", true);
+		    have_win || !prop_override("debug.dxr.leia.origin_compat", true);
 		if (trust_origin) {
 			static int32_t trust_last = INT32_MIN;
 			if (win_y != trust_last) {
