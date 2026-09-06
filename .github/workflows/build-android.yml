@@ -89,7 +89,11 @@ env:
   # phase gate outside normal viewing distance -> flat 2D with tracking alive.
   # Two-file fix on top of 0.10.65; no API change. Loader/plug-in/impl are
   # one version again from here.
-  CNSDK_TAG: v0.10.66
+  # 0.10.67: adds the libfilter input-noise-thread stop flag (LeiaInc/CNSDK#730)
+  # so leia_core_release returns instead of joining forever — the Android
+  # activity-relaunch hang (runtime freeform regression, 2026-09-06). No API
+  # change; lockstepped with runtime v2.16.10 (loader == plug-in == impl).
+  CNSDK_TAG: v0.10.67
 
 jobs:
   Android:
