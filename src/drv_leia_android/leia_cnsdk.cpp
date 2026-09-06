@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <cmath>
 #include <thread>
 
@@ -1159,15 +1160,63 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 		cnsdk->interlacer = NULL;
 	}
 
+	// leia_core_release can hang FOREVER on Android: CNSDK's FaceTracking owns an
+	// LLSEyePairPredictor whose input-noise measurement thread loops `while(true)`
+	// with no stop flag (libfilter llseyepairpredictor.cpp, on by default on
+	// Android since CNSDK 0.10.53), and the predictor's destructor joins it. Any
+	// destroy path that releases the core therefore never returns. That is fatal
+	// on the one thread it always runs on here — android_main, inside
+	// xrDestroySession — because NativeActivity.onDestroy is meanwhile blocking
+	// the JAVA MAIN THREAD in android_app_free until android_main exits. A
+	// config-change relaunch (the recents "freeform" toggle on a demo whose
+	// manifest lacks screenLayout|smallestScreenSize) then wedges the app for
+	// good: no new window is ever created, the WM reports an app-transition
+	// timeout, and the user sees "nothing happens" (runtime freeform regression,
+	// 2026-09-06; backtrace in the PR). Same watchdog shape as the worker join
+	// above: release on a side thread, wait a bounded time, and on timeout
+	// detach and LEAK the core + library rather than hang the process. A leaked
+	// core costs one sleeping thread and its memory until the process dies;
+	// nothing else in the process references it once we drop our pointers.
+	bool core_released = true;
 	if (cnsdk->core != NULL) {
-		leia_core_release(cnsdk->core);
+		struct leia_core *core = cnsdk->core;
 		cnsdk->core = NULL;
+		// Heap-owned flag, shared with the releaser by value: if the release
+		// ever does complete after we gave up and detached, the thread must not
+		// write into this (long dead) stack frame.
+		auto released = std::make_shared<std::atomic<bool>>(false);
+		std::thread releaser([core, released]() {
+			leia_core_release(core);
+			released->store(true, std::memory_order_release);
+		});
+		constexpr auto kCoreReleaseTimeoutMs = std::chrono::milliseconds(3000);
+		const auto deadline = std::chrono::steady_clock::now() + kCoreReleaseTimeoutMs;
+		while (!released->load(std::memory_order_acquire) &&
+		       std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (released->load(std::memory_order_acquire)) {
+			releaser.join();
+		} else {
+			U_LOG_W("HW_DBG_CNSDK: leia_core_release did not return within %lld ms "
+			        "(CNSDK predictor-thread join hang); detaching and LEAKING the "
+			        "core so xrDestroySession can return",
+			        (long long)kCoreReleaseTimeoutMs.count());
+			releaser.detach();
+			core_released = false;
+		}
 	}
 
 	// CNSDK 0.10.x: release the loader library last (replaces 0.7.28's
-	// leia_platform_on_library_unload()).
+	// leia_platform_on_library_unload()). Skipped when the core is still being
+	// torn down on the detached thread — unloading the library under it would
+	// turn a leak into a crash.
 	if (cnsdk->lib != NULL) {
-		leia_core_library_release(cnsdk->lib);
+		if (core_released) {
+			leia_core_library_release(cnsdk->lib);
+		} else {
+			U_LOG_W("HW_DBG_CNSDK: keeping the CNSDK library loaded — core release still pending");
+		}
 		cnsdk->lib = NULL;
 	}
 
