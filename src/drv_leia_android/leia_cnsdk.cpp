@@ -68,6 +68,15 @@ typedef leia_bool (*leia_interlacer_get_last_weave_result)(struct leia_interlace
 #define leia_interlacer_get_last_weave_result_VERSION (1)
 #endif
 
+/*!
+ * #1394: how many dropped-frame RUNS log verbatim before the 5 s throttle takes
+ * over. Sized so a realistic episode (measured on the pad: 17 drops across 8
+ * forced trials, every one of run length 1) is reported in full, while
+ * drop/good alternation at frame rate cannot produce a per-frame WARN for more
+ * than half a second.
+ */
+static const uint64_t kDropVerboseRuns = 32;
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -257,14 +266,14 @@ struct leia_cnsdk
 	//! immediately after, on the same (render) thread. Never latched across
 	//! frames — the runtime asks about the frame it just submitted.
 	bool last_weave_dropped{false};
-	//! #1394 logging state: consecutive drops in the current episode, total
-	//! drops this session, and the last time we said anything about either.
+	//! #1394 logging state, keyed on the drop RUN rather than the drop:
+	//! length of the run in progress (0 = not in one), how many runs and how
+	//! many drops this session, and the last time a rate-limited line went out.
 	//! Render-thread only, like the weave itself.
 	uint64_t weave_drop_run{0};
+	uint64_t weave_drop_runs{0};
 	uint64_t weave_drop_total{0};
 	int64_t weave_drop_last_log_ns{0};
-	bool weave_drop_logged_once{false};
-	bool weave_recovered_logged_once{false};
 
 	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
 	// not document whether they return mm (like get_primary_face) or meters,
@@ -2810,46 +2819,57 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		const int64_t log_period_ns = 5LL * 1000LL * 1000LL * 1000LL;
 		if (!weave_ok) {
 			cnsdk->last_weave_dropped = true;
-			cnsdk->weave_drop_run++;
 			cnsdk->weave_drop_total++;
 			/*
-			 * A drop is survivable by design, so it must never log per
-			 * frame — a repeating failure at 60 Hz is its own
-			 * ship-blocker. One WARN the first time it ever happens, then
-			 * at most one line per 5 s carrying the running count.
+			 * Log the START of a run, not every drop and not on a clock.
 			 *
-			 * Submit-failure vs fence-timeout is NOT distinguishable
-			 * through this API — CNSDK's own preceding line
-			 * (`[Weave] vkQueueSubmit failed: VkResult=…` /
-			 * `[Weave] fence wait timed out after … ms`) is the only
-			 * discriminator, which is why we point at it instead of
-			 * guessing.
+			 * A pure time throttle hides exactly the evidence it carries:
+			 * measured on the pad, a second failure 689 ms after the first
+			 * produced no line at all, and the pairing between a vendor
+			 * failure and the frame it cost became unreadable. Every
+			 * measured occurrence so far has run length 1, so a run-keyed
+			 * line is one line per occurrence.
+			 *
+			 * The case a throttle does defend against is drop/good
+			 * alternation at frame rate, where every drop starts a run — so
+			 * the first kDropVerboseRuns runs log unconditionally and the
+			 * rest fall back to one line per 5 s. The line count therefore
+			 * tracks RUNS, not drops; the totals are in the line.
 			 */
-			if (!cnsdk->weave_drop_logged_once ||
-			    now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
-				cnsdk->weave_drop_logged_once = true;
-				cnsdk->weave_drop_last_log_ns = now_ns;
-				U_LOG_W("#1394: CNSDK DROPPED this weave — frame discarded, not "
-				        "presented (%llu consecutive, %llu this session). The "
-				        "LeiaSDK line immediately above says whether a "
-				        "vkQueueSubmit failed or the bounded fence wait timed "
-				        "out.",
-				        (unsigned long long)cnsdk->weave_drop_run,
-				        (unsigned long long)cnsdk->weave_drop_total);
+			if (cnsdk->weave_drop_run == 0) {
+				cnsdk->weave_drop_runs++;
+				const bool verbose = cnsdk->weave_drop_runs <= kDropVerboseRuns;
+				if (verbose || now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
+					cnsdk->weave_drop_last_log_ns = now_ns;
+					/*
+					 * The help text must NOT quote the vendor's own log
+					 * literals: a bare grep for them over a logcat then
+					 * matches our line too and double-counts the cause
+					 * (29 phantom timeouts in the first hardware arm).
+					 */
+					U_LOG_W("#1394: CNSDK DROPPED a weave — frame discarded, not "
+					        "presented (run %llu, %llu dropped in total). See the "
+					        "LeiaSDK [Weave] line above for the cause.%s",
+					        (unsigned long long)cnsdk->weave_drop_runs,
+					        (unsigned long long)cnsdk->weave_drop_total,
+					        cnsdk->weave_drop_runs == kDropVerboseRuns
+					            ? " Further lines are rate-limited to one per 5 s."
+					            : "");
+				}
 			}
+			cnsdk->weave_drop_run++;
 		} else if (cnsdk->weave_drop_run != 0) {
 			const unsigned long long k = (unsigned long long)cnsdk->weave_drop_run;
 			cnsdk->weave_drop_run = 0;
-			// WARN, not INFO, for the repeats too: the compositor drops aux
-			// INFO from the frame path, so an INFO here would be decorative —
-			// present in the source, absent from the one log a bug report
-			// actually carries. The 5 s throttle is what keeps it honest.
-			if (!cnsdk->weave_recovered_logged_once ||
-			    now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
-				cnsdk->weave_recovered_logged_once = true;
-				cnsdk->weave_drop_last_log_ns = now_ns;
-				U_LOG_W("#1394: weave recovered after %llu dropped frame(s)", k);
-			}
+			/*
+			 * ALWAYS a WARN, and never suppressed below the run rate: this is
+			 * the line that makes a single drop observable per occurrence.
+			 * U_LOG_I would be decorative — the compositor drops aux INFO from
+			 * the frame path, so it would be in the source and absent from the
+			 * one log a bug report carries.
+			 */
+			U_LOG_W("#1394: weave recovered after %llu dropped frame(s) (run %llu)", k,
+			        (unsigned long long)cnsdk->weave_drop_runs);
 		}
 	}
 	return true;
