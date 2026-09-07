@@ -2840,13 +2840,15 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 		} else if (cnsdk->weave_drop_run != 0) {
 			const unsigned long long k = (unsigned long long)cnsdk->weave_drop_run;
 			cnsdk->weave_drop_run = 0;
-			if (!cnsdk->weave_recovered_logged_once) {
+			// WARN, not INFO, for the repeats too: the compositor drops aux
+			// INFO from the frame path, so an INFO here would be decorative —
+			// present in the source, absent from the one log a bug report
+			// actually carries. The 5 s throttle is what keeps it honest.
+			if (!cnsdk->weave_recovered_logged_once ||
+			    now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
 				cnsdk->weave_recovered_logged_once = true;
 				cnsdk->weave_drop_last_log_ns = now_ns;
 				U_LOG_W("#1394: weave recovered after %llu dropped frame(s)", k);
-			} else if (now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
-				cnsdk->weave_drop_last_log_ns = now_ns;
-				U_LOG_I("#1394: weave recovered after %llu dropped frame(s)", k);
 			}
 		}
 	}

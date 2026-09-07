@@ -219,6 +219,19 @@ struct leia_dp_cnsdk
 	//! wait gone the weave is genuinely in flight when the gate is recorded, so
 	//! this ordering has to be expressed rather than inferred from submit order.
 	VkSemaphore cmp_weave_sem;
+	//! runtime#1394: semaphores retired by reset_weave_semaphores, awaiting a
+	//! safe moment to destroy. Only vkDestroySemaphore carries the
+	//! "must not be in use by the device" VU — creating a replacement and
+	//! swapping it in needs no synchronisation at all — so a drop swaps
+	//! instantly and defers the destroy instead of idling the device on the
+	//! weave thread. Drained after LEIA_RETIRE_QUIESCE_WEAVES clean weaves (by
+	//! which point the runtime has drained the DP queue and fence-waited its
+	//! composite that many times, so nothing from the dropped frame can still
+	//! be in flight) and at teardown.
+	VkSemaphore retired_sems[32];
+	uint32_t retired_count;
+	//! Consecutive clean weaves since the last drop; gates the drain above.
+	uint32_t clean_weaves;
 	//! runtime#1394: did the LAST process_atlas() drop its frame? Written at the
 	//! end of every process_atlas_weave (including a plain `false` on every
 	//! early return, so a skipped weave never reads as a drop) and read by the
@@ -1153,12 +1166,19 @@ drain_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
 	}
 }
 
+// runtime#1394: how many consecutive clean weaves prove a retired semaphore is
+// no longer referenced by the device. Each clean weave ends with the runtime's
+// post-weave queue drain (#837) and a fence-waited composite submit, so ONE
+// would do; this is two orders of magnitude of margin on a path that costs
+// nothing to be patient on.
+static const uint32_t kRetireQuiesceWeaves = 120;
+
 /*
  * runtime#1394: put the compose→weave→gate semaphore chain back into a KNOWN
  * state after CNSDK dropped a frame.
  *
  * `drain_semaphore` above cannot be used here, because after a drop we do not
- * know which side of the chain broke and both guesses can hang forever:
+ * know which side of the chain broke and both guesses can block for ever:
  *
  *   - a weaver submit that FAILED never waited `cmp_done_sem` (still signalled,
  *     must be consumed) and never signalled `cmp_weave_sem` (waiting on it
@@ -1167,15 +1187,61 @@ drain_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
  *     `cmp_done_sem` (waiting on it blocks for ever) and will signal
  *     `cmp_weave_sem` late.
  *
- * CNSDK exposes no way to tell those apart, so instead of guessing: idle the
- * device — the same hammer the un-chained alpha-gate fallback already uses in
- * this file — and then destroy and recreate both semaphores. A freshly created
- * binary semaphore is unsignalled by definition, which is the one state the next
- * frame can reason about. Strictly off the happy path (a drop is rare by
- * construction), and a no-op when the chain is not live at all — which is every
- * opaque app, since `cmp_done_sem` is only handed out when compose-under
- * actually composed.
+ * CNSDK exposes no way to tell those apart, so instead of guessing we replace
+ * the pair: a freshly created binary semaphore is unsignalled by definition,
+ * which is the one state the next frame can reason about.
+ *
+ * What this deliberately does NOT do is idle the device first. The fence-timeout
+ * arm is precisely the case where CNSDK's own 500 ms wait expired because work
+ * is still outstanding — vkDeviceWaitIdle would then wait on that same stuck
+ * work, unbounded, on the weave thread while it holds the compositor lock, and
+ * under runtime#1397 that becomes a 2 s abandon. It would re-introduce the wait
+ * this whole change exists to remove. Only vkDestroySemaphore has the
+ * "not in use by the device" requirement; creating and swapping do not. So the
+ * swap is immediate and the destroy is deferred to `retire_drain` below.
+ *
+ * No-op when the chain is not live at all — which is every opaque app, since
+ * `cmp_done_sem` is only handed out when compose-under actually composed.
  */
+static void
+retire_drain(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr || impl->retired_count == 0) {
+		return;
+	}
+	for (uint32_t i = 0; i < impl->retired_count; i++) {
+		if (impl->retired_sems[i] != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, impl->retired_sems[i], nullptr);
+			impl->retired_sems[i] = VK_NULL_HANDLE;
+		}
+	}
+	impl->retired_count = 0;
+}
+
+static void
+retire_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
+{
+	if (sem == VK_NULL_HANDLE) {
+		return;
+	}
+	if (impl->retired_count >= ARRAY_SIZE(impl->retired_sems)) {
+		// Lifecycle-rare by construction (a drop is rare, and the list drains
+		// after 120 clean weaves). Leaking two semaphore handles for the life
+		// of the DP beats either destroying one that may still be in use or
+		// idling the device on the weave thread.
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("#1394: semaphore retire list full (%u) — leaking the rest until "
+			        "teardown; this means drops are arriving faster than they drain",
+			        (unsigned)impl->retired_count);
+		}
+		return;
+	}
+	impl->retired_sems[impl->retired_count++] = sem;
+}
+
 static void
 destroy_compose(leia_dp_cnsdk *impl);
 
@@ -1186,7 +1252,6 @@ reset_weave_semaphores(leia_dp_cnsdk *impl)
 	if (vk == nullptr || !impl->cmp_inited) {
 		return;
 	}
-	vk->vkDeviceWaitIdle(vk->device);
 	VkSemaphoreCreateInfo sci = {};
 	sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 	VkSemaphore fresh_done = VK_NULL_HANDLE, fresh_weave = VK_NULL_HANDLE;
@@ -1195,26 +1260,23 @@ reset_weave_semaphores(leia_dp_cnsdk *impl)
 		res = vk->vkCreateSemaphore(vk->device, &sci, nullptr, &fresh_weave);
 	}
 	if (res != VK_SUCCESS) {
-		// Lifecycle-rare; if we cannot get a clean pair the honest thing is to
-		// tear the compose pipeline down and let the next frame rebuild it,
-		// rather than carry semaphores of unknown state into it.
-		if (fresh_done != VK_NULL_HANDLE) {
-			vk->vkDestroySemaphore(vk->device, fresh_done, nullptr);
-		}
-		U_LOG_W("#1394: could not recreate the weave semaphores (%d) — rebuilding the "
-		        "compose pipeline next frame",
+		// Could not get a clean pair. Retire what we made and leave the old pair
+		// in place: the next frame's chain may misbehave, but that is strictly
+		// better than tearing the pipeline down from here (destroy_compose
+		// destroys objects that may still be in flight, which is the very thing
+		// this function exists to avoid).
+		retire_semaphore(impl, fresh_done);
+		U_LOG_W("#1394: could not recreate the weave semaphores (%d) — keeping the "
+		        "existing pair; the compose chain may be degraded until the next "
+		        "pipeline rebuild",
 		        res);
-		destroy_compose(impl);
 		return;
 	}
-	if (impl->cmp_done_sem != VK_NULL_HANDLE) {
-		vk->vkDestroySemaphore(vk->device, impl->cmp_done_sem, nullptr);
-	}
-	if (impl->cmp_weave_sem != VK_NULL_HANDLE) {
-		vk->vkDestroySemaphore(vk->device, impl->cmp_weave_sem, nullptr);
-	}
+	retire_semaphore(impl, impl->cmp_done_sem);
+	retire_semaphore(impl, impl->cmp_weave_sem);
 	impl->cmp_done_sem = fresh_done;
 	impl->cmp_weave_sem = fresh_weave;
+	impl->clean_weaves = 0;
 }
 
 static bool
@@ -1297,6 +1359,10 @@ destroy_compose(leia_dp_cnsdk *impl)
 		vk->vkDestroyFence(vk->device, impl->cmp_fence, nullptr);
 		impl->cmp_fence = VK_NULL_HANDLE;
 	}
+	// runtime#1394: the deferred destroys. Every caller of destroy_compose
+	// already destroys the LIVE pair right below, and the retired ones are
+	// strictly older, so this is safe wherever that is.
+	retire_drain(impl);
 	if (impl->cmp_done_sem != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, impl->cmp_done_sem, nullptr);
 		impl->cmp_done_sem = VK_NULL_HANDLE;
@@ -1306,6 +1372,7 @@ destroy_compose(leia_dp_cnsdk *impl)
 		impl->cmp_weave_sem = VK_NULL_HANDLE;
 	}
 	impl->cmp_fence_armed = false;
+	impl->clean_weaves = 0;
 	impl->cmp_fill_w = 0;
 	impl->cmp_fill_h = 0;
 	impl->cmp_fmt = VK_FORMAT_UNDEFINED;
@@ -2486,10 +2553,22 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	 */
 	if (wove && leia_cnsdk_last_weave_dropped(impl->cnsdk)) {
 		impl->last_frame_dropped = true;
+		impl->clean_weaves = 0;
 		if (compose_done_sem != VK_NULL_HANDLE || weave_done_sem != VK_NULL_HANDLE) {
 			reset_weave_semaphores(impl);
 		}
 		return;
+	}
+
+	// runtime#1394: this weave is clean. Once enough of them have gone by, any
+	// semaphore retired by an earlier drop is provably unreferenced — each clean
+	// weave ends with the runtime's post-weave queue drain (#837) and a
+	// fence-waited composite submit — so the deferred destroys can happen here,
+	// off the weave thread's critical path and without a device idle. No-op in
+	// the overwhelmingly common case where nothing was ever retired.
+	if (impl->retired_count != 0 && ++impl->clean_weaves >= kRetireQuiesceWeaves) {
+		retire_drain(impl);
+		impl->clean_weaves = 0;
 	}
 
 	// #568: the weave interlaced into opaque RGB — reconstruct per-pixel alpha
