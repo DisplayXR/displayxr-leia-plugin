@@ -219,6 +219,12 @@ struct leia_dp_cnsdk
 	//! wait gone the weave is genuinely in flight when the gate is recorded, so
 	//! this ordering has to be expressed rather than inferred from submit order.
 	VkSemaphore cmp_weave_sem;
+	//! runtime#1394: did the LAST process_atlas() drop its frame? Written at the
+	//! end of every process_atlas_weave (including a plain `false` on every
+	//! early return, so a skipped weave never reads as a drop) and read by the
+	//! runtime through the appended `get_last_frame_dropped` vtable slot,
+	//! immediately after, on the same thread. Never latched across frames.
+	bool last_frame_dropped;
 };
 
 inline leia_dp_cnsdk *
@@ -1145,6 +1151,70 @@ drain_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
 	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
+}
+
+/*
+ * runtime#1394: put the compose→weave→gate semaphore chain back into a KNOWN
+ * state after CNSDK dropped a frame.
+ *
+ * `drain_semaphore` above cannot be used here, because after a drop we do not
+ * know which side of the chain broke and both guesses can hang forever:
+ *
+ *   - a weaver submit that FAILED never waited `cmp_done_sem` (still signalled,
+ *     must be consumed) and never signalled `cmp_weave_sem` (waiting on it
+ *     blocks for ever);
+ *   - a weaver submit that succeeded but whose FENCE timed out consumed
+ *     `cmp_done_sem` (waiting on it blocks for ever) and will signal
+ *     `cmp_weave_sem` late.
+ *
+ * CNSDK exposes no way to tell those apart, so instead of guessing: idle the
+ * device — the same hammer the un-chained alpha-gate fallback already uses in
+ * this file — and then destroy and recreate both semaphores. A freshly created
+ * binary semaphore is unsignalled by definition, which is the one state the next
+ * frame can reason about. Strictly off the happy path (a drop is rare by
+ * construction), and a no-op when the chain is not live at all — which is every
+ * opaque app, since `cmp_done_sem` is only handed out when compose-under
+ * actually composed.
+ */
+static void
+destroy_compose(leia_dp_cnsdk *impl);
+
+static void
+reset_weave_semaphores(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr || !impl->cmp_inited) {
+		return;
+	}
+	vk->vkDeviceWaitIdle(vk->device);
+	VkSemaphoreCreateInfo sci = {};
+	sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	VkSemaphore fresh_done = VK_NULL_HANDLE, fresh_weave = VK_NULL_HANDLE;
+	VkResult res = vk->vkCreateSemaphore(vk->device, &sci, nullptr, &fresh_done);
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateSemaphore(vk->device, &sci, nullptr, &fresh_weave);
+	}
+	if (res != VK_SUCCESS) {
+		// Lifecycle-rare; if we cannot get a clean pair the honest thing is to
+		// tear the compose pipeline down and let the next frame rebuild it,
+		// rather than carry semaphores of unknown state into it.
+		if (fresh_done != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, fresh_done, nullptr);
+		}
+		U_LOG_W("#1394: could not recreate the weave semaphores (%d) — rebuilding the "
+		        "compose pipeline next frame",
+		        res);
+		destroy_compose(impl);
+		return;
+	}
+	if (impl->cmp_done_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, impl->cmp_done_sem, nullptr);
+	}
+	if (impl->cmp_weave_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, impl->cmp_weave_sem, nullptr);
+	}
+	impl->cmp_done_sem = fresh_done;
+	impl->cmp_weave_sem = fresh_weave;
 }
 
 static bool
@@ -2177,6 +2247,23 @@ set_predicted_scanout_cnsdk(struct xrt_display_processor_vk *xdp, uint64_t predi
 }
 #endif // XRT_DP_VK_HAS_PREDICTED_SCANOUT
 
+#ifdef XRT_DP_VK_HAS_FRAME_DROPPED
+/*
+ * runtime#1394: the verdict for the process_atlas() that just returned.
+ *
+ * Read by the compositor immediately after process_atlas, on the weave thread,
+ * before any other DP call — so a plain read of the flag process_atlas_weave
+ * just wrote is exactly the right frame's answer. Runs per frame: no logging, no
+ * lock, no blocking.
+ */
+bool
+get_last_frame_dropped_cnsdk(struct xrt_display_processor_vk *xdp)
+{
+	leia_dp_cnsdk *impl = reinterpret_cast<leia_dp_cnsdk *>(xdp); // dp_vk is at offset 0
+	return impl != nullptr && impl->last_frame_dropped;
+}
+#endif // XRT_DP_VK_HAS_FRAME_DROPPED
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -2210,6 +2297,14 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                             canvas_width != target_width || canvas_height != target_height);
 
 	leia_dp_cnsdk *impl = as_impl(xdp);
+
+	// runtime#1394: clear the per-frame verdict BEFORE any early return. Every
+	// path out of this function below either leaves it false (the frame is as
+	// good as it ever was — a skipped weave, a mono blit, a not-yet-ready
+	// interlacer: all of those are today's behaviour and the runtime must keep
+	// presenting them) or sets it true explicitly at the one place CNSDK tells
+	// us the weave did not reach the GPU.
+	impl->last_frame_dropped = false;
 
 	// #201: the tracking watchdog is cycling core pause/resume to recover a
 	// lost frame subscription. CNSDK state is mid-teardown; running the
@@ -2365,6 +2460,36 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 		// next frame, so drain both rather than assume.
 		drain_semaphore(impl, compose_done_sem);
 		weave_done_sem = VK_NULL_HANDLE;
+	}
+
+	/*
+	 * runtime#1394 / LeiaInc/CNSDK#734 — CNSDK may have taken the weave and
+	 * still produced nothing: an Adreno GSL timestamp collision fails its
+	 * internal vkQueueSubmit, or its bounded fence wait expires. Either way this
+	 * atlas never became pixels, and the target holds whatever the pre-weave
+	 * barrier left there.
+	 *
+	 * Report it up so the compositor discards the frame instead of presenting
+	 * it, counting it, and folding its timing into the next one. Deliberately
+	 * NOT a retry: retrying submits into the very collision that failed, and the
+	 * runtime presents exactly once per weave — a second woven frame for one
+	 * atlas would double-expose a target already transitioned to PRESENT_SRC.
+	 *
+	 * The #206 horizon publish stays where it is, BEFORE the weave: the
+	 * interlacer consumes it during the weave, and a horizon consumed by a
+	 * dropped frame leaves no lasting state behind (confirmed on the CNSDK
+	 * side). What must not survive the drop is the FRAME, not the horizon.
+	 *
+	 * Skip the post-weave alpha gate: it exists to reconstruct alpha from woven
+	 * pixels, and there are none. Chasing it would also make the gate wait a
+	 * `weave_done_sem` that a failed submit never signals.
+	 */
+	if (wove && leia_cnsdk_last_weave_dropped(impl->cnsdk)) {
+		impl->last_frame_dropped = true;
+		if (compose_done_sem != VK_NULL_HANDLE || weave_done_sem != VK_NULL_HANDLE) {
+			reset_weave_semaphores(impl);
+		}
+		return;
 	}
 
 	// #568: the weave interlaced into opaque RGB — reconstruct per-pixel alpha
@@ -2637,6 +2762,12 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 #endif
 #ifdef XRT_DP_VK_HAS_PREDICTED_SCANOUT
 	impl->dp_vk.set_predicted_scanout = set_predicted_scanout_cnsdk;
+#endif
+#ifdef XRT_DP_VK_HAS_FRAME_DROPPED
+	// runtime#1394: let the compositor discard a frame CNSDK dropped. Filling
+	// the pointer is all the runtime needs — struct_size above already covers
+	// the slot (it is sizeof(xrt_display_processor_vk)).
+	impl->dp_vk.get_last_frame_dropped = get_last_frame_dropped_cnsdk;
 #endif
 
 	*out_xdp = &impl->dp_vk.base;

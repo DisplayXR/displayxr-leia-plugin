@@ -36,6 +36,38 @@
 #endif
 #endif
 
+/*
+ * #1394 / LeiaInc/CNSDK#733 — "did the weave I just asked for actually reach the
+ * GPU?"
+ *
+ * CNSDK PR #734 makes a failed weaver `vkQueueSubmit` DISARM its fence and
+ * return false through `Apply2DEffect` (with a 500 ms bounded fence wait as the
+ * net), and exposes the outcome as a new EXPERIMENTAL entry point:
+ *
+ *     leia_bool leia_interlacer_get_last_weave_result(struct leia_interlacer*)
+ *
+ *   1 = every GPU submit of the most recent `do_post_process` succeeded
+ *   0 = that frame was DROPPED (a submit failed, or the 500 ms fence wait timed
+ *       out — the two are the same host action and the API does not distinguish
+ *       them; only CNSDK's own preceding log line does)
+ *
+ * It reflects THIS frame only (reset at the top of each Vulkan DoPostProcess),
+ * so it must be read immediately after `do_post_process` returns, on the same
+ * thread, before the next weave. That is exactly where `leia_cnsdk_weave` reads
+ * it.
+ *
+ * Declared HERE rather than taken from the headers because the pinned CNSDK
+ * (0.10.67) predates #734: this way the plug-in still builds against the current
+ * CNSDK_TAG and only needs the fixed CORE at runtime. On an older core
+ * `leia_get_experimental_api` returns NULL, we never ask, and every frame reads
+ * as "not dropped" — i.e. today's behaviour, bit for bit. The guard means the
+ * declaration silently disappears the moment a CNSDK ships the real one.
+ */
+#if !defined(leia_interlacer_get_last_weave_result_VERSION)
+typedef leia_bool (*leia_interlacer_get_last_weave_result)(struct leia_interlacer *);
+#define leia_interlacer_get_last_weave_result_VERSION (1)
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -217,6 +249,22 @@ struct leia_cnsdk
 	leia_interlacer_set_predicted_scanout_ns fn_set_predicted_scanout{nullptr};
 #endif
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes{nullptr};
+	// #1394: the per-frame weave outcome. nullptr on a core older than
+	// LeiaInc/CNSDK#734 — we then never report a drop, which is today's
+	// behaviour. See the typedef block at the top of this file.
+	leia_interlacer_get_last_weave_result fn_get_last_weave_result{nullptr};
+	//! #1394: set by leia_cnsdk_weave from the call above; read by the DP
+	//! immediately after, on the same (render) thread. Never latched across
+	//! frames — the runtime asks about the frame it just submitted.
+	bool last_weave_dropped{false};
+	//! #1394 logging state: consecutive drops in the current episode, total
+	//! drops this session, and the last time we said anything about either.
+	//! Render-thread only, like the weave itself.
+	uint64_t weave_drop_run{0};
+	uint64_t weave_drop_total{0};
+	int64_t weave_drop_last_log_ns{0};
+	bool weave_drop_logged_once{false};
+	bool weave_recovered_logged_once{false};
 
 	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
 	// not document whether they return mm (like get_primary_face) or meters,
@@ -964,6 +1012,12 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_lookaround_eyes);
 	leia_core_get_non_predicted_eyes fn_nonpred_eyes =
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_core_get_non_predicted_eyes);
+	// #1394: per-frame weave outcome (LeiaInc/CNSDK#734). Resolved BY NAME, so
+	// a core that predates the fix simply yields nullptr and we keep today's
+	// "every frame presented" behaviour. Same library-level lookup as above —
+	// no core required.
+	leia_interlacer_get_last_weave_result fn_weave_result =
+	    LEIA_GET_EXPERIMENTAL_API(lib, leia_interlacer_get_last_weave_result);
 	// #206: the per-frame prediction horizon sink. Absent on older CNSDK.
 #if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 	leia_interlacer_set_predicted_scanout_ns fn_scanout =
@@ -971,10 +1025,12 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 #else
 	void *fn_scanout = nullptr; // API predates this CNSDK
 #endif
-	U_LOG_W("HW_EYES: experimental API — lookaround=%s non_predicted=%s predicted_scanout=%s",
+	U_LOG_W("HW_EYES: experimental API — lookaround=%s non_predicted=%s predicted_scanout=%s "
+	        "last_weave_result=%s",
 	        fn_lookaround != nullptr ? "OK" : "MISSING",
 	        fn_nonpred_eyes != nullptr ? "OK" : "MISSING",
-	        fn_scanout != nullptr ? "OK" : "MISSING");
+	        fn_scanout != nullptr ? "OK" : "MISSING",
+	        fn_weave_result != nullptr ? "OK" : "MISSING (core predates CNSDK#734)");
 
 #ifdef XRT_OS_ANDROID
 	// LOXR-730/733: register the host Activity for orientation tracking so the
@@ -1073,6 +1129,7 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	cnsdk->fn_set_predicted_scanout = fn_scanout;
 #endif
 	cnsdk->fn_nonpred_eyes = fn_nonpred_eyes;
+	cnsdk->fn_get_last_weave_result = fn_weave_result;
 #ifdef XRT_OS_ANDROID
 	// Same gate as limit_orientations above: Activity-typed CNSDK calls
 	// (leia_core_on_pause/on_resume) are only safe with a real Activity.
@@ -2731,5 +2788,76 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	leia_interlacer_vulkan_do_post_process(
 	    cnsdk->interlacer, w, h, false, fb, targetImage, NULL,
 	    wait_sem, signal_sem, 0);
+
+	/*
+	 * #1394 — read CNSDK's verdict for THIS frame, right here.
+	 *
+	 * The flag is reset at the top of every Vulkan DoPostProcess, so it is only
+	 * meaningful in the window between `do_post_process` returning and the next
+	 * weave starting, on this thread. Anywhere else it is a different frame's
+	 * answer.
+	 *
+	 * We do NOT retry, and we deliberately leave the #206 horizon publish above
+	 * where it is: the interlacer consumes the horizon DURING the weave, and a
+	 * horizon consumed by a dropped frame leaves no lasting state behind
+	 * (confirmed with the CNSDK side). What must not happen is the frame being
+	 * PRESENTED — that is what the DP forwards to the compositor.
+	 */
+	cnsdk->last_weave_dropped = false;
+	if (cnsdk->fn_get_last_weave_result != nullptr) {
+		const bool weave_ok = cnsdk->fn_get_last_weave_result(cnsdk->interlacer) != 0;
+		const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		const int64_t log_period_ns = 5LL * 1000LL * 1000LL * 1000LL;
+		if (!weave_ok) {
+			cnsdk->last_weave_dropped = true;
+			cnsdk->weave_drop_run++;
+			cnsdk->weave_drop_total++;
+			/*
+			 * A drop is survivable by design, so it must never log per
+			 * frame — a repeating failure at 60 Hz is its own
+			 * ship-blocker. One WARN the first time it ever happens, then
+			 * at most one line per 5 s carrying the running count.
+			 *
+			 * Submit-failure vs fence-timeout is NOT distinguishable
+			 * through this API — CNSDK's own preceding line
+			 * (`[Weave] vkQueueSubmit failed: VkResult=…` /
+			 * `[Weave] fence wait timed out after … ms`) is the only
+			 * discriminator, which is why we point at it instead of
+			 * guessing.
+			 */
+			if (!cnsdk->weave_drop_logged_once ||
+			    now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
+				cnsdk->weave_drop_logged_once = true;
+				cnsdk->weave_drop_last_log_ns = now_ns;
+				U_LOG_W("#1394: CNSDK DROPPED this weave — frame discarded, not "
+				        "presented (%llu consecutive, %llu this session). The "
+				        "LeiaSDK line immediately above says whether a "
+				        "vkQueueSubmit failed or the bounded fence wait timed "
+				        "out.",
+				        (unsigned long long)cnsdk->weave_drop_run,
+				        (unsigned long long)cnsdk->weave_drop_total);
+			}
+		} else if (cnsdk->weave_drop_run != 0) {
+			const unsigned long long k = (unsigned long long)cnsdk->weave_drop_run;
+			cnsdk->weave_drop_run = 0;
+			if (!cnsdk->weave_recovered_logged_once) {
+				cnsdk->weave_recovered_logged_once = true;
+				cnsdk->weave_drop_last_log_ns = now_ns;
+				U_LOG_W("#1394: weave recovered after %llu dropped frame(s)", k);
+			} else if (now_ns - cnsdk->weave_drop_last_log_ns > log_period_ns) {
+				cnsdk->weave_drop_last_log_ns = now_ns;
+				U_LOG_I("#1394: weave recovered after %llu dropped frame(s)", k);
+			}
+		}
+	}
 	return true;
+}
+
+extern "C" bool
+leia_cnsdk_last_weave_dropped(struct leia_cnsdk *cnsdk)
+{
+	// Plain read: written by leia_cnsdk_weave on the weave thread and read by
+	// the DP on that same thread, between the two weaves. No cross-thread
+	// visibility to establish, so no atomic.
+	return cnsdk != NULL && cnsdk->last_weave_dropped;
 }

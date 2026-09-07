@@ -417,6 +417,28 @@ leia_cnsdk_set_panel_size(struct leia_cnsdk *cnsdk, uint32_t panel_w, uint32_t p
 void
 leia_cnsdk_set_predicted_scanout(struct leia_cnsdk *cnsdk, uint64_t weave_to_scanout_ns);
 
+/*!
+ * #1394: did the LAST @ref leia_cnsdk_weave on this handle actually reach the
+ * GPU?
+ *
+ * `leia_cnsdk_weave` returning true only means the weave was HANDED to CNSDK.
+ * With LeiaInc/CNSDK#734 the interlacer can fail its own internal
+ * `vkQueueSubmit` (Adreno GSL timestamp collision, runtime#1394) or time out its
+ * bounded 500 ms fence wait, and in both cases it produces no pixels for that
+ * atlas. `leia_cnsdk_weave` reads CNSDK's per-frame verdict immediately after
+ * `do_post_process` returns — the only point at which it is valid — and latches
+ * it here for the display processor to forward to the runtime.
+ *
+ * Valid ONLY between a `leia_cnsdk_weave` returning and the next one starting,
+ * on the weave thread. On a core older than CNSDK#734 the verdict does not
+ * exist and this always returns false, i.e. today's behaviour.
+ *
+ * @return true if the last weave was DROPPED and its frame must not be
+ *         presented.
+ */
+bool
+leia_cnsdk_last_weave_dropped(struct leia_cnsdk *cnsdk);
+
 #ifdef __cplusplus
 }
 #endif
