@@ -174,10 +174,10 @@ set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
 set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
-# Android carries its own pin too. It currently holds the SAME value as the
-# Windows tag -- the point is not that it differs today, it is that the Android
-# arm can move independently without dragging the Windows installer's derived
-# MIN_RUNTIME_VERSION with it.
+# Android carries its own pin too, and as of the get_last_frame_dropped repin it
+# is AHEAD of the Windows tag (v2.16.19 vs v2.16.9) -- which is the whole reason
+# the suffixed key exists: the Android arm moves independently without dragging
+# the Windows installer's derived MIN_RUNTIME_VERSION up with it.
 #
 # FLOOR IS v2.7.2. That is the first tag carrying BOTH
 # XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT (runtime#1037 / ADR-036 D2) and
@@ -191,7 +191,21 @@ set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
 # The _ANDROID suffix is invisible to the runtime's scripts/check_plugin_abi.py
 # regex (DXR_RUNTIME_GIT_TAG\s+") because \s+ cannot match an underscore --
 # the same reason _LINUX above is already safe.
-set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.16.0" CACHE STRING
+# v2.16.19 (from v2.16.0): first tag shipping the appended VK DP slot
+# `get_last_frame_dropped` (runtime#1394/#1411), announced by
+# XRT_DP_VK_HAS_FRAME_DROPPED. src/drv_leia_android compiles the slot ONLY when
+# that macro is present, so an older pin still builds and still loads -- it just
+# silently ships a plug-in that cannot tell the compositor a weave was dropped,
+# and the runtime presents a target the weaver never wrote. Same silent-omission
+# shape as the CLASS_HOST_CTX case above; the difference is that this one has no
+# witness string in CI, so verify it in the .so's symbol table:
+#   llvm-nm libdxrp050_leia_cnsdk.so | grep get_last_frame_dropped_cnsdk
+# Appended slot, struct_size-gated: plugin ABI is v5 at BOTH v2.16.0 and
+# v2.16.19, so a plug-in built here still runs on an older runtime (the runtime
+# reads the slot only when struct_size covers it). That is also why the runtime's
+# ABI-gated runtime-pin-bump.yml SKIPS this track -- an appended slot is
+# invisible to an ABI comparison, so the repin is human-driven.
+set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.16.19" CACHE STRING
     "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
 
 if(DXR_RUNTIME_SOURCE_DIR)

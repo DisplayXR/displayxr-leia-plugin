@@ -57,7 +57,16 @@ env:
   # DXR_RUNTIME_GIT_TAG_ANDROID (rule-5 self-check below). Floor is v2.7.2 --
   # the first tag with XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT (runtime#1037)
   # and XRT_DP_VK_HAS_WINDOW_SCREEN_RECT (runtime#1033).
-  RUNTIME_REF_ANDROID: v2.16.0
+  # v2.16.19: first tag with the appended VK DP slot get_last_frame_dropped
+  # (runtime#1394/#1411, announced by XRT_DP_VK_HAS_FRAME_DROPPED), which
+  # leia_display_processor_cnsdk.cpp fills under that guard. Built against an
+  # older ref the guard compiles OUT silently -- the plug-in still builds, still
+  # loads, still reports ABI v5 -- and a dropped weave is presented anyway.
+  # Appended + struct_size-gated, so this pin does NOT raise the floor: the
+  # plug-in still runs on older runtimes. (No installer derives a
+  # MIN_RUNTIME_VERSION from the Android pin; that derivation is off the
+  # Windows DXR_RUNTIME_GIT_TAG, which stays where it is.)
+  RUNTIME_REF_ANDROID: v2.16.19
   # NDK the runtime APK is built with (displayxr-runtime build-android.yml +
   # gradle.properties). Bump together, or the plug-in links against a different
   # libc++/sysroot than the APK it gets dropped into.
