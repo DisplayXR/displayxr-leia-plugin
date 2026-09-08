@@ -274,6 +274,7 @@ struct leia_cnsdk
 	uint64_t weave_drop_runs{0};
 	uint64_t weave_drop_total{0};
 	int64_t weave_drop_last_log_ns{0};
+	int64_t weave_drop_last_rec_ns{0};
 
 	// #ROLL: unit auto-detect for the experimental eye accessors. core.h does
 	// not document whether they return mm (like get_primary_face) or meters,
@@ -2862,14 +2863,22 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 			const unsigned long long k = (unsigned long long)cnsdk->weave_drop_run;
 			cnsdk->weave_drop_run = 0;
 			/*
-			 * ALWAYS a WARN, and never suppressed below the run rate: this is
-			 * the line that makes a single drop observable per occurrence.
-			 * U_LOG_I would be decorative — the compositor drops aux INFO from
-			 * the frame path, so it would be in the source and absent from the
-			 * one log a bug report carries.
+			 * WARN and not INFO: the compositor drops aux INFO from the frame
+			 * path, so an INFO would be in the source and absent from the one
+			 * log a bug report carries. This is the line that makes a single
+			 * drop observable per occurrence.
+			 *
+			 * Carries the SAME verbose-then-throttle budget as the run-start
+			 * line, on the same run counter, so the two stay PAIRED. Without it,
+			 * drop/good alternation at frame rate would make this per-frame,
+			 * which the logging rules forbid outright.
 			 */
-			U_LOG_W("#1394: weave recovered after %llu dropped frame(s) (run %llu)", k,
-			        (unsigned long long)cnsdk->weave_drop_runs);
+			if (cnsdk->weave_drop_runs <= kDropVerboseRuns ||
+			    now_ns - cnsdk->weave_drop_last_rec_ns > log_period_ns) {
+				cnsdk->weave_drop_last_rec_ns = now_ns;
+				U_LOG_W("#1394: weave recovered after %llu dropped frame(s) (run %llu)", k,
+				        (unsigned long long)cnsdk->weave_drop_runs);
+			}
 		}
 	}
 	return true;
