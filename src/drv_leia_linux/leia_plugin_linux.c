@@ -35,6 +35,7 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 
+#include "vk/vk_helpers.h" // sizeof/offsetof(struct vk_bundle) fingerprint (#233)
 #include "leia_interface.h"
 #include "leia_sr_linux.h"
 #include "leia_display_processor_linux.h"
@@ -215,6 +216,19 @@ static struct xrt_plugin_iface g_leia_lnx_iface = {
 
     /* Vulkan only — the Linux compositor is vk_native (contract §3.1). */
     .create_dp_vk = leia_lnx_dp_factory_vk,
+    /*
+     * #1243/#1244 vk_bundle ABI fingerprint (#233). Unconditional here,
+     * unlike the Windows arm: this arm always has a VK factory, because
+     * vk_native IS the Linux compositor.
+     *
+     * The loader only WARNS on desktop when these are absent (it refuses
+     * outright on Android), so the pairing shipped in the .deb has never
+     * been layout-checked. The warning text even names the .deb as the
+     * reason it stays permissive — which is precisely the pairing this
+     * makes verifiable instead of assumed.
+     */
+    .vk_bundle_abi_size = (uint32_t)sizeof(struct vk_bundle),
+    .vk_bundle_fn_table_offset = (uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr),
     .create_dp_d3d11 = NULL,
     .create_dp_d3d12 = NULL,
     .create_dp_gl = NULL,
