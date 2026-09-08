@@ -145,6 +145,22 @@ void
 leia_cnsdk_set_eye_tracking_mode(struct leia_cnsdk *cnsdk, uint32_t mode);
 
 /*!
+ * Runtime-requested hardware display mode (xrt_display_processor::request_display_mode).
+ * true = 3D light-field backlight wanted, false = flat 2D. Applied on the render
+ * thread by the weave's backlight toggle (which also honours the
+ * debug.dxr.leia.backlight A/B prop). Thread-safe.
+ */
+void
+leia_cnsdk_set_display_mode_3d(struct leia_cnsdk *cnsdk, bool enable_3d);
+
+/*!
+ * Hardware 3D state as last APPLIED to the panel. Returns false when unknown
+ * (nothing applied yet); *out_is_3d is then untouched.
+ */
+bool
+leia_cnsdk_get_hardware_3d_state(struct leia_cnsdk *cnsdk, bool *out_is_3d);
+
+/*!
  * Fetch native display metrics from CNSDK's device config.
  *
  * The four values are snapshotted once by the face-tracking worker

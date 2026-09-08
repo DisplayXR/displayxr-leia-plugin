@@ -166,6 +166,10 @@ struct leia_cnsdk
 	// leave it (stuck-3D-after-close bug). throttle is render-thread-only.
 	std::atomic<int> backlight_applied{-1};
 	int backlight_throttle{0};
+	// What the RUNTIME asked for via request_display_mode (mono/2D rendering modes
+	// ask for false). Default 3D: a plug-in that never hears a request behaves
+	// exactly as before. Combined with the debug prop in apply_backlight_toggle.
+	std::atomic<bool> want_3d{true};
 
 	// True when the host context handed to CNSDK is a real Activity
 	// (in-process). leia_core_on_pause/on_resume internally call
@@ -1411,6 +1415,35 @@ leia_cnsdk_set_eye_tracking_mode(struct leia_cnsdk *cnsdk, uint32_t mode)
 	}
 }
 
+void
+leia_cnsdk_set_display_mode_3d(struct leia_cnsdk *cnsdk, bool enable_3d)
+{
+	if (cnsdk == NULL) {
+		return;
+	}
+	const bool prev = cnsdk->want_3d.exchange(enable_3d, std::memory_order_acq_rel);
+	if (prev != enable_3d) {
+		U_LOG_W("HW_DBG_CNSDK: runtime requested display mode -> %s", enable_3d ? "3D" : "2D");
+		// Let the next weave apply it immediately instead of waiting out the
+		// 30-frame throttle: reset the throttle counter so the toggle runs now.
+		cnsdk->backlight_throttle = 0;
+	}
+}
+
+bool
+leia_cnsdk_get_hardware_3d_state(struct leia_cnsdk *cnsdk, bool *out_is_3d)
+{
+	if (cnsdk == NULL || out_is_3d == NULL) {
+		return false;
+	}
+	const int applied = cnsdk->backlight_applied.load(std::memory_order_acquire);
+	if (applied < 0) {
+		return false;
+	}
+	*out_is_3d = applied == 1;
+	return true;
+}
+
 extern "C" bool
 leia_cnsdk_get_display_metrics(struct leia_cnsdk *cnsdk,
                                float *out_width_m,
@@ -2349,6 +2382,12 @@ apply_backlight_toggle(struct leia_cnsdk *cnsdk)
 		return;
 	}
 	int want = get_prop_bool("debug.dxr.leia.backlight", true) ? 1 : 0;
+	// The runtime's request_display_mode (a 2D rendering mode, the idle splash of
+	// the media player, #64) wins over the default; the prop stays an A/B override
+	// that can only force 2D, never re-light a panel the runtime asked to be flat.
+	if (!cnsdk->want_3d.load(std::memory_order_acquire)) {
+		want = 0;
+	}
 
 	// #558 overlay mode: the avatar runs as a backgrounded system overlay over the
 	// 2D launcher, so face tracking is lost — MANAGED NoFaceMode would drop the

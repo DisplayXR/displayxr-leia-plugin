@@ -2741,6 +2741,27 @@ on_resume_cnsdk(struct xrt_display_processor *xdp)
 
 // #522: the runtime's MANAGED/MANUAL selection. Forward to the CNSDK wrapper,
 // which toggles NoFaceMode (with the licensing/availability guard).
+static bool
+request_display_mode_cnsdk(struct xrt_display_processor *xdp, bool enable_3d)
+{
+	leia_dp_cnsdk *impl = as_impl(xdp);
+	if (impl == nullptr || impl->cnsdk == nullptr) {
+		return false;
+	}
+	leia_cnsdk_set_display_mode_3d(impl->cnsdk, enable_3d);
+	return true;
+}
+
+static bool
+get_hardware_3d_state_cnsdk(struct xrt_display_processor *xdp, bool *out_is_3d)
+{
+	leia_dp_cnsdk *impl = as_impl(xdp);
+	if (impl == nullptr || impl->cnsdk == nullptr) {
+		return false;
+	}
+	return leia_cnsdk_get_hardware_3d_state(impl->cnsdk, out_is_3d);
+}
+
 void
 set_eye_tracking_mode_cnsdk(struct xrt_display_processor *xdp, uint32_t mode)
 {
@@ -2824,6 +2845,11 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->dp_vk.base.get_display_dimensions = get_display_dimensions_default;
 	impl->dp_vk.base.get_display_pixel_info = get_display_pixel_info_default;
 	impl->dp_vk.base.set_eye_tracking_mode = set_eye_tracking_mode_cnsdk; // #522
+	// Hardware 2D/3D follows the runtime's rendering mode (the idle splash borrows
+	// a flat mode, media-player #64). Without these two slots a mode switch reached
+	// the runtime and stopped there: the backlight was driven only by the A/B prop.
+	impl->dp_vk.base.request_display_mode = request_display_mode_cnsdk;
+	impl->dp_vk.base.get_hardware_3d_state = get_hardware_3d_state_cnsdk;
 	impl->dp_vk.base.destroy = destroy_impl;
 	impl->dp_vk.set_transparent_background = set_transparent_background_cnsdk; // #568 (variant slot)
 	// runtime#602 recreate notification (variant slot, inside struct_size above).
