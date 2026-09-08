@@ -31,6 +31,15 @@
 
 #include "leia_interface.h"
 #include "leia_display_processor.h"
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+/*
+ * #1243 fingerprint source. Gated on the SAME condition as the VK sources
+ * (src/drv_leia/CMakeLists.txt only adds leia_display_processor.cpp, and only
+ * puts the aux Vulkan headers on the include path, inside the Vulkan block), so
+ * a Vulkan-less configure still builds.
+ */
+#include "vk/vk_helpers.h"
+#endif
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia_display_processor_d3d11.h"
 #include "leia_sr_d3d11.h" /* leiasr_query_recommended_view_dimensions + leiasr_static_get_display_dimensions */
@@ -341,6 +350,23 @@ static struct xrt_plugin_iface g_leia_iface = {
      */
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
     .create_dp_vk = leia_dp_factory_vk,
+    /*
+     * #1243/#1244 vk_bundle ABI fingerprint (#233). The loader compares these against
+     * its own sizeof/offsetof and refuses the VK DP factory on mismatch, so a
+     * build-config skew (NDEBUG changes os_mutex by 16 bytes = two fn-pointer
+     * slots) surfaces as an unwoven session plus an actionable error instead of
+     * a crash inside the Vulkan driver.
+     *
+     * Without these the loader takes its "unknown" branch: it REFUSES the VK
+     * factory on Android but only WARNS on desktop, so every Windows pairing
+     * shipped unverified -- the guard existed and this arm was silently outside
+     * it. Android has set them since #1244; this closes the Windows half.
+     *
+     * Set only where there IS a VK factory to fingerprint; a Vulkan-less build
+     * leaves them 0, which is the correct "no VK factory" answer.
+     */
+    .vk_bundle_abi_size = (uint32_t)sizeof(struct vk_bundle),
+    .vk_bundle_fn_table_offset = (uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr),
 #else
     .create_dp_vk = NULL,
 #endif
