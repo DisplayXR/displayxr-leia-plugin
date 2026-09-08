@@ -166,12 +166,23 @@ endif()
 # runtime checkout ref so the two can't drift.
 set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
-# Linux carries its own pin: the Windows/Android tag predates runtime
-# Linux support entirely (scripts/build_linux.sh first shipped in
-# v1.26.2; the VK-compositor + CI dev-lib fixes #708/#709 first ship
-# in v1.28.0). build-linux.yml's rule-5 self-check asserts this value
-# equals its RUNTIME_REF so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.2.0" CACHE STRING
+# Linux carries its own pin so it can move independently of the Windows
+# installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
+# build-linux.yml's rule-5 self-check asserts this value equals its
+# RUNTIME_REF so the two can't drift.
+#
+# FLOOR IS v2.14.6 (from v2.2.0): the first tag whose xrt_plugin.h carries
+# the #1243/#1244 vk_bundle ABI fingerprint fields (vk_bundle_abi_size +
+# vk_bundle_fn_table_offset), which src/drv_leia_linux now sets. Unlike the
+# guarded slots documented elsewhere in this file there is NO announcing
+# feature macro for these — they are discovered at runtime via struct_size
+# — so an older pin does not silently omit them, it fails to COMPILE. That
+# is why this one is a real floor rather than a capability hint.
+#
+# The old comment justified v2.2.0 by when Linux support first landed
+# (v1.26.2 / v1.28.0). That reasoning was satisfied long ago and the pin
+# had simply stopped moving; the Windows arm is on v2.16.9.
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.14.6" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it

@@ -48,9 +48,11 @@ permissions:
 env:
   # Runtime ref the Linux arm builds against. MUST equal the CMake
   # DXR_RUNTIME_GIT_TAG_LINUX default (rule-5 self-check below, same policy
-  # as build-windows.yml's RUNTIME_REF check) — v1.28.0 is the first runtime
-  # tag with complete Linux support (#708/#709).
-  RUNTIME_REF: v2.2.0
+  # as build-windows.yml's RUNTIME_REF check) — v2.14.6 is the first runtime
+  # tag carrying the #1243 vk_bundle ABI fingerprint fields the plug-in sets
+  # (see the CMakeLists comment; there is no feature macro for them, so an
+  # older ref does not degrade, it fails to compile).
+  RUNTIME_REF: v2.14.6
 
 jobs:
   Build:
