@@ -56,12 +56,15 @@
  * thread, before the next weave. That is exactly where `leia_cnsdk_weave` reads
  * it.
  *
- * Declared HERE rather than taken from the headers because the pinned CNSDK
- * (0.10.67) predates #734: this way the plug-in still builds against the current
- * CNSDK_TAG and only needs the fixed CORE at runtime. On an older core
- * `leia_get_experimental_api` returns NULL, we never ask, and every frame reads
- * as "not dropped" — i.e. today's behaviour, bit for bit. The guard means the
- * declaration silently disappears the moment a CNSDK ships the real one.
+ * The declaration below is a FALLBACK, kept for building against a CNSDK that
+ * predates #734 (it was written when the pin was 0.10.67, which did). The pin is
+ * now v0.10.68, whose interlacer.h publishes both the typedef and the _VERSION
+ * macro — so the guard below is false and we take the header's declaration,
+ * exactly as intended. Keep the fallback: it is what lets this file compile
+ * against an older CNSDK_TAG, and against a NEWER core the runtime behaviour is
+ * identical either way. On a core older than the fix `leia_get_experimental_api`
+ * returns NULL, we never ask, and every frame reads as "not dropped" — i.e. the
+ * pre-#230 behaviour, bit for bit.
  */
 #if !defined(leia_interlacer_get_last_weave_result_VERSION)
 typedef leia_bool (*leia_interlacer_get_last_weave_result)(struct leia_interlacer *);

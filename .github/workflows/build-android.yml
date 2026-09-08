@@ -93,7 +93,17 @@ env:
   # so leia_core_release returns instead of joining forever — the Android
   # activity-relaunch hang (runtime freeform regression, 2026-09-06). No API
   # change; lockstepped with runtime v2.16.10 (loader == plug-in == impl).
-  CNSDK_TAG: v0.10.67
+  #
+  # 0.10.68: first CNSDK carrying LeiaInc/CNSDK#734 (the #733 fix) — a failed
+  # weaver vkQueueSubmit now DISARMS its fence and returns false out of
+  # Apply2DEffect, with a 500 ms bounded fence wait as the net, instead of
+  # waiting on a fence nothing will ever signal. That unbounded wait is what
+  # stalled the mini-window weave (runtime#1394). It also PUBLISHES the
+  # experimental entry point `leia_interlacer_get_last_weave_result` in
+  # interlacer.h (with its _VERSION macro), so #230's local fallback
+  # declaration in leia_cnsdk.cpp now compiles out and we take the header's.
+  # Loader/plug-in/impl stay one version; lockstepped with runtime v2.16.19.
+  CNSDK_TAG: v0.10.68
 
 jobs:
   Android:
