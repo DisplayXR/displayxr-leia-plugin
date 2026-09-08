@@ -1227,14 +1227,18 @@ retire_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
 	}
 	if (impl->retired_count >= ARRAY_SIZE(impl->retired_sems)) {
 		// Lifecycle-rare by construction (a drop is rare, and the list drains
-		// after 120 clean weaves). Leaking two semaphore handles for the life
-		// of the DP beats either destroying one that may still be in use or
-		// idling the device on the weave thread.
+		// after 120 clean weaves). An overflowed handle is dropped on the floor:
+		// nothing references it any more, so it is LEAKED for the life of the
+		// VkDevice — teardown cannot reclaim it either, because retire_drain
+		// only sees what is still on the list. That is still the least-bad
+		// option: the alternatives are destroying a semaphore that may be in
+		// use by the device, or idling the device on the weave thread.
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
-			U_LOG_W("#1394: semaphore retire list full (%u) — leaking the rest until "
-			        "teardown; this means drops are arriving faster than they drain",
+			U_LOG_W("#1394: semaphore retire list full (%u) — further retired semaphores "
+			        "are LEAKED for the life of the VkDevice (not reclaimed at teardown). "
+			        "This means drops are arriving faster than they drain.",
 			        (unsigned)impl->retired_count);
 		}
 		return;
