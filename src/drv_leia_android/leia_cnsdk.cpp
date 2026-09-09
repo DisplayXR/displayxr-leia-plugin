@@ -707,7 +707,8 @@ apply_eye_tracking_mode(struct leia_cnsdk *cnsdk)
 	// (MANAGED). NoFaceMode OFF => force the 3D light-field regardless of face
 	// (MANUAL, or MANAGED-without-license POC guard).
 	leia_core_enable_no_face_mode(cnsdk->core, managed_auto_2d);
-	leia_core_enable_3d(cnsdk->core, true);
+	// Honour a runtime 2D request (want_3d) instead of forcing 3D unconditionally.
+	leia_core_enable_3d(cnsdk->core, cnsdk->want_3d.load(std::memory_order_acquire));
 	DXR_HW_DBG("apply_eye_tracking_mode: mode=%u tracking_available=%d -> no_face_mode=%d",
 	           mode, (int)tracking_available, (int)managed_auto_2d);
 }
@@ -745,7 +746,7 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// known: MANAGED + licensed -> NoFaceMode on; MANUAL or unlicensed -> stays
 	// force-3D. A live 2D/3D A-B toggle is available via debug.dxr.leia.backlight.
 	leia_core_enable_no_face_mode(cnsdk->core, false);
-	leia_core_enable_3d(cnsdk->core, true);
+	leia_core_enable_3d(cnsdk->core, cnsdk->want_3d.load(std::memory_order_acquire));
 	DXR_HW_DBG("worker: bootstrap force-3D (no-face mode OFF) until tracking status known");
 
 	// Phase 2a: snapshot all device-config values we need on the render
@@ -1424,9 +1425,19 @@ leia_cnsdk_set_display_mode_3d(struct leia_cnsdk *cnsdk, bool enable_3d)
 	const bool prev = cnsdk->want_3d.exchange(enable_3d, std::memory_order_acq_rel);
 	if (prev != enable_3d) {
 		U_LOG_W("HW_DBG_CNSDK: runtime requested display mode -> %s", enable_3d ? "3D" : "2D");
-		// Let the next weave apply it immediately instead of waiting out the
-		// 30-frame throttle: reset the throttle counter so the toggle runs now.
 		cnsdk->backlight_throttle = 0;
+		// Apply NOW, not on the next weave: a mono rendering mode (the reason a
+		// runtime asks for 2D) never weaves, so the weave-time toggle would never
+		// run and the panel would keep the previous state. On the multi-client
+		// backlight tier enable_3d(false) is a bind/unbind vote, synchronous on
+		// the calling thread; the request arrives from the app's session thread
+		// while the activity is resumed, which is what the bind requires.
+		const int want = (enable_3d && get_prop_bool("debug.dxr.leia.backlight", true)) ? 1 : 0;
+		if (cnsdk->core != NULL && want != cnsdk->backlight_applied.load(std::memory_order_acquire)) {
+			leia_core_enable_3d(cnsdk->core, want != 0);
+			cnsdk->backlight_applied.store(want, std::memory_order_release);
+			U_LOG_W("HW_DBG_CNSDK: backlight -> %s (mode request)", want ? "3D ON" : "2D OFF");
+		}
 	}
 }
 
@@ -2469,11 +2480,15 @@ assert_lens_preference(struct leia_cnsdk *cnsdk, const char *reason)
 	if (cnsdk == NULL || cnsdk->core == NULL || !leia_core_is_initialized(cnsdk->core)) {
 		return;
 	}
-	if (cnsdk->backlight_applied.load(std::memory_order_acquire) == 1) {
+	// Re-assert what the RUNTIME wants, not 3D unconditionally: a session whose
+	// rendering mode is flat (idle splash) must come back from the picker or a
+	// background stint still flat.
+	const int want = cnsdk->want_3d.load(std::memory_order_acquire) ? 1 : 0;
+	if (cnsdk->backlight_applied.load(std::memory_order_acquire) == want) {
 		return; // already asserted
 	}
-	leia_core_enable_3d(cnsdk->core, true);
-	cnsdk->backlight_applied.store(1, std::memory_order_release);
+	leia_core_enable_3d(cnsdk->core, want != 0);
+	cnsdk->backlight_applied.store(want, std::memory_order_release);
 	U_LOG_W("HW_DBG_CNSDK: lens preference ASSERTED (bind, refcount++) (%s)", reason);
 }
 
