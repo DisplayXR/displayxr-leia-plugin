@@ -1,0 +1,34 @@
+name: lint
+
+# Fast, secret-free checks that run on every PR and every push to main.
+#
+# - SR pin guard: the SR SDK tags this repo's Windows arm fetches at build time
+#   are declared TWICE by hand -- `set SR_TAG=...` etc. in
+#   scripts/build-windows.bat (what a developer runs) and the matching
+#   `SR_TAG: ...` keys in build-windows.yml's jobs.Build.env (what CI runs).
+#   Nothing but a "KEEP IN SYNC" comment held them together, and a
+#   half-applied repin is silent: both sides compile clean against different
+#   SDKs. It also checks SR_V2_TAG and SR_V2_DIR still name the same build,
+#   which is the pair a repin is most likely to split. See
+#   scripts/check_sr_pins.py.
+#
+# Pure file reads of four paths in this repo -- no network, no token, no SDK,
+# no build. Add other lightweight lint jobs here as needed.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  PinSync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: SR SDK pins agree between build-windows.bat and CI
+        run: python3 scripts/check_sr_pins.py

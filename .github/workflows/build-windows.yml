@@ -46,6 +46,11 @@ jobs:
     needs: DetectChanges
     runs-on: windows-2022
     env:
+      # SR SDK pins. Declared here AND in scripts/build-windows.bat as
+      # `set SR_TAG=...` etc. KEEP IN SYNC — enforced by
+      # scripts/check_sr_pins.py, which lint.yml runs on every PR. It also
+      # asserts SR_V2_TAG and SR_V2_DIR name the same SR v2 build, the pair
+      # a repin is most likely to split.
       SR_TAG: 1.35.0.2011
       # Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. A separate tag because
       # it is grafted from a different SR branch than SR_TAG's SDK — v1.36.4 tree
