@@ -121,7 +121,11 @@ reads it with the `LEIALOFT_GITHUB_TOKEN` secret (same one the Android arm
 uses for `LeiaInc/CNSDK`), so fork PRs cannot build the Windows/Linux arms.
 On first run the script pulls the SR SDK at `SR_TAG` / `SR_VKSTAMP_TAG` /
 `SR_V2_TAG` (set in `scripts/build-windows.bat`; keep in sync with
-`build-windows.yml`).
+`build-windows.yml`). CI enforces that sync: `scripts/check_sr_pins.py`,
+run by `.github/workflows/lint.yml` on every PR, asserts all five pins
+(`SR_TAG`, `SR_VKSTAMP_TAG`, `SR_V2_TAG`, `SR_V2_DIR`, `SR_SDK_REPO`) are
+declared exactly once and identically in both files, and that
+`SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build.
 
 ### Linux (Track A — stub weaver)
 ```bash

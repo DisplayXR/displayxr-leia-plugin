@@ -32,6 +32,13 @@ setlocal enabledelayedexpansion
 
 set SCRIPT_DIR=%~dp0
 set REPO=%SCRIPT_DIR%..\
+:: --- SR SDK pins ------------------------------------------------------
+:: SR_TAG / SR_VKSTAMP_TAG / SR_V2_TAG / SR_V2_DIR / SR_SDK_REPO are set
+:: here AND in .github/workflows/build-windows.yml (jobs.Build.env). KEEP
+:: THEM IN SYNC -- enforced by scripts/check_sr_pins.py, which
+:: .github/workflows/lint.yml runs on every PR, so a half-applied repin
+:: fails CI instead of quietly building this box against a different SR
+:: SDK than CI builds against.
 set SR_TAG=1.35.0.2011
 :: Every sr-sdk-v* release (SR SDK zips, Vulkan weaver rescue DLLs) lives in
 :: Leia's PRIVATE artifact repo -- it is Leia SDK material and must not be
@@ -41,7 +48,9 @@ set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: SR v2 C99 SDK pin (landing set; see the release notes on this tag).
-:: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml.
+:: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml,
+:: and with each other -- the tag's <ver>.<build> must equal the dir's
+:: <ver>+<build>. Both are asserted by scripts/check_sr_pins.py (lint.yml).
 :: RESOLVED (#158): 1490 is the converged cut -- its dispatch table is IDENTICAL to the
 :: shipped (super) lineage's, giving a strict prefix chain main < 1450 < 1490, so lineage
 :: no longer matters for ABI and DXR_LEIA_HAS_SR_CONNECTION_STATE is now ON in CI/release.
