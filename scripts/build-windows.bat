@@ -47,7 +47,10 @@ set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
-:: SR v2 C99 SDK pin (landing set; see the release notes on this tag).
+:: SR v2 C99 SDK pin: 1564 = post-merge release-candidate/david-q3-2026 @ 559cd7db7
+:: (RC + #217 + #218; LeiaSR run 34775216986). See the release notes on this tag for
+:: the acceptance table. Over 1502 it appends six slots (83-88) and deprecates the
+:: four lens getters, none of which this plug-in calls; snap (slot 75) is unchanged.
 :: KEEP IN SYNC with SR_V2_TAG / SR_V2_DIR in .github/workflows/build-windows.yml,
 :: and with each other -- the tag's <ver>.<build> must equal the dir's
 :: <ver>+<build>. Both are asserted by scripts/check_sr_pins.py (lint.yml).
@@ -59,8 +62,8 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: counts a comment's pfnWeaverGetACTMode as a phantom slot) and require that the new
 :: table APPENDS ONLY: every shared index must hold the same function. An insertion
 :: shifts indices and mis-dispatches SILENTLY, since only the index is checked.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1502
-set SR_V2_DIR=LeiaSR-SDK-1.37.0+1502.1b85d46d17-win64-Release
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1564
+set SR_V2_DIR=LeiaSR-SDK-1.37.0+1564.559cd7db71-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
