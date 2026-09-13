@@ -59,13 +59,16 @@ jobs:
       # SR v2 C99 SDK (win64). Defines DXR_LEIA_HAS_SR_V2 so the v2 path
       # compiles IN; at runtime the plug-in still lazy-loads
       # LeiaSR_runtime.dll and falls back to v1 on older SR Platforms.
-      # This pin is the ST-5656-free LANDING SET (LeiaInc/LeiaSR run
-      # 31577655173, test/sdk-v2-super @ 2bd551714), re-hosted as a release
-      # asset on SR_SDK_REPO because upstream ships the win64 v2 SDK only as a
-      # CI run artifact — there is no upstream release asset to point at.
-      # Replace with one when the SR v2 PRs land.
-      SR_V2_TAG: sr-sdk-v2-1.37.0.1502
-      SR_V2_DIR: LeiaSR-SDK-1.37.0+1502.1b85d46d17-win64-Release
+      # 1564 = the post-merge release-candidate/david-q3-2026 head @ 559cd7db7
+      # (LeiaInc/LeiaSR run 34775216986; RC + #217 ST-5750 + #218 ST-5751),
+      # re-hosted as a release asset on SR_SDK_REPO because upstream ships the
+      # win64 v2 SDK only as a CI run artifact. Over 1502 it APPENDS six slots
+      # (83-88: weaver phase-centre adjust + pattern get/set, display view-cone
+      # angle + optimal viewing distance) and deprecates the four lens getters
+      # (GetSlant/GetPx/GetN/GetDoN), none of which this plug-in calls. The
+      # srWeaverSnapToPhase surface (slot 75) is byte-identical to 1502.
+      SR_V2_TAG: sr-sdk-v2-1.37.0.1564
+      SR_V2_DIR: LeiaSR-SDK-1.37.0+1564.559cd7db71-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
