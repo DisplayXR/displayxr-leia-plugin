@@ -112,7 +112,24 @@ env:
   # interlacer.h (with its _VERSION macro), so #230's local fallback
   # declaration in leia_cnsdk.cpp now compiles out and we take the header's.
   # Loader/plug-in/impl stay one version; lockstepped with runtime v2.16.19.
-  CNSDK_TAG: v0.10.68
+  #
+  # 0.10.69: the blink detector stops re-extracting its model when the cache is
+  # current. libleiaBlinkDetectorPlugin.so drops 14,592 kB -> 640 kB resident and
+  # stops rewriting ~14 MB to flash on every engine restart. That plug-in is loaded
+  # out of the SERVICE package into each client process, so the saving reaches every
+  # client, including in-app ones. SNPE also comes out of the service package.
+  #
+  # Why this repo moves FIRST: the CNSDK loader shim refuses a plug-in built against
+  # a different apiVersion -- leia_cnsdk_create fails, the runtime takes the no-DP
+  # path, and every in-process app renders in 2D with no error surfaced anywhere.
+  # The "Inspect APK contents" step proves loader == plug-in from the binaries, so the
+  # runtime cannot move its own CNSDK_TAG until a plug-in release built against the
+  # same CNSDK exists for it to pin.
+  #
+  # NOT credited here, deliberately: 0.10.69 also carries two foreground-status fixes
+  # that CNSDK reports as untested on any device. Nothing observed after this bump
+  # should be attributed to them.
+  CNSDK_TAG: v0.10.69
 
 jobs:
   Android:
