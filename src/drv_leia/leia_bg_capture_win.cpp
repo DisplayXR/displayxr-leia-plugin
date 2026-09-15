@@ -66,6 +66,18 @@ struct leia_bg_preview_slot
 	UINT w = 0, h = 0;
 	UINT64 gen = 0; //!< capture generation (signaled_value) these pixels came from.
 	bool pending = false;
+	/*!
+	 * Region of the window CLIENT rect these pixels actually cover, in
+	 * window-normalised coords (u right, v down, 0,0 = client top-left) —
+	 * i.e. exactly @ref xrt_dp_background_preview::canvas_u0 .. canvas_v1.
+	 * Identity unless the monitor clamp fired, which it does whenever the
+	 * window is partially off-screen.
+	 *
+	 * PER SLOT, not one current value: the readback below serves generation
+	 * N-1, so a window that moved between produce and readback would
+	 * otherwise publish this generation's rect for last generation's pixels.
+	 */
+	float cu0 = 0.0f, cv0 = 0.0f, cu1 = 1.0f, cv1 = 1.0f;
 };
 #endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
@@ -115,6 +127,7 @@ struct leia_bg_capture
 	bool preview_enabled;      //!< false ⟹ LEIA_DP_DISABLE_BG_PREVIEW armed.
 	bool preview_broken;       //!< one-shot: a D3D failure retired the producer.
 	bool preview_logged_ready; //!< one-shot init log.
+	bool preview_clamp_logged; //!< one-shot: the monitor clamp fired (window partially off-screen).
 	bool poll_ok;              //!< verdict of the last leia_bg_capture_poll().
 
 	UINT preview_src_w, preview_src_h; //!< window rect the mip chain is sized for.
@@ -128,6 +141,8 @@ struct leia_bg_capture
 	std::vector<uint8_t> preview_cpu; //!< latest read-back bytes, BGRA8 top-down, tightly packed.
 	uint32_t preview_cpu_w, preview_cpu_h, preview_cpu_stride;
 	UINT64 preview_cpu_gen;
+	//! Canvas rect OF THE READ-BACK BYTES — copied from the slot they came from, never recomputed.
+	float preview_cpu_cu0, preview_cpu_cv0, preview_cpu_cu1, preview_cpu_cv1;
 #endif
 };
 
@@ -301,6 +316,74 @@ preview_env_disable()
 }
 
 /*!
+ * Clamp a monitor-relative window rect to the captured monitor AND report what
+ * fraction of the window that clamped crop covers.
+ *
+ * The capture texture is exactly one monitor, so a window hanging off any edge
+ * can only be previewed over its VISIBLE part. The runtime maps every
+ * window-normalised region it owns — the app's content mask, its projected
+ * content bounds, the 3D display zones — into preview pixels with
+ * `x = (u - cu0) / (cu1 - cu0) * width` (`comp_rear_budget.c`), so the crop's
+ * extent in window-normalised coords is not decoration: publishing 0,0,1,1 for
+ * a clamped crop stretches every one of those regions across the visible strip
+ * and measures the wrong band of desktop.
+ *
+ * Pure arithmetic, no D3D and no Win32 handles, so it is the unit to pin when a
+ * test target lands in this repo. Coordinate convention matches the runtime's
+ * `xrt_dp_background_preview::canvas_u0..canvas_v1`: u to the right, v DOWN,
+ * origin at the client rect's top-left.
+ *
+ * @param      rx0,ry0  Unclamped client-rect origin, monitor-relative pixels.
+ * @param      rw0,rh0  Unclamped client-rect size, pixels.
+ * @param      mon_w,mon_h  Captured monitor texture dims.
+ * @param[out] out_rect  Clamped rect {x, y, w, h}, monitor-relative.
+ * @param[out] out_uv    {cu0, cv0, cu1, cv1} of that crop, window-normalised.
+ * @return false when nothing is left to preview (degenerate or fully
+ *         off-screen window) — the caller must then decline the preview.
+ */
+static bool
+leia_bg_preview_canvas_uv(
+    long rx0, long ry0, long rw0, long rh0, long mon_w, long mon_h, long out_rect[4], float out_uv[4])
+{
+	if (rw0 <= 0 || rh0 <= 0 || mon_w <= 0 || mon_h <= 0) {
+		return false;
+	}
+
+	long rx = rx0, ry = ry0, rw = rw0, rh = rh0;
+	if (rx < 0) {
+		rw += rx;
+		rx = 0;
+	}
+	if (ry < 0) {
+		rh += ry;
+		ry = 0;
+	}
+	if (rx + rw > mon_w) {
+		rw = mon_w - rx;
+	}
+	if (ry + rh > mon_h) {
+		rh = mon_h - ry;
+	}
+	// Fully off-screen (or off the CAPTURED monitor, on a straddle): decline.
+	if (rw <= 0 || rh <= 0) {
+		return false;
+	}
+
+	out_rect[0] = rx;
+	out_rect[1] = ry;
+	out_rect[2] = rw;
+	out_rect[3] = rh;
+
+	const float inv_w = 1.0f / (float)rw0;
+	const float inv_h = 1.0f / (float)rh0;
+	out_uv[0] = (float)(rx - rx0) * inv_w;
+	out_uv[1] = (float)(ry - ry0) * inv_h;
+	out_uv[2] = out_uv[0] + (float)rw * inv_w;
+	out_uv[3] = out_uv[1] + (float)rh * inv_h;
+	return true;
+}
+
+/*!
  * How far to reduce: at least 4x (the brief's box filter), more when a 4K-wide
  * window would still exceed the 512 px ceiling the runtime struct documents.
  */
@@ -419,23 +502,34 @@ preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, U
 		return;
 	}
 
-	// Clamp the window rect to the captured monitor texture.
-	if (rx < 0) {
-		rw += rx;
-		rx = 0;
+	// Clamp the window rect to the captured monitor texture, and keep what
+	// fraction of the window survived — the preview covers THAT, not the
+	// client rect, and the runtime must be told so.
+	const LONG rx0 = rx, ry0 = ry, rw0 = rw, rh0 = rh;
+	long crop[4];
+	float uv[4];
+	if (!leia_bg_preview_canvas_uv(rx0, ry0, rw0, rh0, (long)c->monitor_w, (long)c->monitor_h, crop, uv)) {
+		return; // fully off-screen / degenerate — no preview, as before.
 	}
-	if (ry < 0) {
-		rh += ry;
-		ry = 0;
-	}
-	if (rx + rw > (LONG)c->monitor_w) {
-		rw = (LONG)c->monitor_w - rx;
-	}
-	if (ry + rh > (LONG)c->monitor_h) {
-		rh = (LONG)c->monitor_h - ry;
-	}
+	rx = (LONG)crop[0];
+	ry = (LONG)crop[1];
+	rw = (LONG)crop[2];
+	rh = (LONG)crop[3];
 	if (rw < LEIA_BG_PREVIEW_MIN_SRC || rh < LEIA_BG_PREVIEW_MIN_SRC) {
 		return;
+	}
+
+	// One-shot, never per frame: a partially off-screen window is a normal
+	// thing for a user to do, but it is the only way the published canvas rect
+	// stops being the identity, so say it once.
+	if ((rx != rx0 || ry != ry0 || rw != rw0 || rh != rh0) && !c->preview_clamp_logged) {
+		c->preview_clamp_logged = true;
+		U_LOG_W("leia_bg_capture: window is partially off the captured monitor — client rect "
+		        "%ld,%ld %ldx%ld clamped to %ld,%ld %ldx%ld on a %ux%u monitor; the background "
+		        "preview covers canvas u[%.4f,%.4f] v[%.4f,%.4f] of the window and is published "
+		        "with that rect (logged once)",
+		        (long)rx0, (long)ry0, (long)rw0, (long)rh0, (long)rx, (long)ry, (long)rw, (long)rh,
+		        c->monitor_w, c->monitor_h, uv[0], uv[2], uv[1], uv[3]);
 	}
 
 	if (!preview_ensure_targets(c, (UINT)rw, (UINT)rh)) {
@@ -463,6 +557,11 @@ preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, U
 	                           nullptr);
 	wslot.gen = gen;
 	wslot.pending = true;
+	// Travels WITH the pixels: the readback below serves the other slot.
+	wslot.cu0 = uv[0];
+	wslot.cv0 = uv[1];
+	wslot.cu1 = uv[2];
+	wslot.cv1 = uv[3];
 	// The copy must reach the GPU now so it is retired by the time the NEXT
 	// generation maps this slot.
 	ctx->Flush();
@@ -497,6 +596,10 @@ preview_produce(struct leia_bg_capture *c, LONG rx, LONG ry, LONG rw, LONG rh, U
 	c->preview_cpu_h = rslot.h;
 	c->preview_cpu_stride = stride;
 	c->preview_cpu_gen = rslot.gen;
+	c->preview_cpu_cu0 = rslot.cu0;
+	c->preview_cpu_cv0 = rslot.cv0;
+	c->preview_cpu_cu1 = rslot.cu1;
+	c->preview_cpu_cv1 = rslot.cv1;
 }
 
 //! True when the runtime's struct_size covers @p field in full.
@@ -534,16 +637,21 @@ leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_
 	out->stride_bytes = c->preview_cpu_stride;
 	out->bgra = c->preview_cpu.data();
 
-	// The preview covers the window's CLIENT rect, which is the desktop region
-	// under the canvas for every app that fills its window — i.e. 0,0,1,1 per
-	// the spec. (A canvas sub-rect inside the window, the #131 compose remap,
-	// is not modelled here: the sub-rect is DP state, not capture state. A
-	// follow-up can plumb it through and narrow these UVs.)
+	// What the preview ACTUALLY covers, carried over from the slot these bytes
+	// were read back from — 0,0,1,1 for a wholly on-screen window, and the
+	// visible fraction of the client rect when the monitor clamp fired
+	// (partially off-screen window). Publishing the identity for a clamped crop
+	// makes the runtime stretch every window-normalised region it maps through
+	// this rect — content mask, projected bounds, display zones — across the
+	// visible strip, so it measures the wrong band of desktop.
+	//
+	// (A canvas sub-rect INSIDE the window, the #131 compose remap, is still
+	// not modelled here: that sub-rect is DP state, not capture state.)
 	if (LEIA_BGP_FITS(out, canvas_v1)) {
-		out->canvas_u0 = 0.0f;
-		out->canvas_v0 = 0.0f;
-		out->canvas_u1 = 1.0f;
-		out->canvas_v1 = 1.0f;
+		out->canvas_u0 = c->preview_cpu_cu0;
+		out->canvas_v0 = c->preview_cpu_cv0;
+		out->canvas_u1 = c->preview_cpu_cu1;
+		out->canvas_v1 = c->preview_cpu_cv1;
 	}
 
 	// STALE = the source knows the preview no longer reflects the screen; an
