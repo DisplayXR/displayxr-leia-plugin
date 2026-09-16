@@ -178,6 +178,24 @@ leia_sr_v2_result_str(SrResult r);
  * ------------------------------------------------------------------ */
 
 //! Per-weaver latch for "can this weaver take an absolute target?".
+/*!
+ * One-shot WARN latches, owned by the CALLER (one set per weaver).
+ *
+ * These used to be function-local `static bool` inside the shared helpers,
+ * which made them once per PROCESS per branch rather than once per arm: if
+ * D3D11 hit a failure and VK later hit the same one, only D3D11 logged and the
+ * record read as though VK had been fine. Same class of lying diagnostic as the
+ * getLatency readback that disagreed with the weave. Keyed per weaver now, so
+ * every arm that refuses target mode says so in its own voice.
+ */
+struct leia_sr_v2_warn_latches
+{
+	bool no_slot;      //!< SR_ERROR_FUNCTION_UNSUPPORTED reported
+	bool no_interface; //!< SR_ERROR_FEATURE_NOT_SUPPORTED reported
+	bool probe_failed; //!< any other probe failure reported
+	bool now_failed;   //!< srGetTimeUs failed mid-run
+};
+
 enum leia_sr_target_state
 {
 	LEIA_SR_TARGET_UNKNOWN = 0,   //!< Not probed yet.
@@ -219,7 +237,7 @@ leia_sr_target_time_opt_in(void);
  * @return true when the weaver accepted the call and target mode may engage.
  */
 bool
-leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm);
+leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm, struct leia_sr_v2_warn_latches *w);
 
 /*!
  * Verify `srGetTimeUs` really is the clock it documents before we build any
@@ -248,7 +266,7 @@ leia_sr_v2_clock_gate(SrInstance instance, const char *arm);
  * untouched and the caller must not push a target this weave.
  */
 bool
-leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm);
+leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm, struct leia_sr_v2_warn_latches *w);
 
 /*!
  * One-shot acceptance log for the first target a weaver accepts.

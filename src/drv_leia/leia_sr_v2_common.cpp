@@ -68,19 +68,18 @@ leia_sr_target_time_opt_in(void)
 }
 
 bool
-leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm)
+leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm, struct leia_sr_v2_warn_latches *w)
 {
 	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
 		// Older SR runtime: srWeaverSetTargetTime is appended dispatch slot 90
 		// and is NULL there, so the loader trampoline answered without reaching
 		// a backend. Not a fault -- and not a reason to do anything other than
 		// keep the adaptive setLatency path we have always had.
-		static bool warned = false;
-		if (!warned) {
+		if (w != nullptr && !w->no_slot) {
 			U_LOG_W("Leia %s target time: this SR runtime has no srWeaverSetTargetTime "
 			        "(SR_ERROR_FUNCTION_UNSUPPORTED) - staying on adaptive setLatency",
 			        arm);
-			warned = true;
+			w->no_slot = true;
 		}
 		return false;
 	}
@@ -89,23 +88,21 @@ leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm)
 		// Current runtime, but this weaver's backend has no target-time
 		// interface. Distinct from the above on purpose: the fix is a backend,
 		// not a runtime.
-		static bool warned = false;
-		if (!warned) {
+		if (w != nullptr && !w->no_interface) {
 			U_LOG_W("Leia %s target time: this weaver backend has no target-time interface "
 			        "(SR_ERROR_FEATURE_NOT_SUPPORTED) - staying on adaptive setLatency",
 			        arm);
-			warned = true;
+			w->no_interface = true;
 		}
 		return false;
 	}
 
 	if (!SR_SUCCEEDED(r)) {
-		static bool warned = false;
-		if (!warned) {
+		if (w != nullptr && !w->probe_failed) {
 			U_LOG_W("Leia %s target time: probe failed: %s (%d) - staying on adaptive "
 			        "setLatency",
 			        arm, leia_sr_v2_result_str(r), (int)r);
-			warned = true;
+			w->probe_failed = true;
 		}
 		return false;
 	}
@@ -195,18 +192,17 @@ leia_sr_v2_clock_gate(SrInstance instance, const char *arm)
 }
 
 bool
-leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm)
+leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm, struct leia_sr_v2_warn_latches *w)
 {
 	uint64_t now_us = 0;
 	const SrResult r = srGetTimeUs(instance, &now_us);
 	if (!SR_SUCCEEDED(r)) {
 		// Once, not per frame -- this sits on the weave path.
-		static bool warned = false;
-		if (!warned) {
+		if (w != nullptr && !w->now_failed) {
 			U_LOG_W("Leia %s target time: srGetTimeUs failed mid-run: %s (%d) - this weave "
 			        "keeps the previous target",
 			        arm, leia_sr_v2_result_str(r), (int)r);
-			warned = true;
+			w->now_failed = true;
 		}
 		return false;
 	}

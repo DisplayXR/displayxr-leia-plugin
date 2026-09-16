@@ -118,6 +118,7 @@ struct leiasr_d3d12
 	bool     target_logged = false;         //!< one-shot acceptance log already fired
 	uint64_t target_pending_us = 0;         //!< the absolute target we set
 	uint64_t target_pending_horizon_us = 0; //!< the horizon it was built from
+	struct leia_sr_v2_warn_latches target_warn = {}; //!< per-weaver one-shot WARN latches
 
 	// --- #158 SR platform restart detection -------------------------------
 	// Reporting only on this arm. Unlike D3D11 — which rebuilds its SDK
@@ -589,7 +590,7 @@ w_target_time_available(leiasr_d3d12 *sr)
 	// the loader null-checks the handle BEFORE the dispatch slot -- a
 	// null-handle call is not a capability probe (#625).
 	const SrResult r = srWeaverSetTargetTime(sr->weaver_v2, 0);
-	if (!leia_sr_v2_target_time_probe_ok(r, "D3D12")) {
+	if (!leia_sr_v2_target_time_probe_ok(r, "D3D12", &sr->target_warn)) {
 		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
 		return false;
 	}
@@ -619,7 +620,7 @@ w_push_target_time(leiasr_d3d12 *sr, uint64_t horizon_us)
 	                             : horizon_us;
 
 	uint64_t now_us = 0;
-	if (!leia_sr_v2_now_us(sr->instance_v2, &now_us, "D3D12")) {
+	if (!leia_sr_v2_now_us(sr->instance_v2, &now_us, "D3D12", &sr->target_warn)) {
 		return;
 	}
 
@@ -1252,6 +1253,17 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 		// it anyway) -- whatever horizon the fallback above computed is simply
 		// expressed as now+horizon instead.
 		if (have_push) {
+			/*
+			 * DELIBERATE ASYMMETRY -- do not "make this consistent". The
+			 * target branch pushes EVERY weave; only the setLatency branch
+			 * keeps the deadband. A deadband suppresses a push when the value
+			 * has not moved much, which is right for a LEVEL (a latency) and
+			 * wrong for an INSTANT: skipping a target push does not hold the
+			 * old target steady, it lets it AGE -- the weaver keeps aiming at
+			 * a photon time that has already passed, and the error grows by a
+			 * weave interval every time the deadband suppresses. Reviewed and
+			 * confirmed load-bearing by the SDK author on PR #245.
+			 */
 			if (w_target_time_available(leiasr)) {
 				w_push_target_time(leiasr, push_us);
 				leiasr->last_set_latency_us = push_us;
