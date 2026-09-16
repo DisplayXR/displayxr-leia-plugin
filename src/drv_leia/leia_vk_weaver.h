@@ -113,6 +113,28 @@ struct leia_vk_weaver_ops
 	 * take. NULL on the v1 backends.
 	 */
 	bool (*enable_late_latching)(void *raw, bool enable);
+
+	/*!
+	 * `srWeaverSetTargetTime` -- the absolute weave target (SR SDK 1584).
+	 * Returns the raw `SrResult` as an int so the caller can tell the two
+	 * "no" codes apart (`SR_ERROR_FUNCTION_UNSUPPORTED` = older runtime,
+	 * `SR_ERROR_FEATURE_NOT_SUPPORTED` = backend without the interface)
+	 * without this header having to know the SR result enum.
+	 *
+	 * NULL on the v1 backends -- there is no C++ surface for it -- so the
+	 * caller's null-check is what decides, in one place. Passing 0 clears,
+	 * and the plug-in does that EXACTLY once per weaver, as the capability
+	 * probe, before any real target is ever set: 1584's clear is broken.
+	 * See leia_sr_v2_common.h.
+	 */
+	int (*set_target_time)(void *raw, uint64_t target_time_us);
+
+	/*!
+	 * `srWeaverGetLatency` -- the horizon the last weave's target resolved to.
+	 * ACCEPTANCE READBACK ONLY; never a horizon for our own maths.
+	 * NULL on the v1 backends.
+	 */
+	bool (*get_latency)(void *raw, uint64_t *out_latency_us);
 };
 
 //! Dispatch table compiled against `sr_vk_abi/legacy/sr/weaver/vkweaver.h`.

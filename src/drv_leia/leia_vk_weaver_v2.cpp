@@ -123,6 +123,26 @@ v2_set_latency(void *raw, uint64_t latency_us)
 	srWeaverSetLatency(as_weaver(raw), latency_us);
 }
 
+/*!
+ * Absolute target time. Returns the raw SrResult; the caller classifies it
+ * (leia_sr_v2_target_time_probe_ok) so the two "no" codes stay distinguishable.
+ */
+int
+v2_set_target_time(void *raw, uint64_t target_time_us)
+{
+	return (int)srWeaverSetTargetTime(as_weaver(raw), target_time_us);
+}
+
+/*!
+ * Acceptance readback for the target set on the last weave. Never a horizon
+ * for our own maths -- see leia_sr_v2_log_target_accepted.
+ */
+bool
+v2_get_latency(void *raw, uint64_t *out_latency_us)
+{
+	return SR_SUCCEEDED(srWeaverGetLatency(as_weaver(raw), out_latency_us));
+}
+
 void
 v2_weave(void *raw)
 {
@@ -200,6 +220,8 @@ const struct leia_vk_weaver_ops g_ops_v2 = {
     v2_get_predicted_eye_positions,
     v2_weave_submitted,
     v2_enable_late_latching,
+    v2_set_target_time,
+    v2_get_latency,
 };
 
 } // namespace

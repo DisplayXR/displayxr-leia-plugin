@@ -154,6 +154,19 @@ struct leiasr_d3d11
 	uint64_t forward_seen_ns = 0;
 	bool     forward_logged = false;
 
+	// --- Absolute weave target time (SR 1584; opt-in) ---------------------
+	// DXR_LEIA_SR_TARGET_TIME=1 lets this weaver express the horizon as the
+	// INSTANT the frame reaches the panel instead of a duration, removing the
+	// last lossy conversion. Engages once per weaver and is then never cleared
+	// and never toggled -- the SDK's clear/toggle paths are broken in 1584.
+	// Full reasoning: leia_sr_v2_common.h, "Absolute target time".
+	int      target_state = 0;              //!< enum leia_sr_target_state
+	bool     target_pending = false;        //!< a target was set for the weave now running
+	bool     target_logged = false;         //!< one-shot acceptance log already fired
+	uint64_t target_pending_us = 0;         //!< the absolute target we set
+	uint64_t target_pending_horizon_us = 0; //!< the horizon it was built from
+	struct leia_sr_v2_warn_latches target_warn = {}; //!< per-weaver one-shot WARN latches
+
 	// --- #144 async weaver creation/destruction --------------------------
 	// SR context + weaver creation blocks for seconds (SR-service retry
 	// loops, correction-texture PNG loads from disk, senses start) and the
@@ -469,6 +482,155 @@ w_set_latency(leiasr_d3d11 *sr, uint64_t latency_us)
 	}
 #endif
 	sr->weaver->setLatency(latency_us);
+}
+
+/* --- absolute weave target time ------------------------------------- *
+ * Same "one place per operation" rule as the helpers around it. What is NOT
+ * duplicated here lives in leia_sr_v2_common.cpp: the opt-in read, the probe
+ * classification, the clock gate, the clock read and the acceptance log. Only
+ * the three lines that touch THIS arm's weaver are here, because the D3D11 and
+ * D3D12 arms hold a typed `SrWeaver` while the Vulkan arm holds an opaque
+ * `void *` behind a vtable -- one shared helper would need a void* or a
+ * template to cover both, which buys nothing over a nine-line function.
+ * --------------------------------------------------------------------- */
+
+/*!
+ * Has target mode engaged for this weaver? Probes at most once, then latches.
+ */
+bool
+w_target_time_available(leiasr_d3d11 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->target_state == LEIA_SR_TARGET_AVAILABLE) {
+		return true;
+	}
+	if (sr->target_state == LEIA_SR_TARGET_UNAVAILABLE) {
+		return false;
+	}
+
+	// v1 weavers have no C surface for this at all, and the opt-in is checked
+	// before anything is touched: default OFF means the SDK never sees a single
+	// target-time call.
+	if (sr->weaver_v2 == nullptr || sr->instance_v2 == nullptr || !leia_sr_target_time_opt_in()) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	// Clock gate BEFORE the probe. If srGetTimeUs is not the clock it
+	// documents, we never call srWeaverSetTargetTime at all -- not even with
+	// the probe's 0 -- so a failed gate cannot leave the weaver in a state the
+	// broken clear would have to undo.
+	if (!leia_sr_v2_clock_gate(sr->instance_v2, "D3D11")) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	// THE PROBE. This is the ONLY call in the plug-in that passes 0, and it is
+	// safe only because it runs before any real target has ever been set on
+	// this weaver: there is nothing for the broken clear (defect 1) to fail to
+	// restore and no target-mode cadence state to starve (defect 2).
+	//
+	// It is also a REAL weaver, deliberately. The loader's weaver trampolines
+	// null-check the handle BEFORE the dispatch slot, so a null-handle call
+	// returns SR_ERROR_HANDLE_INVALID whether the slot is present or not -- it
+	// is NOT a capability probe. Same trap the snap work hit (#625).
+	const SrResult r = srWeaverSetTargetTime(sr->weaver_v2, 0);
+	if (!leia_sr_v2_target_time_probe_ok(r, "D3D11", &sr->target_warn)) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	sr->target_state = LEIA_SR_TARGET_AVAILABLE;
+	U_LOG_W("Leia D3D11 target time: ENGAGED - every weave from here sets a fresh absolute "
+	        "target; never cleared, never toggled, setLatency no longer pushed");
+	return true;
+#else
+	(void)sr;
+	return false;
+#endif
+}
+
+/*!
+ * Express @p horizon_us as an absolute target for the weave about to run.
+ *
+ * Called on the weave thread only. On failure the previous (sticky) target
+ * stands -- we never clear, so a missed push degrades to "one weave predicted
+ * from the last instant" rather than to a mode change.
+ */
+void
+w_push_target_time(leiasr_d3d11 *sr, uint64_t horizon_us)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	// Clamp OURSELVES. The SDK documents the same 150 ms ceiling, but its
+	// bounds handling is exactly what defect 2 is about. The floor is 0 by
+	// construction: the horizon is unsigned.
+	const uint64_t horizon = horizon_us > (uint64_t)LEIA_SR_TARGET_MAX_HORIZON_US
+	                             ? (uint64_t)LEIA_SR_TARGET_MAX_HORIZON_US
+	                             : horizon_us;
+
+	uint64_t now_us = 0;
+	if (!leia_sr_v2_now_us(sr->instance_v2, &now_us, "D3D11", &sr->target_warn)) {
+		return;
+	}
+
+	const uint64_t target_us = now_us + horizon;
+	if (target_us == 0) {
+		// Unreachable in practice (srGetTimeUs is microseconds since boot, so a
+		// live weave cannot read 0), but 0 is the SDK's CLEAR and 1584's clear
+		// is broken. Making that a property of the code rather than of the
+		// arithmetic keeps the invariant checkable by grep: the only call that
+		// passes 0 is the one-shot probe above.
+		return;
+	}
+	const SrResult r = srWeaverSetTargetTime(sr->weaver_v2, target_us);
+	if (!SR_SUCCEEDED(r)) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia D3D11 target time: srWeaverSetTargetTime failed mid-run: %s (%d)",
+			        leia_sr_v2_result_str(r), (int)r);
+			warned = true;
+		}
+		return;
+	}
+
+	sr->target_pending_us = target_us;
+	sr->target_pending_horizon_us = horizon;
+	sr->target_pending = true;
+#else
+	(void)sr;
+	(void)horizon_us;
+#endif
+}
+
+/*!
+ * One-shot acceptance log. MUST be called immediately after the weave returns.
+ *
+ * srWeaverGetLatency resolves inside srWeaverWeave, so a read taken before the
+ * weave reports the PREVIOUS weave's horizon; read here it reports the one this
+ * weave's predictors actually used.
+ */
+void
+w_log_target_acceptance(leiasr_d3d11 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (!sr->target_pending) {
+		return;
+	}
+	sr->target_pending = false;
+	if (sr->target_logged) {
+		return;
+	}
+
+	uint64_t resolved_us = 0;
+	if (!SR_SUCCEEDED(srWeaverGetLatency(sr->weaver_v2, &resolved_us))) {
+		return; // next weave tries again
+	}
+	sr->target_logged = true;
+	leia_sr_v2_log_target_accepted("D3D11", sr->target_pending_us, sr->target_pending_horizon_us,
+	                               resolved_us);
+#else
+	(void)sr;
+#endif
 }
 
 void
@@ -959,6 +1121,13 @@ create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 	//   LEIA_D3D11_PANEL_HZ=hz          panel refresh for display term (default 60)
 	//   LEIA_D3D11_LATENCY_DISPLAY_US=N override display term outright
 	//   LEIA_D3D11_LATENCY_MIN_US/_MAX_US/_EMA_ALPHA  clamps + smoothing
+	//   DXR_LEIA_SR_TARGET_TIME=1|true|on  OPT-IN (default OFF): express the
+	//                                   horizon computed below as an ABSOLUTE
+	//                                   target (srGetTimeUs + now+horizon)
+	//                                   instead of pushing it through
+	//                                   setLatency. Per-weaver probe + clock
+	//                                   gate still decide; see
+	//                                   leia_sr_v2_common.h.
 	{
 		auto getf = [](const char *n, float def) -> float {
 			const char *v = std::getenv(n);
@@ -1017,6 +1186,18 @@ create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 void
 destroy_sdk_objects(leiasr_d3d11 *sr)
 {
+	// The target-time latch is per WEAVER, and the #158 in-place reconnect
+	// recreates the weaver on this same struct. Reset it here so the new
+	// weaver gets its own probe + clock gate rather than inheriting a verdict
+	// reached about a weaver that no longer exists -- and so the one-shot
+	// probe stays what it claims to be: the first target-time call made on
+	// that weaver, before any real target.
+	sr->target_state = 0; // LEIA_SR_TARGET_UNKNOWN
+	sr->target_pending = false;
+	sr->target_logged = false;
+	sr->target_pending_us = 0;
+	sr->target_pending_horizon_us = 0;
+
 	// #625: tear down the phase-snap probe (weaver restores the probe window's
 	// WndProc) before the SRContext goes away.
 	if (sr->snap_probe_weaver != nullptr) {
@@ -1601,6 +1782,15 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 		// feedback loop) when fresh; heuristic only as fallback.
 		const bool measured_fresh = leiasr->measured_r_us > 0 &&
 		                            (now_ns - leiasr->measured_seen_ns) < 250ULL * 1000 * 1000;
+		// Both producing branches below compute a horizon and converge on the
+		// ONE push at the end of the block, so the choice between "duration"
+		// (setLatency) and "instant" (setTargetTime) is made in exactly one
+		// place. The arithmetic, the clamps and the logs in each branch are
+		// unchanged.
+		uint64_t push_us = 0;
+		bool have_push = false;
+		bool deadband_applies = false;
+		bool deadband_pass = true;
 		if (forward_fresh) {
 			uint64_t latency_us = leiasr->forward_horizon_us;
 			if (latency_us < leiasr->latency_min_us) {
@@ -1609,8 +1799,8 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 			if (latency_us > leiasr->latency_max_us) {
 				latency_us = leiasr->latency_max_us;
 			}
-			w_set_latency(leiasr, latency_us);
-			leiasr->last_set_latency_us = latency_us;
+			push_us = latency_us;
+			have_push = true;
 			if (!leiasr->forward_logged) {
 				leiasr->forward_logged = true;
 				U_LOG_W("Leia D3D11 weave latency: #206 FORWARD per-weave horizon engaged "
@@ -1645,19 +1835,52 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 			const uint64_t latency_us = (uint64_t)(horizon_us + 0.5);
 
 			// Deadband: only re-push on a meaningful change (>=250 us).
+			// It governs the setLatency push ONLY (see the convergence point
+			// below): a target is an instant, not a level, so a deadband on it
+			// would be meaningless.
 			const uint64_t prev = leiasr->last_set_latency_us;
 			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
-			if (prev == 0 || diff >= 250) {
-				w_set_latency(leiasr, latency_us);
-				if (prev == 0 || diff >= 2000) {
-					U_LOG_I("Leia D3D11 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
-					        (unsigned long long)latency_us,
-					        leiasr->ema_interval_ns / 1e6,
-					        1e9 / leiasr->ema_interval_ns,
-					        (double)leiasr->latency_frames_factor,
-					        (unsigned long long)leiasr->display_term_us);
-				}
-				leiasr->last_set_latency_us = latency_us;
+			deadband_applies = true;
+			deadband_pass = (prev == 0 || diff >= 250);
+			// The 2000-us log throttle implies the 250-us deadband, so hoisting
+			// the log out of the push is exactly equivalent to the nesting it
+			// replaces.
+			if (prev == 0 || diff >= 2000) {
+				U_LOG_I("Leia D3D11 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
+				        (unsigned long long)latency_us,
+				        leiasr->ema_interval_ns / 1e6,
+				        1e9 / leiasr->ema_interval_ns,
+				        (double)leiasr->latency_frames_factor,
+				        (unsigned long long)leiasr->display_term_us);
+			}
+			push_us = latency_us;
+			have_push = true;
+		}
+
+		// ---- the single push ------------------------------------------
+		// Once target mode has engaged for this weaver it stays engaged for
+		// the weaver's life: a stale forward horizon does NOT clear the target
+		// and does NOT fall back to setLatency (a sticky target would override
+		// it anyway) -- whatever horizon the fallback above computed is simply
+		// expressed as now+horizon instead.
+		if (have_push) {
+			/*
+			 * DELIBERATE ASYMMETRY -- do not "make this consistent". The
+			 * target branch pushes EVERY weave; only the setLatency branch
+			 * keeps the deadband. A deadband suppresses a push when the value
+			 * has not moved much, which is right for a LEVEL (a latency) and
+			 * wrong for an INSTANT: skipping a target push does not hold the
+			 * old target steady, it lets it AGE -- the weaver keeps aiming at
+			 * a photon time that has already passed, and the error grows by a
+			 * weave interval every time the deadband suppresses. Reviewed and
+			 * confirmed load-bearing by the SDK author on PR #245.
+			 */
+			if (w_target_time_available(leiasr)) {
+				w_push_target_time(leiasr, push_us);
+				leiasr->last_set_latency_us = push_us;
+			} else if (!deadband_applies || deadband_pass) {
+				w_set_latency(leiasr, push_us);
+				leiasr->last_set_latency_us = push_us;
 			}
 		}
 	}
@@ -1671,6 +1894,11 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
 	}
+
+	// Read the acceptance back AFTER the weave: the target resolves to a
+	// horizon inside srWeaverWeave, so this reports what THIS weave predicted
+	// against. One line, once per weaver.
+	w_log_target_acceptance(leiasr);
 }
 
 /*!
