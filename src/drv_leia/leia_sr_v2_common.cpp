@@ -12,8 +12,12 @@
 
 #include "util/u_logging.h"
 
+#include <sr/sr_instance.h>
 #include <sr/sr_version.h>
+#include <sr/sr_weaver.h>
 
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 
 const char *
@@ -37,6 +41,197 @@ leia_sr_v2_result_str(SrResult r)
 	case SR_ERROR_LENS_NOT_AVAILABLE: return "SR_ERROR_LENS_NOT_AVAILABLE";
 	default: return "SR_<unknown>";
 	}
+}
+
+/* ------------------------------------------------------------------ *
+ * Absolute target time -- see the long comment in the header.
+ * ------------------------------------------------------------------ */
+
+bool
+leia_sr_target_time_opt_in(void)
+{
+	// Read once, cached. Same shape as the LEIA_*_LATENCY_* knobs, except that
+	// this one is process-wide rather than per-arm: the weaver that engages is
+	// per-arm, the decision to allow it is not.
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("DXR_LEIA_SR_TARGET_TIME");
+		const bool on = v != nullptr && (strcmp(v, "1") == 0 || _stricmp(v, "true") == 0 ||
+		                                 _stricmp(v, "on") == 0);
+		cached = on ? 1 : 0;
+		if (on) {
+			U_LOG_W("Leia SR: DXR_LEIA_SR_TARGET_TIME set - absolute weave target time "
+			        "requested (per-weaver probe + clock gate decide whether it engages)");
+		}
+	}
+	return cached == 1;
+}
+
+bool
+leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm)
+{
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		// Older SR runtime: srWeaverSetTargetTime is appended dispatch slot 90
+		// and is NULL there, so the loader trampoline answered without reaching
+		// a backend. Not a fault -- and not a reason to do anything other than
+		// keep the adaptive setLatency path we have always had.
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia %s target time: this SR runtime has no srWeaverSetTargetTime "
+			        "(SR_ERROR_FUNCTION_UNSUPPORTED) - staying on adaptive setLatency",
+			        arm);
+			warned = true;
+		}
+		return false;
+	}
+
+	if (r == SR_ERROR_FEATURE_NOT_SUPPORTED) {
+		// Current runtime, but this weaver's backend has no target-time
+		// interface. Distinct from the above on purpose: the fix is a backend,
+		// not a runtime.
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia %s target time: this weaver backend has no target-time interface "
+			        "(SR_ERROR_FEATURE_NOT_SUPPORTED) - staying on adaptive setLatency",
+			        arm);
+			warned = true;
+		}
+		return false;
+	}
+
+	if (!SR_SUCCEEDED(r)) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia %s target time: probe failed: %s (%d) - staying on adaptive "
+			        "setLatency",
+			        arm, leia_sr_v2_result_str(r), (int)r);
+			warned = true;
+		}
+		return false;
+	}
+
+	return true;
+}
+
+namespace {
+
+/*!
+ * This process's own QPC-since-boot in microseconds.
+ *
+ * Deliberately NOT routed through any existing monotonic helper: os_monotonic
+ * on Windows is its own normalisation and there is no guarantee it is the same
+ * domain, which is the entire thing this gate exists to check. Split-divide so
+ * a multi-hour uptime cannot overflow the intermediate.
+ */
+bool
+qpc_since_boot_us(uint64_t *out_us)
+{
+	LARGE_INTEGER freq{};
+	LARGE_INTEGER ctr{};
+	if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0) {
+		return false;
+	}
+	if (!QueryPerformanceCounter(&ctr) || ctr.QuadPart < 0) {
+		return false;
+	}
+	const uint64_t f = (uint64_t)freq.QuadPart;
+	const uint64_t c = (uint64_t)ctr.QuadPart;
+	*out_us = (c / f) * 1000000ULL + ((c % f) * 1000000ULL) / f;
+	return true;
+}
+
+} // namespace
+
+bool
+leia_sr_v2_clock_gate(SrInstance instance, const char *arm)
+{
+	uint64_t sr_us = 0;
+	const SrResult r = srGetTimeUs(instance, &sr_us);
+	if (!SR_SUCCEEDED(r)) {
+		U_LOG_W("Leia %s target time: srGetTimeUs failed: %s (%d) - not using absolute "
+		        "target time for this weaver",
+		        arm, leia_sr_v2_result_str(r), (int)r);
+		return false;
+	}
+
+	uint64_t our_us = 0;
+	if (!qpc_since_boot_us(&our_us)) {
+		U_LOG_W("Leia %s target time: QueryPerformanceCounter unavailable - not using "
+		        "absolute target time for this weaver",
+		        arm);
+		return false;
+	}
+
+	// Signed, and always logged: "they were both large numbers" is not a
+	// verification. The delta IS the measurement.
+	const int64_t delta_us = (int64_t)sr_us - (int64_t)our_us;
+	const int64_t mag_us = delta_us < 0 ? -delta_us : delta_us;
+
+	if (mag_us > 250000) {
+		U_LOG_W("Leia %s target time: srGetTimeUs is NOT our clock - sr %llu us vs our "
+		        "QPC-since-boot %llu us, delta %+lld us (> 250 ms). Not using absolute "
+		        "target time for this weaver; adaptive setLatency stays in charge",
+		        arm, (unsigned long long)sr_us, (unsigned long long)our_us,
+		        (long long)delta_us);
+		return false;
+	}
+
+	if (mag_us > 1000) {
+		// Passes the fail-closed gate, but this is not the agreement the two
+		// clocks should have: both are QueryPerformanceCounter divided by
+		// QueryPerformanceFrequency, so anything past call latency means a
+		// different frequency read or a wall-clock leak somewhere.
+		U_LOG_W("Leia %s target time: clock-domain agreement WEAKER THAN EXPECTED - "
+		        "delta %+lld us (expected tens of us; both sides are QPC/QPF). Engaging "
+		        "anyway (under the 250 ms gate), but treat the prediction with suspicion",
+		        arm, (long long)delta_us);
+		return true;
+	}
+
+	U_LOG_W("Leia %s target time: clock gate OK - srGetTimeUs %llu us vs our "
+	        "QPC-since-boot %llu us, delta %+lld us",
+	        arm, (unsigned long long)sr_us, (unsigned long long)our_us, (long long)delta_us);
+	return true;
+}
+
+bool
+leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm)
+{
+	uint64_t now_us = 0;
+	const SrResult r = srGetTimeUs(instance, &now_us);
+	if (!SR_SUCCEEDED(r)) {
+		// Once, not per frame -- this sits on the weave path.
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia %s target time: srGetTimeUs failed mid-run: %s (%d) - this weave "
+			        "keeps the previous target",
+			        arm, leia_sr_v2_result_str(r), (int)r);
+			warned = true;
+		}
+		return false;
+	}
+	*out_now_us = now_us;
+	return true;
+}
+
+void
+leia_sr_v2_log_target_accepted(const char *arm, uint64_t target_us, uint64_t horizon_us, uint64_t resolved_us)
+{
+	// ACCEPTANCE SIGNAL ONLY -- never a horizon for our own maths.
+	//
+	// srWeaverGetLatency reports the horizon the target RESOLVED to, computed
+	// inside srWeaverWeave (updateLatencyState + both predict calls), against
+	// the SDK's own clock reading at that point -- not the reading our
+	// predictors used. It is read here immediately AFTER the weave returns, so
+	// it describes THIS weave; a read taken before the weave would describe the
+	// previous one. Either way it is evidence that the target was consumed, and
+	// nothing else: feeding it back into the horizon estimate would close a loop
+	// between our prediction and the SDK's rounding of it.
+	const int64_t delta_us = (int64_t)resolved_us - (int64_t)horizon_us;
+	U_LOG_W("Leia %s target time: LIVE - target %llu us, horizon asked %llu us, weaver "
+	        "resolved %llu us, delta %+lld us (acceptance readback only; never fed back)",
+	        arm, (unsigned long long)target_us, (unsigned long long)horizon_us,
+	        (unsigned long long)resolved_us, (long long)delta_us);
 }
 
 bool

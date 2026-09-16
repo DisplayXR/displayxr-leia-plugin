@@ -178,6 +178,12 @@ const struct leia_vk_weaver_ops g_ops = {
     // so the caller's null-check is the thing that decides, in one place.
     nullptr,
     nullptr,
+    // set_target_time / get_latency: NULL on v1 for the same reason — the
+    // absolute target is a v2 C-surface entry point with no C++ equivalent, so
+    // target mode simply never engages on a v1 weaver and the adaptive
+    // setLatency path stays in charge.
+    nullptr,
+    nullptr,
 };
 
 } // namespace

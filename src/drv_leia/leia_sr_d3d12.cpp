@@ -108,6 +108,17 @@ struct leiasr_d3d12
 	uint64_t forward_seen_ns = 0;
 	bool     forward_logged = false;
 
+	// --- Absolute weave target time (SR 1584; opt-in) ---------------------
+	// DXR_LEIA_SR_TARGET_TIME=1 lets this weaver express the horizon as the
+	// INSTANT the frame reaches the panel instead of a duration. Engages once
+	// per weaver and is then never cleared and never toggled -- the SDK's
+	// clear/toggle paths are broken in 1584. See leia_sr_v2_common.h.
+	int      target_state = 0;              //!< enum leia_sr_target_state
+	bool     target_pending = false;        //!< a target was set for the weave now running
+	bool     target_logged = false;         //!< one-shot acceptance log already fired
+	uint64_t target_pending_us = 0;         //!< the absolute target we set
+	uint64_t target_pending_horizon_us = 0; //!< the horizon it was built from
+
 	// --- #158 SR platform restart detection -------------------------------
 	// Reporting only on this arm. Unlike D3D11 — which rebuilds its SDK
 	// objects IN PLACE off a detached worker, behind the async_state gate every
@@ -532,6 +543,144 @@ w_set_latency(leiasr_d3d12 *sr, uint64_t latency_us)
 	sr->weaver->setLatency(latency_us);
 }
 
+/* --- absolute weave target time ------------------------------------- *
+ * Deliberately the same shape as the D3D11 arm's block rather than a shared
+ * helper: the only difference is the struct type, and the Vulkan arm -- which
+ * reaches its weaver through an opaque `void *` behind a vtable -- could not
+ * use a shared version anyway without a void* or a template. Everything that
+ * ISN'T arm-specific (opt-in read, probe classification, clock gate, clock
+ * read, acceptance log) does live in one place: leia_sr_v2_common.cpp.
+ * --------------------------------------------------------------------- */
+
+/*!
+ * Has target mode engaged for this weaver? Probes at most once, then latches.
+ */
+bool
+w_target_time_available(leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->target_state == LEIA_SR_TARGET_AVAILABLE) {
+		return true;
+	}
+	if (sr->target_state == LEIA_SR_TARGET_UNAVAILABLE) {
+		return false;
+	}
+
+	// v1 weavers have no C surface for this at all, and the opt-in is checked
+	// before anything is touched: default OFF means the SDK never sees a single
+	// target-time call.
+	if (sr->weaver_v2 == nullptr || sr->instance_v2 == nullptr || !leia_sr_target_time_opt_in()) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	// Clock gate BEFORE the probe: if srGetTimeUs is not the clock it
+	// documents, we never call srWeaverSetTargetTime at all -- not even with
+	// the probe's 0.
+	if (!leia_sr_v2_clock_gate(sr->instance_v2, "D3D12")) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	// THE PROBE, and the ONLY call in the plug-in that passes 0. Safe only
+	// because it runs before any real target has ever been set on this weaver:
+	// nothing for the broken clear (defect 1) to fail to restore, no
+	// target-mode cadence state to starve (defect 2). A REAL weaver, because
+	// the loader null-checks the handle BEFORE the dispatch slot -- a
+	// null-handle call is not a capability probe (#625).
+	const SrResult r = srWeaverSetTargetTime(sr->weaver_v2, 0);
+	if (!leia_sr_v2_target_time_probe_ok(r, "D3D12")) {
+		sr->target_state = LEIA_SR_TARGET_UNAVAILABLE;
+		return false;
+	}
+
+	sr->target_state = LEIA_SR_TARGET_AVAILABLE;
+	U_LOG_W("Leia D3D12 target time: ENGAGED - every weave from here sets a fresh absolute "
+	        "target; never cleared, never toggled, setLatency no longer pushed");
+	return true;
+#else
+	(void)sr;
+	return false;
+#endif
+}
+
+/*!
+ * Express @p horizon_us as an absolute target for the weave about to run.
+ * Weave thread only. On failure the previous (sticky) target stands.
+ */
+void
+w_push_target_time(leiasr_d3d12 *sr, uint64_t horizon_us)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	// Clamp OURSELVES -- the SDK documents the same 150 ms ceiling but its
+	// bounds handling is what defect 2 is about. Floor is 0 by construction.
+	const uint64_t horizon = horizon_us > (uint64_t)LEIA_SR_TARGET_MAX_HORIZON_US
+	                             ? (uint64_t)LEIA_SR_TARGET_MAX_HORIZON_US
+	                             : horizon_us;
+
+	uint64_t now_us = 0;
+	if (!leia_sr_v2_now_us(sr->instance_v2, &now_us, "D3D12")) {
+		return;
+	}
+
+	const uint64_t target_us = now_us + horizon;
+	if (target_us == 0) {
+		// Unreachable in practice (srGetTimeUs is microseconds since boot, so a
+		// live weave cannot read 0), but 0 is the SDK's CLEAR and 1584's clear
+		// is broken. Making that a property of the code rather than of the
+		// arithmetic keeps the invariant checkable by grep: the only call that
+		// passes 0 is the one-shot probe above.
+		return;
+	}
+	const SrResult r = srWeaverSetTargetTime(sr->weaver_v2, target_us);
+	if (!SR_SUCCEEDED(r)) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("Leia D3D12 target time: srWeaverSetTargetTime failed mid-run: %s (%d)",
+			        leia_sr_v2_result_str(r), (int)r);
+			warned = true;
+		}
+		return;
+	}
+
+	sr->target_pending_us = target_us;
+	sr->target_pending_horizon_us = horizon;
+	sr->target_pending = true;
+#else
+	(void)sr;
+	(void)horizon_us;
+#endif
+}
+
+/*!
+ * One-shot acceptance log. MUST be called immediately after the weave returns:
+ * the target resolves to a horizon INSIDE srWeaverWeave, so a read taken before
+ * it would report the previous weave.
+ */
+void
+w_log_target_acceptance(leiasr_d3d12 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (!sr->target_pending) {
+		return;
+	}
+	sr->target_pending = false;
+	if (sr->target_logged) {
+		return;
+	}
+
+	uint64_t resolved_us = 0;
+	if (!SR_SUCCEEDED(srWeaverGetLatency(sr->weaver_v2, &resolved_us))) {
+		return; // next weave tries again
+	}
+	sr->target_logged = true;
+	leia_sr_v2_log_target_accepted("D3D12", sr->target_pending_us, sr->target_pending_horizon_us,
+	                               resolved_us);
+#else
+	(void)sr;
+#endif
+}
+
 void
 w_set_latency_in_frames(leiasr_d3d12 *sr, uint64_t frames)
 {
@@ -768,6 +917,13 @@ leiasr_d3d12_create(double max_time,
 	// would silently leave v2 on the SDK default and present as "v2 is slower".
 
 	// Adaptive-latency knobs, mirroring LEIA_D3D11_* / LEIA_VK_*.
+	//   DXR_LEIA_SR_TARGET_TIME=1|true|on  OPT-IN (default OFF): express the
+	//                                   horizon computed below as an ABSOLUTE
+	//                                   target (srGetTimeUs + now+horizon)
+	//                                   instead of pushing it through
+	//                                   setLatency. Per-weaver probe + clock
+	//                                   gate still decide; see
+	//                                   leia_sr_v2_common.h.
 	{
 		auto getf = [](const char *n, float def) -> float {
 			const char *v = std::getenv(n);
@@ -1016,6 +1172,14 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 		// feedback loop) when fresh; heuristic only as fallback.
 		const bool measured_fresh = leiasr->measured_r_us > 0 &&
 		                            (now_ns - leiasr->measured_seen_ns) < 250ULL * 1000 * 1000;
+		// Both producing branches below compute a horizon and converge on the
+		// ONE push at the end of the block, so the choice between "duration"
+		// (setLatency) and "instant" (setTargetTime) is made in exactly one
+		// place. The arithmetic, the clamps and the logs are unchanged.
+		uint64_t push_us = 0;
+		bool have_push = false;
+		bool deadband_applies = false;
+		bool deadband_pass = true;
 		if (forward_fresh) {
 			uint64_t latency_us = leiasr->forward_horizon_us;
 			if (latency_us < leiasr->latency_min_us) {
@@ -1024,8 +1188,8 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 			if (latency_us > leiasr->latency_max_us) {
 				latency_us = leiasr->latency_max_us;
 			}
-			w_set_latency(leiasr, latency_us);
-			leiasr->last_set_latency_us = latency_us;
+			push_us = latency_us;
+			have_push = true;
 			if (!leiasr->forward_logged) {
 				leiasr->forward_logged = true;
 				U_LOG_W("Leia D3D12 weave latency: #206 FORWARD per-weave horizon engaged "
@@ -1059,19 +1223,41 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 				horizon_us = (double)leiasr->latency_max_us;
 			const uint64_t latency_us = (uint64_t)(horizon_us + 0.5);
 
+			// The deadband governs the setLatency push ONLY (see the
+			// convergence point below): a target is an instant, not a level,
+			// so a deadband on it would be meaningless.
 			const uint64_t prev = leiasr->last_set_latency_us;
 			const uint64_t diff = latency_us > prev ? latency_us - prev : prev - latency_us;
-			if (prev == 0 || diff >= 250) {
-				w_set_latency(leiasr, latency_us);
-				if (prev == 0 || diff >= 2000) {
-					U_LOG_I("Leia D3D12 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
-					        (unsigned long long)latency_us,
-					        leiasr->ema_interval_ns / 1e6,
-					        1e9 / leiasr->ema_interval_ns,
-					        (double)leiasr->latency_frames_factor,
-					        (unsigned long long)leiasr->display_term_us);
-				}
-				leiasr->last_set_latency_us = latency_us;
+			deadband_applies = true;
+			deadband_pass = (prev == 0 || diff >= 250);
+			// The 2000-us log throttle implies the 250-us deadband, so hoisting
+			// the log out of the push is exactly equivalent to the nesting it
+			// replaces.
+			if (prev == 0 || diff >= 2000) {
+				U_LOG_I("Leia D3D12 adaptive latency: %llu us (%.2f ms/frame ~ %.0f fps; %.2f x iv + %llu us disp)",
+				        (unsigned long long)latency_us,
+				        leiasr->ema_interval_ns / 1e6,
+				        1e9 / leiasr->ema_interval_ns,
+				        (double)leiasr->latency_frames_factor,
+				        (unsigned long long)leiasr->display_term_us);
+			}
+			push_us = latency_us;
+			have_push = true;
+		}
+
+		// ---- the single push ------------------------------------------
+		// Once target mode has engaged for this weaver it stays engaged for
+		// the weaver's life: a stale forward horizon does NOT clear the target
+		// and does NOT fall back to setLatency (a sticky target would override
+		// it anyway) -- whatever horizon the fallback above computed is simply
+		// expressed as now+horizon instead.
+		if (have_push) {
+			if (w_target_time_available(leiasr)) {
+				w_push_target_time(leiasr, push_us);
+				leiasr->last_set_latency_us = push_us;
+			} else if (!deadband_applies || deadband_pass) {
+				w_set_latency(leiasr, push_us);
+				leiasr->last_set_latency_us = push_us;
 			}
 		}
 	}
@@ -1143,6 +1329,11 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
 	}
+
+	// Read the acceptance back AFTER the weave: the target resolves to a
+	// horizon inside srWeaverWeave, so this reports what THIS weave predicted
+	// against. One line, once per weaver.
+	w_log_target_acceptance(leiasr);
 }
 
 bool

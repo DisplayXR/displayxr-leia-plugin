@@ -132,6 +132,140 @@ leia_sr_v2_create_lens(SrInstance instance, SrLens *out_lens);
 const char *
 leia_sr_v2_result_str(SrResult r);
 
+/* ------------------------------------------------------------------ *
+ * Absolute target time (SR SDK 1584: srGetTimeUs + srWeaverSetTargetTime)
+ *
+ * The runtime hands the plug-in a per-weave FORWARD HORIZON (a duration)
+ * through the `set_predicted_scanout` DP slot. `srWeaverSetLatency` takes a
+ * duration too, so the horizon has to be re-anchored to the SDK's idea of
+ * "now", which it samples further down inside the weave -- the difference
+ * lands straight on the predicted eye position. The absolute API removes that
+ * conversion: we hand over the instant itself.
+ *
+ * OPT-IN, default OFF -- `DXR_LEIA_SR_TARGET_TIME=1|true|on`. The adaptive
+ * `setLatency` path stays as the fallback and is NOT going away.
+ *
+ * ## Why the shape is "engage once, then never stop"
+ *
+ * SDK 1584 ships three state-machine defects (fixed upstream, not in 1584):
+ *
+ *  1. `srWeaverSetTargetTime(w, 0)` -- the documented "clear" -- does NOT
+ *     restore the previously configured latency mode. The weaver keeps the
+ *     last target's horizon forever.
+ *  2. Target mode starves the SDK's cadence sampler, so a clear yields ~10
+ *     frames pinned at the 150 ms ceiling, and toggling per frame silently
+ *     inflates the fallback horizon.
+ *  3. The target is a non-atomic field read twice; a concurrent clear can make
+ *     it predict from minus the machine uptime.
+ *
+ * So the design never clears and never toggles. Target mode is a property of
+ * the WEAVER'S LIFE, not of the frame:
+ *
+ *  - probe ONCE per weaver, before any real target is ever set;
+ *  - once engaged, EVERY weave sets a fresh target;
+ *  - if the runtime's forward horizon goes stale we do NOT clear and do NOT
+ *    drop back to `setLatency` (a sticky target would override it anyway) --
+ *    whatever horizon the fallback logic computed is expressed as
+ *    `now + horizon` instead;
+ *  - the setter is only ever called from the weave thread.
+ *
+ * The helpers below are the parts that do not depend on how an arm reaches its
+ * weaver: the opt-in read, the probe-result classification, the clock gate,
+ * the clock read and the acceptance log. Each arm keeps its own three-line
+ * dispatch helper (see the `w_*` blocks) because the three structs reach the
+ * weaver differently -- a typed `SrWeaver` member on D3D11/D3D12, an opaque
+ * `void *` behind the `leia_vk_weaver_ops` vtable on Vulkan.
+ * ------------------------------------------------------------------ */
+
+//! Per-weaver latch for "can this weaver take an absolute target?".
+enum leia_sr_target_state
+{
+	LEIA_SR_TARGET_UNKNOWN = 0,   //!< Not probed yet.
+	LEIA_SR_TARGET_AVAILABLE = 1, //!< Probed and engaged; every weave sets one.
+	LEIA_SR_TARGET_UNAVAILABLE = 2, //!< Opt-in off, no interface, or clock mismatch.
+};
+
+/*!
+ * Ceiling we clamp the horizon to ourselves before building a target.
+ *
+ * The SDK documents the same 150 ms clamp, but its bounds handling is the
+ * subject of defect 2 above, so we do not rely on it.
+ */
+#define LEIA_SR_TARGET_MAX_HORIZON_US 150000
+
+/*!
+ * Is the absolute-target opt-in set? Read once per process, cached.
+ *
+ * `DXR_LEIA_SR_TARGET_TIME` = `1` / `true` / `on` enables. Anything else,
+ * including unset, leaves the plug-in on the adaptive `setLatency` path.
+ */
+bool
+leia_sr_target_time_opt_in(void);
+
+/*!
+ * Classify the one-shot probe's result, warning once per arm on each way of
+ * saying "no".
+ *
+ * Two distinct codes mean no, and they mean different things:
+ *   - `SR_ERROR_FUNCTION_UNSUPPORTED` -- older SR runtime; slots 89/90 are
+ *     NULL and the loader trampoline returned without reaching a backend.
+ *   - `SR_ERROR_FEATURE_NOT_SUPPORTED` -- current runtime, but this weaver's
+ *     backend has no target-time interface.
+ * Both are "no", neither is a fault, and they are logged separately because
+ * the fix is different.
+ *
+ * @param r   Result of `srWeaverSetTargetTime(weaver, 0)` on a REAL weaver.
+ * @param arm "D3D11" / "D3D12" / "VK", for the log line.
+ * @return true when the weaver accepted the call and target mode may engage.
+ */
+bool
+leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm);
+
+/*!
+ * Verify `srGetTimeUs` really is the clock it documents before we build any
+ * target on top of it.
+ *
+ * `srGetTimeUs` is documented as QPC-since-boot microseconds. Rather than
+ * trust the doc, this compares it against this process's own QPC-since-boot,
+ * computed from `QueryPerformanceCounter`/`QueryPerformanceFrequency`. The two
+ * are derived from the same counter divided by the same frequency, so the
+ * honest expected agreement is TENS OF MICROSECONDS -- call latency, nothing
+ * more. The gate fails closed at 250 ms (target mode is simply not used for
+ * this weaver); a delta above 1 ms still engages but earns its own WARN,
+ * because at that size something real is wrong (a different frequency read, a
+ * wall-clock leak) even though it passes.
+ *
+ * Runs BEFORE the probe deliberately: if the clock is not the clock, we never
+ * call `srWeaverSetTargetTime` at all, not even with the probe's 0.
+ *
+ * @return true when the two clocks agree well enough to build targets.
+ */
+bool
+leia_sr_v2_clock_gate(SrInstance instance, const char *arm);
+
+/*!
+ * `srGetTimeUs` with the failure logged once per arm. False leaves `*out_now_us`
+ * untouched and the caller must not push a target this weave.
+ */
+bool
+leia_sr_v2_now_us(SrInstance instance, uint64_t *out_now_us, const char *arm);
+
+/*!
+ * One-shot acceptance log for the first target a weaver accepts.
+ *
+ * Without this there is no way to tell "target mode ran" from "target mode was
+ * never called and the image happened to look fine" -- a weaver that ignored
+ * the target just falls back to the configured latency and still looks
+ * plausible. Same reasoning as the `#625 snap ... LIVE` line.
+ *
+ * @param resolved_us `srWeaverGetLatency` read back AFTER the weave returned.
+ */
+void
+leia_sr_v2_log_target_accepted(const char *arm,
+                               uint64_t target_us,
+                               uint64_t horizon_us,
+                               uint64_t resolved_us);
+
 #ifdef __cplusplus
 }
 #endif
