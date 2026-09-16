@@ -62,8 +62,15 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: counts a comment's pfnWeaverGetACTMode as a phantom slot) and require that the new
 :: table APPENDS ONLY: every shared index must hold the same function. An insertion
 :: shifts indices and mis-dispatches SILENTLY, since only the index is checked.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1564
-set SR_V2_DIR=LeiaSR-SDK-1.37.0+1564.559cd7db71-win64-Release
+:: 1584 = release-candidate/david-q3-2026 @ e6f6b20ab = 1564 + ST-5753 (#219)
+:: + its two follow-ups (#220 target bounds, #221 target state machine). Note the
+:: build number: CI stamped 1584, not 1583 -- the artifact filename is authoritative.
+:: Acceptance test run per the note above, from the artifact's own sr_loader.h using
+:: the DECLARATION grep: 88 -> 90 slots, 1564's 88 an exact ordered prefix, APPENDS
+:: ONLY -- 89 pfnWeaverSetTargetTime, 90 pfnGetTimeUs. Slot 75 pfnWeaverSnapToPhase
+:: unchanged in index and name, and its declaration is byte-identical.
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1584
+set SR_V2_DIR=LeiaSR-SDK-1.37.0+1584.e6f6b20ab9-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
