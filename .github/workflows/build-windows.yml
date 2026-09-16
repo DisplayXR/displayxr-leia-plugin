@@ -59,16 +59,21 @@ jobs:
       # SR v2 C99 SDK (win64). Defines DXR_LEIA_HAS_SR_V2 so the v2 path
       # compiles IN; at runtime the plug-in still lazy-loads
       # LeiaSR_runtime.dll and falls back to v1 on older SR Platforms.
-      # 1564 = the post-merge release-candidate/david-q3-2026 head @ 559cd7db7
-      # (LeiaInc/LeiaSR run 34775216986; RC + #217 ST-5750 + #218 ST-5751),
-      # re-hosted as a release asset on SR_SDK_REPO because upstream ships the
-      # win64 v2 SDK only as a CI run artifact. Over 1502 it APPENDS six slots
-      # (83-88: weaver phase-centre adjust + pattern get/set, display view-cone
-      # angle + optimal viewing distance) and deprecates the four lens getters
-      # (GetSlant/GetPx/GetN/GetDoN), none of which this plug-in calls. The
-      # srWeaverSnapToPhase surface (slot 75) is byte-identical to 1502.
-      SR_V2_TAG: sr-sdk-v2-1.37.0.1564
-      SR_V2_DIR: LeiaSR-SDK-1.37.0+1564.559cd7db71-win64-Release
+      # 1584 = release-candidate/david-q3-2026 @ e6f6b20ab (LeiaInc/LeiaSR run
+      # 35055499444) = 1564 + ST-5753 (#219, absolute predicted-photon target
+      # time) + #220 (target bounds reached only the reported horizon, not the
+      # predictors) + #221 (target state machine: clear-restores-mode, cadence
+      # queue kept warm, target made atomic). CI stamped 1584, not 1583 -- the
+      # artifact filename is authoritative. Over 1564 it APPENDS TWO slots
+      # (89 pfnWeaverSetTargetTime, 90 pfnGetTimeUs) and nothing else moves:
+      # verified from the artifact's own sr_loader.h with the DECLARATION grep
+      # the .bat prescribes, 1564's 88 an exact ordered prefix. This plug-in
+      # calls NEITHER new slot -- the #71 adaptive block still pushes
+      # srWeaverSetLatency() every frame -- so this repin is SDK-version only,
+      # no behaviour change. srWeaverSnapToPhase (slot 75), which this plug-in
+      # DOES call, is unchanged in index, name and declaration.
+      SR_V2_TAG: sr-sdk-v2-1.37.0.1584
+      SR_V2_DIR: LeiaSR-SDK-1.37.0+1584.e6f6b20ab9-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
