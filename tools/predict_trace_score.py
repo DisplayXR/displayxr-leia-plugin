@@ -642,6 +642,72 @@ def print_arm_comparison(results):
                 % (arm, len(group), st["n"], st["rms"], st["mean"], st["std"])
             )
     print("")
+    print("  The pooled numbers above are NOT the comparison: the arms are separate runs and")
+    print("  their horizon (push_us) distributions differ with load and motion, so a pooled")
+    print("  difference can come from horizon MIX alone. Compare BIN TO BIN below.")
+
+    # Bin-to-bin horizon comparison. Every arm's hbins share the same edges, so
+    # the k-th bin lines up across arms. A bin is SPARSE below SPARSE_N samples
+    # in either arm and is printed but not read into the headline.
+    SPARSE_N = 50
+    arms = list(by_arm.keys())
+    n_bins = None
+    per_arm_bins = {}
+    for arm, group in by_arm.items():
+        merged = None
+        for res in group:
+            if merged is None:
+                merged = [{"lo": b["lo"], "hi": b["hi"], "vals": list(b["vals"])} for b in res["hbins"]]
+            else:
+                for mb, b in zip(merged, res["hbins"]):
+                    mb["vals"].extend(b["vals"])
+        per_arm_bins[arm] = merged or []
+        n_bins = len(per_arm_bins[arm]) if n_bins is None else min(n_bins, len(per_arm_bins[arm]))
+
+    print("")
+    print("  HORIZON BIN-TO-BIN (midpoint |error| mm; rms / sd per arm; SPARSE = n < %d in either arm)" % SPARSE_N)
+    header = "    %-12s" % "push_us"
+    for arm in arms:
+        header += " | %-8s %6s %8s %8s" % (arm, "n", "rms", "sd")
+    header += " | %s" % "rms delta (2nd - 1st)"
+    print(header)
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for k in range(n_bins or 0):
+        lo = per_arm_bins[arms[0]][k]["lo"]
+        hi = per_arm_bins[arms[0]][k]["hi"]
+        label = "%.0f-%s ms" % (lo, "inf" if hi == float("inf") else "%.0f" % hi)
+        line = "    %-12s" % label
+        sts = []
+        for arm in arms:
+            st = stats(per_arm_bins[arm][k]["vals"])
+            sts.append(st)
+            if st is None:
+                line += " | %-8s %6s %8s %8s" % ("", "0", "-", "-")
+            else:
+                line += " | %-8s %6d %8.3f %8.3f" % ("", st["n"], st["rms"], st["std"])
+        sparse = any(st is None or st["n"] < SPARSE_N for st in sts)
+        if len(sts) >= 2 and sts[0] is not None and sts[1] is not None:
+            d = sts[1]["rms"] - sts[0]["rms"]
+            line += " | %+8.3f%s" % (d, "  SPARSE - do not read" if sparse else "")
+            if not sparse:
+                # Common weight: the SMALLER n of the two arms in this bin, so a
+                # bin one arm barely visited cannot dominate the headline.
+                wgt = float(min(sts[0]["n"], sts[1]["n"]))
+                weighted_num += d * wgt
+                weighted_den += wgt
+        else:
+            line += " | %s" % ("(one arm empty)" + ("  SPARSE" if sparse else ""))
+        print(line)
+    if weighted_den > 0:
+        print("")
+        print("  HEADLINE: common-weighted rms delta (%s minus %s) over non-sparse bins = %+.3f mm"
+              % (arms[1], arms[0], weighted_num / weighted_den))
+        print("  (weights = the smaller per-bin n of the two arms; negative favours %s)" % arms[1])
+    else:
+        print("")
+        print("  HEADLINE: no non-sparse bin shared by both arms -- no headline can be read.")
+    print("")
     print("  Compare SPREAD and RMS. See the caveats printed above; in particular the")
     print("  legacy arm's mean is expected to be offset and is not by itself a verdict.")
 
