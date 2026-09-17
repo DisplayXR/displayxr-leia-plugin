@@ -54,14 +54,22 @@ SR_EVENT_USER_FOUND = 16
 SR_EVENT_USER_LOST = 17
 
 CAVEATS = [
+    "The REFERENCE is not ground truth. It is each weave's own srEyeTrackerPredict(0) on a "
+    "separate tracker handle -- the filter's smoothed estimate for now + min(1/120 s, "
+    "max_prediction_scene_s) (-4.36 ms on this profile), computed the SAME way in both arms. "
+    "No raw eye measurement exists in the C99 surface (enablePrediction is ignored by SDK "
+    "1584). ABSOLUTE errors are therefore comparison-only; the ARM-TO-ARM comparison is "
+    "sound because both arms are scored against the same reference.",
     "arm A (legacy) bias is ARITHMETIC, not a defect: the relative path predicts for "
     "now-4.36 ms (max_prediction_scene_s) while the frame is shown at now+horizon, so a "
     "constant offset is expected. Judge the arms on SPREAD and RMS, not on mean bias.",
     "Two consecutive runs are TWO SAMPLES, not a paired comparison: nothing here pairs a "
     "legacy weave with a target weave, and the viewer moved differently in each run.",
-    "Instrumented runs add one predictor call per weave (srWeaverGetPredictedEyePositions "
-    "plus two clock reads). They are comparable to EACH OTHER and NOT to an uninstrumented "
-    "baseline.",
+    "Instrumented runs add THREE predictor calls per weave (the getter, the reference "
+    "predict, plus clock reads), one of which emits a T row. They are comparable to EACH "
+    "OTHER and NOT to an uninstrumented baseline.",
+    "T rows are DIAGNOSTIC ONLY: the tracker callback stream is an echo of predict() calls, "
+    "not measurements. Nothing here scores against them.",
 ]
 
 DEFAULT_SPEED_BINS = (0.0, 25.0, 75.0, 200.0, float("inf"))
@@ -79,6 +87,8 @@ class Trace(object):
         self.path = path
         self.meta = OrderedDict()
         self.trailer = ""
+        self.t_untimed = 0  # T rows with timeUs == 0: untracked default pairs, no capture time
+        self.s_mapped = 0  # S rows whose timestamp was mapped through the header clock pair
         self.t_rows = []  # (time_us, lx,ly,lz, rx,ry,rz)
         self.s_rows = []  # (time_us, event_type)
         self.w_rows = []  # dict
@@ -101,6 +111,26 @@ def _i(v):
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+FILETIME_UNIX_EPOCH_100NS = 116444736000000000  # 1970-01-01 in FILETIME ticks
+
+
+def _map_s_time(tr, v):
+    """S rows were observed (2026-09-16 smoke) NOT to be in the srGetTimeUs
+    domain: they looked like 100 ns ticks since the Unix epoch. Map such a
+    value onto the SDK clock through the header clock pair; leave anything
+    already plausible (< 1e15) alone."""
+    if v < 10 ** 15:
+        return v
+    try:
+        sr_us = int(tr.meta["clock_pair_sr_us"])
+        ft = int(tr.meta["clock_pair_filetime_100ns_since_1601"])
+    except (KeyError, ValueError):
+        return v
+    unix100_at_pair = ft - FILETIME_UNIX_EPOCH_100NS
+    tr.s_mapped += 1
+    return sr_us + (v - unix100_at_pair) // 10
 
 
 def read_trace(path):
@@ -128,6 +158,11 @@ def read_trace(path):
             kind = row[0]
             try:
                 if kind == "T" and len(row) >= 9:
+                    if int(row[2]) == 0:
+                        # No capture time: the SDK delivers default pairs
+                        # when nobody is tracked. Not ground truth.
+                        tr.t_untimed += 1
+                        continue
                     tr.t_rows.append(
                         (
                             int(row[2]),
@@ -140,7 +175,7 @@ def read_trace(path):
                         )
                     )
                 elif kind == "S" and len(row) >= 3:
-                    tr.s_rows.append((int(row[2]), int(row[1])))
+                    tr.s_rows.append((_map_s_time(tr, int(row[2])), int(row[1])))
                 elif kind == "W" and len(row) >= 19:
                     tr.w_rows.append(
                         {
@@ -158,6 +193,11 @@ def read_trace(path):
                             "pl": (_f(row[12]), _f(row[13]), _f(row[14])),
                             "pr": (_f(row[15]), _f(row[16]), _f(row[17])),
                             "swap": _i(row[18]),
+                            # format 2 reference fields; absent on format-1 files
+                            "ref_now_us": _i(row[19]) if len(row) >= 27 else None,
+                            "rl": (_f(row[20]), _f(row[21]), _f(row[22])) if len(row) >= 27 else None,
+                            "rr": (_f(row[23]), _f(row[24]), _f(row[25])) if len(row) >= 27 else None,
+                            "ref_ok": _i(row[26]) if len(row) >= 27 else 0,
                         }
                     )
                 else:
@@ -193,14 +233,23 @@ def lost_spans(s_rows):
     A LOST with no following FOUND runs to infinity -- the user never came
     back, and every weave after it is untracked.
     """
+    # USER_FOUND / USER_LOST are PERSISTENT events in the SDK: the current
+    # state is replayed to every new listener with its ORIGINAL timestamp, so
+    # the first event is state rather than a transition, may predate the run,
+    # and FOUND/LOST need not alternate. Tolerate repeats and a leading event
+    # of either type; only a LOST->FOUND transition closes a span.
     spans = []
     open_at = None
+    state = None
     for time_us, ev in s_rows:
-        if ev == SR_EVENT_USER_LOST and open_at is None:
+        if ev == state:
+            continue  # repeat of the current state: not a transition
+        if ev == SR_EVENT_USER_LOST:
             open_at = time_us
         elif ev == SR_EVENT_USER_FOUND and open_at is not None:
             spans.append((open_at, time_us))
             open_at = None
+        state = ev
     if open_at is not None:
         spans.append((open_at, float("inf")))
     return spans
@@ -305,14 +354,40 @@ def fmt_stats(label, st):
 # ---------------------------------------------------------------------------
 
 
+def reference_rows(tr):
+    """The reference series: every weave's own srEyeTrackerPredict(0) sample,
+    anchored at ref_now_us + min(8333, max_prediction_scene_s * 1e6). predict(0)
+    resolves to min(1/120 s, maxPredictionScene_s): on this profile the clamp
+    (-4.36 ms) wins; on a profile without it the 1/120 s term would, and
+    anchoring on the clamp alone would mis-place the whole series. Same tuple
+    shape as the T rows so bracket/interp/speed work unchanged."""
+    try:
+        scene_s = float(tr.meta.get("max_prediction_scene_s", "-0.00436"))
+    except ValueError:
+        scene_s = -0.00436
+    off = min(8333.0, scene_s * 1e6)
+    rows = []
+    for w in tr.w_rows:
+        if not w.get("ref_ok") or not w.get("ref_now_us"):
+            continue
+        rows.append((int(w["ref_now_us"] + off),) + tuple(w["rl"]) + tuple(w["rr"]))
+    rows.sort(key=lambda r: r[0])
+    return rows, off
+
+
 def score_trace(tr, bins):
-    period = tracker_period_us(tr.t_rows)
+    ref_rows, ref_off = reference_rows(tr)
+    # The period of the REFERENCE series (one sample per weave, so ~the weave
+    # period); scanout is 30-60 ms ahead and is bracketed by later weaves.
+    period = tracker_period_us(ref_rows)
     tol = 2.0 * period if period else None
     spans = lost_spans(tr.s_rows)
 
     res = {
         "trace": tr,
         "period_us": period,
+        "ref_rows": len(ref_rows),
+        "ref_offset_us": ref_off,
         "lost_spans": len(spans),
         "kept": 0,
         "drop_no_bracket": 0,
@@ -348,12 +423,12 @@ def score_trace(tr, bins):
             res["drop_untracked"] += 1
             continue
 
-        i = bracket(tr.t_rows, t_us, hint)
+        i = bracket(ref_rows, t_us, hint)
         if i is None:
             res["drop_no_bracket"] += 1
             continue
         hint = i
-        vals, span = interp(tr.t_rows, i, t_us)
+        vals, span = interp(ref_rows, i, t_us)
         if vals is None:
             res["drop_no_bracket"] += 1
             continue
@@ -388,7 +463,7 @@ def score_trace(tr, bins):
 
         # Head-speed bins, so leash saturation is visible rather than averaged
         # into the aggregate.
-        v = speed_mm_s(tr.t_rows, i)
+        v = speed_mm_s(ref_rows, i)
         for b in res["bins"]:
             if b["lo"] <= v < b["hi"]:
                 b["vals"].append(mag)
@@ -433,8 +508,16 @@ def print_trace_report(res):
                 2.0 * res["period_us"],
             )
         )
+    print("  %-24s %d samples, anchored at ref_now_us %+.0f us (T rows: %d, diagnostic only)"
+          % ("reference series", res["ref_rows"], res["ref_offset_us"], len(tr.t_rows)))
     if tr.trailer:
         print("  %-24s %s" % ("recorder trailer", tr.trailer))
+    else:
+        print("  %-24s %s" % ("recorder trailer", "MISSING - player hard-killed? drop counts unknown"))
+    if tr.t_untimed:
+        print("  %-24s %d (timeUs == 0: untracked default pairs, excluded)" % ("T rows untimed", tr.t_untimed))
+    if tr.s_mapped:
+        print("  %-24s %d (mapped through header clock pair; S domain advisory)" % ("S rows mapped", tr.s_mapped))
     if tr.malformed:
         print("  %-24s %d" % ("malformed lines", tr.malformed))
 

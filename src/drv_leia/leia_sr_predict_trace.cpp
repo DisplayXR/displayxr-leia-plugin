@@ -236,6 +236,7 @@ struct leia_sr_predict_trace
 
 	std::atomic<uint64_t> skipped_no_clock{0};
 	std::atomic<uint64_t> skipped_no_eyes{0};
+	std::atomic<uint64_t> ref_failed{0}; //!< W rows written with ref_ok = 0
 
 	std::thread writer;
 	std::atomic<bool> quit{false};
@@ -264,7 +265,22 @@ struct leia_sr_predict_trace
 	float display_height_m = 0.0f;
 
 	bool header_written = false;
+	//! The clock-gate delta is not known when the header goes out: the first
+	//! T row (~120 Hz, right after srInitialize) forces the header well before
+	//! the first weave runs the gate. So the header omits the line and the
+	//! writer appends `# clock_gate_delta_us=` the first time the gate has run;
+	//! destroy writes `n/a` if it never did. The scorer reads keys by name and
+	//! keeps the FIRST value it sees, which is why the header must not emit a
+	//! placeholder.
+	bool gate_line_pending = false;
 	uint64_t start_ms = 0;
+	//! One simultaneous reading of the SDK clock and the system clock, taken
+	//! at create. The S rows' timestamps turned out (2026-09-16 smoke) NOT to
+	//! be in the srGetTimeUs domain, so the scorer needs a pair to map them;
+	//! recording both costs nothing and lets the mapping be done offline
+	//! without guessing which epoch the SDK meant.
+	uint64_t clock_pair_sr_us = 0;
+	uint64_t clock_pair_filetime = 0; //!< 100 ns ticks since 1601-01-01 (FILETIME)
 };
 
 namespace {
@@ -344,20 +360,24 @@ write_header(leia_sr_predict_trace *rec)
 	int64_t gate_delta_us = 0;
 	const bool gate_known = leia_sr_v2_clock_gate_last_delta(&gate_delta_us);
 
-	fprintf(rec->fp, "# format=dxr-leia-predict-trace-1\n");
+	fprintf(rec->fp, "# format=dxr-leia-predict-trace-2\n");
 	fprintf(rec->fp, "# arm=%s\n", rec->arm);
 	fprintf(rec->fp, "# weaver_arm=%s\n", rec->weaver_arm);
 	fprintf(rec->fp, "# plugin_version=%s\n", rec->plugin_version);
 	fprintf(rec->fp, "# sr_sdk_pin=%s\n", rec->sdk_pin);
 	fprintf(rec->fp, "# sr_runtime_version=%s\n", rec->sr_runtime_version);
+	fprintf(rec->fp, "# note_runtime_version=srGetRuntimeVersion is a hardcoded stub in SDK 1584 (always "
+	                 "1.0.0); sr_sdk_pin is the build we compiled against\n");
 	fprintf(rec->fp, "# sr_api_reason=%s\n", rec->api_reason);
 	fprintf(rec->fp, "# pid=%lu\n", (unsigned long)GetCurrentProcessId());
 	if (gate_known) {
 		fprintf(rec->fp, "# clock_gate_delta_us=%lld\n", (long long)gate_delta_us);
 	} else {
-		// Expected on the legacy arm: the gate is target-mode-only, so
-		// "not run" is the honest value and a 0 would be a lie.
-		fprintf(rec->fp, "# clock_gate_delta_us=n/a\n");
+		// Not known yet (target arm: the gate runs inside the first weave,
+		// after the first T row forced this header out) or never (legacy
+		// arm). Emit nothing here; the writer appends the line when the gate
+		// has run and destroy writes n/a if it never did.
+		rec->gate_line_pending = true;
 	}
 	fprintf(rec->fp, "# panel_id=%s\n", rec->panel_id);
 	fprintf(rec->fp, "# monitor_device=%s\n", rec->monitor_device);
@@ -371,6 +391,14 @@ write_header(leia_sr_predict_trace *rec)
 	// No SDK call reports the tracker's nominal rate (searched the whole
 	// 1584 header tree). 0 means "unknown"; the scorer estimates the period
 	// from the T stream's own spacing instead.
+	// Clock pair (see the struct): lets the scorer map any timestamp that is
+	// NOT in the srGetTimeUs domain onto it. The S rows are the known case.
+	fprintf(rec->fp, "# clock_pair_sr_us=%llu\n", (unsigned long long)rec->clock_pair_sr_us);
+	fprintf(rec->fp, "# clock_pair_filetime_100ns_since_1601=%llu\n",
+	        (unsigned long long)rec->clock_pair_filetime);
+	fprintf(rec->fp, "# note_S_timeUs=observed NOT in the srGetTimeUs domain (2026-09-16 smoke: looked "
+	                 "like 100 ns ticks since the Unix epoch); map through clock_pair; advisory until "
+	                 "pinned by the SDK\n");
 	fprintf(rec->fp, "# tracker_nominal_hz=0\n");
 	// Documentation constants, for the scorer's prose only. NOTHING at
 	// runtime reads or applies these -- they are here so a file can be
@@ -382,7 +410,20 @@ write_header(leia_sr_predict_trace *rec)
 	fprintf(rec->fp, "# legend_S=S,eventType,timeUs  (16=USER_FOUND 17=USER_LOST)\n");
 	fprintf(rec->fp,
 	        "# legend_W=W,seq,arm,now_us,push_us,scanout_us,pushed,last_set_latency_us,"
-	        "target_us,horizon_us,resolved_us,read_now_us,plx,ply,plz,prx,pry,prz,swap_flag\n");
+	        "target_us,horizon_us,resolved_us,read_now_us,plx,ply,plz,prx,pry,prz,swap_flag,"
+	        "ref_now_us,rlx,rly,rlz,rrx,rry,rrz,ref_ok\n");
+	fprintf(rec->fp,
+	        "# reference=srEyeTrackerPredict(tracker,0) on the recorder's own tracker handle, per weave; "
+	        "ref_instant_us = ref_now_us + min(8333, max_prediction_scene_s*1e6); the filter's smoothed "
+	        "low-lag estimate, NOT a raw measurement (none exists in the C99 surface; enablePrediction is "
+	        "ignored by SDK 1584)\n");
+	fprintf(rec->fp,
+	        "# note_T=the tracker callback stream is an ECHO of predict() calls (updated only at the end "
+	        "of predict/predictAt), so T rows are DIAGNOSTIC ONLY and must not be used as ground truth; "
+	        "timeUs==0 means never-measured, and it stays STALE after a face is lost (use S)\n");
+	fprintf(rec->fp,
+	        "# note_observer=each weave gains three extra predictor calls (getter, clock, reference), one "
+	        "of which emits a T row; not comparable to an uninstrumented baseline\n");
 	rec->header_written = true;
 }
 
@@ -416,13 +457,15 @@ drain(leia_sr_predict_trace *rec)
 		}
 		fprintf(rec->fp,
 		        "W,%llu,%s,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,"
-		        "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u\n",
+		        "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,"
+		        "%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u\n",
 		        (unsigned long long)w.seq, rec->arm, (unsigned long long)w.now_us,
 		        (unsigned long long)w.push_us, (unsigned long long)w.scanout_us, (unsigned)w.pushed,
 		        (unsigned long long)w.last_set_latency_us, (unsigned long long)w.target_us,
 		        (unsigned long long)w.horizon_us, (unsigned long long)w.resolved_us,
 		        (unsigned long long)w.read_now_us, w.pl[0], w.pl[1], w.pl[2], w.pr[0], w.pr[1], w.pr[2],
-		        (unsigned)w.swap_flag);
+		        (unsigned)w.swap_flag, (unsigned long long)w.ref_now_us, w.rl[0], w.rl[1], w.rl[2],
+		        w.rr[0], w.rr[1], w.rr[2], (unsigned)w.ref_ok);
 		rec->ring_w.written++;
 	}
 }
@@ -440,6 +483,20 @@ writer_body(leia_sr_predict_trace *rec)
 		for (;;) {
 			const bool quitting = rec->quit.load(std::memory_order_acquire);
 			drain(rec);
+			if (rec->header_written && rec->gate_line_pending) {
+				int64_t d = 0;
+				if (leia_sr_v2_clock_gate_last_delta(&d)) {
+					fprintf(rec->fp, "# clock_gate_delta_us=%lld\n", (long long)d);
+					rec->gate_line_pending = false;
+				}
+			}
+			// Flush every drain: a hard-killed player (TerminateProcess) never
+			// reaches destroy, and without this the last CRT buffer -- up to
+			// 64 KiB of rows -- dies with it and the file ends mid-row. One
+			// flush per 10 ms on a below-normal thread is nothing.
+			if (rec->fp != nullptr) {
+				fflush(rec->fp);
+			}
 			if (!rec->header_written && (GetTickCount64() - rec->start_ms) >= 1000) {
 				// A run that never wove still deserves a readable
 				// file saying which arm it was.
@@ -554,6 +611,16 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 	}
 	rec->instance = instance;
 	rec->start_ms = GetTickCount64();
+	{
+		// Clock pair for the header: system time and SDK time read back to
+		// back, SDK second so the pair is as tight as two calls allow.
+		FILETIME ft;
+		GetSystemTimePreciseAsFileTime(&ft);
+		uint64_t pair_sr_us = probe_now_us;
+		(void)srGetTimeUs(instance, &pair_sr_us);
+		rec->clock_pair_filetime = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
+		rec->clock_pair_sr_us = pair_sr_us;
+	}
 
 	snprintf(rec->arm, sizeof(rec->arm), "%s", info->arm != nullptr ? info->arm : "unknown");
 	snprintf(rec->weaver_arm, sizeof(rec->weaver_arm), "%s",
@@ -742,16 +809,27 @@ leia_sr_predict_trace_destroy(struct leia_sr_predict_trace **rec_ptr)
 		if (!rec->header_written) {
 			write_header(rec);
 		}
+		if (rec->gate_line_pending) {
+			int64_t d = 0;
+			if (leia_sr_v2_clock_gate_last_delta(&d)) {
+				fprintf(rec->fp, "# clock_gate_delta_us=%lld\n", (long long)d);
+			} else {
+				// Honest value for a gate that never ran (the legacy arm).
+				fprintf(rec->fp, "# clock_gate_delta_us=n/a\n");
+			}
+			rec->gate_line_pending = false;
+		}
 		fprintf(rec->fp,
 		        "# trailer rows_T=%llu rows_S=%llu rows_W=%llu dropped_T=%llu dropped_S=%llu "
-		        "dropped_W=%llu skipped_W_no_clock=%llu skipped_W_no_eyes=%llu\n",
+		        "dropped_W=%llu skipped_W_no_clock=%llu skipped_W_no_eyes=%llu ref_failed=%llu\n",
 		        (unsigned long long)rec->ring_t.written, (unsigned long long)rec->ring_s.written,
 		        (unsigned long long)rec->ring_w.written,
 		        (unsigned long long)rec->ring_t.dropped.load(std::memory_order_relaxed),
 		        (unsigned long long)rec->ring_s.dropped.load(std::memory_order_relaxed),
 		        (unsigned long long)rec->ring_w.dropped.load(std::memory_order_relaxed),
 		        (unsigned long long)rec->skipped_no_clock.load(std::memory_order_relaxed),
-		        (unsigned long long)rec->skipped_no_eyes.load(std::memory_order_relaxed));
+		        (unsigned long long)rec->skipped_no_eyes.load(std::memory_order_relaxed),
+		        (unsigned long long)rec->ref_failed.load(std::memory_order_relaxed));
 		fflush(rec->fp);
 		fclose(rec->fp);
 		rec->fp = nullptr;
@@ -768,7 +846,36 @@ leia_sr_predict_trace_on_weave(struct leia_sr_predict_trace *rec, const struct l
 	if (rec == nullptr || w == nullptr) {
 		return;
 	}
-	(void)rec->ring_w.push(*w);
+	struct leia_sr_predict_trace_weave row = *w;
+	row.ref_ok = 0;
+	row.ref_now_us = 0;
+	// The reference (see the struct doc): the tracker handle's own zero-
+	// horizon predict, clock-stamped immediately before. Same call, same
+	// handle, same expression on both arms. It is the third extra predictor
+	// call per weave and it emits a T row of its own -- both stated in the
+	// header. A failure leaves ref_ok = 0 and the row is still recorded,
+	// because the prediction half of it is still evidence.
+	if (rec->tracker != nullptr && rec->instance != nullptr) {
+		uint64_t ref_now_us = 0;
+		if (SR_SUCCEEDED(srGetTimeUs(rec->instance, &ref_now_us))) {
+			SrEyePair pair{};
+			if (SR_SUCCEEDED(srEyeTrackerPredict(rec->tracker, 0, &pair))) {
+				row.ref_now_us = ref_now_us;
+				row.rl[0] = pair.leftEye.x;
+				row.rl[1] = pair.leftEye.y;
+				row.rl[2] = pair.leftEye.z;
+				row.rr[0] = pair.rightEye.x;
+				row.rr[1] = pair.rightEye.y;
+				row.rr[2] = pair.rightEye.z;
+				row.ref_ok = 1;
+			} else {
+				rec->ref_failed.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else {
+			rec->ref_failed.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	(void)rec->ring_w.push(row);
 }
 
 void

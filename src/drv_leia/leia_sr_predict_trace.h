@@ -133,6 +133,30 @@ struct leia_sr_predict_trace_weave
 	double pr[3];                 //!< Predicted RIGHT eye, mm, as the getter returned it.
 	uint8_t pushed;               //!< 1 if a set_latency/set_target actually happened this weave.
 	uint8_t swap_flag;            //!< 1 when pl.x > pr.x (the getter swaps; the raw T rows do not).
+
+	/*!
+	 * @name The REFERENCE, filled in by the recorder itself inside
+	 * leia_sr_predict_trace_on_weave -- the arm never touches these.
+	 *
+	 * The tracker callback stream turned out to be an ECHO of predict()
+	 * calls (the SDK updates its eye-pair stream only at the end of predict
+	 * / predictAt, never on a raw measurement), so on the target arm every
+	 * T row is a prediction FOR THE TARGET INSTANT and scoring against it
+	 * would be circular. The reference is therefore built explicitly:
+	 * `srEyeTrackerPredict(tracker, 0, ...)` on the recorder's OWN tracker
+	 * handle, which resolves to the filter's low-lag estimate for
+	 * `now + min(1/120 s, maxPredictionScene_s)` (-4.36 ms on this profile)
+	 * -- the identical expression in both arms, untouched by target mode.
+	 * `enablePrediction` on the create info is IGNORED by SDK 1584 (the
+	 * handle is always a predicting tracker), so there is no raw sample to
+	 * be had from it: the reference is filtered and lagged, by design.
+	 * @{
+	 */
+	uint64_t ref_now_us; //!< srGetTimeUs immediately before the reference predict.
+	double rl[3];        //!< Reference LEFT eye, mm.
+	double rr[3];        //!< Reference RIGHT eye, mm.
+	uint8_t ref_ok;      //!< 1 when the reference predict succeeded; 0 = rl/rr are not data.
+	/*! @} */
 };
 
 /*!
