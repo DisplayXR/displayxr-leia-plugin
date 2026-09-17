@@ -18,6 +18,12 @@ set(LEIA_SOURCES
     leia_sr_api_select.cpp
     leia_sr_v2_common.h
     leia_sr_v2_common.cpp
+    # Opt-in per-weave eye-prediction recorder. Listed unconditionally: the
+    # whole translation unit is inside #ifdef DXR_LEIA_HAS_SR_V2, so a
+    # v1-only configure compiles it to an empty object rather than needing a
+    # second place that has to agree about when it exists.
+    leia_sr_predict_trace.h
+    leia_sr_predict_trace.cpp
     leia_sr_liveness.h
     leia_sr_liveness.cpp
     leia_vk_weaver_v2.cpp
@@ -273,6 +279,23 @@ if(LEIA_SR_V2_AVAILABLE)
         "${LEIASR_V2_SDKROOT}/lib/srSDK_loader.lib"
         advapi32)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_V2=1)
+
+    # The v2 SDK pin, as a string, for diagnostics that have to be readable
+    # years later (the predict-trace header line, today). DERIVED from the SDK
+    # root's own directory name rather than hand-typed: a hand-typed pin is a
+    # second copy of SR_V2_DIR that nothing checks, and check_sr_pins.py only
+    # guards the build script against the workflow, not against a constant in
+    # a source file.
+    get_filename_component(_leia_v2_dirname "${LEIASR_V2_SDKROOT}" NAME)
+    if(_leia_v2_dirname MATCHES "LeiaSR-SDK-([0-9]+\\.[0-9]+\\.[0-9]+\\+[0-9]+)")
+        set(_leia_v2_pin "${CMAKE_MATCH_1}")
+    else()
+        set(_leia_v2_pin "${_leia_v2_dirname}")
+    endif()
+    message(STATUS "SR v2 SDK pin (diagnostics): ${_leia_v2_pin}")
+    target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_SR_V2_SDK_PIN="${_leia_v2_pin}")
+    unset(_leia_v2_dirname)
+    unset(_leia_v2_pin)
 
     # Narrower gate, set only when this SDK root actually declares the ST-5673
     # connection-state/platform-id pair. See the long note above the probe.

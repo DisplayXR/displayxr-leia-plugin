@@ -221,6 +221,18 @@ bool
 leia_sr_target_time_opt_in(void);
 
 /*!
+ * DIAGNOSTIC ONLY: `DXR_LEIA_SR_TARGET_HORIZON_OVERRIDE_US` replaces the
+ * horizon the converged push block would have handed to the TARGET branch,
+ * so a run can ask for a far-forward target (e.g. 140000) and the predict-trace
+ * recorder can see whether the app-facing eye output moves toward it at all.
+ * Read once per process, cached; 0 = unset = shipping behaviour. Applied only
+ * inside the target branch, after `w_target_time_available`; the setLatency
+ * branch never sees it. The plug-in's own 150 ms clamp still applies on top.
+ */
+uint64_t
+leia_sr_target_horizon_override_us(void);
+
+/*!
  * Classify the one-shot probe's result, warning once per arm on each way of
  * saying "no".
  *
@@ -260,6 +272,23 @@ leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm, struct leia_sr_v2_w
  */
 bool
 leia_sr_v2_clock_gate(SrInstance instance, const char *arm);
+
+/*!
+ * The signed delta the last @ref leia_sr_v2_clock_gate computed, in
+ * microseconds (`srGetTimeUs - our QPC-since-boot`).
+ *
+ * Exposed so a diagnostic can RECORD the number the gate already measured
+ * rather than measure its own. A second measurement would be a second
+ * measurement: taken at a different instant, through a different call, and
+ * therefore able to disagree with the one that actually decided whether target
+ * mode engaged. This returns that decision's evidence or nothing at all.
+ *
+ * @return false when the gate has never run in this process -- which is the
+ *         NORMAL state on the adaptive-setLatency arm, where it is never
+ *         reached. `*out_delta_us` is left untouched.
+ */
+bool
+leia_sr_v2_clock_gate_last_delta(int64_t *out_delta_us);
 
 /*!
  * `srGetTimeUs` with the failure logged once per arm. False leaves `*out_now_us`
