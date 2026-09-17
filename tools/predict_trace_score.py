@@ -403,6 +403,13 @@ def score_trace(tr, bins):
                 1: {"L": {a: [] for a in AXES}, "R": {a: [] for a in AXES}}},
         "eye_n": {0: 0, 1: 0},
         "bins": [{"lo": bins[k], "hi": bins[k + 1], "vals": []} for k in range(len(bins) - 1)],
+        # Horizon bins (push_us, ms). The effect under test is a function of the
+        # horizon -- the expected advance on this profile is horizon + 4.36 ms,
+        # a load-dependent range of roughly 21-64 ms (16.5 ms idle horizon up to
+        # the 60 ms ceiling under load) -- so pooling across a 4x horizon range
+        # would blur exactly the thing being measured.
+        "hbins": [{"lo": lo, "hi": hi, "vals": []} for lo, hi in
+                  ((0.0, 20.0), (20.0, 40.0), (40.0, 60.0), (60.0, float("inf")))],
         "corr_slack": [],
         "corr_absmag": [],
     }
@@ -416,7 +423,11 @@ def score_trace(tr, bins):
         if not w["push_us"]:
             # No horizon was computed this weave, so `scanout` is just `now`
             # and there is no photon instant to score against. Not an error --
-            # it is what a weave before the horizon feed comes up looks like.
+            # it is the pre-engagement first weave (seq=1: push_us=0, and on
+            # the target arm resolved_us = the weaver's default one frame).
+            # Filter on push_us, NOT on `pushed`: on the legacy arm pushed=0 is
+            # routine (the deadband suppressed the setLatency call while
+            # push_us is a real horizon) and those rows are valid.
             res["drop_no_horizon"] += 1
             continue
         if in_any_span(t_us, spans):
@@ -468,6 +479,11 @@ def score_trace(tr, bins):
             if b["lo"] <= v < b["hi"]:
                 b["vals"].append(mag)
                 break
+        h_ms = w["push_us"] / 1000.0
+        for b in res["hbins"]:
+            if b["lo"] <= h_ms < b["hi"]:
+                b["vals"].append(mag)
+                break
 
         # Target arm only: does the error track how far the weaver's resolved
         # horizon drifted from the one we asked for?
@@ -502,7 +518,7 @@ def print_trace_report(res):
         print(
             "  %-24s %.0f us (%.1f Hz), bracket tolerance %.0f us"
             % (
-                "tracker period (est)",
+                "reference period (est)",
                 res["period_us"],
                 1e6 / res["period_us"],
                 2.0 * res["period_us"],
@@ -565,6 +581,20 @@ def print_trace_report(res):
         hi = "inf" if b["hi"] == float("inf") else "%.0f" % b["hi"]
         st = stats(b["vals"])
         label = "%.0f-%s" % (b["lo"], hi)
+        if st is None:
+            print("    %-22s (no samples)" % label)
+        else:
+            print(
+                "    %-22s n=%-6d rms|error|=%8.3f  mean=%8.3f"
+                % (label, st["n"], st["rms"], st["mean"])
+            )
+
+    print("  Horizon bins (push_us, ms; expected advance on this profile = horizon + 4.36 ms, "
+          "a load-dependent 21-64 ms range):")
+    for b in res["hbins"]:
+        hi = "inf" if b["hi"] == float("inf") else "%.0f" % b["hi"]
+        st = stats(b["vals"])
+        label = "%.0f-%s ms" % (b["lo"], hi)
         if st is None:
             print("    %-22s (no samples)" % label)
         else:
