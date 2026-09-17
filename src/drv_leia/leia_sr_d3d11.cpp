@@ -10,6 +10,7 @@
 #include "leia_sr_d3d11.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_liveness.h"
+#include "leia_sr_predict_trace.h"
 #include "leia_sr_v2_common.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -166,6 +167,33 @@ struct leiasr_d3d11
 	uint64_t target_pending_us = 0;         //!< the absolute target we set
 	uint64_t target_pending_horizon_us = 0; //!< the horizon it was built from
 	struct leia_sr_v2_warn_latches target_warn = {}; //!< per-weaver one-shot WARN latches
+
+	// --- Per-weave eye-prediction recorder (DXR_LEIA_SR_PREDICT_TRACE) ----
+	// PURELY OBSERVATIONAL. Everything below is written by the weave thread
+	// and read by the weave thread; NOTHING in the weave path branches on any
+	// of it, so a build with the recorder off behaves identically. See
+	// leia_sr_predict_trace.h.
+#ifdef DXR_LEIA_HAS_SR_V2
+	struct leia_sr_predict_trace *trace = nullptr; //!< NULL unless the opt-in is set
+#endif
+	//! Horizon the converged push block computed THIS weave, BEFORE the
+	//! deadband could suppress the push. Reset to 0 by the recorder each
+	//! weave, so a weave that computed nothing records a 0 rather than the
+	//! previous weave's value.
+	uint64_t trace_push_us = 0;
+	//! Did a set_latency/set_target actually happen this weave? Set beside
+	//! each existing `last_set_latency_us = push_us` store, cleared by the
+	//! recorder after it reads it.
+	bool trace_pushed = false;
+	//! Legacy arm only: `srGetTimeUs` sampled ONCE immediately before the
+	//! weave. The target arm never uses this -- it derives its "now" from the
+	//! target the push already built, so the record describes the real push
+	//! rather than a second, later clock read.
+	uint64_t trace_now_us = 0;
+	bool trace_now_valid = false;
+	uint64_t trace_seq = 0;                          //!< weave counter for the record
+	struct leia_sr_v2_warn_latches trace_warn = {};  //!< own latches: the recorder must never
+	                                                 //!< consume target mode's one-shot WARNs
 
 	// --- #144 async weaver creation/destruction --------------------------
 	// SR context + weaver creation blocks for seconds (SR-service retry
@@ -424,7 +452,52 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 		return false;
 	}
 
+	/*
+	 * Per-weave eye-prediction recorder, if DXR_LEIA_SR_PREDICT_TRACE is set.
+	 *
+	 * HERE, and nowhere else, because the recorder owns two SENSES (an eye
+	 * tracker and a system monitor) and the SDK requires senses AND their
+	 * callbacks to exist before srInitialize starts them
+	 * (sr_eye_tracker.h:179 and :258; the Linux arm obeys the same rule at
+	 * drv_leia_linux/leia_sr_linux_sdk.c:256-276). Between the weaver create
+	 * above and the initialize below is the only window that satisfies both
+	 * that rule and "the weaver exists, so its identity can go in the header".
+	 *
+	 * A NULL result is the normal, uninstrumented case and needs no handling:
+	 * every entry point below NULL-checks, exactly as it does for the lens.
+	 */
+	if (leia_sr_predict_trace_enabled()) {
+		struct leia_sr_predict_trace_open_info ti = {};
+		// The arm is REPORTED, never chosen: both are the shipping paths and
+		// DXR_LEIA_SR_TARGET_TIME picks between them as it always did.
+		ti.arm = leia_sr_target_time_opt_in() ? "target" : "legacy";
+		ti.weaver_arm = "d3d11";
+#ifdef DXR_PLUGIN_GIT_DESC
+		ti.plugin_version = DXR_PLUGIN_GIT_DESC;
+#else
+		ti.plugin_version = "unknown";
+#endif
+#ifdef DXR_LEIA_SR_V2_SDK_PIN
+		ti.sdk_pin = DXR_LEIA_SR_V2_SDK_PIN;
+#else
+		ti.sdk_pin = "unknown";
+#endif
+		ti.api_reason = leia_sr_api_reason();
+		ti.hwnd = hwnd;
+		ti.weaver = sr.weaver_v2;
+		ti.display_pixel_width = info.pixel_width;
+		ti.display_pixel_height = info.pixel_height;
+		ti.display_screen_left = info.screen_left;
+		ti.display_screen_top = info.screen_top;
+		ti.display_width_m = info.width_m;
+		ti.display_height_m = info.height_m;
+		sr.trace = leia_sr_predict_trace_create(sr.instance_v2, &ti);
+	}
+
 	if (!leia_sr_v2_initialize(sr.instance_v2)) {
+		// The recorder's senses belong to this instance — take them down
+		// before it, never after.
+		leia_sr_predict_trace_destroy(&sr.trace);
 		srDestroyWeaver(sr.weaver_v2);
 		sr.weaver_v2 = nullptr;
 		srDestroyInstance(sr.instance_v2);
@@ -743,6 +816,168 @@ w_get_predicted_eyes(leiasr_d3d11 *sr, float left_mm[3], float right_mm[3])
 		return false;
 	}
 	return true;
+}
+
+/* --- per-weave eye-prediction recorder ------------------------------- *
+ *
+ * PURELY OBSERVATIONAL, and the two functions below are the whole of this
+ * arm's share of it. Neither adds, moves or removes a srWeaverSetTargetTime /
+ * srWeaverSetLatency call; neither changes what the converged push block
+ * decides; neither is reachable at all unless DXR_LEIA_SR_PREDICT_TRACE is
+ * set. The arm under test is whichever SHIPPING path DXR_LEIA_SR_TARGET_TIME
+ * selected, exactly as it would have been without this.
+ *
+ * Everything expensive (formatting, I/O) happens on the recorder's own writer
+ * thread; what runs here is a fixed-size struct push into a lock-free ring,
+ * plus the SDK reads the record is FOR.
+ * --------------------------------------------------------------------- */
+
+/*!
+ * Legacy arm: sample the clock ONCE, immediately before the weave.
+ *
+ * Called from leiasr_d3d11_weave just ahead of w_weave. Does nothing on the
+ * target arm and nothing at all when the recorder is off.
+ */
+void
+w_trace_pre_weave(leiasr_d3d11 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	sr->trace_now_valid = false;
+	if (sr->trace == nullptr || sr->instance_v2 == nullptr) {
+		return;
+	}
+	/*
+	 * TARGET ARM: deliberately no clock read.
+	 *
+	 * Its "now" is DERIVED in w_trace_record as target - horizon, which is
+	 * the instant the push actually used. Reading the clock again here would
+	 * produce a different, later instant, and the recorded horizon would then
+	 * describe a push nobody made. The derivation touches nothing; a second
+	 * read would be a second measurement of a thing already measured.
+	 */
+	if (sr->target_state == (int)LEIA_SR_TARGET_AVAILABLE) {
+		return;
+	}
+	/*
+	 * LEGACY ARM: setLatency carries a duration, so no instant exists
+	 * anywhere for the record to derive. One read, here, and only when the
+	 * recorder is running. Its own warn latches, so a failure here can never
+	 * consume target mode's one-shot WARN and make that diagnostic lie.
+	 */
+	uint64_t now_us = 0;
+	if (leia_sr_v2_now_us(sr->instance_v2, &now_us, "D3D11 trace", &sr->trace_warn)) {
+		sr->trace_now_us = now_us;
+		sr->trace_now_valid = true;
+	}
+#else
+	(void)sr;
+#endif
+}
+
+/*!
+ * Build and push this weave's record. Called immediately after the weave
+ * returns, on EVERY weave and on BOTH arms.
+ *
+ * MUST run BEFORE w_log_target_acceptance, which consumes `target_pending`.
+ * That flag is this record's exact answer to "did a target actually land this
+ * weave?" — it is set only by a srWeaverSetTargetTime that returned success,
+ * alongside the target and horizon it was built from, so reading it here is
+ * what keeps `now_us` from being derived out of a stale pair.
+ *
+ * The SDK reads below (latency readback, clock, predicted eyes) are what the
+ * record is for; they are also the reason an instrumented run is not
+ * comparable to an uninstrumented baseline, which the file says in its header.
+ */
+void
+w_trace_record(leiasr_d3d11 *sr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (sr->trace == nullptr || sr->weaver_v2 == nullptr) {
+		return;
+	}
+
+	// Consume the push block's two pure stores and clear them: a weave that
+	// computed no horizon must record 0, not the previous weave's value.
+	const uint64_t push_us = sr->trace_push_us;
+	const bool pushed_latency = sr->trace_pushed;
+	sr->trace_push_us = 0;
+	sr->trace_pushed = false;
+
+	const bool target_arm = sr->target_state == (int)LEIA_SR_TARGET_AVAILABLE;
+	const bool now_valid = sr->trace_now_valid;
+	sr->trace_now_valid = false;
+
+	struct leia_sr_predict_trace_weave w = {};
+	w.seq = ++sr->trace_seq;
+	w.push_us = push_us;
+	w.last_set_latency_us = sr->last_set_latency_us;
+
+	if (target_arm) {
+		if (!sr->target_pending) {
+			// No target landed this weave, so there is no instant the
+			// push used and nothing to derive a "now" from. The only way
+			// this happens is a failed srGetTimeUs inside the push (or a
+			// weave that computed no horizon at all); either way the row
+			// would be a guess. Count it instead.
+			leia_sr_predict_trace_skip_weave(sr->trace, LEIA_SR_PREDICT_TRACE_SKIP_NO_CLOCK);
+			return;
+		}
+		w.pushed = 1;
+		w.target_us = sr->target_pending_us;
+		w.horizon_us = sr->target_pending_horizon_us;
+		w.now_us = sr->target_pending_us - sr->target_pending_horizon_us;
+	} else {
+		if (!now_valid) {
+			leia_sr_predict_trace_skip_weave(sr->trace, LEIA_SR_PREDICT_TRACE_SKIP_NO_CLOCK);
+			return;
+		}
+		w.pushed = pushed_latency ? 1u : 0u;
+		w.target_us = 0;
+		w.horizon_us = push_us;
+		w.now_us = sr->trace_now_us;
+	}
+
+	// ONE definition of the evaluation instant, identical on both arms — the
+	// whole point of the comparison is that the two arms are scored against
+	// the same question.
+	w.scanout_us = w.now_us + push_us;
+
+	// Record only, exactly as the acceptance log says: srWeaverGetLatency
+	// reports the horizon the weave RESOLVED to, and feeding it back into any
+	// computation would close a loop between our prediction and the SDK's
+	// rounding of it.
+	uint64_t resolved_us = 0;
+	if (SR_SUCCEEDED(srWeaverGetLatency(sr->weaver_v2, &resolved_us))) {
+		w.resolved_us = resolved_us;
+	}
+
+	// The getter below runs a FRESH prediction against its own clock read, so
+	// the scorer has to know when that was. Sampled immediately before it.
+	uint64_t read_now_us = 0;
+	if (leia_sr_v2_now_us(sr->instance_v2, &read_now_us, "D3D11 trace", &sr->trace_warn)) {
+		w.read_now_us = read_now_us;
+	}
+
+	float l[3] = {0.0f, 0.0f, 0.0f};
+	float r[3] = {0.0f, 0.0f, 0.0f};
+	if (!w_get_predicted_eyes(sr, l, r)) {
+		leia_sr_predict_trace_skip_weave(sr->trace, LEIA_SR_PREDICT_TRACE_SKIP_NO_EYES);
+		return;
+	}
+	for (int i = 0; i < 3; i++) {
+		w.pl[i] = (double)l[i];
+		w.pr[i] = (double)r[i];
+	}
+	// The getter swaps left/right when left.x > right.x; the raw tracker rows
+	// do not. Recording the flag rather than undoing it keeps the file a
+	// record of what the SDK said, and lets the scorer report per-eye numbers
+	// separately for the two populations.
+	w.swap_flag = w.pl[0] > w.pr[0] ? 1u : 0u;
+
+	leia_sr_predict_trace_on_weave(sr->trace, &w);
+#else
+	(void)sr;
+#endif
 }
 
 /*!
@@ -1197,6 +1432,21 @@ destroy_sdk_objects(leiasr_d3d11 *sr)
 	sr->target_logged = false;
 	sr->target_pending_us = 0;
 	sr->target_pending_horizon_us = 0;
+
+#ifdef DXR_LEIA_HAS_SR_V2
+	// The recorder FIRST: it holds senses on instance_v2 and a file, and its
+	// destroy removes the SDK callbacks before destroying the senses (which
+	// must themselves go before the instance). Doing it here also gives the
+	// #158 in-place reconnect the behaviour the recorder wants for free — the
+	// old file is closed with its trailer and the rebuilt weaver opens a new
+	// one, instead of one file silently spanning two different weavers.
+	leia_sr_predict_trace_destroy(&sr->trace);
+	sr->trace_push_us = 0;
+	sr->trace_pushed = false;
+	sr->trace_now_valid = false;
+	sr->trace_seq = 0;
+	sr->trace_warn = {};
+#endif
 
 	// #625: tear down the phase-snap probe (weaver restores the probe window's
 	// WndProc) before the SRContext goes away.
@@ -1864,6 +2114,11 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 		// it anyway) -- whatever horizon the fallback above computed is simply
 		// expressed as now+horizon instead.
 		if (have_push) {
+			// OBSERVATIONAL RECORDER, pure store, no control flow: the
+			// horizon THIS weave computed, captured BEFORE the deadband
+			// below can decide not to push it. Nothing in the weave path
+			// reads this field.
+			leiasr->trace_push_us = push_us;
 			/*
 			 * DELIBERATE ASYMMETRY -- do not "make this consistent". The
 			 * target branch pushes EVERY weave; only the setLatency branch
@@ -1878,12 +2133,18 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 			if (w_target_time_available(leiasr)) {
 				w_push_target_time(leiasr, push_us);
 				leiasr->last_set_latency_us = push_us;
+				leiasr->trace_pushed = true; // observational, pure store
 			} else if (!deadband_applies || deadband_pass) {
 				w_set_latency(leiasr, push_us);
 				leiasr->last_set_latency_us = push_us;
+				leiasr->trace_pushed = true; // observational, pure store
 			}
 		}
 	}
+
+	// Observational recorder: the legacy arm's one clock read, immediately
+	// before the weave. No-op when the recorder is off or on the target arm.
+	w_trace_pre_weave(leiasr);
 
 	// The weaver writes to the currently bound render target.
 	// Make sure OMSetRenderTargets and RSSetViewports have been called.
@@ -1894,6 +2155,11 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
 	}
+
+	// Observational recorder: one row per weave, on BOTH arms. Runs BEFORE
+	// the acceptance log because that log consumes `target_pending`, which is
+	// this record's exact "did a target land this weave?".
+	w_trace_record(leiasr);
 
 	// Read the acceptance back AFTER the weave: the target resolves to a
 	// horizon inside srWeaverWeave, so this reports what THIS weave predicted

@@ -16,6 +16,7 @@
 #include <sr/sr_version.h>
 #include <sr/sr_weaver.h>
 
+#include <atomic>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -137,7 +138,29 @@ qpc_since_boot_us(uint64_t *out_us)
 	return true;
 }
 
+/*!
+ * The last delta the gate computed, for @ref leia_sr_v2_clock_gate_last_delta.
+ *
+ * Two atomics rather than a sentinel value: 0 us is a perfectly possible --
+ * indeed the ideal -- delta, so "never ran" has to be its own bit. Written on
+ * the weave thread (the gate runs inside the first weave's
+ * w_target_time_available), read on a diagnostic thread; relaxed is enough for
+ * a value that is only ever printed.
+ */
+std::atomic<int64_t> g_clock_gate_delta_us{0};
+std::atomic<bool> g_clock_gate_ran{false};
+
 } // namespace
+
+bool
+leia_sr_v2_clock_gate_last_delta(int64_t *out_delta_us)
+{
+	if (out_delta_us == nullptr || !g_clock_gate_ran.load(std::memory_order_acquire)) {
+		return false;
+	}
+	*out_delta_us = g_clock_gate_delta_us.load(std::memory_order_relaxed);
+	return true;
+}
 
 bool
 leia_sr_v2_clock_gate(SrInstance instance, const char *arm)
@@ -163,6 +186,13 @@ leia_sr_v2_clock_gate(SrInstance instance, const char *arm)
 	// verification. The delta IS the measurement.
 	const int64_t delta_us = (int64_t)sr_us - (int64_t)our_us;
 	const int64_t mag_us = delta_us < 0 ? -delta_us : delta_us;
+
+	// Publish it for leia_sr_v2_clock_gate_last_delta. Recorded here, at the
+	// one place it is measured, and deliberately NOT on the two early-return
+	// paths above: if either clock could not be read there is no delta, and a
+	// diagnostic must be able to tell that apart from a delta of zero.
+	g_clock_gate_delta_us.store(delta_us, std::memory_order_relaxed);
+	g_clock_gate_ran.store(true, std::memory_order_release);
 
 	if (mag_us > 250000) {
 		U_LOG_W("Leia %s target time: srGetTimeUs is NOT our clock - sr %llu us vs our "
