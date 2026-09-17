@@ -70,7 +70,33 @@ CAVEATS = [
     "OTHER and NOT to an uninstrumented baseline.",
     "T rows are DIAGNOSTIC ONLY: the tracker callback stream is an echo of predict() calls, "
     "not measurements. Nothing here scores against them.",
+    "The look-around chain (the getter AND the reference) carries a PER-CALL exponential decay "
+    "filter (alpha 0.1/0.1/0.05 on AL, no dt term): each call moves the output ~10% toward the "
+    "request, time constant ~10 CALLS. Absolute errors below are dominated by that filter's lag, "
+    "not by prediction quality; the arm comparison survives because both arms make the same "
+    "calls. Instrumenting CHANGES the lag (three extra calls per weave -> ~2 weaves of lag "
+    "instead of ~5 uninstrumented), so absolute numbers do not describe an uninstrumented app. "
+    "The filter is on the look-around path only: the WEAVE gets the unsmoothed forward "
+    "prediction, the app camera does not. Nothing here measures the weave.",
+    "The two runs differ in SPEED MIX as well as horizon. Pooled and single-axis bins are "
+    "confounded; read only the JOINT (horizon x speed) cells, cell by cell, and refuse thin cells.",
 ]
+
+SPEED_EDGES = (0.0, 25.0, 75.0, 200.0, float("inf"))
+HORIZON_EDGES_MS = (0.0, 20.0, 40.0, 60.0, float("inf"))
+CELL_FLOOR_N = 50  # a joint cell below this in EITHER arm is printed but not read
+
+
+def _bin_index(edges, v):
+    for k in range(len(edges) - 1):
+        if edges[k] <= v < edges[k + 1]:
+            return k
+    return None
+
+
+def _edge_label(edges, k, unit=""):
+    hi = "inf" if edges[k + 1] == float("inf") else "%.0f" % edges[k + 1]
+    return "%.0f-%s%s" % (edges[k], hi, unit)
 
 DEFAULT_SPEED_BINS = (0.0, 25.0, 75.0, 200.0, float("inf"))
 
@@ -410,6 +436,10 @@ def score_trace(tr, bins):
         # would blur exactly the thing being measured.
         "hbins": [{"lo": lo, "hi": hi, "vals": []} for lo, hi in
                   ((0.0, 20.0), (20.0, 40.0), (40.0, 60.0), (60.0, float("inf")))],
+        # JOINT (horizon bin, speed bin) -> |error| values. The two runs differ
+        # in speed mix as well as horizon, and error scales with both, so only
+        # a cell-by-cell comparison is defensible.
+        "cells": {},
         "corr_slack": [],
         "corr_absmag": [],
     }
@@ -484,6 +514,10 @@ def score_trace(tr, bins):
             if b["lo"] <= h_ms < b["hi"]:
                 b["vals"].append(mag)
                 break
+        hk = _bin_index(HORIZON_EDGES_MS, h_ms)
+        sk = _bin_index(SPEED_EDGES, v)
+        if hk is not None and sk is not None:
+            res["cells"].setdefault((hk, sk), []).append(mag)
 
         # Target arm only: does the error track how far the weaver's resolved
         # horizon drifted from the one we asked for?
@@ -701,12 +735,64 @@ def print_arm_comparison(results):
         print(line)
     if weighted_den > 0:
         print("")
-        print("  HEADLINE: common-weighted rms delta (%s minus %s) over non-sparse bins = %+.3f mm"
-              % (arms[1], arms[0], weighted_num / weighted_den))
-        print("  (weights = the smaller per-bin n of the two arms; negative favours %s)" % arms[1])
+        print("  Horizon-only headline (SPEED-CONFOUNDED, superseded by the joint cells below): "
+              "%s minus %s = %+.3f mm" % (arms[1], arms[0], weighted_num / weighted_den))
     else:
         print("")
-        print("  HEADLINE: no non-sparse bin shared by both arms -- no headline can be read.")
+        print("  Horizon-only headline: no non-sparse bin shared by both arms.")
+
+    # JOINT (horizon x speed) cells, cell by cell. This is the comparison.
+    per_arm_cells = {}
+    for arm, group in by_arm.items():
+        merged = {}
+        for res in group:
+            for key, vals in res["cells"].items():
+                merged.setdefault(key, []).extend(vals)
+        per_arm_cells[arm] = merged
+    print("")
+    print("  JOINT CELLS (horizon ms x head speed mm/s): midpoint |error| rms / sd per arm; "
+          "a cell with n < %d in EITHER arm is THIN and not read" % CELL_FLOOR_N)
+    hdr = "    %-10s %-12s" % ("horizon", "speed")
+    for arm in arms:
+        hdr += " | %-8s %6s %8s %8s" % (arm, "n", "rms", "sd")
+    hdr += " | rms delta (2nd - 1st)"
+    print(hdr)
+    jnum = 0.0
+    jden = 0.0
+    readable = 0
+    for hk in range(len(HORIZON_EDGES_MS) - 1):
+        for sk in range(len(SPEED_EDGES) - 1):
+            key = (hk, sk)
+            sts = [stats(per_arm_cells[arm].get(key, [])) for arm in arms]
+            if all(st is None for st in sts):
+                continue
+            line = "    %-10s %-12s" % (_edge_label(HORIZON_EDGES_MS, hk, " ms"), _edge_label(SPEED_EDGES, sk))
+            for st in sts:
+                if st is None:
+                    line += " | %-8s %6s %8s %8s" % ("", "0", "-", "-")
+                else:
+                    line += " | %-8s %6d %8.3f %8.3f" % ("", st["n"], st["rms"], st["std"])
+            thin = any(st is None or st["n"] < CELL_FLOOR_N for st in sts)
+            if len(sts) >= 2 and sts[0] is not None and sts[1] is not None:
+                d = sts[1]["rms"] - sts[0]["rms"]
+                line += " | %+8.3f%s" % (d, "  THIN - not read" if thin else "")
+                if not thin:
+                    wgt = float(min(sts[0]["n"], sts[1]["n"]))
+                    jnum += d * wgt
+                    jden += wgt
+                    readable += 1
+            else:
+                line += " | (one arm empty)%s" % ("  THIN" if thin else "")
+            print(line)
+    print("")
+    if jden > 0:
+        print("  JOINT HEADLINE over %d readable cell(s): common-weighted rms delta (%s minus %s) = %+.3f mm"
+              % (readable, arms[1], arms[0], jnum / jden))
+        print("  (weights = the smaller per-cell n; negative favours %s). Read the cells, not just this line."
+              % arms[1])
+    else:
+        print("  JOINT HEADLINE: no cell readable in both arms -- freehand motion did not cover a common "
+              "(horizon, speed) region; a controlled-motion protocol is needed before any verdict.")
     print("")
     print("  Compare SPREAD and RMS. See the caveats printed above; in particular the")
     print("  legacy arm's mean is expected to be offset and is not by itself a verdict.")
