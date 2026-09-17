@@ -85,6 +85,7 @@ CAVEATS = [
 SPEED_EDGES = (0.0, 25.0, 75.0, 200.0, float("inf"))
 HORIZON_EDGES_MS = (0.0, 20.0, 40.0, 60.0, float("inf"))
 CELL_FLOOR_N = 50  # a joint cell below this in EITHER arm is printed but not read
+REF_STARTUP_DROP = 10  # reference rows dropped after the chain's first non-default output
 
 
 def _bin_index(edges, v):
@@ -114,6 +115,7 @@ class Trace(object):
         self.meta = OrderedDict()
         self.trailer = ""
         self.t_untimed = 0  # T rows with timeUs == 0: untracked default pairs, no capture time
+        self.ref_startup_dropped = 0  # reference rows dropped for the Animator start-up transient
         self.s_mapped = 0  # S rows whose timestamp was mapped through the header clock pair
         self.t_rows = []  # (time_us, lx,ly,lz, rx,ry,rz)
         self.s_rows = []  # (time_us, event_type)
@@ -398,6 +400,28 @@ def reference_rows(tr):
             continue
         rows.append((int(w["ref_now_us"] + off),) + tuple(w["rl"]) + tuple(w["rr"]))
     rows.sort(key=lambda r: r[0])
+    # Start-up transient (format 3, separate reference chain): the Animator is
+    # process-static with a shared dt-accumulating previousTime, so the
+    # reference chain's FIRST animate() after its history fills can see a huge
+    # deltaT and slam the blend toward the 2D default (0, 100, 600 mm) for a
+    # call or two. Drop everything up to the chain's first non-default output
+    # and the REF_STARTUP_DROP rows after it; push_us == 0 does not catch this.
+    dflt = (0.0, 100.0, 600.0)
+    first = None
+    for i, r in enumerate(rows):
+        mid = ((r[1] + r[4]) / 2, (r[2] + r[5]) / 2, (r[3] + r[6]) / 2)
+        if max(abs(mid[k] - dflt[k]) for k in range(3)) > 1.0:
+            first = i
+            break
+    dropped = 0
+    if first is None:
+        dropped = len(rows)
+        rows = []
+    else:
+        cut = first + REF_STARTUP_DROP
+        dropped = min(cut, len(rows))
+        rows = rows[cut:]
+    tr.ref_startup_dropped = dropped
     return rows, off
 
 
@@ -560,6 +584,11 @@ def print_trace_report(res):
         )
     print("  %-24s %d samples, anchored at ref_now_us %+.0f us (T rows: %d, diagnostic only)"
           % ("reference series", res["ref_rows"], res["ref_offset_us"], len(tr.t_rows)))
+    if tr.ref_startup_dropped:
+        print("  %-24s %d (up to the chain's first non-default output + %d rows; Animator start-up transient)"
+              % ("reference rows dropped", tr.ref_startup_dropped, REF_STARTUP_DROP))
+    if tr.meta.get("reference_instance", "").startswith("separate") is False and tr.meta.get("format", "") in ("dxr-leia-predict-trace-1", "dxr-leia-predict-trace-2"):
+        print("  %-24s %s" % ("REFERENCE CONTAMINATED", "format<3: reference was taken on the WEAVER's chain and is ~90% the getter's output on the target arm; magnitudes invalid, sign robust"))
     if tr.trailer:
         print("  %-24s %s" % ("recorder trailer", tr.trailer))
     else:
