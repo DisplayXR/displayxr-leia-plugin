@@ -967,7 +967,17 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	 * encode is hardcoded here. The fully-general negotiated path (runtime
 	 * declaring the encoding per-frame via set_atlas_encoding, like the D3D11
 	 * service) is the ADR-021 follow-up. */
-	srWeaverSetShaderSRGBConversion(lnx->weaver, SR_FALSE, SR_TRUE);
+	/* CONFIRMED on-panel (Linux/Intel iGPU DS1, 2026-09-17): the atlas on THIS
+	 * path is already sRGB-ENCODED, NOT the linear the comment above assumes, so
+	 * the (FALSE,TRUE) encode double-encoded → cube+avatar both washed-out/pale.
+	 * Passthrough (FALSE,FALSE) — hand the already-encoded atlas straight to the
+	 * UNORM present surface — reads correct by eye. NOTE this contradicts the
+	 * hardcoded "atlas is linear" assumption; the encoding clearly differs by
+	 * build/config, so the real fix is the ADR-021 negotiated per-frame atlas
+	 * encoding (runtime declares it via set_atlas_encoding) rather than either
+	 * side guessing. This flip is correct for this box; would regress a config
+	 * whose atlas really is linear. */
+	srWeaverSetShaderSRGBConversion(lnx->weaver, SR_FALSE, SR_FALSE);
 
 	U_LOG_I("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d)",
 	        (unsigned long)(uintptr_t)info->x11_window,
