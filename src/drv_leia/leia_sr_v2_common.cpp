@@ -68,6 +68,30 @@ leia_sr_target_time_opt_in(void)
 	return cached == 1;
 }
 
+uint64_t
+leia_sr_target_horizon_override_us(void)
+{
+	// Read once, cached. DIAGNOSTIC knob for the predict-trace experiment; see
+	// the header. Parsed with strtoull so a trailing space from `set X=v &&`
+	// in cmd.exe (the DXR_LEIA_SR_API trap) cannot silently zero it.
+	static long long cached = -1;
+	if (cached < 0) {
+		const char *v = getenv("DXR_LEIA_SR_TARGET_HORIZON_OVERRIDE_US");
+		unsigned long long us = 0;
+		if (v != nullptr && v[0] != '\0') {
+			us = strtoull(v, nullptr, 10);
+		}
+		cached = (long long)us;
+		if (us != 0) {
+			U_LOG_W("Leia SR: DXR_LEIA_SR_TARGET_HORIZON_OVERRIDE_US=%llu - DIAGNOSTIC: the target "
+			        "branch will push now + %llu us instead of the computed horizon (clamped to "
+			        "%d us). Not a shipping configuration.",
+			        us, us, (int)LEIA_SR_TARGET_MAX_HORIZON_US);
+		}
+	}
+	return (uint64_t)cached;
+}
+
 bool
 leia_sr_v2_target_time_probe_ok(SrResult r, const char *arm, struct leia_sr_v2_warn_latches *w)
 {

@@ -2131,8 +2131,14 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 			 * confirmed load-bearing by the SDK author on PR #245.
 			 */
 			if (w_target_time_available(leiasr)) {
-				w_push_target_time(leiasr, push_us);
-				leiasr->last_set_latency_us = push_us;
+				// DIAGNOSTIC override (leia_sr_target_horizon_override_us):
+				// 0 = unset = push exactly what was computed. Recorded as
+				// push_us in the trace so the file says what was ASKED.
+				const uint64_t ovr_us = leia_sr_target_horizon_override_us();
+				const uint64_t tgt_push_us = ovr_us != 0 ? ovr_us : push_us;
+				w_push_target_time(leiasr, tgt_push_us);
+				leiasr->last_set_latency_us = tgt_push_us;
+				leiasr->trace_push_us = tgt_push_us;
 				leiasr->trace_pushed = true; // observational, pure store
 			} else if (!deadband_applies || deadband_pass) {
 				w_set_latency(leiasr, push_us);
