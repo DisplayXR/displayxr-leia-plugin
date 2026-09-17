@@ -40,13 +40,28 @@
  *
  * ## Lifecycle
  *
+ * The recorder owns its OWN `SrInstance`, and the eye tracker and system
+ * monitor are created on THAT, never on the weaver's. This is not tidiness: the
+ * SDK's eye tracker is a `PredictingEyeTracker` per `SRContext` (one per
+ * instance) whose post-stages -- speed limiter, exponential decay, noise
+ * rejection -- are stateful PER CALL, so a reference predict issued on the
+ * weaver's instance microseconds after the weaver's own getter simply returns
+ * most of the weaver's answer back. A separate instance is a separate context,
+ * a separate predictor chain, and a reference that never sees target mode. Only
+ * `srGetTimeUs` still goes to the weaver's instance, so the clock domain and
+ * the file's clock pair are unchanged (the clock is machine-wide
+ * QPC-since-boot; the instance is a validity argument, `sr_instance.h:514-553`).
+ *
  * The eye tracker and the system monitor are SENSES: the SDK requires them,
  * and their callbacks, to exist BEFORE `srInitialize` runs on the owning
  * instance (`sr_eye_tracker.h:179,258`; the system monitor is created the same
- * way in the Linux arm, `drv_leia_linux/leia_sr_linux_sdk.c:256-276`). So
- * @ref leia_sr_predict_trace_create is called from inside the arm's creation
- * sequence, between the weaver create and `leia_sr_v2_initialize`, and
- * @ref leia_sr_predict_trace_destroy runs before the instance is destroyed.
+ * way in the Linux arm, `drv_leia_linux/leia_sr_linux_sdk.c:256-276`). The
+ * recorder owns both sides of that rule for its own instance and runs
+ * `leia_sr_v2_initialize` on it itself. @ref leia_sr_predict_trace_create is
+ * still called from inside the arm's creation sequence, between the weaver
+ * create and the arm's own `leia_sr_v2_initialize`, and
+ * @ref leia_sr_predict_trace_destroy runs before the arm's instance is
+ * destroyed.
  *
  * Both are therefore tied to the WEAVER'S life, which on the D3D11 arm means
  * they ride the #144 async create/destroy CAS and the #158 in-place reconnect
@@ -143,10 +158,16 @@ struct leia_sr_predict_trace_weave
 	 * / predictAt, never on a raw measurement), so on the target arm every
 	 * T row is a prediction FOR THE TARGET INSTANT and scoring against it
 	 * would be circular. The reference is therefore built explicitly:
-	 * `srEyeTrackerPredict(tracker, 0, ...)` on the recorder's OWN tracker
-	 * handle, which resolves to the filter's low-lag estimate for
+	 * `srEyeTrackerPredict(tracker, 0, ...)` on the recorder's OWN tracker,
+	 * living on the recorder's OWN instance (so its predictor state is a
+	 * different chain from the weaver's, see the file header), which resolves
+	 * to the filter's low-lag estimate for
 	 * `now + min(1/120 s, maxPredictionScene_s)` (-4.36 ms on this profile)
 	 * -- the identical expression in both arms, untouched by target mode.
+	 * That chain is called ONCE per weave against the weaver's ~4, so its
+	 * per-call filter lag is the same in CALLS and ~4x in SECONDS: the
+	 * reference reads smoother and later than the getter by construction,
+	 * equally in both arms.
 	 * `enablePrediction` on the create info is IGNORED by SDK 1584 (the
 	 * handle is always a predicting tracker), so there is no raw sample to
 	 * be had from it: the reference is filtered and lagged, by design.
@@ -167,26 +188,32 @@ bool
 leia_sr_predict_trace_enabled(void);
 
 /*!
- * Create the recorder: senses + callbacks + file + writer thread.
+ * Create the recorder: own instance + senses + callbacks + `srInitialize` on
+ * that instance + file + writer thread.
  *
- * MUST be called BEFORE `srInitialize` on @p instance (the SDK lifecycle rule
- * quoted in the file header). Returns NULL when tracing is off, when the
- * runtime is missing a function the recorder needs, or when the file could not
- * be opened -- in every case the caller simply carries a NULL and weaves
- * exactly as it would have.
+ * @param instance The WEAVER'S instance. Read ONLY for `srGetTimeUs`, so the
+ *                 recorder's timestamps stay in the arm's clock domain; no
+ *                 object is created on it. The recorder's senses go on an
+ *                 instance it creates for itself (see the file header).
+ *
+ * Returns NULL when tracing is off, when the runtime is missing a function the
+ * recorder needs, when its own instance could not be created or initialised, or
+ * when the file could not be opened -- in every case the caller simply carries
+ * a NULL and weaves exactly as it would have.
  */
 struct leia_sr_predict_trace *
 leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_trace_open_info *info);
 
 /*!
- * Remove the callbacks, destroy the senses, stop the writer, write the
- * trailer, close the file, free.
+ * Remove the callbacks, destroy the senses, destroy the recorder's own
+ * instance, stop the writer, write the trailer, close the file, free.
  *
- * MUST be called before `srDestroyInstance` on the owning instance, and the
- * senses are destroyed here rather than left to the instance so the ordering
- * is explicit. `*rec_ptr` is NULLed first, so a racing reader sees NULL rather
- * than a dying recorder -- the same discipline the arm already uses for its
- * other SDK objects.
+ * MUST be called before `srDestroyInstance` on the WEAVER'S instance, because
+ * the recorder keeps reading that instance's clock until it is torn down. The
+ * senses are destroyed explicitly rather than left to the recorder's own
+ * instance so the ordering is visible. `*rec_ptr` is NULLed first, so a racing
+ * reader sees NULL rather than a dying recorder -- the same discipline the arm
+ * already uses for its other SDK objects.
  */
 void
 leia_sr_predict_trace_destroy(struct leia_sr_predict_trace **rec_ptr);

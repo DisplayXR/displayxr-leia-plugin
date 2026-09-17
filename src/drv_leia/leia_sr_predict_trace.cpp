@@ -114,6 +114,15 @@ constexpr uint32_t RING_CAP_T = 2048;
 constexpr uint32_t RING_CAP_S = 256;
 constexpr uint32_t RING_CAP_W = 2048;
 
+/*
+ * Seconds the recorder's own srCreateInstance may spend waiting for the SR
+ * server. The arm's own instance already exists by the time we are called, so
+ * the server is demonstrably up and this budget only ever absorbs a transient
+ * refusal. Kept far below the arm's budget on purpose: the recorder is a
+ * diagnostic and must never be the reason weaver creation takes longer.
+ */
+constexpr double RECORDER_INSTANCE_MAX_WAIT_S = 2.0;
+
 /* ------------------------------------------------------------------ *
  * Env
  * ------------------------------------------------------------------ */
@@ -224,9 +233,15 @@ build_trace_path(const char *arm, char *out, size_t out_cap)
 
 struct leia_sr_predict_trace
 {
-	// SDK objects this recorder owns. Created before srInitialize, torn
-	// down before srDestroyInstance.
+	//! The WEAVER'S instance. Read ONLY for srGetTimeUs -- never a parent of
+	//! anything this recorder creates. Not owned; outlives the recorder.
 	SrInstance instance = nullptr;
+	//! The recorder's OWN instance, created and destroyed here. Parent of the
+	//! two senses below, so their predictor chain is a different chain from the
+	//! weaver's. See the long comment at the create site.
+	SrInstance own_instance = nullptr;
+	// SDK objects this recorder owns. Created before srInitialize on
+	// own_instance, torn down before srDestroyInstance on it.
 	SrEyeTracker tracker = nullptr;
 	SrSystemMonitor monitor = nullptr;
 
@@ -360,7 +375,7 @@ write_header(leia_sr_predict_trace *rec)
 	int64_t gate_delta_us = 0;
 	const bool gate_known = leia_sr_v2_clock_gate_last_delta(&gate_delta_us);
 
-	fprintf(rec->fp, "# format=dxr-leia-predict-trace-2\n");
+	fprintf(rec->fp, "# format=dxr-leia-predict-trace-3\n");
 	fprintf(rec->fp, "# arm=%s\n", rec->arm);
 	fprintf(rec->fp, "# weaver_arm=%s\n", rec->weaver_arm);
 	fprintf(rec->fp, "# plugin_version=%s\n", rec->plugin_version);
@@ -413,17 +428,30 @@ write_header(leia_sr_predict_trace *rec)
 	        "target_us,horizon_us,resolved_us,read_now_us,plx,ply,plz,prx,pry,prz,swap_flag,"
 	        "ref_now_us,rlx,rly,rlz,rrx,rry,rrz,ref_ok\n");
 	fprintf(rec->fp,
-	        "# reference=srEyeTrackerPredict(tracker,0) on the recorder's own tracker handle, per weave; "
-	        "ref_instant_us = ref_now_us + min(8333, max_prediction_scene_s*1e6); the filter's smoothed "
-	        "low-lag estimate, NOT a raw measurement (none exists in the C99 surface; enablePrediction is "
-	        "ignored by SDK 1584)\n");
+	        "# reference=srEyeTrackerPredict(tracker,0) per weave on a SEPARATE tracker/predictor chain -- "
+	        "the recorder's own SrInstance/SRContext -- so the predictor's per-call state never sees the "
+	        "weaver's target mode and the T rows are that chain's echo, not the weaver's; ref_instant_us = "
+	        "ref_now_us + min(8333, max_prediction_scene_s*1e6); the filter's smoothed low-lag estimate, "
+	        "NOT a raw measurement (none exists in the C99 surface; enablePrediction is ignored by SDK "
+	        "1584)\n");
+	fprintf(rec->fp, "# reference_instance=separate (own SrInstance/SRContext; reference chain never sees "
+	                 "target mode)\n");
+	fprintf(rec->fp,
+	        "# note_reference_cadence=the reference chain is called ONCE per weave (~60 calls/s) while the "
+	        "weaver's chain runs ~4 predicts per weave (~240 calls/s); the look-around predictor's "
+	        "post-stages (speed limiter, exponential decay alpha 0.1, noise-rejection deadband) are "
+	        "stateful PER CALL, so the reference carries the same lag in CALLS but ~4x the lag in SECONDS. "
+	        "Identical in both arms, so it cancels arm-vs-arm -- but it is why the reference looks SMOOTHER "
+	        "and LATER than the getter even when both are asked for the same instant\n");
 	fprintf(rec->fp,
 	        "# note_T=the tracker callback stream is an ECHO of predict() calls (updated only at the end "
 	        "of predict/predictAt), so T rows are DIAGNOSTIC ONLY and must not be used as ground truth; "
 	        "timeUs==0 means never-measured, and it stays STALE after a face is lost (use S)\n");
 	fprintf(rec->fp,
-	        "# note_observer=each weave gains three extra predictor calls (getter, clock, reference), one "
-	        "of which emits a T row; not comparable to an uninstrumented baseline\n");
+	        "# note_observer=each weave gains three extra calls: a getter and a clock read on the WEAVER'S "
+	        "chain, plus the reference on the recorder's own chain (which is what emits the T row). Since "
+	        "format 3 the reference no longer advances the weaver's predictor state; the getter still "
+	        "does, so this is still not comparable to an uninstrumented baseline\n");
 	rec->header_written = true;
 }
 
@@ -672,21 +700,66 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 	setvbuf(rec->fp, rec->buf, _IOFBF, sizeof(rec->buf));
 
 	/*
+	 * A SEPARATE SrInstance FOR THE REFERENCE, and it is the whole point.
+	 *
+	 * The eye tracker the SDK hands out is a PredictingEyeTracker created per
+	 * SRContext (one context per SrInstance), and the look-around predictor's
+	 * post-stages -- speed limiter, exponential decay, noise-rejection deadband
+	 * -- are stateful PER CALL. Sharing the weaver's instance therefore shares
+	 * that state: the reference predict, issued ~15 us after the weaver's own
+	 * getter call, came back as ~90% of the getter's output. A reference
+	 * contaminated by the thing under test measures nothing.
+	 *
+	 * Owning an instance gives the reference its own context, its own tracker
+	 * and its own predictor state, which never sees a srWeaverSetTargetTime.
+	 * sr_types.h:135 advises "exactly one instance per process"; the SDK owner
+	 * has confirmed a second one is legal and self-contained (own SRContext,
+	 * own senses, own UDP socket on an ephemeral port), and the only
+	 * process-static stage is the Animator's shared blend factor -- common
+	 * mode, not a position, so nothing to guard. Nothing else the plug-in does
+	 * is process-global: leia_sr_v2_create_instance is srCreateInstance and
+	 * nothing else (leia_sr_v2_common.cpp:288-326), and the arm already
+	 * creates and destroys a throwaway probe instance in the same process
+	 * (leia_sr_api_select.cpp:55-81).
+	 *
+	 * srGetTimeUs stays on the WEAVER'S instance (rec->instance) so the clock
+	 * domain and the header's clock pair are untouched by this change. That is
+	 * safe rather than merely convenient: the clock is machine-wide
+	 * QPC-since-boot and the instance is only a handle-validity argument
+	 * (sr_instance.h:514-553).
+	 */
+	if (!leia_sr_v2_create_instance(RECORDER_INSTANCE_MAX_WAIT_S, &rec->own_instance) ||
+	    rec->own_instance == nullptr) {
+		// leia_sr_v2_create_instance has already logged the SrResult.
+		U_LOG_W("Leia predict trace: could not create the recorder's own SR instance - the "
+		        "reference would share the weaver's predictor state, so the recorder is disabled "
+		        "for this weaver rather than writing an uninterpretable reference");
+		rec->own_instance = nullptr;
+		fclose(rec->fp);
+		rec->fp = nullptr;
+		remove(rec->path);
+		delete rec;
+		return nullptr;
+	}
+
+	/*
 	 * SENSES BEFORE srInitialize. The SDK states the rule twice --
 	 * sr_eye_tracker.h:179 ("must be created ... before srInitialize") and
 	 * :258 ("Callbacks must be registered before srInitialize") -- and the
 	 * Linux arm already obeys it (drv_leia_linux/leia_sr_linux_sdk.c:256-276).
-	 * The caller guarantees we are on that side of the call.
+	 * On the recorder's own instance we own both sides of that rule, so the
+	 * senses are created here and leia_sr_v2_initialize runs below.
 	 *
-	 * enablePrediction is SR_TRUE to match the Linux arm. It costs nothing
-	 * here: this tracker's PREDICTION is never read. Only its raw-sample
-	 * callback is, and that delivers the measurement regardless.
+	 * enablePrediction is SR_TRUE to match the Linux arm. It is also what the
+	 * reference predict rides: SDK 1584 ignores the flag (the handle is always
+	 * a predicting tracker) and the raw-sample callback is delivered either
+	 * way.
 	 */
 	SrEyeTrackerCreateInfo tci{};
 	tci.sType = SR_TYPE_EYE_TRACKER_CREATE_INFO;
 	tci.pNext = nullptr;
 	tci.enablePrediction = SR_TRUE;
-	const SrResult er = srCreateEyeTracker(instance, &tci, &rec->tracker);
+	const SrResult er = srCreateEyeTracker(rec->own_instance, &tci, &rec->tracker);
 	if (!SR_SUCCEEDED(er) || rec->tracker == nullptr) {
 		// No tracker means no ground truth, which means the file cannot be
 		// scored. Fail the whole recorder rather than ship a W-only file
@@ -695,6 +768,8 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 		        "disabled for this weaver",
 		        leia_sr_v2_result_str(er));
 		rec->tracker = nullptr;
+		srDestroyInstance(rec->own_instance);
+		rec->own_instance = nullptr;
 		fclose(rec->fp);
 		rec->fp = nullptr;
 		remove(rec->path);
@@ -708,6 +783,8 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 		        leia_sr_v2_result_str(ar));
 		srDestroyEyeTracker(rec->tracker);
 		rec->tracker = nullptr;
+		srDestroyInstance(rec->own_instance);
+		rec->own_instance = nullptr;
 		fclose(rec->fp);
 		rec->fp = nullptr;
 		remove(rec->path);
@@ -720,7 +797,7 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 	SrSystemMonitorCreateInfo mci{};
 	mci.sType = SR_TYPE_SYSTEM_MONITOR_CREATE_INFO;
 	mci.pNext = nullptr;
-	const SrResult mr = srCreateSystemMonitor(instance, &mci, &rec->monitor);
+	const SrResult mr = srCreateSystemMonitor(rec->own_instance, &mci, &rec->monitor);
 	if (SR_SUCCEEDED(mr) && rec->monitor != nullptr) {
 		if (!SR_SUCCEEDED(srSystemMonitorAddCallback(rec->monitor, on_system_event, rec))) {
 			U_LOG_W("Leia predict trace: srSystemMonitorAddCallback failed - no USER_FOUND/"
@@ -733,6 +810,30 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 		        "rows; untracked spans cannot be excluded from the score",
 		        leia_sr_v2_result_str(mr));
 		rec->monitor = nullptr;
+	}
+
+	// Start OUR instance's senses. The arm initializes its own instance after
+	// we return; the two are independent, and neither initialize is the
+	// other's.
+	if (!leia_sr_v2_initialize(rec->own_instance)) {
+		// leia_sr_v2_initialize has already logged the SrResult.
+		U_LOG_W("Leia predict trace: srInitialize on the recorder's own instance failed - no "
+		        "reference and no ground truth, recorder disabled for this weaver");
+		srEyeTrackerRemoveCallback(rec->tracker, on_eye_pair, rec);
+		srDestroyEyeTracker(rec->tracker);
+		rec->tracker = nullptr;
+		if (rec->monitor != nullptr) {
+			srSystemMonitorRemoveCallback(rec->monitor, on_system_event, rec);
+			srDestroySystemMonitor(rec->monitor);
+			rec->monitor = nullptr;
+		}
+		srDestroyInstance(rec->own_instance);
+		rec->own_instance = nullptr;
+		fclose(rec->fp);
+		rec->fp = nullptr;
+		remove(rec->path);
+		delete rec;
+		return nullptr;
 	}
 
 	try {
@@ -748,6 +849,8 @@ leia_sr_predict_trace_create(SrInstance instance, const struct leia_sr_predict_t
 			srDestroySystemMonitor(rec->monitor);
 			rec->monitor = nullptr;
 		}
+		srDestroyInstance(rec->own_instance);
+		rec->own_instance = nullptr;
 		fclose(rec->fp);
 		rec->fp = nullptr;
 		remove(rec->path);
@@ -780,7 +883,12 @@ leia_sr_predict_trace_destroy(struct leia_sr_predict_trace **rec_ptr)
 	 *     and guaranteed not to be invoked again after it returns. Our
 	 *     callbacks take no lock, so this can never deadlock against them.
 	 *  2. destroy the senses -- before the instance, never after.
-	 *  3. stop the writer and flush -- only once no producer can push again.
+	 *  3. destroy OUR OWN instance -- srDestroyInstance blocks until the
+	 *     instance's threads are joined and its pending callbacks have
+	 *     completed (sr_instance.h:299-300), so after this no producer for the
+	 *     T or S rings exists at all. The WEAVER'S instance (rec->instance) is
+	 *     not ours and is not touched; the arm destroys it after we return.
+	 *  4. stop the writer and flush -- only once no producer can push again.
 	 */
 	if (rec->tracker != nullptr) {
 		srEyeTrackerRemoveCallback(rec->tracker, on_eye_pair, rec);
@@ -796,6 +904,11 @@ leia_sr_predict_trace_destroy(struct leia_sr_predict_trace **rec_ptr)
 		srDestroySystemMonitor(rec->monitor);
 		rec->monitor = nullptr;
 	}
+	if (rec->own_instance != nullptr) {
+		srDestroyInstance(rec->own_instance);
+		rec->own_instance = nullptr;
+	}
+	// rec->instance is the WEAVER'S and is deliberately left alone.
 
 	rec->quit.store(true, std::memory_order_release);
 	if (rec->writer.joinable()) {
@@ -849,12 +962,18 @@ leia_sr_predict_trace_on_weave(struct leia_sr_predict_trace *rec, const struct l
 	struct leia_sr_predict_trace_weave row = *w;
 	row.ref_ok = 0;
 	row.ref_now_us = 0;
-	// The reference (see the struct doc): the tracker handle's own zero-
-	// horizon predict, clock-stamped immediately before. Same call, same
-	// handle, same expression on both arms. It is the third extra predictor
-	// call per weave and it emits a T row of its own -- both stated in the
-	// header. A failure leaves ref_ok = 0 and the row is still recorded,
-	// because the prediction half of it is still evidence.
+	// The reference (see the struct doc): a zero-horizon predict on the
+	// recorder's OWN tracker, clock-stamped immediately before. Same call,
+	// same expression on both arms. The tracker lives on the recorder's own
+	// SrInstance, not the weaver's, because the predictor's post-stages are
+	// stateful per call and per SRContext -- on a shared instance this read
+	// came back as ~90% of the weaver's own getter output, i.e. the reference
+	// was measuring the thing under test. The clock stays on the weaver's
+	// instance (same machine-wide QPC domain) so the timestamps are unchanged.
+	// It is the third extra predictor call per weave and it emits a T row of
+	// its own -- both stated in the header. A failure leaves ref_ok = 0 and the
+	// row is still recorded, because the prediction half of it is still
+	// evidence.
 	if (rec->tracker != nullptr && rec->instance != nullptr) {
 		uint64_t ref_now_us = 0;
 		if (SR_SUCCEEDED(srGetTimeUs(rec->instance, &ref_now_us))) {
