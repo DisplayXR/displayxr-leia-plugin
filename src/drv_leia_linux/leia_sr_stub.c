@@ -283,6 +283,18 @@ leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us)
 	}
 }
 
+void
+leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear)
+{
+	/* TODO(Track B): the sdk backend maps this onto the weave shader's
+	 * sRGB read/write conversion pair (ADR-021 / runtime#1484). The stub's
+	 * passthrough SBS blit is a plain vkCmdBlitImage — it applies no
+	 * transfer function either way, so there is nothing to configure and
+	 * nothing worth recording. */
+	(void)lnx;
+	(void)atlas_linear;
+}
+
 
 /*
  *
