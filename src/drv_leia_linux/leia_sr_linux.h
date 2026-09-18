@@ -290,6 +290,27 @@ leiasr_lnx_output_invalidated(struct leiasr_lnx *lnx);
 void
 leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us);
 
+/*!
+ * Declare the transfer function of the atlas the *next* weave will sample
+ * (R-W4 nearest — the input atlas's format/encoding semantics; the contract
+ * carries no colour-encoding requirement of its own) — (ADR-021
+ * runtime-declared atlas encoding, runtime#1484).
+ *
+ * @p atlas_linear false = display-referred / sRGB-ENCODED (the ADR-021 default
+ * a runtime that cannot declare degrades to), true = scene-referred / linear.
+ * The backend combines it with what it alone can see — whether the *target*
+ * format encodes on store — to pick the weave shader's read/write conversion
+ * pair; see the truth table in `sdk_apply_srgb_conversion()`.
+ *
+ * Sticky, like @ref leiasr_lnx_set_latency_us: set it once and every later
+ * weave keeps the value. Safe to call from the render thread immediately
+ * before a weave (the sdk backend defers the one SDK call to the weave).
+ *
+ * srSDK 1.0.0: feeds `srWeaverSetShaderSRGBConversion(weaver, read, write)`.
+ */
+void
+leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear);
+
 
 /*
  *

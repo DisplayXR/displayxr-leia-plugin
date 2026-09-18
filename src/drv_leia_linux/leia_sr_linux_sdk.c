@@ -518,6 +518,21 @@ struct leiasr_lnx
 	uint32_t flip_w, flip_h;
 	VkFormat flip_format;
 
+	/* Gamma / ADR-021 (runtime#1484). Two independent inputs decide the
+	 * weave shader's sRGB conversion pair: @p atlas_linear, which the RUNTIME
+	 * declares through the base DP's set_atlas_encoding slot, and
+	 * @p hw_encodes, the target-format half only we can see. The pair itself
+	 * is derived + applied by sdk_apply_srgb_conversion(); srgb_read/
+	 * srgb_write/srgb_applied latch what the SDK was last told so the log
+	 * fires ON CHANGE ONLY, and srgb_dirty defers the SDK call to the weave
+	 * (render thread) — see leiasr_lnx_set_atlas_linear(). */
+	bool atlas_linear;
+	bool hw_encodes;
+	bool srgb_dirty;
+	bool srgb_applied;
+	SrBool32 srgb_read;
+	SrBool32 srgb_write;
+
 	struct leiasr_lnx_eye_pair_mm last_good_pair;
 	bool have_last_good;
 };
@@ -709,6 +724,99 @@ sdk_format_is_srgb(VkFormat format)
 	case VK_FORMAT_R8_SRGB:
 	case VK_FORMAT_R8G8_SRGB: return true;
 	default: return false;
+	}
+}
+
+/*!
+ * Derive the weave shader's sRGB read/write conversion pair and tell the SDK.
+ *
+ * Gamma / ADR-021 (runtime#778, this repo #247, runtime#1484). Two independent
+ * inputs decide it, one from each side of the seam:
+ *
+ *   atlas_linear  The **runtime declares** it, out-of-band, through the base
+ *                 display-processor slot `set_atlas_encoding` (ADR-021, wired
+ *                 in leia_display_processor_linux.c). The plug-in no longer
+ *                 GUESSES the atlas's transfer function — removing that guess
+ *                 is the whole point of runtime#1484. The default is false =
+ *                 display-referred / sRGB-ENCODED, because
+ *                 XRT_ATLAS_ENCODING_ENCODED is 0 so an un-negotiated path
+ *                 degrades to encoded passthrough and never to a spurious
+ *                 "linear" — a runtime that never calls the slot therefore
+ *                 lands on exactly the #247 behaviour.
+ *   hw_encodes    Whether the *target* format encodes linear→sRGB on store
+ *                 (`*_SRGB`) or stores our bytes verbatim (`*_UNORM`) — see
+ *                 sdk_format_is_srgb(). This is a fact about the present
+ *                 surface that the runtime cannot see, so it stays local.
+ *
+ * srSDK semantics: read = SR_TRUE decodes sRGB→linear as the shader samples
+ * the atlas; write = SR_TRUE encodes linear→sRGB as it writes the target.
+ *
+ *   atlas     target    read  write  why
+ *   ENCODED   *_UNORM   F     F      passthrough, nobody converts (#247's fix)
+ *   ENCODED   *_SRGB    T     F      decode so the HW encode doesn't double
+ *   LINEAR    *_UNORM   F     T      we encode; the HW won't (#778-era pair)
+ *   LINEAR    *_SRGB    F     F      hand the HW linear, it encodes
+ *
+ *   read  = !atlas_linear && hw_encodes
+ *   write =  atlas_linear && !hw_encodes
+ *
+ * History worth not re-learning: this pair flipped twice on honest on-panel
+ * readings six weeks apart — (F,T) for runtime#778's crushed-dark (linear bytes
+ * sent to an sRGB display exaggerate a near-neutral clear's channel ratio by
+ * ^2.2, which is why it read BLUE rather than merely dark), then back to (F,F)
+ * for #247's washed-out. Both readings were real; the bug was that a single
+ * *constant* cannot express two different atlases. It is no longer a constant —
+ * the runtime says which atlas it sent, so both rows are reachable without
+ * anyone flipping anything a third time.
+ *
+ * DXR_LEIA_SRGB **stays**, as the plug-in-side kill switch / diagnostic
+ * override: "RW", each of 0/1, applied LAST so it wins over both inputs above
+ * (=01 restores the pre-#247 pair for a rebuild-free on-panel A/B; =00 pins
+ * passthrough if a runtime ever declares LINEAR wrongly). It is a diagnostic,
+ * not a setting: never document it as one.
+ *
+ * Called at create and, when the declaration changed, from the weave — so the
+ * U_LOG_W below is gated on the applied pair actually changing (first apply
+ * counts), never per-frame.
+ */
+static void
+sdk_apply_srgb_conversion(struct leiasr_lnx *lnx)
+{
+	if (lnx == NULL || lnx->weaver == NULL) {
+		return;
+	}
+	lnx->srgb_dirty = false;
+
+	SrBool32 srgb_read = (!lnx->atlas_linear && lnx->hw_encodes) ? SR_TRUE : SR_FALSE;
+	SrBool32 srgb_write = (lnx->atlas_linear && !lnx->hw_encodes) ? SR_TRUE : SR_FALSE;
+	const char *reason =
+	    lnx->atlas_linear
+	        ? (lnx->hw_encodes ? "atlas LINEAR + *_SRGB target: hand the HW linear, it encodes"
+	                           : "atlas LINEAR + *_UNORM target: we encode, the HW won't")
+	        : (lnx->hw_encodes ? "atlas ENCODED + *_SRGB target: decode so the HW encode doesn't double"
+	                           : "atlas ENCODED + *_UNORM target: passthrough, nobody converts");
+
+	const char *srgb_override = getenv("DXR_LEIA_SRGB");
+	if (srgb_override != NULL && srgb_override[0] != '\0' && srgb_override[1] != '\0') {
+		srgb_read = srgb_override[0] == '1' ? SR_TRUE : SR_FALSE;
+		srgb_write = srgb_override[1] == '1' ? SR_TRUE : SR_FALSE;
+		reason = "DXR_LEIA_SRGB kill switch / diagnostic override";
+	}
+
+	const bool changed = !lnx->srgb_applied || srgb_read != lnx->srgb_read || srgb_write != lnx->srgb_write;
+
+	SrResult res = srWeaverSetShaderSRGBConversion(lnx->weaver, srgb_read, srgb_write);
+	if (SR_FAILED(res)) {
+		LOG_SR_ONCE("srWeaverSetShaderSRGBConversion", res);
+		return;
+	}
+	lnx->srgb_read = srgb_read;
+	lnx->srgb_write = srgb_write;
+	lnx->srgb_applied = true;
+
+	if (changed) {
+		U_LOG_W("leia_sr_sdk: weave sRGB conversion read=%u write=%u — %s", (unsigned)srgb_read,
+		        (unsigned)srgb_write, reason);
 	}
 }
 
@@ -980,65 +1088,24 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 
-	/* Gamma / ADR-021 (runtime#778, this repo #247). The atlas the compositor
-	 * hands us is **display-referred (sRGB-ENCODED)**, and it is that way by
-	 * construction, not by luck: when an app asks for an `*_SRGB` swapchain the
-	 * runtime creates the colour image as the `*_UNORM` sibling and exposes sRGB
-	 * only as a mutable *view*, precisely so the compose blit "passes the app's
-	 * stored bytes through unchanged" for a DP that "wants display-referred
-	 * bytes" (comp_vk_native_swapchain.c); the atlas itself is
-	 * B8G8R8A8_UNORM (comp_vk_native_renderer.c). ADR-021 agrees from the other
-	 * end — XRT_ATLAS_ENCODING_ENCODED is 0 so that an un-negotiated path
-	 * degrades to encoded passthrough, never to a spurious "linear".
-	 *
-	 * So the weave never has to encode: it must only avoid *double*-encoding.
-	 * The one thing that varies is whether the target encodes for us —
-	 *
-	 *   target *_UNORM : stores our bytes verbatim, display wants encoded
-	 *                    ⟹ passthrough      (read=FALSE, write=FALSE)
-	 *   target *_SRGB  : HW encodes linear→sRGB on store
-	 *                    ⟹ feed it linear   (read=TRUE,  write=FALSE)
-	 *
-	 * — and that we can read off `target_format` locally.
-	 *
-	 * What we still CANNOT see here is a genuinely linear atlas: an app that
-	 * renders linear values into a UNORM swapchain leaves one, and the runtime
-	 * passes those bytes through untouched too. The VK display-processor vtable
-	 * has no `set_atlas_encoding` slot yet (D3D11/GL/Metal do), so the runtime
-	 * cannot declare it — that slot is the real fix (runtime#1484, appended and
-	 * struct_size-gated per ADR-020, not an ABI major). Until it lands, the
-	 * ADR-021 default is what we assume, and DXR_LEIA_SRGB below exists ONLY so
-	 * an on-panel A/B needs no rebuild. It is a diagnostic, not a setting:
-	 * never document it as one, and delete it when the slot lands.
-	 *
-	 * History worth not re-learning: this pair has now flipped twice on honest
-	 * on-panel readings six weeks apart — (FALSE,TRUE) for #778's crushed-dark
-	 * (linear bytes on an sRGB display exaggerate a near-neutral clear's channel
-	 * ratio by ^2.2, which is why it read BLUE rather than merely dark), then
-	 * back for #247's washed-out. Do not flip the constant a third time; get the
-	 * app's requested XrSwapchainCreateInfo::format out of both boxes' logs, or
-	 * land the slot. */
-	const bool hw_encodes = sdk_format_is_srgb(rp_format);
-	SrBool32 srgb_read = hw_encodes ? SR_TRUE : SR_FALSE;
-	SrBool32 srgb_write = SR_FALSE;
-	const char *srgb_override = getenv("DXR_LEIA_SRGB");
-	if (srgb_override != NULL && srgb_override[0] != '\0' && srgb_override[1] != '\0') {
-		/* "RW", each of 0/1 — e.g. DXR_LEIA_SRGB=01 restores the pre-#247
-		 * (read=off, write=on) pair for a rebuild-free comparison. */
-		srgb_read = srgb_override[0] == '1' ? SR_TRUE : SR_FALSE;
-		srgb_write = srgb_override[1] == '1' ? SR_TRUE : SR_FALSE;
-		U_LOG_W("leia_sr_sdk: DXR_LEIA_SRGB=%s overrides the weave sRGB conversion "
-		        "(diagnostic only — see the ADR-021 note in leiasr_lnx_create)",
-		        srgb_override);
-	}
-	srWeaverSetShaderSRGBConversion(lnx->weaver, srgb_read, srgb_write);
+	/* Gamma / ADR-021: the target-side half of the conversion pair — the only
+	 * half we can see locally, and fixed for the weaver's lifetime because the
+	 * render-pass format is. The atlas-side half arrives later, declared by the
+	 * runtime through leiasr_lnx_set_atlas_linear(); `lnx` is calloc'd, so we
+	 * start on the ADR-021 default (ENCODED) = exactly the #247 behaviour, which
+	 * is also where a runtime that never declares anything stays. The derivation,
+	 * the truth table and the DXR_LEIA_SRGB kill switch all live in
+	 * sdk_apply_srgb_conversion() — read that comment, not this one. */
+	lnx->hw_encodes = sdk_format_is_srgb(rp_format);
+	sdk_apply_srgb_conversion(lnx);
 
 	U_LOG_I("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d%s, "
-	        "atlas assumed sRGB-ENCODED, weave sRGB read=%u write=%u)",
+	        "atlas encoding awaiting the runtime's declaration (ADR-021 default ENCODED), "
+	        "weave sRGB read=%u write=%u)",
 	        (unsigned long)(uintptr_t)info->x11_window,
 	        info->x11_window == NULL ? " = windowless/display-scoped" : "", rp_format,
-	        hw_encodes ? " = *_SRGB, HW encodes on store" : " = *_UNORM, stores verbatim",
-	        (unsigned)srgb_read, (unsigned)srgb_write);
+	        lnx->hw_encodes ? " = *_SRGB, HW encodes on store" : " = *_UNORM, stores verbatim",
+	        (unsigned)lnx->srgb_read, (unsigned)lnx->srgb_write);
 	*out_lnx = lnx;
 	return LEIASR_LNX_SUCCESS;
 }
@@ -1111,6 +1178,14 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 				logged = true;
 			}
 		}
+	}
+
+	/* Apply a pending atlas-encoding declaration (ADR-021 / runtime#1484)
+	 * before the weave is recorded — here, on the render thread, rather than
+	 * wherever the runtime happened to call the DP slot from. Dirty only when
+	 * the declaration actually changed, so this is not a per-frame SDK call. */
+	if (lnx->srgb_dirty) {
+		sdk_apply_srgb_conversion(lnx);
 	}
 
 	SrResult res = srWeaverSetCommandBufferVulkan(lnx->weaver, (SrVkCommandBuffer)cmd_buffer);
@@ -1230,6 +1305,21 @@ leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us)
 	if (SR_FAILED(res)) {
 		LOG_SR_ONCE("srWeaverSetLatency", res);
 	}
+}
+
+void
+leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear)
+{
+	if (lnx == NULL || lnx->atlas_linear == atlas_linear) {
+		return;
+	}
+	lnx->atlas_linear = atlas_linear;
+	/* Store + mark dirty only; leiasr_lnx_weave() does the one SDK call.
+	 * srWeaverSetShaderSRGBConversion has no documented thread-safety, and
+	 * the weave is the one place we know we are on the compositor's render
+	 * thread. Sticky either way — a declaration that repeats its value costs
+	 * nothing (early-out above), so nothing here runs per frame. */
+	lnx->srgb_dirty = true;
 }
 
 

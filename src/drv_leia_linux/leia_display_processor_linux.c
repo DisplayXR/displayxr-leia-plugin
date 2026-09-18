@@ -1474,6 +1474,19 @@ leia_lnx_dp_set_background_2d(struct xrt_display_processor *xdp,
 	ldp->bg2d_h = height;
 }
 
+// The runtime DECLARES the transfer function of the atlas it is about to send
+// (ADR-021 / runtime#1484) — base slot 14, present since runtime v2.0.0, so no
+// #ifdef gate and no pin change; struct_size already spans it. Back-compat
+// contract: only == LINEAR is special, anything else is ENCODED. The backend
+// combines this with the target format (which the runtime cannot see) and logs
+// on change, so log nothing here. An absent call leaves the ENCODED default.
+static void
+leia_lnx_dp_set_atlas_encoding(struct xrt_display_processor *xdp, enum xrt_atlas_encoding enc)
+{
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	leiasr_lnx_set_atlas_linear(ldp->sr, enc == XRT_ATLAS_ENCODING_LINEAR);
+}
+
 #ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
 // Windowed weaving (runtime#757 / LeiaSR#85): store the app window's panel-relative
 // origin; process_atlas forwards it as the weave phase origin. Guarded so the
@@ -1632,6 +1645,9 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->base.base.get_hardware_3d_state = leia_lnx_dp_get_hardware_3d_state;
 	ldp->base.base.get_render_pass = leia_lnx_dp_get_render_pass;
 	ldp->base.base.set_eye_tracking_mode = leia_lnx_dp_set_eye_tracking_mode;
+	// ADR-021 / runtime#1484: consume the runtime's per-frame atlas-encoding
+	// declaration instead of guessing it in the backend. Base slot, unguarded.
+	ldp->base.base.set_atlas_encoding = leia_lnx_dp_set_atlas_encoding;
 	ldp->base.base.destroy = leia_lnx_dp_destroy;
 	ldp->base.notify_target_recreated = leia_lnx_dp_notify_target_recreated;
 	// XR_DXR_display_zones (ADR-027): zones aggregate into the one content
