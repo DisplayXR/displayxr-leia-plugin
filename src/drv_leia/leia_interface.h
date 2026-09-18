@@ -190,6 +190,45 @@ struct xrt_device *
 leia_hmd_create(void);
 
 /*!
+ * Seed the single per-view-scale derivation from a backend's recommended
+ * per-view render size and the panel's native size, in pixels.
+ *
+ * This is the ONLY place the ratio is computed. Ignored (fallback kept) when
+ * any dimension is zero, and ignored once a value is latched: FIRST writer
+ * wins, because by then the value may already be published in the device's
+ * rendering-mode table, and a fresher number that DISAGREES with what the app
+ * was sized from is worse than a staler one that agrees.
+ *
+ * @param view_w    Backend-recommended per-view width in pixels.
+ * @param view_h    Backend-recommended per-view height in pixels.
+ * @param native_w  Native panel width in pixels.
+ * @param native_h  Native panel height in pixels.
+ *
+ * @ingroup drv_leia
+ */
+void
+leia_view_scale_set_from_dims(uint32_t view_w, uint32_t view_h, uint32_t native_w, uint32_t native_h);
+
+/*!
+ * The per-view scale, derived once per process.
+ *
+ * Both consumers MUST read it from here so they cannot disagree:
+ * `xrt_rendering_mode::view_scale_x/y` (which sizes tiles, the worst-case atlas
+ * and the compositor's tile grid) and
+ * `xrt_plugin_display_info::recommended_view_scale_x/y` (which sizes
+ * `XrViewConfigurationView.recommended*`). On first call, and only if nothing
+ * has seeded it, this performs the live SR query itself; the result — including
+ * the 0.5 x 0.5 fallback — is latched and logged once.
+ *
+ * @param[out] out_scale_x Horizontal per-view scale; may be NULL.
+ * @param[out] out_scale_y Vertical per-view scale; may be NULL.
+ *
+ * @ingroup drv_leia
+ */
+void
+leia_view_scale_get(float *out_scale_x, float *out_scale_y);
+
+/*!
  * Set an optional external pose source for the Leia HMD.
  *
  * When set, leia_hmd_get_tracked_pose() delegates to this device
