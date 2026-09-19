@@ -175,10 +175,15 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	    nat_h > 0) {
 		out_info->display_pixel_width = nat_w;
 		out_info->display_pixel_height = nat_h;
-		out_info->recommended_view_scale_x = (float)sr_w / (float)nat_w;
-		out_info->recommended_view_scale_y = (float)sr_h / (float)nat_h;
+		/* The scale is NOT computed here. It is derived once (see
+		 * leia_view_scale_set_from_dims / leia_view_scale_get) and read back,
+		 * so this scalar and rendering_modes[1].view_scale_x/y can never
+		 * disagree — a disagreement sizes the app's views from one number and
+		 * its tiles/atlas from the other. */
+		leia_view_scale_set_from_dims(sr_w, sr_h, nat_w, nat_h);
 		any_populated = true;
 	}
+	leia_view_scale_get(&out_info->recommended_view_scale_x, &out_info->recommended_view_scale_y);
 
 	/* Physical dimensions + nominal viewer position from SR SDK. */
 	struct leiasr_display_dimensions dims = {0};

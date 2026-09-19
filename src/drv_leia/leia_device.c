@@ -151,6 +151,95 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
 //! so this is a bounded safety net, not a blocking probe.
 #define LEIA_DEVICE_SR_QUERY_TIMEOUT_S 2.0
 
+//! Fallback per-view scale when nothing can tell us better: the 2x1 SBS half.
+//! Also what every shipping SR panel evaluates to, since the SDK defaults
+//! recommendedViewsTexture{Width,Height} to physicalResolution/2 and no
+//! product screen.ini overrides it.
+#define LEIA_DEFAULT_VIEW_SCALE 0.5f
+
+
+/*
+ *
+ * Per-view scale -- ONE derivation, two consumers.
+ *
+ */
+
+/*
+ * The per-view scale reaches apps through two entirely separate paths:
+ *
+ *   - xrt_rendering_mode::view_scale_x/y (the MODE TABLE below), which sizes
+ *     the mode's tiles, the worst-case atlas and the compositor's tile grid
+ *     (u_tiling_compute_mode / u_tiling_compute_canvas_view), and is what
+ *     XrDisplayRenderingModeInfoDXR reports;
+ *   - xrt_plugin_display_info::recommended_view_scale_x/y (the SCALAR that
+ *     leia_plugin_get_display_info fills), which sizes
+ *     XrViewConfigurationView.recommended* at xrCreateInstance.
+ *
+ * They MUST agree: if they disagree, an app is sized per view from one number
+ * and tiled from the other, and the declared atlas can be too small to hold two
+ * real tiles. The mode table used to carry a hardcoded 0.5f "overridden by SR
+ * SDK" placeholder that nothing ever overrode -- correct only because the SR
+ * default happens to be exactly one half.
+ *
+ * So the pair is derived HERE, once, and both call sites read it back. The
+ * derivation is cached, so the probe-cache fast path in leia_hmd_create() (which
+ * skips the live geometry query) still gets the SR-derived pair rather than a
+ * second, hardcoded one.
+ */
+static bool g_view_scale_valid = false;
+static float g_view_scale_x = LEIA_DEFAULT_VIEW_SCALE;
+static float g_view_scale_y = LEIA_DEFAULT_VIEW_SCALE;
+
+void
+leia_view_scale_set_from_dims(uint32_t view_w, uint32_t view_h, uint32_t native_w, uint32_t native_h)
+{
+	if (g_view_scale_valid) {
+		/* FIRST writer wins, on purpose. By the time a second caller arrives
+		 * the value may already be published in the device's mode table, and
+		 * a fresher number that disagrees with what the app was sized from is
+		 * strictly worse than a slightly staler one that agrees. */
+		return;
+	}
+	if (view_w == 0 || view_h == 0 || native_w == 0 || native_h == 0) {
+		return; /* Not a usable answer — leave the fallback in place. */
+	}
+	g_view_scale_x = (float)view_w / (float)native_w;
+	g_view_scale_y = (float)view_h / (float)native_h;
+	g_view_scale_valid = true;
+}
+
+void
+leia_view_scale_get(float *out_scale_x, float *out_scale_y)
+{
+	if (!g_view_scale_valid) {
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+		/* The SR context is warm by here (probe + get_display_info both ran
+		 * first), so this resolves from cached SR state rather than paying
+		 * the full timeout. Result is memoised, so at most one query. */
+		uint32_t view_w = 0, view_h = 0, nat_w = 0, nat_h = 0;
+		float hz = 0.0f;
+		if (leiasr_query_recommended_view_dimensions(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, &view_w, &view_h, &hz,
+		                                             &nat_w, &nat_h)) {
+			leia_view_scale_set_from_dims(view_w, view_h, nat_w, nat_h);
+		}
+#endif
+		U_LOG_W("Leia per-view scale %.4f x %.4f (%s)", (double)g_view_scale_x, (double)g_view_scale_y,
+		        g_view_scale_valid ? "derived from the backend's recommended view dimensions"
+		                           : "fallback — no backend answer");
+		/* Latch either way: the fallback is the answer for this process too,
+		 * and re-querying every call would re-pay the timeout on a box with
+		 * no SR service. */
+		g_view_scale_valid = true;
+	}
+
+	if (out_scale_x != NULL) {
+		*out_scale_x = g_view_scale_x;
+	}
+	if (out_scale_y != NULL) {
+		*out_scale_y = g_view_scale_y;
+	}
+}
+
 struct xrt_device *
 leia_hmd_create(void)
 {
@@ -202,6 +291,12 @@ leia_hmd_create(void)
 			float hz = 0.0f;
 			bool got_px = leiasr_query_recommended_view_dimensions(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, &view_w,
 			                                                       &view_h, &hz, &nat_w, &nat_h);
+			/* Feed the ONE per-view-scale derivation with what we just
+			 * queried, so leia_view_scale_get() below answers from these
+			 * numbers instead of re-querying SR. */
+			if (got_px) {
+				leia_view_scale_set_from_dims(view_w, view_h, nat_w, nat_h);
+			}
 			if (got_px && nat_w > 0 && nat_h > 0) {
 				pixel_w = (int)nat_w;
 				pixel_h = (int)nat_h;
@@ -274,14 +369,16 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[0].tile_rows = 1;
 	hmd->base.rendering_modes[0].mode_flags = 0;
 
-	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from SR SDK — set later by
-	// target_instance). Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
+	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from the ONE derivation in
+	// leia_view_scale_get() — the same pair leia_plugin_get_display_info() reports
+	// as recommended_view_scale_x/y, never a second hardcoded number).
+	// Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
 	// reserved[] stays zeroed via the calloc'd U_DEVICE_ALLOCATE block.
 	hmd->base.rendering_modes[1].mode_index = 1;
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
 	hmd->base.rendering_modes[1].view_count = 2;
-	hmd->base.rendering_modes[1].view_scale_x = 0.5f; // Default, overridden by SR SDK
-	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
+	leia_view_scale_get(&hmd->base.rendering_modes[1].view_scale_x,
+	                    &hmd->base.rendering_modes[1].view_scale_y);
 	hmd->base.rendering_modes[1].hardware_display_3d = true;
 	hmd->base.rendering_modes[1].tile_columns = 2;
 	hmd->base.rendering_modes[1].tile_rows = 1;

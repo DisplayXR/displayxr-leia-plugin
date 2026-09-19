@@ -78,6 +78,21 @@ leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 	// SR display queries in the sdk backend).
 	(void)leiasr_probe_display(0.0);
 
+	// Seed the ONE per-view-scale derivation from the backend's recommended
+	// per-view size. Done HERE, at probe, because the mode table is written in
+	// leia_hmd_create() (create_device) — which the runtime calls BEFORE
+	// get_display_info — so seeding from get_display_info would be too late and
+	// the mode table would keep the 0.5 x 0.5 fallback while the scalar moved.
+	// The stub backend answers 1920x1080 of 3840x2160, i.e. exactly the
+	// fallback; a Track B SDK backend's real numbers now reach both consumers.
+	{
+		struct leiasr_lnx_display_info di;
+		if (leiasr_lnx_query_display_info(&di) && di.valid) {
+			leia_view_scale_set_from_dims(di.recommended_view_width, di.recommended_view_height,
+			                              di.pixel_width, di.pixel_height);
+		}
+	}
+
 	if (forced) {
 		U_LOG_W("leia_lnx_plugin: probe FORCED (DXR_LEIA_FORCE_PROBE=1)");
 	} else {
@@ -140,10 +155,12 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	out_info->nominal_viewer_z_m = info.nominal_viewer_z_m;
 	out_info->display_pixel_width = info.pixel_width;
 	out_info->display_pixel_height = info.pixel_height;
-	out_info->recommended_view_scale_x =
-	    info.pixel_width != 0 ? (float)info.recommended_view_width / (float)info.pixel_width : 1.0f;
-	out_info->recommended_view_scale_y =
-	    info.pixel_height != 0 ? (float)info.recommended_view_height / (float)info.pixel_height : 1.0f;
+	/* Read back the pair seeded at probe from these same backend numbers — the
+	 * mode table (leia_device.c) reads the identical pair, so the scalar that
+	 * sizes XrViewConfigurationView and the scale that sizes the tiles/atlas
+	 * cannot disagree. Deliberately NOT re-derived here: the device was created
+	 * before this call, so a fresher number would only disagree with it. */
+	leia_view_scale_get(&out_info->recommended_view_scale_x, &out_info->recommended_view_scale_y);
 	out_info->display_screen_left = info.screen_left;
 	out_info->display_screen_top = info.screen_top;
 
