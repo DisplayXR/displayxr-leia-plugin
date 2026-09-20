@@ -73,8 +73,10 @@ turns on and whether tracking runs:
 - **[26.04 box] Screen blank powers the panel's USB hub down (LeiaSR #231).** On blank the
   DS1 drops its hub: the camera and the FPC vanish, SRService marks the FPC disconnected
   (it re-authenticates on re-enumeration via `FpcHotplugMonitor`), and the manual tracker
-  most likely aborts. GNOME `idle-delay` is **300 s** — keep the box active during a run, or
-  agree a longer `idle-delay` with David for long ones. Screen **lock** additionally disables
+  most likely aborts. On this box GNOME `idle-delay` is **0 — permanently, by David's
+  decision** (the box is always on power): the screen never blanks, the hub stays powered,
+  and the tracker survives idle periods. Do not "restore" it to a timeout. If a different
+  box blanks on idle, expect exactly that failure chain. Screen **lock** additionally disables
   the GNOME window-geometry extension, so the runtime's #817 consumer falls back to
   display-scoped geometry.
 
