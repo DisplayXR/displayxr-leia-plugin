@@ -28,6 +28,8 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 - **[Android weaving, orientation, zones & transparency](android-weaving-and-transparency.md)** — the Android CNSDK weave model (per-subpixel phase, predicted center eye), the three-orientation reconciliation, sub-rect/display-zone weaving (the two viewport knobs + the portrait==natural test gotcha), and why per-pixel-alpha transparency is fundamentally limited on Android (+ the background-capture privilege landscape on NP02J).
 - **[The untracked fallback, and how to tell which SDK shader drew a bad frame](untracked-fallback.md)** — who owns the no-viewer frame (the SDK, driven by config, not this plug-in), why the eye pair the DP reports is NOT the tracker the SDK branches on, and the alpha fingerprint that identifies which SDK shader drew a bad frame. Records #178 (untracked pulse renders black; fixed SDK-side in LeiaSR#189).
 - **[LeiaSR Linux SDK contract](leia-linux-sdk-contract.md)** — PROPOSED interface contract the LeiaSR Linux SDK must expose (Vulkan weaver, eye tracking, display/calibration) so the Linux backend (#81) and the SDK can be built in parallel.
+- **[Linux Track B runbook](linux-track-b-runbook.md)** — how to build and validate the real srSDK Vulkan weaver on a Leia-panel Linux box: the `leiasr-runtime` .deb as SDK, the mandatory local-runtime-checkout ABI rule, dev plug-in registration, Linux logging (no log file — stderr + `XRT_LOG=info`), and per-box bring-up gotchas (22.04/NVIDIA and Ubuntu 26.04/Mesa).
+- **[Linux `.deb` packaging](linux-deb-packaging.md)** — the vendor `.deb` that drops the DP into the runtime's built-in discovery dir at probe_order 50.
 
 ## Build flags
 
