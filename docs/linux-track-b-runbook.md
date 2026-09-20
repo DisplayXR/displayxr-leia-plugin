@@ -257,6 +257,32 @@ runtime feeds with a panel-relative origin; the bogus display rect only affects 
 of that rect — which the runtime now overrides (#1579). A window at desktop (3556, 100)
 with the panel at x = 3456 is fed (100, 100).
 
+### Lookaround looks quantized? It is the SDK's noise-rejection hold, not the plug-in
+
+Seen on the DS1 (2026-09-20): head-driven lookaround stepping rather than moving
+continuously. Cause (from LeiaSR source, confirmed by A/B): our plug-in consumes
+`srEyeTrackerPredict`, whose output goes through `[LookaroundFilter]` in
+`/opt/leiasr/products/D1/ft_user.ini` — `useNoiseRejection=true`,
+`noiseRejectionThreshold_cm=[0.2,0.2,3]`, `noiseRejectionAlpha=[0,0,0.001]`: the eye
+position is **frozen** until the head moves >2 mm laterally or **>3 cm in depth**, and a
+3 cm depth step is very visible in an off-axis projection. The file is byte-identical to
+the Windows install and the filter has no platform `#ifdef`s — a product-tuning question
+for LeiaSR, not a Linux or plug-in bug. (`[WeavingPoseFilter]` is the *weaver's* filter and
+is unrelated to this path; LeiaSR #236's decode-time timestamps only matter there.)
+
+A/B without rebuilding anything — the SR client resolves its products tree through
+`$LEIASR_DATA_DIR` first:
+
+```bash
+cp -r /opt/leiasr/products "$AB"/          # any writable dir
+sed -i 's/^useNoiseRejection=true/useNoiseRejection=false/' "$AB/products/D1/ft_user.ini"   # ONLY the [LookaroundFilter] one
+LEIASR_DATA_DIR="$AB" <run the app>        # ft_user.ini is read at eye-tracker creation → restart the client
+```
+
+Result at the panel: with the hold off, David reports lookaround "looks good" (noisier,
+continuous). Note the client-side `[filterconfiguration] runtime data root: …` line does
+**not** reach the runtime's stderr, so the visual A/B is the confirmation.
+
 ### [26.04 box] Native Wayland does not weave — X11/XWayland only
 
 Under a *native* Wayland surface there is no X11 `Window`, so the plug-in creates the
