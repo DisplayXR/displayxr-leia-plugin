@@ -20,9 +20,13 @@ Track A passthrough SBS blit, and report friction.
 - **Bring-up, 26.04/Mesa:** Track B **compiles clean with no source changes** against the
   *installed* `leiasr-runtime` .deb, and `displayxr-cli selftest` is **all-pass with
   `leia-sr` active** (§2). The July `display_info`/`display_dims` failure did **not**
-  reproduce. Eye tracking **is** running (§0). **The first on-panel weave through the
-  plug-in on 26.04 is still pending** — do not read the green selftest as weave validation;
-  a headless run never touches weave geometry or phase.
+  reproduce. Eye tracking **is** running (§0). **Fullscreen on-panel weave through the
+  plug-in is validated on this box** (2026-09-20, David on the DS1: weave *and* Kooima
+  projection correct) — but only with **displayxr-runtime#1579** or newer; on an older
+  runtime a panel that is not at the desktop origin gets a wrong Kooima projection.
+  **Windowed** on-panel weave is not validated yet, and a **native Wayland** session cannot
+  weave at all on 1.37 (§3). A green headless selftest is still not weave validation — it
+  never touches weave geometry or phase.
 
 **Pin:** build against the **installed `leiasr-runtime` .deb** — `1.37.0.6048+gb9262217a0`
 on the 26.04 box. **The .deb *is* the dev package**; there is no separate SDK dev package to
@@ -182,11 +186,33 @@ leia_lnx_dp: Linux VK display processor created (backend: weaver)
 - `leia_sr_sdk: system event 14: Lens has been enabled`
 - `leia_sr_sdk: system event 16 / 17` — `USER_FOUND` / `USER_LOST`
 
+Windowed-weave **present-origin** proof lines (runtime side, `vk_native` compositor —
+displayxr-runtime#1579). These are what tells a box that really is feeding a windowed
+phase apart from one that silently is not:
+
+- `X11 present origin accepted: panel desktop rect WxH == panel native size — root
+  coordinates are physical panel pixels, windowed weave phase is fed.` (INFO, one-shot)
+- `get_window_metrics: the display processor reports its panel at (0, 0) but the runtime
+  resolved it at (3456, 0) — using the runtime's origin for window-scoped metrics (Kooima
+  projection + present origin), per ADR-033` (WARN, one-shot) — the #1579 override firing,
+  i.e. the plug-in's (0,0) is being corrected rather than believed.
+- The plug-in logs **nothing** on the success path: `srWeaverSetPresentOrigin` is issued
+  before every weave and only logs on failure, so **absence of the failure line below is
+  the success signal.**
+
 Failure signatures:
 
 - `srCreateWeaverVulkan failed`
 - `no Vulkan weaver backend (weaverBackends=0x…)`
 - `weaver backend creation failed (SR service unavailable)`
+- `leia_sr_sdk: srWeaverSetPresentOrigin failed: …` (WARN, once) — the SDK rejected the
+  phase origin; the weave falls back to display-scoped. A runtime predating LeiaSR#85
+  reports `SR_ERROR_FUNCTION_UNSUPPORTED` here.
+- `X11 present origin refused: the panel's desktop rect … is not the panel's native size
+  …` (WARN, runtime side) — root coordinates are not physical panel pixels (display scaling,
+  or XWayland), so nothing is fed and weaving stays display-scoped.
+- `Window handle is invalid in VulkanWeaver::setWindowHandle: weaving is disabled.` (SDK)
+  — no X11 window; native Wayland. See §3.
 
 ## 3. Real weave on the panel
 
@@ -225,6 +251,28 @@ screen pos: (3456, 0) [runtime override by size match; plug-in reported (0, 0)]
 A plug-in-side fallback (query the origin without RandR EDID) is **optional** and tracked
 here as **#251**. Separately, Mutter may veto pre-map window positions (runtime #729).
 
+Scope note: `srDisplayGetLocation`'s bogus (0,0) origin (LeiaSR #225) is **not** on the
+windowed-phase path. The weave phase comes from `srWeaverSetPresentOrigin`, which the
+runtime feeds with a panel-relative origin; the bogus display rect only affects consumers
+of that rect — which the runtime now overrides (#1579). A window at desktop (3556, 100)
+with the panel at x = 3456 is fed (100, 100).
+
+### [26.04 box] Native Wayland does not weave — X11/XWayland only
+
+Under a *native* Wayland surface there is no X11 `Window`, so the plug-in creates the
+weaver with `window = 0`. On `leiasr-runtime 1.37.0.6048` the Vulkan weaver then logs
+
+```
+Window handle is invalid in VulkanWeaver::setWindowHandle: weaving is disabled.
+```
+
+and never weaves. `srWeaverSetPresentOrigin` cannot rescue it: the null-window gate fires
+before any phase input is read. Fixing this needs a **LeiaSR change** — let the Linux
+weavers weave with no window once a present origin has been supplied (the gate is Win32
+heritage); logged as a DisplayXR ask on LeiaSR #224/#225. Until then run the app on
+X11 or XWayland. (The 2026-07-08 22.04 run wove windowless on the *prototype* SDK; that
+path is closed on 1.37.)
+
 ## 4. Bring-up toggles (env vars)
 
 | Var | Meaning |
@@ -259,8 +307,9 @@ enabling client just exited — that case is legitimate, not a bug.
 2. Eye tracking: latency feel, `USER_FOUND/USER_LOST` cadence, whether the MANAGED
    collapse (weaver auto-blits below 1 mm eye separation) looks right.
 3. Anything from the reconciliation gap list that bites in practice
-   (`docs/leia-linux-sdk-contract.md` §8): no phase origin, no refresh getter,
-   teardown time on `srDestroyInstance`.
+   (`docs/leia-linux-sdk-contract.md` §8): no refresh getter, teardown time on
+   `srDestroyInstance`, and the null-window weave gate (§3). **Not** the phase origin —
+   `srWeaverSetPresentOrigin` shipped (LeiaSR#85) and the plug-in drives it.
 
 ### Results — 2026-09-19/20, Ubuntu 26.04 box (in-house)
 
@@ -271,8 +320,17 @@ enabling client just exited — that case is legitimate, not a bug.
    reproduce.
 3. **Eye tracking runs** (`FaceLockBlinkEyeTracker`), superseding the July "Blink SDK not
    wired" item — with the tracker-side coordinate bug of §0 (LeiaSR #227) as the live caveat.
-4. **On-panel weave through the plug-in: still pending on this box.** Record it as open.
-5. **Desktop-position phantom origin under XWayland** — diagnosed, fixed on the runtime side
+4. **Fullscreen on-panel weave through the plug-in: VALIDATED** (2026-09-20, David on the
+   DS1) — weave *and* Kooima projection correct, with **displayxr-runtime#1579** or newer
+   (older runtimes mis-project a panel that is not at the desktop origin). **Windowed**
+   on-panel weave is not validated yet.
+5. **Phase origin works.** `srWeaverSetPresentOrigin` exists in srSDK 1.0.0 as shipped in
+   `leiasr-runtime 1.37.0.6048` (LeiaSR#85 landed) and the plug-in issues it before every
+   weave — contract §8 R-W7 flipped from ❌ to ✅. Needed in *every* layout: the Linux
+   weaver never tracks the window's desktop position itself.
+6. **Native Wayland cannot weave on 1.37** — `window = 0` trips
+   `VulkanWeaver::setWindowHandle: weaving is disabled` (§3). Carried to LeiaSR #224/#225.
+7. **Desktop-position phantom origin under XWayland** — diagnosed, fixed on the runtime side
    (runtime#1579); optional plug-in fallback is #251 (§3).
 
 ### Results — 2026-07-08, DS1 on 22.04/NVIDIA (displayxr-leia-plugin#81)
