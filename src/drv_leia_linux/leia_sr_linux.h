@@ -311,6 +311,64 @@ leiasr_lnx_set_latency_us(struct leiasr_lnx *lnx, uint64_t latency_us);
 void
 leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear);
 
+/*!
+ * Phase-snap a proposed window position (runtime#1588 — Windows parity with
+ * the D3D11 arm's `snap_window_rect`, drv_leia/leia_sr_d3d11.cpp:2272).
+ *
+ * The interlacing phase is a function of where the window sits on the lens
+ * lattice, so a freely dragged window lands between lens columns and the 3D
+ * collapses. The fix is to quantise the drag target onto that lattice: the
+ * runtime offers its raw target, the backend returns the nearest
+ * lattice-correct position, the runtime moves the window there.
+ *
+ * Pure coordinate math: no window handle, no hardware touch, no thread
+ * affinity. Called from whichever thread owns the window (NOT the render
+ * thread) and once per window MOVE, never per weave.
+ *
+ * @return true only when @p out_x / @p out_y hold a genuinely snapped
+ * position. Every other outcome writes the target back unchanged and returns
+ * false — including the SDK's SR_DECLINED ("could not snap yet", typically no
+ * viewing distance before the first tracked frame), which is a real answer
+ * rather than a failure and is reported as such so an unsnapped position is
+ * never mistaken for a snap that had nothing to correct. The caller proceeds
+ * with its target either way; the boolean only says whether a correction was
+ * applied.
+ *
+ * srSDK: `srWeaverSnapToPhase` (sr_weaver.h), called unconditionally through
+ * the loader trampoline — which writes the target back before it can fail, so
+ * a runtime predating the call degrades to identity for free (logged once).
+ * The loader archive MUST come from the same tree as the runtime; see the sdk
+ * backend for why no runtime guard can substitute for that.
+ *
+ * COORDINATE FRAME — pass both pairs through in whatever frame the runtime
+ * gave them, and never translate either one.  The runtime slot is
+ * desktop-absolute (caller-frame) and the runtime converts nothing; this
+ * backend converts nothing either, and the vendor source is why that is safe
+ * rather than lucky: the snap consumes only the DISPLACEMENT, target minus
+ * origin, so any constant offset between frames cancels and desktop-absolute
+ * and panel-relative give the same answer. What does NOT cancel is mixing the
+ * frames between the two pairs — an origin in one and a target in the other
+ * corrupts the displacement — and neither does the unit.
+ *
+ * DEVICE PIXELS, not logical ones. The displacement is measured against a
+ * physical lens pitch, so a logical / fractionally-scaled pixel displacement
+ * arrives multiplied by the scale factor and snaps to the wrong lattice
+ * position. That failure is silent: it still returns a plausible nearby
+ * integer.
+ *
+ * A rotated or flipped panel needs no handling here either — the SR runtime
+ * converts into and out of its canonical landscape space using the
+ * orientation it is weaving for.
+ */
+bool
+leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y);
+
 
 /*
  *

@@ -75,6 +75,37 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     # propagates to leia_plugin_linux.c compiled into DisplayXR-LeiaSR.
     target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_WEAVER_SDK=1)
 
+    # --- Drag phase-snap capability (runtime#1588) -------------------------
+    # srWeaverSnapToPhase is called through the loader TRAMPOLINE, not through
+    # a hand-rolled dispatch lookup (leia_sr_linux_sdk.c explains why: the v2
+    # table diverged between the Linux and Windows lines at equal size, so
+    # indexing it by hand is false safety — only "loader and runtime from one
+    # tree" is safe, and only this variable establishes it).
+    #
+    # So the probe has to answer BOTH halves in one go: does the header declare
+    # the call, and does this loader archive actually carry the trampoline?
+    # check_symbol_exists takes the symbol's address, so it compiles AND links
+    # — a header-new/archive-old SDK root fails it here, at configure time,
+    # instead of at link time with --no-undefined. An SDK root that predates
+    # the call compiles the feature out to identity rather than failing the
+    # build.
+    include(CheckSymbolExists)
+    get_target_property(_srsdk_snap_inc srSDK::loader_dynamic INTERFACE_INCLUDE_DIRECTORIES)
+    set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
+    set(CMAKE_REQUIRED_LIBRARIES srSDK::loader)
+    check_symbol_exists(srWeaverSnapToPhase "sr/sr_weaver.h" DXR_LEIA_LNX_HAVE_SR_SNAP)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(DXR_LEIA_LNX_HAVE_SR_SNAP)
+        target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_SNAP=1)
+        message(STATUS "DisplayXR-LeiaSR: drag phase-snap ENABLED "
+                       "(srWeaverSnapToPhase declared + linkable from ${_srsdk_snap_inc})")
+    else()
+        message(STATUS "DisplayXR-LeiaSR: drag phase-snap COMPILED OUT — no srWeaverSnapToPhase in "
+                       "${_srsdk_snap_inc} (or no trampoline in this loader archive); "
+                       "window drags will not phase-snap")
+    endif()
+
     # DEV-ONLY convenience: bake the SDK lib dir as DT_RUNPATH so the static
     # loader's dlopen("libLeiaSR_runtime.so") resolves with zero environment
     # setup on a spike/bring-up box (glibc honors the CALLING object's

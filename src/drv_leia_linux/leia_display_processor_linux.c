@@ -1501,6 +1501,48 @@ leia_lnx_dp_set_present_origin(struct xrt_display_processor_vk *xdp_vk, int32_t 
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+// Drag phase-snap (runtime#1588) — the Vulkan twin of the D3D11 arm's slot 18,
+// same signature and same semantics, so the two arms differ only in which
+// backend they forward to. A false return leaves the caller on its raw target
+// (already written back below). Pure query: no window is moved, no weaver
+// re-phased, no lens touched.
+//
+// COORDINATE FRAME — both pairs pass through in whatever frame the runtime
+// gave them (desktop-absolute / caller-frame; the runtime converts nothing),
+// and neither is ever translated here. That is safe by construction, not by
+// luck: the vendor snap consumes only the DISPLACEMENT, target minus origin,
+// so a constant offset between frames cancels and desktop-absolute and
+// panel-relative produce the same answer. Translating one pair "into panel
+// space" would therefore not fix anything — it would only risk the one error
+// that does NOT cancel, an origin in one frame with a target in the other.
+//
+// The other non-cancelling property is the UNIT: these must be DEVICE pixels.
+// The displacement is measured against a physical lens pitch, so logical /
+// fractionally-scaled coordinates arrive multiplied by the scale factor and
+// snap to the wrong lattice position — silently, since the result is still a
+// plausible nearby integer.
+//
+// Rotation needs no handling either: the SR runtime converts into and out of
+// its canonical landscape space using the orientation it is weaving for.
+//
+// Guarded so the plug-in still compiles against a runtime that predates the
+// slot — the vtable assignment below is then skipped and struct_size, which is
+// sizeof(the variant), shrinks with it, so the runtime's presence gate agrees.
+static bool
+leia_lnx_dp_snap_window_rect(struct xrt_display_processor_vk *xdp_vk,
+                             int32_t origin_x,
+                             int32_t origin_y,
+                             int32_t target_x,
+                             int32_t target_y,
+                             int32_t *out_x,
+                             int32_t *out_y)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp_vk;
+	return leiasr_lnx_snap_to_phase(ldp->sr, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+#endif
+
 static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -1668,6 +1710,10 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	// carries the slot; sizeof(base) (→ struct_size above) grows with it, so the
 	// runtime's presence gate matches.
 	ldp->base.set_present_origin = leia_lnx_dp_set_present_origin;
+#endif
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+	// Drag phase-snap (runtime#1588) — Windows parity (D3D11 slot 18).
+	ldp->base.snap_window_rect = leia_lnx_dp_snap_window_rect;
 #endif
 	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the
 	// X11 window position).

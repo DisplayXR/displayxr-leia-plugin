@@ -295,6 +295,30 @@ leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear)
 	(void)atlas_linear;
 }
 
+bool
+leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y)
+{
+	/* No lens, no lattice: there is no phase to snap to. Honour the
+	 * contract anyway — write the target back and report "not snapped", so
+	 * the caller's identity fallback is the same code path it takes against
+	 * an SR runtime that predates srWeaverSnapToPhase. */
+	(void)lnx;
+	(void)origin_x;
+	(void)origin_y;
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	*out_x = target_x;
+	*out_y = target_y;
+	return false;
+}
+
 
 /*
  *
