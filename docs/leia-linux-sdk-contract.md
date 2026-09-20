@@ -168,7 +168,7 @@ The screen-position query matters doubly on Linux: it anchors lenticular phase (
 
 ## 7. Packaging & platform
 
-- **Target platform:** Ubuntu 26.04 LTS (GCC 15), x86_64, **Intel Arc Xe-3 iGPU / Mesa ANV** (the launch hardware). Ubuntu 22.04 + NVIDIA is the interim dev box. → open question Q1: please confirm 26.04 + Mesa/ANV are in the SDK's support matrix.
+- **Target platform:** Ubuntu 26.04 LTS (GCC 15), x86_64, **Intel iGPU / Mesa ANV** (the launch hardware). Ubuntu 22.04 + NVIDIA is the interim dev box. → Q1, **partly answered (2026-09-20)**: on the first in-house 26.04 box (Panther Lake / Mesa 26, GCC 15.2) the SDK from the installed `leiasr-runtime 1.37.0.6048` .deb builds and runs headless — `displayxr-cli selftest` all-pass with the srSDK backend active. On-panel weave on Mesa/ANV is **not yet confirmed**.
 - **ABI: C strongly preferred.** A C API (CNSDK precedent) avoids GCC C++ ABI/version coupling between SDK builds and plug-in builds, and R-W11 for free. If C++ (SR port), the SDK MUST document its compiler/stdlib baseline and keep exceptions inside (R-W11).
 - **CMake config package.** Ship `find_package`-able config files, as both existing SDKs do (`simulatedreality`/`srDirectX` on Windows, `CNSDKConfig` on Android): headers + `.so`s + `lib/cmake/<pkg>/<pkg>Config.cmake`, relocatable via a single root env/CMake var (`LEIASR_SDKROOT` shape).
 - **Runtime-optional loading.** The plug-in must remain loadable (and cleanly declining in `probe()`) on machines without the SDK/service installed. Either the SDK core is dlopen-able behind a thin always-present loader stub (CNSDK loader model), or the plug-in will dlopen the SDK itself (Windows uses `/DELAYLOAD` for the same effect). Loader-stub model preferred.
@@ -204,13 +204,13 @@ ask on the C99-API PR (send new asks to **LeiaInc/LeiaSR#75**, which supersedes 
 | R-D2 2D/3D switch | ✅ | `sr_lens.h`: `srLensEnable/Disable/IsEnabled` (+ `lensPreference` at instance create, `SR_EVENT_TYPE_LENS_ON/OFF` events). |
 | R-D3 calibration internal | ✅ | No interlace parameters exposed anywhere. |
 | R-D4 headless-tolerant | ✅ | `srCreateDisplay` succeeds with no panel; getters return `SR_ERROR_DISPLAY_NOT_FOUND`; `srDisplayIsValid` is the probe primitive. |
-| §7 packaging | ✅ | C API ✅; `find_package(srSDK CONFIG)` package, relocatable ✅; loader-stub dlopen model ✅ (static `libsrSDK_loader.a` → `libLeiaSR_runtime.so`, search order: `/etc/leia/sr/1/active_runtime.json` → `SR_RUNTIME_PATH` → plain dlopen). Support matrix (26.04/Mesa ANV) unconfirmed (→ Q1). |
+| §7 packaging | ✅ | C API ✅; `find_package(srSDK CONFIG)` package, relocatable ✅; loader-stub dlopen model ✅ (static `libsrSDK_loader.a` → `libLeiaSR_runtime.so`, search order: `/etc/leia/sr/1/active_runtime.json` → `SR_RUNTIME_PATH` → plain dlopen — and the `leiasr-runtime` .deb now registers `active_runtime.json` itself). **The .deb *is* the dev package** (headers + `libsrSDK_loader.a` + `lib/cmake/srSDK/` under `/opt/leiasr`); no separate SDK download. Support matrix (26.04/Mesa ANV): headless build+run confirmed, on-panel weave pending (→ Q1). |
 
 ## 9. Open questions for ratification
 
 Post-reconciliation status per question — answered ones kept for the record:
 
-1. **Ubuntu 26.04 / GCC 15 / Mesa ANV (Intel Arc Xe-3)** — **still open.** The prototype ships x86_64 Linux binaries but the support matrix is unconfirmed.
+1. **Ubuntu 26.04 / GCC 15 / Mesa ANV (Intel)** — **partly answered (2026-09-20).** On the first in-house 26.04 box (Panther Lake / Mesa 26 / GCC 15.2 / CMake 4.2), Track B builds clean against the installed `leiasr-runtime 1.37.0.6048` .deb with no source changes, and `displayxr-cli selftest` is all-pass with the srSDK backend active. **Still open:** the first on-panel weave on Mesa/ANV, and a formal support-matrix statement from the SDK team.
 2. **Lineage** — **answered:** new C99 srSDK (LeiaInc/LeiaSR#53 loader/runtime split), neither a straight SR C++ port nor CNSDK; SR-derived semantics with a Vulkan-style extensible-struct C API.
 3. **Tracking service model on Linux** — **still open.** `SrNetworkMode` (STANDALONE/CLIENT/…) exists in the API but the intended Linux deployment (in-process runtime vs daemon), camera stack, and udev/permission story are undocumented.
 4. **Phase origin API (R-W7)** — **answered: NOT in 1.0.0.** Viewport/scissor only; the decoupled screen-position-phase knob is the top carried ask (runtime#85 class).

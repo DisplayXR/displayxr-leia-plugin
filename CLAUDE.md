@@ -12,14 +12,20 @@ Three platform arms, all implementing the `xrt_plugin_iface` ABI from
   (D3D11/D3D12/GL/VK). Loaded via registry discovery
   (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
 - **Android** (`src/drv_leia_android`) → `libdxrp050_leia_cnsdk.so`, CNSDK.
-- **Linux desktop** (`src/drv_leia_linux`) → `DisplayXR-LeiaSR.so`. **Track A
-  scaffold: STUB weaver** (passthrough SBS blit, no SR SDK) behind the
-  weaver-backend seam `leia_sr_linux.h`, whose interface is shaped by the
-  [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED,
-  #81). Track B swaps in the real SDK (`-DDXR_LEIA_LINUX_WEAVER=sdk`).
+- **Linux desktop** (`src/drv_leia_linux`) → `DisplayXR-LeiaSR.so`. Two weaver
+  backends behind the seam `leia_sr_linux.h`, whose interface is shaped by the
+  [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED, #81):
+  **Track B = the real srSDK Vulkan weaver** (`-DDXR_LEIA_LINUX_WEAVER=sdk`) and
+  **Track A = a STUB weaver** (passthrough SBS blit, no SR SDK; still the
+  default, for CI and SDK-less boxes). Track B **builds clean on Ubuntu 26.04
+  against the installed `leiasr-runtime` .deb and passes `displayxr-cli
+  selftest` with `leia-sr` active**; the weave itself is validated on
+  22.04/NVIDIA (#81), with **on-panel weave validation on 26.04 still
+  pending** — see [`docs/linux-track-b-runbook.md`](docs/linux-track-b-runbook.md).
   Discovery is JSON-manifest (`XRT_PLUGIN_SEARCH_PATH` / XDG
-  `DisplayProcessors/` roots). The stub probe **declines by default**;
-  `DXR_LEIA_FORCE_PROBE=1` force-binds it for bring-up/CI.
+  `DisplayProcessors/` roots). The **stub** probe declines by default and
+  `DXR_LEIA_FORCE_PROBE=1` force-binds it; on a real panel the SDK backend
+  auto-binds via DRM/EDID and needs no env.
 
 End-user artifact: `DisplayXRLeiaSRSetup-<version>.exe`. Hard prereq:
 the DisplayXR runtime must be installed first; the installer reads
@@ -95,6 +101,7 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
 | `src/drv_leia_linux/leia_sr_linux.h` | **Linux weaver-backend seam** — interface shaped 1:1 by `docs/leia-linux-sdk-contract.md` (every declaration cites its R-* requirement). Track B implements it against the real SDK. |
 | `src/drv_leia_linux/leia_sr_stub.c` | Track A stub backend: canned panel info + passthrough SBS blit, `TODO(Track B)` at every body. |
+| `src/drv_leia_linux/leia_sr_linux_sdk.c` | Track B backend: the real srSDK (C99, API 1.0.0) behind the same seam — instance/display/lens/weaver + event latching. Selected by `-DDXR_LEIA_LINUX_WEAVER=sdk`. |
 | `src/drv_leia_linux/leia_plugin_linux.c` | Linux `xrtPluginNegotiate` + iface (VK-only factories; env-gated probe). |
 | `src/drv_leia_linux/leia_display_processor_linux.c` | Linux VK DP — 1×1 grid blits, multi-view goes through the seam. Reuses `../drv_leia/leia_device.c`. |
 | `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `$RuntimeInstall\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Path, ProbeOrder}`. |
@@ -127,15 +134,34 @@ run by `.github/workflows/lint.yml` on every PR, asserts all five pins
 declared exactly once and identically in both files, and that
 `SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build.
 
-### Linux (Track A — stub weaver)
+### Linux
 ```bash
-./scripts/build-linux.sh            # build .so + displayxr-cli, stage manifest, selftest
+./scripts/build-linux.sh            # Track A stub: .so + displayxr-cli, stage manifest, selftest
 ./scripts/build-linux.sh --no-test  # build + stage only
+
+# Track B (real srSDK weaver) on a box with the leiasr-runtime .deb installed:
+SRSDK_ROOT=/opt/leiasr cmake -S . -B build -G Ninja \
+    -DDXR_RUNTIME_SOURCE_DIR=$(pwd)/../displayxr-runtime \
+    -DDXR_LEIA_LINUX_WEAVER=sdk
 ```
 Needs a local runtime checkout (default `../displayxr-runtime`, or set
 `DXR_RUNTIME_SOURCE_DIR`). Deps = the apt list in
 `.github/workflows/build-linux.yml`. CI builds on Ubuntu 22.04/24.04/26.04
 containers and asserts single-export + discovery + ABI-green selftest.
+
+**Building against a local runtime checkout is mandatory for anything you
+intend to load** — not a convenience. The runtime's loader compares
+`vk_bundle_abi_size` exactly, and the pinned `DXR_RUNTIME_GIT_TAG_LINUX`
+(`v2.14.6`) headers have a `struct vk_bundle` 8 bytes smaller than runtime
+`main`'s, so a tag-pinned build is hard-rejected at load even though
+`XRT_PLUGIN_API_VERSION_CURRENT` is 5 on both and
+`scripts/check_plugin_abi.py` does not model that struct fingerprint.
+
+The installed **`leiasr-runtime` .deb is the SDK dev package** (headers under
+`/opt/leiasr/include/sr/`, `libsrSDK_loader.a`, `lib/cmake/srSDK/`, and it
+registers `/etc/leia/sr/1/active_runtime.json`). There is no separate SDK
+download for Linux. Full recipe + bring-up gotchas:
+[`docs/linux-track-b-runbook.md`](docs/linux-track-b-runbook.md).
 
 ### Android (CNSDK)
 ```bash
