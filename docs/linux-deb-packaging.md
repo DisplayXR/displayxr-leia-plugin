@@ -39,16 +39,17 @@ path.**
 - ✅ **SR runtime package name = `leiasr-runtime`** — confirmed against LeiaSR
   `packaging/linux/deb/control.in` (ST-5525-linux-support branch; installs under
   `/opt/leiasr`). `Recommends: leiasr-runtime`.
-- ⚠️ **SR-side integration gap:** the `leiasr-runtime` .deb bundles
-  `libLeiaSR_runtime.so` under `/opt/leiasr/lib` but does **not** register
-  `/etc/leia/sr/1/active_runtime.json`, add an `ld.so.conf.d` entry, or
-  `ldconfig` that dir — so the srSDK loader's default resolution finds nothing
-  as-is. The correct fix is on the SR side (register the active_runtime path in
-  its `postinst`). Until then a deployed plug-in needs `SR_RUNTIME_PATH`
-  (env) or a baked rpath to the stable `/opt/leiasr/lib` (a fixed *install*
-  path, distinct from the dev/build-machine rpath the release model rejects).
-  **Raise with George before shipping** — don't paper over it in the plug-in.
-- **Track B build + hardware acceptance** run on an SR box (Suzhou / George).
+- ✅ **SR-side integration gap CLOSED** — the `leiasr-runtime` .deb now registers
+  `/etc/leia/sr/1/active_runtime.json` itself, so the srSDK loader's default
+  resolution finds `libLeiaSR_runtime.so` with no `SR_RUNTIME_PATH` and no baked
+  rpath. Verified on `1.37.0.6048+gb9262217a0` (Ubuntu 26.04, 2026-09-20). The
+  same .deb is also the **dev** package (headers under `/opt/leiasr/include/sr/`,
+  `libsrSDK_loader.a`, `lib/cmake/srSDK/srSDKConfig.cmake`), so `SRSDK_ROOT=/opt/leiasr`
+  is all a Track B build needs — there is no separate SDK dev package.
+- **Track B build + hardware acceptance.** Build + headless acceptance ✅ on the
+  in-house Ubuntu 26.04 box (`displayxr-cli selftest` all-pass, `leia-sr` active —
+  see `docs/linux-track-b-runbook.md`). **On-panel weave acceptance still pending**
+  there; the weave itself is validated on 22.04/NVIDIA (#81).
 - The `-DDXR_LEIA_SDK_DEV_RPATH=OFF` build option lands with the
   `linux-sdk-rpath-dev-only` branch; until it merges, the `patchelf` strip in the
   packager already produces a correct (rpath-free) release artifact.
