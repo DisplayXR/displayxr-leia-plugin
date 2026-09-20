@@ -1354,17 +1354,26 @@ leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear)
  * already written back. Identity comes for free and there is nothing to probe.
  *
  * WHAT THE BUILD MUST GUARANTEE, and why no runtime guard could.  The loader
- * archive has to come from the SAME tree as the runtime it will talk to. Per
- * the ABI warning in sr_loader.h the v2 dispatch table diverged between this
- * Linux line and the Windows release-candidate line from
- * pfnGetRuntimeCapabilities onwards — and the divergence is NOT a length
- * difference that a table-size or version check could catch: the RC line
- * carries pfnWeaverWeaveSubmittedVulkan at the offset this line uses for
- * pfnWeaverSetPresentOrigin. Same size, different meaning. Indexing the table
- * by hand would therefore be false safety, and a mismatched pair lands every
- * call on the wrong function pointer, silently. Only "loader and runtime from
- * one tree" is safe, and only the build can establish that (SRSDK_ROOT).
- * Hence: link the trampoline, never reimplement the dispatch.
+ * archive has to come from the SAME tree as the runtime it will talk to, and
+ * only the build can establish that (SRSDK_ROOT). Hence: link the trampoline,
+ * never reimplement the dispatch.
+ *
+ * Be precise about the reason, because the obvious one is not true today.
+ * The two v2 lines do NOT currently disagree about slot meanings: measured
+ * header-to-header, this Linux line's 74 slots are a byte-identical prefix of
+ * the Windows release-candidate line's 90, with pfnWeaverSetPresentOrigin at
+ * slot 74 and pfnWeaverSnapToPhase at slot 75 on both. So a hand-rolled
+ * dispatch lookup against a same-line runtime would in fact work right now.
+ *
+ * The hazard is forward-looking, which is worse, not better: the RC line
+ * already occupies fifteen slots past pfnWeaverSnapToPhase, so the next append
+ * on THIS line collides with them unless the two are reconciled first. On the
+ * day that happens, a hand-rolled index keeps compiling, keeps returning a
+ * non-NULL pointer, and silently calls the wrong function — there is no length
+ * change and no version bump for a probe to catch. The trampoline is immune
+ * because the loader and the runtime move together. Verified with the vendor
+ * 2026-09-20; an earlier note here claimed the lines had ALREADY diverged at
+ * equal size, which the vendor has since retracted.
  */
 
 bool

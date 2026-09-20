@@ -77,10 +77,12 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
 
     # --- Drag phase-snap capability (runtime#1588) -------------------------
     # srWeaverSnapToPhase is called through the loader TRAMPOLINE, not through
-    # a hand-rolled dispatch lookup (leia_sr_linux_sdk.c explains why: the v2
-    # table diverged between the Linux and Windows lines at equal size, so
-    # indexing it by hand is false safety — only "loader and runtime from one
-    # tree" is safe, and only this variable establishes it).
+    # a hand-rolled dispatch lookup (leia_sr_linux_sdk.c explains why: the two
+    # v2 lines agree on slot meanings TODAY, but the Windows line already holds
+    # fifteen slots past this call, so the next append here collides silently —
+    # no length change, no version bump, nothing for a probe to catch. Only
+    # "loader and runtime from one tree" is safe, and only this variable
+    # establishes it).
     #
     # So the probe has to answer BOTH halves in one go: does the header declare
     # the call, and does this loader archive actually carry the trampoline?
