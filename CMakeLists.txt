@@ -182,7 +182,25 @@ set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
 # The old comment justified v2.2.0 by when Linux support first landed
 # (v1.26.2 / v1.28.0). That reasoning was satisfied long ago and the pin
 # had simply stopped moving; the Windows arm is on v2.16.9.
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.14.6" CACHE STRING
+#
+# v2.17.1 (from v2.14.6), for two reasons:
+#  - The rear-depth-budget background preview (struct xrt_dp_background_preview
+#    + the VK get_background_preview slot, announced by
+#    XRT_DP_VK_HAS_BACKGROUND_PREVIEW) first ships in v2.17.0. src/drv_leia_linux
+#    guards it on that macro, so an older pin still builds — it just ships a
+#    plug-in with no preview, and the runtime clips at the display plane
+#    forever. The DP logs once at startup which way it was built.
+#  - The vk_bundle ABI FINGERPRINT above is an exact-match check: the loader
+#    refuses the VK DP factory (session runs UNWOVEN) unless sizeof(vk_bundle)
+#    and its fn-table offset equal the runtime's. vk_bundle changed layout at
+#    v2.16.0 (one PFN appended) and is identical from v2.16.0 through main, so
+#    a v2.14.6-built plug-in is refused by every runtime >= v2.16.0, and a
+#    v2.17.1-built one by every runtime < v2.16.0. The pin therefore decides
+#    which runtimes WEAVE with this plug-in — move it with the runtime.
+# Not in v2.17.1: the VK snap_window_rect slot (runtime#1592,
+# XRT_DP_VK_HAS_SNAP_WINDOW_RECT), so drag phase-snap compiles out at this pin
+# (expected; it compiles in automatically at the first pin that carries it).
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.17.1" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it

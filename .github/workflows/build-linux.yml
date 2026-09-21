@@ -48,11 +48,12 @@ permissions:
 env:
   # Runtime ref the Linux arm builds against. MUST equal the CMake
   # DXR_RUNTIME_GIT_TAG_LINUX default (rule-5 self-check below, same policy
-  # as build-windows.yml's RUNTIME_REF check) — v2.14.6 is the first runtime
-  # tag carrying the #1243 vk_bundle ABI fingerprint fields the plug-in sets
-  # (see the CMakeLists comment; there is no feature macro for them, so an
-  # older ref does not degrade, it fails to compile).
-  RUNTIME_REF: v2.14.6
+  # as build-windows.yml's RUNTIME_REF check). Floor v2.14.6 (the #1243
+  # vk_bundle ABI fingerprint fields; no feature macro, an older ref fails to
+  # compile). v2.17.1: first line with the rear-depth-budget preview
+  # (XRT_DP_VK_HAS_BACKGROUND_PREVIEW), and a vk_bundle layout that matches
+  # runtimes v2.16.0..main — see the CMakeLists comment.
+  RUNTIME_REF: v2.17.1
 
 jobs:
   Build:
@@ -77,9 +78,9 @@ jobs:
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev \
             libpipewire-0.3-dev libdbus-1-dev
-          # ^ pipewire + dbus: compile-check the portal/PipeWire desktop-capture
-          #   producer (runtime#757 WS1, behind DXR_LEIA_HAVE_PIPEWIRE). CI cannot
-          #   RUN a portal/PipeWire session (no compositor), but with the -dev libs
+          # ^ pipewire + dbus: compile-check the mutter/PipeWire desktop-capture
+          #   producer (runtime#757, behind DXR_LEIA_HAVE_PIPEWIRE). CI cannot
+          #   RUN a mutter/PipeWire session (no compositor), but with the -dev libs
           #   present CMake defines DXR_LEIA_HAVE_PIPEWIRE so the real body is
           #   compiled — otherwise this large producer only ever built on the box.
 
