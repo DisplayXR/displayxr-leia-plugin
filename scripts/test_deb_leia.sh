@@ -64,7 +64,9 @@ docker run --rm \
     "$IMAGE" bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq && apt-get install -y -qq patchelf >/dev/null
+    # libpipewire-0.3-dev + libdbus-1-dev: package_deb_leia.sh refuses a .deb
+    # without the desktop-capture libs linked (the runtime builder image lacks them).
+    apt-get update -qq && apt-get install -y -qq patchelf libpipewire-0.3-dev libdbus-1-dev >/dev/null
     git config --global --add safe.directory /runtime
     git config --global --add safe.directory /plugin
     echo "--- runtime .deb ---"
@@ -93,6 +95,13 @@ docker run --rm \
 
     echo "=== both DPs present in the shared discovery dir ==="
     ls -1 /usr/lib/displayxr/plugins/
+
+    echo "=== desktop-capture libs resolved by Depends (plug-in dlopen needs them) ==="
+    dpkg-query -W -f="\${Depends}\n" displayxr-leia-sr
+    ldd /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so | grep -E "libpipewire-0.3|libdbus-1" \
+        || { echo "FAIL: capture libs not linked/resolved"; exit 1; }
+    ldd /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so | grep -q "not found" \
+        && { echo "FAIL: unresolved soname after apt install"; exit 1; } || true
 
     echo "=== default (no force-probe): stub declines -> sim-display claims ==="
     out_default="$(displayxr-cli info 2>&1)"; echo "$out_default" | grep -E "active plug-in|Selected|:: Display processor" || true
