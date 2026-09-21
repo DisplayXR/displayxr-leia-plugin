@@ -211,3 +211,10 @@ target_link_options(DisplayXR-LeiaSR PRIVATE
 install(TARGETS DisplayXR-LeiaSR
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 )
+
+# --- Host unit test: lens-preference ownership (LeiaSR #266) -------------
+# Pure logic from leia_lens_owner_linux.h; no SDK, no Vulkan, no panel, so it
+# builds and runs in both weaver arms. scripts/build-linux.sh and CI run it.
+add_executable(test_lens_owner_linux tests/test_lens_owner_linux.c)
+target_include_directories(test_lens_owner_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_lens_owner_linux COMMAND test_lens_owner_linux)

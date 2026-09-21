@@ -123,6 +123,9 @@ jobs:
       - name: Build displayxr-cli
         run: cmake --build build --target cli
 
+      - name: Unit test — lens-preference ownership (LeiaSR #266)
+        run: ./build/src/drv_leia_linux/test_lens_owner_linux
+
       - name: Assert single export (ADR-019 / #496)
         run: |
           SO=build/src/drv_leia_linux/DisplayXR-LeiaSR.so
