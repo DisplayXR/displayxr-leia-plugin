@@ -94,6 +94,25 @@ DEBUG_GET_ONCE_BOOL_OPTION(sr_fb_sdk, "DXR_LEIA_SR_FB_SDK", false)
 		}                                                                                                      \
 	} while (0)
 
+#ifdef DXR_LEIA_LNX_HAVE_SR_SNAP
+/*!
+ * Result name for logging. Delegates to the SDK's own srResultToString for
+ * everything EXCEPT SR_DECLINED, which is named here directly. The staged
+ * loader archive does know that code — but it is newer than the code itself,
+ * and an archive that predates it names it something else entirely rather than
+ * failing to compile. Naming the one code this file added handling for keeps
+ * the log honest whichever loader .a ends up in the link line.
+ */
+static const char *
+sdk_sr_result_str(SrResult res)
+{
+	if (res == SR_DECLINED) {
+		return "SR_DECLINED";
+	}
+	return srResultToString(res);
+}
+#endif
+
 
 /*
  *
@@ -1320,6 +1339,147 @@ leiasr_lnx_set_atlas_linear(struct leiasr_lnx *lnx, bool atlas_linear)
 	 * thread. Sticky either way — a declaration that repeats its value costs
 	 * nothing (early-out above), so nothing here runs per frame. */
 	lnx->srgb_dirty = true;
+}
+
+
+/*
+ *
+ * Drag phase-snap (runtime#1588) — srWeaverSnapToPhase.
+ *
+ * ONE SDK call, made unconditionally, with no capability probe in front of it.
+ * That is the SDK's own design, not an omission: the loader trampoline
+ * (sr_loader.c) writes *pX = targetX / *pY = targetY BEFORE anything can fail,
+ * and only then null-checks the weaver and the dispatch slot — so a runtime
+ * that predates the call returns SR_ERROR_FUNCTION_UNSUPPORTED with the target
+ * already written back. Identity comes for free and there is nothing to probe.
+ *
+ * WHAT THE BUILD MUST GUARANTEE, and why no runtime guard could.  The loader
+ * archive has to come from the SAME tree as the runtime it will talk to, and
+ * only the build can establish that (SRSDK_ROOT). Hence: link the trampoline,
+ * never reimplement the dispatch.
+ *
+ * Be precise about the reason, because the obvious one is not true today.
+ * The two v2 lines do NOT currently disagree about slot meanings: measured
+ * header-to-header, this Linux line's 74 slots are a byte-identical prefix of
+ * the Windows release-candidate line's 90, with pfnWeaverSetPresentOrigin at
+ * slot 74 and pfnWeaverSnapToPhase at slot 75 on both. So a hand-rolled
+ * dispatch lookup against a same-line runtime would in fact work right now.
+ *
+ * The hazard is forward-looking, which is worse, not better: the RC line
+ * already occupies fifteen slots past pfnWeaverSnapToPhase, so the next append
+ * on THIS line collides with them unless the two are reconciled first. On the
+ * day that happens, a hand-rolled index keeps compiling, keeps returning a
+ * non-NULL pointer, and silently calls the wrong function — there is no length
+ * change and no version bump for a probe to catch. The trampoline is immune
+ * because the loader and the runtime move together. Verified with the vendor
+ * 2026-09-20; an earlier note here claimed the lines had ALREADY diverged at
+ * equal size, which the vendor has since retracted.
+ */
+
+bool
+leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	*out_x = target_x; /* default on every path below: no-op snap */
+	*out_y = target_y;
+
+#ifdef DXR_LEIA_LNX_HAVE_SR_SNAP
+	if (lnx == NULL || lnx->weaver == NULL) {
+		return false;
+	}
+
+	int32_t sx = target_x;
+	int32_t sy = target_y;
+	const SrResult res = srWeaverSnapToPhase(lnx->weaver, origin_x, origin_y, target_x, target_y, &sx, &sy);
+
+	if (res == SR_DECLINED) {
+		/* "Could not snap yet" — typically no viewing distance before the
+		 * first tracked frame. A real answer, not a failure, and reported
+		 * distinctly on purpose: an unsnapped position returned as success
+		 * is indistinguishable from a snap that had nothing to correct.
+		 * INFO, not WARN: it is the expected state during warm-up. */
+		static bool logged_declined;
+		if (!logged_declined) {
+			U_LOG_I("leia_sr_sdk: srWeaverSnapToPhase declined (no viewing distance yet) — using the "
+			        "raw drag target until tracking settles");
+			logged_declined = true;
+		}
+		return false;
+	}
+
+	if (res == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		/* The loaded SR runtime has no snap slot — i.e. it is older than the
+		 * loader we linked against. On a bring-up box that almost always
+		 * means SR_RUNTIME_PATH did not take and the installed runtime was
+		 * discovered instead, so name the code: it is the difference between
+		 * "this build cannot snap" and "this RUN picked the wrong runtime". */
+		static bool logged_unsupported;
+		if (!logged_unsupported) {
+			U_LOG_W("leia_sr_sdk: srWeaverSnapToPhase reports %s — this SR runtime predates the call "
+			        "(check SR_RUNTIME_PATH); window drags will not phase-snap",
+			        sdk_sr_result_str(res));
+			logged_unsupported = true;
+		}
+		return false;
+	}
+
+	if (res == SR_ERROR_FEATURE_NOT_SUPPORTED) {
+		/* The weaver cannot report the display orientation, without which the
+		 * snap cannot be correct — the runtime declines rather than guessing
+		 * landscape. Distinct from FUNCTION_UNSUPPORTED: the call exists, the
+		 * display does not support it. */
+		static bool logged_feature;
+		if (!logged_feature) {
+			U_LOG_W("leia_sr_sdk: srWeaverSnapToPhase reports %s — the weaver cannot report the display "
+			        "orientation; window drags will not phase-snap",
+			        sdk_sr_result_str(res));
+			logged_feature = true;
+		}
+		return false;
+	}
+
+	if (SR_FAILED(res)) {
+		static bool logged_failed;
+		if (!logged_failed) {
+			U_LOG_W("leia_sr_sdk: srWeaverSnapToPhase failed: %s (%d)", sdk_sr_result_str(res), (int)res);
+			logged_failed = true;
+		}
+		return false;
+	}
+
+	/* Log the FIRST success, once. Without it there is no way to tell "the
+	 * snap ran and corrected the target" from "the snap was never called and
+	 * the drag happened to look right" — the ambiguity that made the Windows
+	 * investigation (LeiaInc/LeiaSR#163) expensive. The delta is included so
+	 * a zero correction reads as a correction of zero, not as a no-op. */
+	static bool logged_live;
+	if (!logged_live) {
+		U_LOG_W("leia_sr_sdk: srWeaverSnapToPhase LIVE — (%d,%d) -> (%d,%d), delta (%d,%d)", target_x, target_y,
+		        sx, sy, sx - target_x, sy - target_y);
+		logged_live = true;
+	}
+
+	*out_x = sx;
+	*out_y = sy;
+	return true;
+#else
+	/* Built against an SDK tree that does not declare (or cannot link)
+	 * srWeaverSnapToPhase: the feature compiles out to identity — the same
+	 * answer the trampoline gives on an older runtime. See the build-time
+	 * message in drv_leia_linux/CMakeLists.txt. */
+	(void)lnx;
+	(void)origin_x;
+	(void)origin_y;
+	return false;
+#endif
 }
 
 
