@@ -41,6 +41,15 @@
  *    collapses below 1 mm separation (vkweaver.cpp weave(): isTracking =
  *    eyeSeparation > 1) — the MANAGED loss lifecycle in action.
  *
+ *  - Lens preference ownership (LeiaSR #266): SRService keeps one lens
+ *    preference per SR context, shared by srCreateLens and the weaver, and
+ *    the first srLensEnable/Disable makes it ours for the context's life.
+ *    We never make that call at startup, leave 3D to the weaver until
+ *    something asks for 2D, and re-apply the last call sent to every new
+ *    context (leia_lens_owner_linux.h). A context invalidated by an
+ *    SRService restart (SR_EVENT_TYPE_CONTEXT_INVALID) is replaced once no
+ *    weaver is alive on it; the dead one is abandoned, not destroyed.
+ *
  *  - srWeaverSetInputTextureVulkan's width/height are PER-VIEW — vendor-
  *    confirmed on LeiaSR#53 ("The size is for a single view, not SBS").
  *    The 1.0.0 implementation stores and never reads them (shader samples
@@ -65,6 +74,7 @@
 
 #include "leia_sr_linux.h"
 #include "leia_edid_probe_linux.h"
+#include "leia_lens_owner_linux.h"
 
 #include "leia_interface.h"
 
@@ -146,6 +156,23 @@ struct sr_ctx
 	_Atomic int64_t last_pair_mono_ns;
 	atomic_bool lens_on;
 	atomic_bool display_info_dirty;
+
+	/*
+	 * Context loss (SR_EVENT_TYPE_CONTEXT_INVALID). The SDK raises it when the
+	 * connection to SRService drops (e.g. the service restarted) and does NOT
+	 * reconnect the instance: every handle hanging off it is dead, and the
+	 * header's instruction is "release all SR handles and re-initialise".
+	 * Latched by the SDK thread, acted on by sr_ctx_ensure() once no weaver
+	 * is alive on the dead context (see there).
+	 */
+	atomic_bool context_invalid;
+	//! Bumped per created context; SDK callbacks carry it as user_data so a
+	//! late callback from an abandoned context cannot write this one's state.
+	_Atomic uint32_t generation;
+	//! Weavers alive on the current context (guarded by g_ctx_lock). A
+	//! context is only replaced while this is 0: a weaver is bound to the
+	//! instance that created it.
+	uint32_t live_weavers;
 	atomic_uint_least64_t last_eye_time_us;
 
 	/* Cached display query (guarded by g_ctx_lock). */
@@ -159,10 +186,27 @@ static struct sr_ctx g_ctx = {
     .device_ready = true, /* assume ready until the monitor says otherwise */
 };
 
+/*!
+ * Lens-preference ownership (LeiaSR #266), guarded by g_ctx_lock. Lives OUTSIDE
+ * g_ctx on purpose: it must survive a context being torn down and re-created,
+ * because re-applying the last request to the new context is its whole job.
+ * The rules are in leia_lens_owner_linux.h.
+ */
+static struct leia_lens_owner g_lens_owner;
+
+//! True when an SDK callback belongs to the live context (see sr_ctx::generation).
+static inline bool
+sr_ctx_callback_is_current(void *user_data)
+{
+	return (uint32_t)(uintptr_t)user_data == atomic_load(&g_ctx.generation);
+}
+
 static void SR_CALL
 sr_ctx_on_eye_pair(const SrEyePair *pair, void *user_data)
 {
-	(void)user_data;
+	if (!sr_ctx_callback_is_current(user_data)) {
+		return; // abandoned context (see sr_ctx_abandon_locked)
+	}
 	/* SDK worker thread — atomic stores only. Positions always come from
 	 * srWeaverGetPredictedEyePositions (R-T1 same-pair rule); this callback
 	 * only tracks sample freshness for the timestamp out-param. */
@@ -173,10 +217,21 @@ sr_ctx_on_eye_pair(const SrEyePair *pair, void *user_data)
 static void SR_CALL
 sr_ctx_on_system_event(const SrSystemEvent *event, void *user_data)
 {
-	(void)user_data;
+	if (!sr_ctx_callback_is_current(user_data)) {
+		return; // abandoned context (see sr_ctx_abandon_locked)
+	}
 	/* SDK worker thread — atomic stores + logging only (the message pointer
 	 * dies when this returns; U_LOG formats it immediately). */
 	switch (event->eventType) {
+	case SR_EVENT_TYPE_CONTEXT_INVALID:
+		/* Lifecycle, one line per loss: this is the edge that explains a
+		 * session that stops tracking and a lens nobody drives any more. */
+		if (!atomic_exchange(&g_ctx.context_invalid, true)) {
+			U_LOG_W("leia_sr_sdk: SR context invalidated (%s) — the connection to SRService is gone; "
+			        "a new context is created once no weaver is alive on this one",
+			        event->message != NULL ? event->message : "no message");
+		}
+		break;
 	case SR_EVENT_TYPE_USER_FOUND: atomic_store(&g_ctx.user_present, true); break;
 	case SR_EVENT_TYPE_USER_LOST: atomic_store(&g_ctx.user_present, false); break;
 	case SR_EVENT_TYPE_DEVICE_READY:
@@ -230,6 +285,84 @@ sr_ctx_teardown_locked(void)
 }
 
 /*!
+ * Forget a context whose connection to SRService is gone, WITHOUT destroying
+ * its handles. srDestroyInstance joins SDK threads and is unbounded when the
+ * service died under it (R-W10) -- exactly the case here -- so one leaked,
+ * dead context per SRService restart is the bounded price of not hanging the
+ * caller. Its callbacks are fenced off by the generation bump in
+ * sr_ctx_ensure(). Caller holds g_ctx_lock and has checked live_weavers == 0.
+ */
+static void
+sr_ctx_abandon_locked(void)
+{
+	g_ctx.monitor = NULL;
+	g_ctx.tracker = NULL;
+	g_ctx.lens = NULL;
+	g_ctx.display = NULL;
+	g_ctx.instance = NULL;
+	g_ctx.display_info_valid = false;
+	atomic_store(&g_ctx.user_present, false);
+	atomic_store(&g_ctx.last_pair_mono_ns, 0);
+	atomic_store(&g_ctx.lens_on, false);
+	atomic_store(&g_ctx.device_ready, true);
+	atomic_store(&g_ctx.context_invalid, false);
+}
+
+/*!
+ * Send one lens call and record it as sent on success. Caller holds g_ctx_lock
+ * and has checked g_ctx.lens != NULL. @p why names the caller in the log.
+ */
+static bool
+sr_ctx_send_lens_locked(enum leia_lens_action action, const char *why)
+{
+	if (action == LEIA_LENS_ACTION_NONE) {
+		return true;
+	}
+	const bool enable = action == LEIA_LENS_ACTION_ENABLE;
+	const bool first_on_ctx = !g_lens_owner.ctx_app_owned;
+	SrResult res = enable ? srLensEnable(g_ctx.lens) : srLensDisable(g_ctx.lens);
+	if (SR_FAILED(res)) {
+		LOG_SR_ONCE("srLensEnable/Disable", res);
+		return false;
+	}
+	leia_lens_owner_commit(&g_lens_owner, action);
+	if (first_on_ctx) {
+		/* One line per context: from here on the weaver no longer writes
+		 * this context's lens preference (LeiaSR #266), so every later
+		 * change must come from us. */
+		U_LOG_W("leia_sr_sdk: lens %s (%s) — DisplayXR now owns this SR context's lens preference; "
+		        "the weaver will no longer turn it on or off",
+		        enable ? "ON" : "OFF", why);
+	}
+	return true;
+}
+
+/*!
+ * A new context's lens handle exists: re-apply the last request sent on an
+ * earlier context, if any (leia_lens_owner_linux.h). Caller holds g_ctx_lock.
+ */
+static void
+sr_ctx_reapply_lens_locked(void)
+{
+	const enum leia_lens_action action = leia_lens_owner_on_new_context(&g_lens_owner);
+	if (action == LEIA_LENS_ACTION_NONE) {
+		/* Deliberately NO srLensEnable at startup. The first lens call on a
+		 * context takes the preference away from the weaver for the rest of
+		 * the context's life (LeiaSR #266), which would lose the weaver's
+		 * automatic "lens off when the window leaves the panel" -- the
+		 * Windows-parity behaviour an untoggled session should get. The
+		 * weaver turns the lens on by itself at its first woven frame. */
+		return;
+	}
+	if (g_ctx.lens == NULL) {
+		U_LOG_W("leia_sr_sdk: cannot re-apply lens %s to the new SR context: no lens handle",
+		        action == LEIA_LENS_ACTION_ENABLE ? "ON" : "OFF");
+		return;
+	}
+	(void)sr_ctx_send_lens_locked(action, "re-applied to a new SR context");
+}
+
+/*!
  * Lazily bring up the process-wide SR context, retrying srCreateInstance for
  * up to @p retry_budget_s while the SR runtime is unreachable (R-W1).
  * Returns the resulting seam code; SUCCESS ⟹ g_ctx.state == SR_CTX_READY.
@@ -238,6 +371,27 @@ static enum leiasr_lnx_result
 sr_ctx_ensure(double retry_budget_s)
 {
 	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.state == SR_CTX_READY && atomic_load(&g_ctx.context_invalid)) {
+		if (g_ctx.live_weavers == 0) {
+			/* The connection to SRService is gone and nothing is bound to
+			 * this context any more: drop it and build a new one below. */
+			U_LOG_W("leia_sr_sdk: replacing the invalidated SR context");
+			sr_ctx_abandon_locked();
+			g_ctx.state = SR_CTX_UNINIT;
+		} else {
+			/* A live weaver is bound to the dead instance. Replacing the
+			 * context under it would need re-creating the weaver and all
+			 * the state set on it; that is not done here, so the session
+			 * keeps the dead context and the next one recovers. */
+			static bool logged;
+			if (!logged) {
+				U_LOG_W("leia_sr_sdk: SR context invalid but %u weaver(s) still alive on it — "
+				        "keeping it until they are destroyed",
+				        g_ctx.live_weavers);
+				logged = true;
+			}
+		}
+	}
 	if (g_ctx.state == SR_CTX_READY) {
 		pthread_mutex_unlock(&g_ctx_lock);
 		return LEIASR_LNX_SUCCESS;
@@ -276,6 +430,11 @@ sr_ctx_ensure(double retry_budget_s)
 
 	srSetLogCallback(g_ctx.instance, sr_ctx_on_sdk_log, NULL);
 
+	/* New context: fence off callbacks from any abandoned one. */
+	const uint32_t gen = atomic_fetch_add(&g_ctx.generation, 1) + 1;
+	void *const gen_tag = (void *)(uintptr_t)gen;
+	atomic_store(&g_ctx.context_invalid, false);
+
 	/* Senses + callbacks BEFORE srInitialize (SDK lifecycle rule). */
 	SrEyeTrackerCreateInfo tci = SrEyeTrackerCreateInfo(.enablePrediction = SR_TRUE);
 	res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker);
@@ -285,13 +444,13 @@ sr_ctx_ensure(double retry_budget_s)
 		U_LOG_W("leia_sr_sdk: srCreateEyeTracker failed (%s) — untracked weaving", srResultToString(res));
 		g_ctx.tracker = NULL;
 	} else {
-		srEyeTrackerAddCallback(g_ctx.tracker, sr_ctx_on_eye_pair, NULL);
+		srEyeTrackerAddCallback(g_ctx.tracker, sr_ctx_on_eye_pair, gen_tag);
 	}
 
 	SrSystemMonitorCreateInfo mci = SrSystemMonitorCreateInfo();
 	res = srCreateSystemMonitor(g_ctx.instance, &mci, &g_ctx.monitor);
 	if (SR_SUCCEEDED(res)) {
-		srSystemMonitorAddCallback(g_ctx.monitor, sr_ctx_on_system_event, NULL);
+		srSystemMonitorAddCallback(g_ctx.monitor, sr_ctx_on_system_event, gen_tag);
 	} else {
 		U_LOG_W("leia_sr_sdk: srCreateSystemMonitor failed (%s) — no tracking-state events",
 		        srResultToString(res));
@@ -327,6 +486,13 @@ sr_ctx_ensure(double retry_budget_s)
 
 	g_ctx.state = SR_CTX_READY;
 	atomic_store(&g_ctx.display_info_dirty, true);
+
+	/* Every path that creates a context comes through here -- first
+	 * creation, a retry after a failed bring-up, and the replacement of an
+	 * invalidated context above -- so this is the one place "the app took
+	 * control" is carried over to a new context. */
+	sr_ctx_reapply_lens_locked();
+
 	pthread_mutex_unlock(&g_ctx_lock);
 	return LEIASR_LNX_SUCCESS;
 
@@ -1059,6 +1225,25 @@ sdk_passthrough_blit(VkCommandBuffer cmd_buffer,
  *
  */
 
+//! Count a weaver alive on the current context (see sr_ctx::live_weavers).
+static void
+sr_ctx_weaver_pin(void)
+{
+	pthread_mutex_lock(&g_ctx_lock);
+	g_ctx.live_weavers++;
+	pthread_mutex_unlock(&g_ctx_lock);
+}
+
+static void
+sr_ctx_weaver_unpin(void)
+{
+	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.live_weavers > 0) {
+		g_ctx.live_weavers--;
+	}
+	pthread_mutex_unlock(&g_ctx_lock);
+}
+
 enum leiasr_lnx_result
 leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx **out_lnx)
 {
@@ -1071,16 +1256,23 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		return res;
 	}
 
+	/* Pin the context for the weaver's lifetime: sr_ctx_ensure only replaces
+	 * an invalidated context while no weaver is alive on it. Taken before the
+	 * weaver exists so a concurrent replacement cannot slip in between. */
+	sr_ctx_weaver_pin();
+
 	SrRuntimeCapabilities caps = SrRuntimeCapabilities();
 	if (SR_FAILED(srGetRuntimeCapabilities(g_ctx.instance, &caps)) ||
 	    (caps.weaverBackends & SR_WEAVER_BACKEND_VULKAN_BIT) == 0) {
 		U_LOG_W("leia_sr_sdk: srSDK runtime reports no Vulkan weaver backend (weaverBackends=0x%llx)",
 		        (unsigned long long)caps.weaverBackends);
+		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 
 	struct leiasr_lnx *lnx = calloc(1, sizeof(*lnx));
 	if (lnx == NULL) {
+		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 	lnx->info = *info;
@@ -1099,6 +1291,7 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	if (SR_FAILED(sres)) {
 		U_LOG_W("leia_sr_sdk: srCreateWeaverVulkan failed: %s", srResultToString(sres));
 		free(lnx);
+		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 
@@ -1108,6 +1301,7 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		U_LOG_W("leia_sr_sdk: render pass creation failed (format %d)", rp_format);
 		srDestroyWeaver(lnx->weaver);
 		free(lnx);
+		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 
@@ -1150,6 +1344,7 @@ leiasr_lnx_destroy(struct leiasr_lnx *lnx)
 		vkDestroyRenderPass(lnx->info.device, lnx->render_pass, NULL);
 	}
 	free(lnx);
+	sr_ctx_weaver_unpin();
 }
 
 void
@@ -1617,11 +1812,23 @@ leiasr_lnx_query_display_info(struct leiasr_lnx_display_info *out_info)
 	return ok;
 }
 
+/*
+ * Lens ownership (LeiaSR #266) -- read leia_lens_owner_linux.h first.
+ *
+ * The short version: 3D before we have ever turned the lens off is left to the
+ * weaver (no SDK call), the first 2D request takes the context's lens
+ * preference away from the weaver for good, and from then on every request is
+ * sent. So whoever asks for 2D here -- the app, or the runtime degrading on its
+ * behalf -- must ask for the previous state back when the reason clears,
+ * because nothing else ever will.
+ */
 bool
 leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d)
 {
 	(void)lnx;
+	pthread_mutex_lock(&g_ctx_lock);
 	if (g_ctx.lens == NULL) {
+		pthread_mutex_unlock(&g_ctx_lock);
 		static bool logged;
 		if (!logged) {
 			U_LOG_W("leia_sr_sdk: request_display_mode(%s) with no lens handle — ignored",
@@ -1630,12 +1837,19 @@ leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d)
 		}
 		return false;
 	}
-	SrResult res = enable_3d ? srLensEnable(g_ctx.lens) : srLensDisable(g_ctx.lens);
-	if (SR_FAILED(res)) {
-		LOG_SR_ONCE("srLensEnable/Disable", res);
-		return false;
+	const enum leia_lens_action action = leia_lens_owner_on_request(&g_lens_owner, enable_3d);
+	if (action == LEIA_LENS_ACTION_NONE) {
+		static bool logged_delegated;
+		if (!logged_delegated) {
+			U_LOG_W("leia_sr_sdk: request_display_mode(3D) left to the weaver — no lens call until "
+			        "something asks for 2D (keeps the weaver's off-panel lens release)");
+			logged_delegated = true;
+		}
 	}
-	return true;
+	const bool ok = sr_ctx_send_lens_locked(action, enable_3d ? "request_display_mode(3D)"
+	                                                          : "request_display_mode(2D)");
+	pthread_mutex_unlock(&g_ctx_lock);
+	return ok;
 }
 
 bool
