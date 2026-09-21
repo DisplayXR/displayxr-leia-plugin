@@ -1866,6 +1866,26 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	U_LOG_W("leia_lnx_dp: Linux VK display processor created (backend: %s)",
 	        leiasr_lnx_get_render_pass(sr) == VK_NULL_HANDLE ? "stub passthrough" : "weaver");
 
+	// Which optional runtime slots this build carries — they compile in or out
+	// with the runtime headers the plug-in was pinned to, so say it once.
+	static bool built_logged = false;
+	if (!built_logged) {
+		built_logged = true;
+		U_LOG_W("leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s",
+#ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
+		        "YES",
+#else
+		        "NO (runtime headers predate XRT_DP_VK_HAS_BACKGROUND_PREVIEW / v2.17.0 — the runtime stays "
+		        "in its no-source, clip-at-the-display-plane state)",
+#endif
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+		        "YES"
+#else
+		        "NO (runtime headers predate XRT_DP_VK_HAS_SNAP_WINDOW_RECT)"
+#endif
+		);
+	}
+
 	*out_xdp = &ldp->base.base;
 	return XRT_SUCCESS;
 }

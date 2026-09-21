@@ -947,6 +947,7 @@ stall_check(struct leia_bg_capture_linux *c, const char *what, uint64_t t0_ns)
  * 2^PANEL_PREVIEW_SHIFT into @p dst (BGRA8, alpha 255). Swizzles RGB-order
  * formats to BGRA, and ignores the source X/A byte (BGRx carries garbage).
  */
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 #if defined(__GNUC__) && !defined(__clang__)
 // The one hot loop in this module (~4.8 ms for a 3840x2160 panel at -O2, ~26 ms
 // at -O0). It runs on the PipeWire thread, where a Debug build's cost would
@@ -1034,6 +1035,7 @@ panel_preview_produce(struct leia_bg_capture_linux *c, const uint8_t *src, size_
 	*b = t;
 	pthread_mutex_unlock(&c->preview_lock);
 }
+#endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
 // ---------------------------------------------------------------------------
 // PipeWire stream callbacks
@@ -1293,9 +1295,14 @@ on_process(void *data)
 					stride = (size_t)d->chunk->stride;
 				}
 			}
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 			if (src != NULL && src != (const uint8_t *)bb->staging_ptr) {
 				panel_preview_produce(c, src, stride, seq);
 			}
+#else
+			(void)src;
+			(void)stride;
+#endif
 		}
 		// Publish the stable slot index; for dma-buf the VkImage import is
 		// fixed for the buffer's lifetime, for shm the frame now sits in the
@@ -1731,6 +1738,7 @@ capture_poll_impl(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	return true;
 }
 
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 /*!
  * Region of the window a preview crop actually covers, in window-normalised
  * coordinates (u right, v down, 0,0 = window top-left) — i.e.
@@ -1915,6 +1923,7 @@ capture_get_preview_impl(struct leia_bg_capture_linux *c, struct xrt_dp_backgrou
 #undef LEIA_BGP_FITS
 	return true;
 }
+#endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
 bool
 leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
@@ -1930,6 +1939,7 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	return ok;
 }
 
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 bool
 leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out)
 {
@@ -1941,6 +1951,7 @@ leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp
 	stall_check(c, "get_background_preview()", t0);
 	return ok;
 }
+#endif
 
 void
 leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c)
@@ -2016,8 +2027,10 @@ void leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *o
 bool leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd, int32_t win_x, int32_t win_y,
                                 uint32_t win_w, uint32_t win_h, float o[2], float e[2])
 { (void)c; (void)cmd; (void)win_x; (void)win_y; (void)win_w; (void)win_h; (void)o; (void)e; return false; }
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 bool leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out)
 { (void)c; (void)out; return false; }
+#endif
 bool leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c) { (void)c; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 

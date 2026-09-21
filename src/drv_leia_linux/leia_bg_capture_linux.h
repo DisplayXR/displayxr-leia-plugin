@@ -42,7 +42,19 @@
 // Vulkan types come from the shared vk_bundle path (xrt_vulkan_includes.h via
 // vk/vk_helpers.h in the translation units that use this).
 #include "vk/vk_helpers.h"
-#include "xrt/xrt_display_processor.h" // struct xrt_dp_background_preview
+#include "xrt/xrt_display_processor_vk.h" // XRT_DP_VK_HAS_BACKGROUND_PREVIEW (+ the preview struct)
+
+/*!
+ * Defined when the runtime headers this plug-in builds against carry the
+ * rear-depth-budget preview (struct xrt_dp_background_preview and the VK
+ * get_background_preview slot — runtime v2.17.0+). Against an older runtime
+ * pin the preview compiles out entirely and the runtime stays in its safe
+ * "no source → clip at the display plane" state. Same name as the Windows
+ * arm's gate (leia_bg_capture_win.h).
+ */
+#ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
+#define LEIA_BG_CAPTURE_HAS_PREVIEW 1
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,8 +87,7 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
 bool
 leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c);
 
-struct xrt_dp_background_preview;
-
+#ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 /*!
  * The rear-depth-budget background preview (runtime xrt_dp_background_preview):
  * the desktop under the window as of the last poll(), box-filtered by >= 4x to
@@ -87,6 +98,7 @@ struct xrt_dp_background_preview;
  */
 bool
 leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out);
+#endif
 
 /*!
  * The captured-desktop image as a Vulkan view, in SHADER_READ_ONLY_OPTIMAL,
