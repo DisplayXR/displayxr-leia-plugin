@@ -429,7 +429,13 @@ leiasr_lnx_query_display_info(struct leiasr_lnx_display_info *out_info);
 /*!
  * Lens/backlight 2D⇄3D switch, independent of weaving (R-D2). Backs the
  * runtime's `request_display_mode` DP slot and MANAGED auto-drop (R-T4).
- * srSDK 1.0.0: `srLensEnable/Disable` — honored as asked.
+ *
+ * srSDK (LeiaSR #266): the first srLensEnable/srLensDisable on an SR context
+ * takes that context's lens preference away from the weaver for good. So the
+ * SDK backend leaves a 3D request to the weaver until something has asked for
+ * 2D, sends every request after that, and re-applies the last one sent to any
+ * new SR context. Whoever asks for 2D must ask for the previous state back.
+ * Rules + rationale: leia_lens_owner_linux.h, docs/display-mode-switching.md.
  */
 bool
 leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d);
