@@ -107,11 +107,14 @@ Configure must print `Track B srSDK weaver backend (SDK at …/lib)`. If it fail
 **Toolchain:** verified on Ubuntu 26.04 with **GCC 15.2 / CMake 4.2 / Ninja** — Track B
 compiles clean, **no source changes**.
 
-**`-DDXR_RUNTIME_SOURCE_DIR` is mandatory, not a convenience.** Building against the
-pinned `DXR_RUNTIME_GIT_TAG_LINUX` (`v2.14.6`) headers produces a plug-in the runtime
-**hard-rejects at load**: those headers' `struct vk_bundle` is 8 bytes smaller than runtime
-`main`'s (`PFN_vkGetRefreshCycleDurationGOOGLE` was added), and the loader compares
-`vk_bundle_abi_size` exactly (runtime `target_plugin_loader.c` ~:2806). Note what this is
+**Match the runtime's `struct vk_bundle`.** The loader compares `vk_bundle_abi_size`
+exactly (runtime `target_plugin_loader.c` ~:2806) and refuses the VK DP on a mismatch.
+`vk_bundle` changed layout at runtime v2.16.0 (`PFN_vkGetRefreshCycleDurationGOOGLE` was
+added, +8 bytes) and is identical from v2.16.0 through `main`. With the Linux pin at
+`v2.17.1` a tag-pinned build therefore loads into any runtime v2.16.0..main; under the old
+`v2.14.6` pin it was 8 bytes short and **hard-rejected**, which is why
+`-DDXR_RUNTIME_SOURCE_DIR` used to be mandatory. It is still the safest way to build a
+plug-in you are about to load. Note what this is
 *not*: `XRT_PLUGIN_API_VERSION_CURRENT` is **5** on both, and the runtime's
 `scripts/check_plugin_abi.py` does not model this struct fingerprint — so neither the
 version number nor the ABI gate warns you. Point the build at the same runtime checkout you
