@@ -68,6 +68,26 @@ return float4(mix(b, a.rgb, a.a), 1.0);
 
 `leia_bg_capture_create` calls `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` so WGC does not recursively capture our own woven output back into the background. Requires Windows 10 build 19041+ (2004); on older Windows the bg-capture module fails to create and the DP falls back to chroma-key.
 
+## Linux: no self-capture defense, so no capture by default
+
+Linux has no `WDA_EXCLUDEFROMCAPTURE`. The Linux DP's background source is an xdg-desktop-portal ScreenCast of the whole **monitor** (`src/drv_leia_linux/leia_bg_capture_linux.c`), and neither the portal's ScreenCast options nor `org.gnome.Mutter.ScreenCast` can exclude a window; monitor streams copy scanout directly. The capture therefore records our own window. Our previous **woven** frame is composed under the new frame and woven again, which puts both views into both eyes. This was confirmed on a DS1 panel: with `DXR_LEIA_BG_DEBUG=1` the window showed a recursive tunnel with the app's own content inside the "background".
+
+**Default: silhouette intersection, capture off.** The XCB window uses a 32-bit ARGB visual, so wherever the post-weave alpha-gate writes `alpha = 0`, mutter composites the real desktop behind us and no capture is involved. By default the Linux gate punches where **any** view is transparent (Windows punches only where **every** view is), so it never leaves a pixel that needs a background composed under it. This is the "silhouette intersection" mitigation from [chroma-key-overlay.md §Limits](chroma-key-overlay.md#limits--disocclusion-fringe-near-the-silhouette). The desktop capture is never started, so no ScreenCast stream runs and the user never sees the portal dialog.
+
+*Cost:* the visible silhouette is the intersection of the per-view silhouettes, so it shrinks by the disparity width at its edges. That is nothing at the display plane and grows with the content's distance in front of or behind it.
+
+| env var | effect |
+|---|---|
+| *(unset)* | Silhouette intersection. No capture. |
+| `DXR_LEIA_BG_CAPTURE=1` | Opt in to the portal capture and compose-under (the gate returns to the every-view rule). **This exhibits the self-capture bug on GNOME/mutter.** It is kept for the longer-term fix, a capture that genuinely excludes our window. If the portal/PipeWire declines, the DP logs this and falls back to silhouette intersection. |
+| `DXR_LEIA_BG_DEBUG=1` | Implies `DXR_LEIA_BG_CAPTURE=1`. The window shows **only** the captured background and the alpha-gate is skipped. If the capture does not start, a WARN says there is nothing to show. |
+
+The session log states the mode once per process:
+```
+leia_lnx_dp: transparency mode = silhouette intersection (punch where ANY view is transparent); desktop capture OFF ...
+leia_lnx_dp: transparency mode = compose-under-capture (desktop capture ON via DXR_LEIA_BG_CAPTURE=1) — WARNING: ...
+```
+
 ## Cross-API sync
 
 The producer is the internal D3D11 device inside `leia_bg_capture_win`. Consumers are the DP's own device (D3D11/D3D12/VK). After each `CopyResource` from the WGC frame into the shared staging texture, the producer signals an `ID3D11Fence` (created with `D3D11_FENCE_FLAG_SHARED`) and flushes its context. Consumers wait before sampling:
