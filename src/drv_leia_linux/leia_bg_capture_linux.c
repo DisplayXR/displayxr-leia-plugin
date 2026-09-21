@@ -28,7 +28,8 @@
  *     re-registers the exclusion and trusts only frames published after that.
  *   - Our format offer carries no modifier, so mutter delivers MemFd/MemPtr
  *     frames (the shm path). The dma-buf import is kept for a producer that
- *     negotiates it anyway.
+ *     negotiates it anyway; the rear-depth-budget preview is produced from
+ *     the shm frames only (see preview_* below).
  */
 
 #include <fcntl.h>
@@ -36,6 +37,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include <math.h>
 
 #include <dbus/dbus.h>
 
@@ -123,6 +127,7 @@ struct leia_bg_capture_linux {
 	uint32_t height;           //!< negotiated frame height
 	uint64_t modifier;         //!< negotiated DRM modifier
 	VkFormat vk_format;        //!< Vulkan format matching the SPA format
+	bool fmt_rgb_order;        //!< SPA format is RGBA/RGBx (preview swaps to BGRA)
 
 	// Buffer cache (indexed by pw buffer id).
 	struct dxr_bg_buffer buffers[DXR_MAX_BUFFERS];
@@ -141,6 +146,33 @@ struct leia_bg_capture_linux {
 	bool dbg_first_frame_logged;
 	bool dbg_first_upload_logged;
 	bool dbg_no_frame_logged;
+
+	// ---- rear depth budget background preview (runtime#224 contract) ------
+	// Two stages, so the expensive part never runs on the render thread:
+	//  1. pw thread, on_process: a 1/PANEL_PREVIEW_SHIFT box filter of the WHOLE
+	//     captured panel into panel_preview (throttled to <= 15 Hz, once per new
+	//     frame). Under preview_lock.
+	//  2. render thread, get_preview: crop the window's region out of it and
+	//     box-reduce further until both sides are <= 512 into preview_out.
+	//     Borrowed by the runtime until the next process_atlas.
+	pthread_mutex_t preview_lock;
+	bool preview_lock_inited;
+	uint8_t *panel_preview;          //!< BGRA8, tightly packed (under preview_lock)
+	uint32_t panel_preview_w, panel_preview_h;
+	uint32_t panel_preview_seq;      //!< frame seq it was built from (0 = none)
+	uint64_t panel_preview_last_ns;  //!< pw-thread throttle
+	uint8_t *preview_out;            //!< render-thread output (borrowed by the runtime)
+	size_t preview_out_cap;
+	uint32_t preview_out_w, preview_out_h;
+	uint32_t preview_out_gen;        //!< bumps whenever preview_out is rebuilt
+	uint32_t preview_src_seq;        //!< panel_preview_seq preview_out was built from
+	float preview_cu0, preview_cv0, preview_cu1, preview_cv1;
+	bool preview_dmabuf_logged;
+	// The window rect of the last poll (DEVICE px, panel-relative).
+	int32_t last_win_x, last_win_y;
+	uint32_t last_win_w, last_win_h;
+	int32_t preview_win_x, preview_win_y;
+	uint32_t preview_win_w, preview_win_h;
 };
 
 static bool s_pw_inited = false; //!< pw_init() guard (only global mutable state)
@@ -804,6 +836,104 @@ mutter_pump(struct leia_bg_capture_linux *c)
 }
 
 // ---------------------------------------------------------------------------
+// Rear-depth-budget background preview (runtime#224 / xrt_dp_background_preview)
+// ---------------------------------------------------------------------------
+
+//! Stage-1 reduction of the whole captured panel (1/2^shift box filter).
+#define PANEL_PREVIEW_SHIFT 2u
+//! Both output dimensions must stay <= this (xrt_dp_background_preview).
+#define PREVIEW_MAX_DIM 512u
+//! Stage-1 throttle: the runtime polls at ~66 ms; producing faster is waste.
+#define PANEL_PREVIEW_MIN_INTERVAL_NS (66ull * 1000ull * 1000ull)
+
+static uint64_t
+mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/*!
+ * pw thread: box-filter a tightly packed width×height 4-byte frame by
+ * 2^PANEL_PREVIEW_SHIFT into @p dst (BGRA8, alpha 255). Swizzles RGB-order
+ * formats to BGRA, and ignores the source X/A byte (BGRx carries garbage).
+ */
+static void
+panel_preview_reduce(const uint8_t *src, uint32_t w, uint32_t h, bool rgb_order, uint8_t *dst, uint32_t pw,
+                     uint32_t ph)
+{
+	const uint32_t f = 1u << PANEL_PREVIEW_SHIFT;
+	const uint32_t n = f * f;
+	const size_t sstride = (size_t)w * 4u;
+	uint32_t acc[3 * 2048];
+	for (uint32_t oy = 0; oy < ph; oy++) {
+		// Columns are processed in chunks so the accumulator stays on the stack.
+		for (uint32_t ox0 = 0; ox0 < pw; ox0 += 2048) {
+			const uint32_t cw = (pw - ox0) < 2048 ? (pw - ox0) : 2048;
+			memset(acc, 0, sizeof(uint32_t) * 3 * cw);
+			for (uint32_t ry = 0; ry < f; ry++) {
+				const uint8_t *row = src + (size_t)(oy * f + ry) * sstride + (size_t)ox0 * f * 4u;
+				for (uint32_t ox = 0; ox < cw; ox++) {
+					const uint8_t *px = row + (size_t)ox * f * 4u;
+					uint32_t *a = &acc[ox * 3];
+					for (uint32_t rx = 0; rx < f; rx++) {
+						a[0] += px[rx * 4 + 0];
+						a[1] += px[rx * 4 + 1];
+						a[2] += px[rx * 4 + 2];
+					}
+				}
+			}
+			uint8_t *out = dst + ((size_t)oy * pw + ox0) * 4u;
+			for (uint32_t ox = 0; ox < cw; ox++) {
+				const uint8_t c0 = (uint8_t)(acc[ox * 3 + 0] / n);
+				const uint8_t c1 = (uint8_t)(acc[ox * 3 + 1] / n);
+				const uint8_t c2 = (uint8_t)(acc[ox * 3 + 2] / n);
+				out[ox * 4 + 0] = rgb_order ? c2 : c0; // B
+				out[ox * 4 + 1] = c1;                  // G
+				out[ox * 4 + 2] = rgb_order ? c0 : c2; // R
+				out[ox * 4 + 3] = 255;
+			}
+		}
+	}
+	(void)h;
+}
+
+/*!
+ * pw thread, right after a shm frame landed in @p staging: refresh the stage-1
+ * panel preview, at most every PANEL_PREVIEW_MIN_INTERVAL_NS.
+ */
+static void
+panel_preview_produce(struct leia_bg_capture_linux *c, const uint8_t *staging, uint32_t seq)
+{
+	if (!c->preview_lock_inited || staging == NULL) {
+		return;
+	}
+	const uint64_t now = mono_ns();
+	if (c->panel_preview_seq != 0 && now - c->panel_preview_last_ns < PANEL_PREVIEW_MIN_INTERVAL_NS) {
+		return;
+	}
+	const uint32_t pw = c->width >> PANEL_PREVIEW_SHIFT;
+	const uint32_t ph = c->height >> PANEL_PREVIEW_SHIFT;
+	if (pw == 0 || ph == 0) {
+		return;
+	}
+	pthread_mutex_lock(&c->preview_lock);
+	if (c->panel_preview == NULL || c->panel_preview_w != pw || c->panel_preview_h != ph) {
+		free(c->panel_preview);
+		c->panel_preview = malloc((size_t)pw * ph * 4u);
+		c->panel_preview_w = c->panel_preview != NULL ? pw : 0;
+		c->panel_preview_h = c->panel_preview != NULL ? ph : 0;
+	}
+	if (c->panel_preview != NULL) {
+		panel_preview_reduce(staging, c->width, c->height, c->fmt_rgb_order, c->panel_preview, pw, ph);
+		c->panel_preview_seq = seq;
+		c->panel_preview_last_ns = now;
+	}
+	pthread_mutex_unlock(&c->preview_lock);
+}
+
+// ---------------------------------------------------------------------------
 // PipeWire stream callbacks
 // ---------------------------------------------------------------------------
 
@@ -852,6 +982,7 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	c->width = info.size.width;
 	c->height = info.size.height;
 	c->vk_format = vkf;
+	c->fmt_rgb_order = (info.format == SPA_VIDEO_FORMAT_RGBA || info.format == SPA_VIDEO_FORMAT_RGBx);
 
 	// spa_video_info_raw carries the negotiated DRM modifier directly in
 	// .modifier (this SPA has no "modifier present" flag). We force LINEAR in
@@ -1044,6 +1175,10 @@ on_process(void *data)
 		}
 		const uint32_t seq = atomic_load(&c->dbg_frames) + 1;
 		atomic_store(&c->slot_seq[slot], seq);
+		if (bb->is_shm) {
+			// Rear-depth-budget preview, stage 1, off the render thread.
+			panel_preview_produce(c, (const uint8_t *)bb->staging_ptr, seq);
+		}
 		// Publish the stable slot index; for dma-buf the VkImage import is
 		// fixed for the buffer's lifetime, for shm the frame now sits in the
 		// slot's staging buffer — either way the render thread can proceed
@@ -1219,6 +1354,9 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
 	c->vk = vk;
 	c->vk_format = VK_FORMAT_UNDEFINED;
 	atomic_store(&c->current_buffer, -1);
+	if (pthread_mutex_init(&c->preview_lock, NULL) == 0) {
+		c->preview_lock_inited = true;
+	}
 
 	// vkGetMemoryFdPropertiesKHR is not in the dispatch table.
 	c->getMemoryFdProperties = (PFN_vkGetMemoryFdPropertiesKHR)
@@ -1286,6 +1424,10 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 		return false;
 	}
 	c->poll_ok = false;
+	c->last_win_x = win_x;
+	c->last_win_y = win_y;
+	c->last_win_w = win_w;
+	c->last_win_h = win_h;
 
 	mutter_pump(c);
 
@@ -1451,6 +1593,189 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	return true;
 }
 
+/*!
+ * Region of the window a preview crop actually covers, in window-normalised
+ * coordinates (u right, v down, 0,0 = window top-left) — i.e.
+ * xrt_dp_background_preview::canvas_u0..canvas_v1. Pure arithmetic.
+ *
+ * The crop is in panel-preview pixels (each @p dev_per_px DEVICE pixels wide
+ * and tall), so it rarely lands exactly on the window's edges: it is rounded
+ * OUTWARD, and the rect says so (u0 slightly < 0, u1 slightly > 1 — the
+ * "margin" the runtime struct allows). Clamping to the panel is what makes it
+ * strictly inside [0,1] for a window hanging off an edge; the runtime maps
+ * every window-normalised region through this rect, so it must be exact.
+ */
+static void
+preview_canvas_uv(float crop_x0_dev, float crop_y0_dev, float crop_x1_dev, float crop_y1_dev, int32_t win_x,
+                  int32_t win_y, uint32_t win_w, uint32_t win_h, float out_uv[4])
+{
+	out_uv[0] = (crop_x0_dev - (float)win_x) / (float)win_w;
+	out_uv[1] = (crop_y0_dev - (float)win_y) / (float)win_h;
+	out_uv[2] = (crop_x1_dev - (float)win_x) / (float)win_w;
+	out_uv[3] = (crop_y1_dev - (float)win_y) / (float)win_h;
+}
+
+bool
+leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out)
+{
+	if (c == NULL || out == NULL || !c->preview_lock_inited) {
+		return false;
+	}
+	// "No source right now" — every case where the last poll declined:
+	// exclusion down, session closed, window off the panel, no frame yet.
+	if (!c->poll_ok) {
+		return false;
+	}
+	if (c->width == 0 || c->height == 0 || c->panel.device_w == 0 || c->panel.device_h == 0) {
+		return false;
+	}
+	int idx = atomic_load(&c->current_buffer);
+	if (idx >= 0 && idx < DXR_MAX_BUFFERS && c->buffers[idx].imported && !c->buffers[idx].is_shm) {
+		// The dma-buf path has no CPU copy to reduce. Not reachable with
+		// today's modifier-less format offer; say so once if it ever is.
+		if (!c->preview_dmabuf_logged) {
+			c->preview_dmabuf_logged = true;
+			U_LOG_W("leia_bg_capture_linux: dma-buf frames — no background preview (rear depth budget "
+			        "stays clipped)");
+		}
+		return false;
+	}
+
+	// The window rect this preview is for (DEVICE px, panel-relative);
+	// display-scoped (w,h = 0) means the whole panel.
+	int32_t wx = c->last_win_x, wy = c->last_win_y;
+	uint32_t ww = c->last_win_w, wh = c->last_win_h;
+	if (ww == 0 || wh == 0) {
+		wx = 0;
+		wy = 0;
+		ww = c->panel.device_w;
+		wh = c->panel.device_h;
+	}
+
+	pthread_mutex_lock(&c->preview_lock);
+	const uint32_t pseq = c->panel_preview_seq;
+	const bool fresh_src = pseq != 0 && pseq > c->untrusted_through;
+	if (!fresh_src) {
+		pthread_mutex_unlock(&c->preview_lock);
+		return false; // no preview yet, or only one built from a distrusted frame
+	}
+	const bool rect_changed = wx != c->preview_win_x || wy != c->preview_win_y || ww != c->preview_win_w ||
+	                          wh != c->preview_win_h;
+	if (pseq != c->preview_src_seq || rect_changed || c->preview_out == NULL) {
+		// DEVICE → stream → panel-preview pixels. stream/device == 1 unless a
+		// fractional scale rounded the stream differently from the mode.
+		const double s_x = (double)c->width / (double)c->panel.device_w;
+		const double s_y = (double)c->height / (double)c->panel.device_h;
+		const double f = (double)(1u << PANEL_PREVIEW_SHIFT);
+		const int32_t pw = (int32_t)c->panel_preview_w, ph = (int32_t)c->panel_preview_h;
+		int32_t x0 = (int32_t)floor((double)wx * s_x / f);
+		int32_t y0 = (int32_t)floor((double)wy * s_y / f);
+		int32_t x1 = (int32_t)ceil((double)(wx + (int32_t)ww) * s_x / f);
+		int32_t y1 = (int32_t)ceil((double)(wy + (int32_t)wh) * s_y / f);
+		x0 = x0 < 0 ? 0 : x0;
+		y0 = y0 < 0 ? 0 : y0;
+		x1 = x1 > pw ? pw : x1;
+		y1 = y1 > ph ? ph : y1;
+		if (x1 - x0 < 2 || y1 - y0 < 2) {
+			pthread_mutex_unlock(&c->preview_lock);
+			return false; // (almost) nothing of the window is on the panel
+		}
+		// Stage 2: a further 2^k box so both sides are <= PREVIEW_MAX_DIM.
+		uint32_t k = 0;
+		while ((((uint32_t)(x1 - x0)) >> k) > PREVIEW_MAX_DIM || (((uint32_t)(y1 - y0)) >> k) > PREVIEW_MAX_DIM) {
+			k++;
+		}
+		const uint32_t ow = ((uint32_t)(x1 - x0)) >> k, oh = ((uint32_t)(y1 - y0)) >> k;
+		const size_t need = (size_t)ow * oh * 4u;
+		if (need > c->preview_out_cap) {
+			uint8_t *nb = realloc(c->preview_out, need);
+			if (nb == NULL) {
+				pthread_mutex_unlock(&c->preview_lock);
+				return false;
+			}
+			c->preview_out = nb;
+			c->preview_out_cap = need;
+		}
+		const uint32_t blk = 1u << k, n = blk * blk;
+		for (uint32_t oy = 0; oy < oh; oy++) {
+			for (uint32_t ox = 0; ox < ow; ox++) {
+				uint32_t sb = 0, sg = 0, sr = 0;
+				for (uint32_t by = 0; by < blk; by++) {
+					const uint8_t *px = c->panel_preview +
+					                    ((size_t)(y0 + (int32_t)(oy * blk + by)) * (size_t)pw +
+					                     (size_t)(x0 + (int32_t)(ox * blk))) * 4u;
+					for (uint32_t bx = 0; bx < blk; bx++) {
+						sb += px[bx * 4 + 0];
+						sg += px[bx * 4 + 1];
+						sr += px[bx * 4 + 2];
+					}
+				}
+				uint8_t *o = c->preview_out + ((size_t)oy * ow + ox) * 4u;
+				o[0] = (uint8_t)(sb / n);
+				o[1] = (uint8_t)(sg / n);
+				o[2] = (uint8_t)(sr / n);
+				o[3] = 255;
+			}
+		}
+		// What the bytes cover, back in DEVICE px, then window-normalised.
+		const double dev_x0 = (double)x0 * f / s_x, dev_y0 = (double)y0 * f / s_y;
+		const double dev_x1 = (double)(x0 + (int32_t)(ow << k)) * f / s_x;
+		const double dev_y1 = (double)(y0 + (int32_t)(oh << k)) * f / s_y;
+		float uv[4];
+		preview_canvas_uv((float)dev_x0, (float)dev_y0, (float)dev_x1, (float)dev_y1, wx, wy, ww, wh, uv);
+		c->preview_cu0 = uv[0];
+		c->preview_cv0 = uv[1];
+		c->preview_cu1 = uv[2];
+		c->preview_cv1 = uv[3];
+		c->preview_out_w = ow;
+		c->preview_out_h = oh;
+		c->preview_src_seq = pseq;
+		c->preview_win_x = wx;
+		c->preview_win_y = wy;
+		c->preview_win_w = ww;
+		c->preview_win_h = wh;
+		if (c->preview_out_gen == 0) {
+			U_LOG_W("leia_bg_capture_linux: background preview ready — window %ux%u DEVICE px -> %ux%u "
+			        "BGRA8 (1/%u box: 1/%u on the pw thread, 1/%u here), covers canvas u[%.4f,%.4f] "
+			        "v[%.4f,%.4f]",
+			        ww, wh, ow, oh, (1u << PANEL_PREVIEW_SHIFT) << k, 1u << PANEL_PREVIEW_SHIFT, 1u << k,
+			        uv[0], uv[2], uv[1], uv[3]);
+		}
+		c->preview_out_gen++;
+	}
+	pthread_mutex_unlock(&c->preview_lock);
+
+	// Field-by-field against the runtime's struct_size (ADR-020): a runtime
+	// whose struct is too small to describe a buffer cannot be handed one.
+#define LEIA_BGP_FITS(field)                                                                                           \
+	((size_t)offsetof(struct xrt_dp_background_preview, field) + sizeof(out->field) <= (size_t)out->struct_size)
+	if (!LEIA_BGP_FITS(width) || !LEIA_BGP_FITS(height) || !LEIA_BGP_FITS(stride_bytes) || !LEIA_BGP_FITS(bgra)) {
+		return false;
+	}
+	if (LEIA_BGP_FITS(generation)) {
+		out->generation = c->preview_out_gen;
+	}
+	out->width = c->preview_out_w;
+	out->height = c->preview_out_h;
+	out->stride_bytes = c->preview_out_w * 4u;
+	out->bgra = c->preview_out; // borrowed until the next process_atlas (render thread owns it)
+	if (LEIA_BGP_FITS(canvas_v1)) {
+		out->canvas_u0 = c->preview_cu0;
+		out->canvas_v0 = c->preview_cv0;
+		out->canvas_u1 = c->preview_cu1;
+		out->canvas_v1 = c->preview_cv1;
+	}
+	// STALE is for a preview the source KNOWS no longer reflects the screen;
+	// every such case (exclusion down, session closed, layout changed, window
+	// off-panel) already returned false above. An unchanged desktop is not
+	// stale — mutter only records on damage.
+	if (LEIA_BGP_FITS(flags)) {
+		out->flags = 0u;
+	}
+#undef LEIA_BGP_FITS
+	return true;
+}
+
 void
 leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c)
 {
@@ -1497,6 +1822,11 @@ leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c)
 		c->dbus = NULL;
 	}
 
+	if (c->preview_lock_inited) {
+		pthread_mutex_destroy(&c->preview_lock);
+	}
+	free(c->panel_preview);
+	free(c->preview_out);
 	free(c->session_path);
 	free(c->stream_path);
 	free(c);
@@ -1518,6 +1848,8 @@ void leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *o
 bool leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd, int32_t win_x, int32_t win_y,
                                 uint32_t win_w, uint32_t win_h, float o[2], float e[2])
 { (void)c; (void)cmd; (void)win_x; (void)win_y; (void)win_w; (void)win_h; (void)o; (void)e; return false; }
+bool leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out)
+{ (void)c; (void)out; return false; }
 bool leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c) { (void)c; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 

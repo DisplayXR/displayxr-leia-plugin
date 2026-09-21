@@ -92,6 +92,8 @@ The fix has two halves:
 
 **Alpha-gate rule, per frame.** When this frame's compose sampled a trusted capture, the gate punches only where **every** view is transparent (the Windows rule). The fringe keeps the captured desktop composed under it, with no halo and no shrink. On any other frame it punches where **any** view is transparent: that is silhouette intersection ([chroma-key-overlay.md §Limits](chroma-key-overlay.md#limits--disocclusion-fringe-near-the-silhouette)), which needs no background, at the cost of edges that shrink by the disparity.
 
+**Rear depth budget.** `get_background_preview` is implemented (Windows contract). The pw thread box-filters the whole captured panel by 4× at ≤ 15 Hz. The render thread crops the window's region, reduces it further to ≤ 512 px, and publishes the covered canvas rect, rounded outward or clamped when the window hangs off the panel. It reports "no source" whenever the capture is not trusted, so the runtime clips only when the background behind the window actually has horizontal disparity.
+
 **UX note.** Any mutter ScreenCast session makes GNOME show its "screen is being shared" indicator while a transparent app runs. Its *Stop* button ends our session too, which the DP handles as above.
 
 | env var | effect |
