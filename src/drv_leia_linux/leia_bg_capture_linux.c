@@ -1693,9 +1693,20 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	// portal's stream position live in different frames on this stack (the
 	// RandR position override only applies at the plugin get_display_info
 	// layer), and mixing them silently declined every frame (#109).
-	if (c->mon_w > 0 && c->mon_h > 0 && win_w > 0 && win_h > 0) {
+	// UNITS. win_x/win_y/win_w/win_h are DEVICE pixels (the runtime's present
+	// origin + window extent). The portal's "size" property (c->mon_w/mon_h) is
+	// the monitor's LOGICAL size — 1920x1080 for a 3840x2160 panel at 200% —
+	// while the negotiated stream (c->width/height) is the monitor's DEVICE
+	// resolution. Dividing device by logical doubled every UV on a scaled
+	// output and made this off-monitor test fire for any window past device
+	// x = 1920, dropping the desktop behind the right half of the panel. So
+	// normalise by the stream extent; the portal size is only a fallback for
+	// the moment before a format is negotiated.
+	const int32_t cap_w = c->width > 0 ? (int32_t)c->width : c->mon_w;
+	const int32_t cap_h = c->height > 0 ? (int32_t)c->height : c->mon_h;
+	if (cap_w > 0 && cap_h > 0 && win_w > 0 && win_h > 0) {
 		// Window fully off the captured monitor → decline (raw pass-through).
-		if (win_x >= c->mon_w || win_y >= c->mon_h ||
+		if (win_x >= cap_w || win_y >= cap_h ||
 		    win_x + (int32_t)win_w <= 0 || win_y + (int32_t)win_h <= 0) {
 			return false;
 		}
@@ -1796,11 +1807,11 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	// up with what a user would see through a glass window at that position.
 	// win_w/win_h == 0 (display-scoped present) maps the full monitor.
 	float uox = 0.0f, uoy = 0.0f, uex = 1.0f, uey = 1.0f;
-	if (c->mon_w > 0 && c->mon_h > 0 && win_w > 0 && win_h > 0) {
-		uox = (float)win_x / (float)c->mon_w;
-		uoy = (float)win_y / (float)c->mon_h;
-		uex = (float)win_w / (float)c->mon_w;
-		uey = (float)win_h / (float)c->mon_h;
+	if (cap_w > 0 && cap_h > 0 && win_w > 0 && win_h > 0) {
+		uox = (float)win_x / (float)cap_w;
+		uoy = (float)win_y / (float)cap_h;
+		uex = (float)win_w / (float)cap_w;
+		uey = (float)win_h / (float)cap_h;
 	}
 	if (out_bg_uv_origin) {
 		out_bg_uv_origin[0] = uox;
