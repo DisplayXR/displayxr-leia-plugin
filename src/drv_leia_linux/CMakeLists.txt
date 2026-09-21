@@ -35,18 +35,19 @@ spirv_shaders(
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PLUGIN_XCB REQUIRED IMPORTED_TARGET xcb xcb-randr)
 
-# Desktop background capture for transparency (runtime#757 WS1): xdg-desktop-
-# portal ScreenCast (D-Bus) → PipeWire → dma-buf. OPTIONAL — not REQUIRED — so a
-# CI image without these -dev packages still builds the graceful-decline path and
-# stays green (portal/PipeWire cannot run in CI anyway). When present, the real
-# producer compiles behind DXR_LEIA_HAVE_PIPEWIRE.
+# Desktop background capture for transparency (runtime#757): org.gnome.Mutter.
+# ScreenCast RecordArea (D-Bus), with our windows excluded by the DisplayXR GNOME
+# Shell extension → PipeWire. OPTIONAL — not REQUIRED — so a CI image without
+# these -dev packages still builds the graceful-decline path and stays green
+# (mutter/PipeWire cannot run in CI anyway). When present, the real producer
+# compiles behind DXR_LEIA_HAVE_PIPEWIRE.
 pkg_check_modules(PLUGIN_PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(PLUGIN_DBUS IMPORTED_TARGET dbus-1)
 if(PLUGIN_PIPEWIRE_FOUND AND PLUGIN_DBUS_FOUND)
     message(STATUS "DisplayXR-LeiaSR: desktop capture enabled (libpipewire-0.3 + dbus-1)")
 else()
     message(STATUS "DisplayXR-LeiaSR: desktop capture unavailable (no libpipewire-0.3/dbus-1) "
-                   "— transparency falls back to the 2D-under backdrop")
+                   "— transparency falls back to silhouette intersection")
 endif()
 
 # --- Weaver backend seam — the Track B switch point ----------------------
@@ -145,6 +146,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_edid_probe_linux.h
     leia_bg_capture_linux.c
     leia_bg_capture_linux.h
+    leia_mutter_capture_linux.c
+    leia_mutter_capture_linux.h
     leia_sr_linux.h
     # Shared, platform-portable device implementation from the Windows arm.
     ../drv_leia/leia_device.c
