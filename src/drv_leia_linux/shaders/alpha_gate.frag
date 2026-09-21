@@ -13,6 +13,23 @@
 //
 // Screen UV equals tile-local UV when target = (tile_columns × view_w,
 // tile_rows × view_h), the canvas-fills-target case.
+//
+// LINUX COPY — two punch rules, selected by pc.punch_any:
+//
+//   punch_any = 0  punch where EVERY view is transparent (the Windows rule).
+//                  The fringe (some views transparent, others not) stays
+//                  opaque and relies on a captured desktop composed under the
+//                  atlas pre-weave. Only safe when that capture excludes our
+//                  own window, which GNOME/mutter cannot do.
+//   punch_any = 1  punch where ANY view is transparent ("silhouette
+//                  intersection", docs/chroma-key-overlay.md §Limits,
+//                  mitigation 2). Only pixels opaque in EVERY view survive, so
+//                  no pixel ever needs a background under it and the desktop
+//                  shows only through genuine holes, composited by mutter.
+//                  Cost: the visible silhouette is the intersection of the
+//                  per-view silhouettes, so it shrinks by the disparity width
+//                  at its edges (zero at the display plane, growing with
+//                  depth away from it).
 
 #version 450
 
@@ -29,7 +46,7 @@ layout(binding = 2) uniform sampler2D backdrop;
 layout(push_constant) uniform PC {
 	uvec2 tile_count;
 	uint  has_backdrop;   // #491 part 3 — 1 ⟹ a 2D-under backdrop is present
-	uint  pad;
+	uint  punch_any;      // 1 ⟹ punch where ANY view is transparent (see header)
 	// #602 — the back-buffer copy (ck_strip_image) is allocated at a
 	// high-water-mark so content-fit zones stop churning it; only its top-left
 	// (w, h) sub-rect holds this frame's copy. Scale screen UV into that
@@ -43,16 +60,20 @@ layout(location = 0) out vec4 out_color;
 void main()
 {
 	bool all_transparent = true;
+	bool any_transparent = false;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
 			vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
 			if (textureLod(atlas, uv_at_tile, 0.0).a > 0.0) {
 				all_transparent = false;
+			} else {
+				any_transparent = true;
 			}
 		}
 	}
+	bool punch = (pc.punch_any != 0u) ? any_transparent : all_transparent;
 
-	if (!all_transparent) {
+	if (!punch) {
 		// Woven 3D content (over the backdrop-over-desktop baked pre-weave):
 		// opaque so DWM shows it as-is. #602 — sample the strip's valid
 		// top-left sub-rect (the image may be over-allocated).

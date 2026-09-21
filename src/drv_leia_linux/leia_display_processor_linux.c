@@ -87,10 +87,12 @@ struct leia_dp_linux
 	bool compose_inited;
 
 	// Post-weave alpha-gate (runtime#757): the srSDK weave flattens alpha, so
-	// after the weave we re-punch alpha=0 where EVERY view was transparent — the
-	// compositor (mutter) then shows the live desktop through those holes. The
-	// de-occlusion band (some views opaque) stays opaque and relies on the
-	// compose-under-bg pass above having baked the desktop in pre-weave.
+	// after the weave we re-punch alpha=0 — the compositor (mutter) then shows
+	// the live desktop through those holes. Default: punch where ANY view is
+	// transparent (silhouette intersection — no background needed anywhere).
+	// Only with an opted-in desktop capture (DXR_LEIA_BG_CAPTURE=1) does it
+	// punch where EVERY view is transparent and leave the de-occlusion band
+	// opaque, relying on compose-under-bg having baked the desktop in pre-weave.
 	VkRenderPass ag_rp;            //!< renders into the target (its format, COLOR_ATTACHMENT in/out)
 	VkFormat ag_target_format;     //!< format ag_rp was built for
 	VkImage ag_strip_image;        //!< sampleable copy of the woven target
@@ -449,6 +451,7 @@ compose_ensure_pipeline(struct leia_dp_linux *ldp)
 // DXR_LEIA_BG_DEBUG=1: compose outputs the captured background ONLY across the
 // whole window and the post-weave alpha-gate is skipped — turns "is the
 // captured desktop actually arriving (vs black)?" into a one-glance panel check.
+// Because it inspects the capture, it also implies DXR_LEIA_BG_CAPTURE=1 below.
 static bool
 dxr_leia_bg_debug(void)
 {
@@ -456,6 +459,31 @@ dxr_leia_bg_debug(void)
 	if (cached < 0) {
 		const char *e = getenv("DXR_LEIA_BG_DEBUG");
 		cached = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+// DXR_LEIA_BG_CAPTURE=1: opt IN to the live-desktop capture (xdg-desktop-portal
+// ScreenCast of the panel monitor) composed under the atlas pre-weave.
+//
+// OFF by default because it is unsafe on GNOME/mutter: the portal records the
+// whole MONITOR including our own window, and neither the portal ScreenCast
+// options nor org.gnome.Mutter.ScreenCast can exclude a window (Windows uses
+// WDA_EXCLUDEFROMCAPTURE; there is no Linux equivalent). The capture therefore
+// contains our previous WOVEN frame, which is composed under the new one and
+// woven again — both views end up in both eyes (confirmed on a DS1 panel).
+//
+// With capture off the post-weave alpha-gate runs in silhouette-intersection
+// mode (punch where ANY view is transparent), which never needs a background.
+// The capture code stays intact behind this opt-in for the longer-term fix
+// (a capture that genuinely excludes our window). DXR_LEIA_BG_DEBUG implies it.
+static bool
+dxr_leia_bg_capture_opted_in(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_LEIA_BG_CAPTURE");
+		cached = ((e != NULL && e[0] == '1') || dxr_leia_bg_debug()) ? 1 : 0;
 	}
 	return cached == 1;
 }
@@ -612,9 +640,28 @@ compose_pre_weave(struct leia_dp_linux *ldp,
  * Post-weave alpha-gate (runtime#757).
  *
  * The srSDK weave flattens alpha to opaque. After it runs, sample the woven
- * output + the ORIGINAL atlas: where every view's atlas was transparent, punch
- * alpha=0 so the compositor (mutter) shows the live desktop; elsewhere keep the
- * woven RGB opaque. Ported from ../drv_leia (Windows), minus the #602
+ * output + the ORIGINAL atlas and punch alpha=0 so the compositor (mutter)
+ * shows the live desktop through the holes; elsewhere keep the woven RGB
+ * opaque. Two punch rules (alpha_gate.frag, push constant punch_any):
+ *
+ *  - SILHOUETTE INTERSECTION (default; no desktop capture running): punch
+ *    where ANY view is transparent. Only pixels opaque in every view survive,
+ *    so no pixel ever needs a background composed under it and nothing
+ *    captured is used — the desktop behind is shown by mutter through genuine
+ *    holes in our 32-bit ARGB window. This is the Windows chroma-key fallback's
+ *    "silhouette intersection" (docs/chroma-key-overlay.md §Limits). COST: the
+ *    visible silhouette is the intersection of the per-view silhouettes, so it
+ *    shrinks by the disparity width at its edges — nothing at the display
+ *    plane, a few pixels for content near it, more the further content sits in
+ *    front of or behind it.
+ *
+ *  - COMPOSE-UNDER-CAPTURE (DXR_LEIA_BG_CAPTURE=1 and the capture started):
+ *    punch only where EVERY view is transparent; the fringe (some views
+ *    transparent, some not) stays opaque and shows the captured desktop that
+ *    compose_pre_weave baked in. Correct only when the capture excludes our own
+ *    window, which GNOME/mutter cannot do today (see
+ *    dxr_leia_bg_capture_opted_in).
+ * Ported from ../drv_leia (Windows), minus the #602
  * high-water-mark strip and the swapchain PRESENT_SRC layout — the Linux target
  * is a COLOR_ATTACHMENT the runtime presents. Shares no state with the compose
  * pass except the vk_bundle.
@@ -833,7 +880,7 @@ ag_ensure_pipeline(struct leia_dp_linux *ldp, VkFormat target_format)
 		}
 	}
 
-	// Push constants: uvec2 tile_count + uint has_backdrop + uint pad + vec2
+	// Push constants: uvec2 tile_count + uint has_backdrop + uint punch_any + vec2
 	// strip_uv_scale = 24 bytes (matches alpha_gate.frag).
 	{
 		VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 24};
@@ -1089,12 +1136,17 @@ alpha_gate_run(struct leia_dp_linux *ldp,
 	{
 		uint32_t tile_count[2];
 		uint32_t has_backdrop;
-		uint32_t pad;
+		uint32_t punch_any; //!< 1 = punch where ANY view is transparent
 		float strip_uv_scale[2];
 	} push = {0};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = 0u;    // no 2D-under backdrop on Linux yet
+	// Silhouette intersection unless a desktop capture is running to fill the
+	// fringe (see the section comment above). Keyed on the live capture object,
+	// not the opt-in, so an opted-in capture the portal declined falls back to
+	// the safe rule instead of weaving a background-less fringe.
+	push.punch_any = (ldp->bg_capture == NULL) ? 1u : 0u;
 	push.strip_uv_scale[0] = 1.0f; // strip sized exactly (w,h) — no high-water-mark
 	push.strip_uv_scale[1] = 1.0f;
 	vk->vkCmdPushConstants(cmd, ldp->ag_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
@@ -1279,10 +1331,10 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	leiasr_lnx_weave(ldp->sr, cmd_buffer, &input, &output, viewport, phase);
 
 	// Post-weave alpha-gate (runtime#757): the weave flattened alpha to opaque,
-	// so where EVERY view's ORIGINAL atlas was transparent, re-punch alpha=0 so
-	// the compositor shows the live desktop through. The de-occlusion band (some
-	// views opaque) was already baked opaque by compose_pre_weave above, so it
-	// stays. Pass the ORIGINAL atlas_view (pre-compose) — that carries the app's
+	// so re-punch alpha=0 where the ORIGINAL atlas was transparent — in ANY view
+	// by default (silhouette intersection), or in EVERY view when a desktop
+	// capture is running and compose_pre_weave baked it into the de-occlusion
+	// band. Pass the ORIGINAL atlas_view (pre-compose) — that carries the app's
 	// per-view alpha the gate keys on.
 	if (ldp->transparent_enabled && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
 		alpha_gate_run(ldp, cmd_buffer, (VkImage)target_image, (VkImageView)atlas_view,
@@ -1433,11 +1485,15 @@ leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, 
 	}
 	ldp->transparent_enabled = want;
 	if (want) {
-		// Start desktop capture for the live background (WS1). Display-scoped
-		// today: capture the panel monitor via its screen origin. The producer
+		// Desktop capture (WS1) is OPT-IN only (DXR_LEIA_BG_CAPTURE=1): on
+		// GNOME/mutter it records our own window and weaves our previous frame
+		// back in (see dxr_leia_bg_capture_opted_in). By default no stream is
+		// started and no portal dialog is shown; the alpha-gate runs in
+		// silhouette-intersection mode instead. When opted in: display-scoped,
+		// capture the panel monitor via its screen origin. The producer
 		// declines cleanly (NULL) if portal/PipeWire is unavailable, and the
-		// compose pass falls back to the 2D-under backdrop.
-		if (ldp->bg_capture == NULL) {
+		// gate then falls back to silhouette intersection too.
+		if (ldp->bg_capture == NULL && dxr_leia_bg_capture_opted_in()) {
 			struct leiasr_lnx_display_info info;
 			int32_t sx = 0, sy = 0;
 			if (leiasr_lnx_query_display_info(&info) && info.valid) {
@@ -1445,6 +1501,12 @@ leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, 
 				sy = info.screen_top;
 			}
 			ldp->bg_capture = leia_bg_capture_linux_create(ldp->vk, sx, sy);
+			if (ldp->bg_capture == NULL) {
+				U_LOG_W("leia_lnx_dp: DXR_LEIA_BG_CAPTURE=1 but the desktop capture did not start "
+				        "(portal/PipeWire unavailable or declined) — falling back to silhouette "
+				        "intersection%s",
+				        dxr_leia_bg_debug() ? "; DXR_LEIA_BG_DEBUG has no captured background to show" : "");
+			}
 		}
 	} else {
 		if (ldp->bg_capture != NULL) {
@@ -1454,7 +1516,13 @@ leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, 
 		compose_release(ldp);
 		ag_release(ldp);
 	}
-	U_LOG_W("leia_lnx_dp: transparency %s", want ? "= compose-under-bg" : "disabled");
+	U_LOG_W("leia_lnx_dp: transparency %s",
+	        !want ? "disabled"
+	        : ldp->bg_capture != NULL
+	            ? (dxr_leia_bg_debug() ? "= compose-under-capture (DXR_LEIA_BG_DEBUG: window shows the captured "
+	                                     "background only, alpha-gate skipped)"
+	                                   : "= compose-under-capture (DXR_LEIA_BG_CAPTURE=1)")
+	            : "= silhouette intersection (no desktop capture)");
 }
 
 // Store the runtime's flattened 2D-under backdrop as the background to compose
@@ -1749,6 +1817,23 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	// went missing in George's on-hardware trace (#81 smoke-test note).
 	U_LOG_W("leia_lnx_dp: Linux VK display processor created (backend: %s)",
 	        leiasr_lnx_get_render_pass(sr) == VK_NULL_HANDLE ? "stub passthrough" : "weaver");
+
+	// One field-log line answering "why is the background not composed?"
+	// without reading code. Once per process: the mode is env-fixed.
+	static bool mode_logged = false;
+	if (!mode_logged) {
+		mode_logged = true;
+		if (dxr_leia_bg_capture_opted_in()) {
+			U_LOG_W("leia_lnx_dp: transparency mode = compose-under-capture (desktop capture ON via %s) — "
+			        "WARNING: GNOME/mutter cannot exclude our window from the capture, so our own previous "
+			        "frame is re-woven into the fringe (both views in both eyes)",
+			        dxr_leia_bg_debug() ? "DXR_LEIA_BG_DEBUG=1" : "DXR_LEIA_BG_CAPTURE=1");
+		} else {
+			U_LOG_W("leia_lnx_dp: transparency mode = silhouette intersection (punch where ANY view is "
+			        "transparent); desktop capture OFF because the Linux portal capture would record our "
+			        "own window and re-weave it — set DXR_LEIA_BG_CAPTURE=1 to opt in");
+		}
+	}
 
 	*out_xdp = &ldp->base.base;
 	return XRT_SUCCESS;
