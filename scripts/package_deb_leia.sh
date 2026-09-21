@@ -12,6 +12,7 @@
 #   SRSDK_ROOT=/path/to/leiasr-sdk ./scripts/package_deb_leia.sh
 #   ./scripts/package_deb_leia.sh --stub          # mechanics test, no SR SDK
 #   ./scripts/package_deb_leia.sh --no-build       # package an existing build/
+#   ./scripts/package_deb_leia.sh --allow-no-capture  # permit a capture-less build
 #
 # Output: dist/displayxr-leia-sr_<ver>_<arch>.deb
 #
@@ -42,6 +43,25 @@
 # plug-in still installs and simply DECLINES its probe (SR runtime absent) so
 # sim-display claims — the intended graceful fallback. `apt install` pulls the
 # SR runtime by default when the package is available.
+#
+# --- Desktop capture is a SHIPPING feature, so its libraries are Depends ------
+# The transparency path's window-excluded desktop capture (runtime#757) links
+# libpipewire-0.3 + libdbus-1. CMake treats both as OPTIONAL so a CI image
+# without the -dev packages still builds the graceful-decline path — which is
+# right for a compile check and wrong for a release: a packaging box that simply
+# lacks libpipewire-0.3-dev produces a .deb that silently cannot capture (v2.0.4
+# shipped exactly that). So this script REQUIRES both in the built .so's
+# DT_NEEDED and fails otherwise; `--allow-no-capture` is the explicit opt-out.
+# Once linked they are hard runtime requirements (a missing soname fails the
+# plug-in's dlopen outright), and the DT_NEEDED -> package resolution below turns
+# them into Depends: (libpipewire-0.3-0[t64], libdbus-1-3) automatically.
+#
+# The capture additionally needs the DisplayXR GNOME Shell extension (version 2,
+# org.displayxr.CaptureExclusion1) — without it the plug-in declines to capture
+# and falls back to silhouette intersection. That is a Recommends on the virtual
+# package `displayxr-window-geometry-publisher` (never on a concrete package:
+# docs/specs/runtime/wayland-window-geometry.md §4 in the runtime), which the
+# runtime .deb provides.
 #
 # ==> Build requires the commercial SR SDK (SRSDK_ROOT) for Track B, which is
 #     never on a generic box. Run this on an SR-equipped Linux box (or a
@@ -76,11 +96,13 @@ SR_RUNTIME_PKG="${SR_RUNTIME_PKG:-leiasr-runtime}"
 
 WEAVER="sdk"       # Track B (real srSDK). --stub switches to Track A.
 NO_BUILD=0
+ALLOW_NO_CAPTURE=0
 for arg in "$@"; do
     case "$arg" in
     --stub) WEAVER="stub" ;;
     --no-build) NO_BUILD=1 ;;
-    *) echo "Unknown option: $arg (supported: --stub --no-build)" >&2; exit 2 ;;
+    --allow-no-capture) ALLOW_NO_CAPTURE=1 ;;
+    *) echo "Unknown option: $arg (supported: --stub --no-build --allow-no-capture)" >&2; exit 2 ;;
     esac
 done
 
@@ -112,6 +134,25 @@ fi
 
 SO="$(find_so)"
 [ -n "$SO" ] || { echo "error: DisplayXR-LeiaSR.so not found after build." >&2; exit 1; }
+
+# Desktop capture gate (see header): the release .so must link both capture libs.
+NEEDED="$(objdump -p "$SO" 2>/dev/null | awk '/NEEDED/{print $2}')"
+CAPTURE=1
+for lib in libpipewire-0.3.so.0 libdbus-1.so.3; do
+    echo "$NEEDED" | grep -qx "$lib" || CAPTURE=0
+done
+if [ "$CAPTURE" = 1 ]; then
+    echo "==> Desktop capture: linked (libpipewire-0.3 + libdbus-1)"
+elif [ "$ALLOW_NO_CAPTURE" = 1 ]; then
+    echo "==> WARNING: desktop capture NOT linked — --allow-no-capture set; this .deb's"
+    echo "    transparency will fall back to silhouette intersection."
+else
+    echo "error: $SO does not link libpipewire-0.3 + libdbus-1, so the .deb would ship" >&2
+    echo "       without desktop capture (transparency degraded to silhouette intersection)." >&2
+    echo "       Install libpipewire-0.3-dev + libdbus-1-dev and rebuild (delete $BUILD_DIR" >&2
+    echo "       first — CMake caches the failed pkg-config probe), or pass --allow-no-capture." >&2
+    exit 1
+fi
 
 # Version: git describe → Debian-legal upstream version (same rule as the runtime).
 # --match 'v[0-9]*' so the plug-in version derives ONLY from canonical release
@@ -180,7 +221,11 @@ compute_lib_depends() {
 LIB_DEPENDS="$(compute_lib_depends)"
 DEPENDS="displayxr-runtime, $LIB_DEPENDS"
 echo "==> Depends: $DEPENDS"
-echo "==> Recommends: $SR_RUNTIME_PKG   (CONFIRM the SR runtime .deb package name)"
+# The GNOME Shell extension that makes window-excluded capture possible is
+# satisfied by the runtime .deb (or any vendor package shipping the publisher).
+RECOMMENDS="$SR_RUNTIME_PKG"
+[ "$CAPTURE" = 1 ] && RECOMMENDS="$RECOMMENDS, displayxr-window-geometry-publisher"
+echo "==> Recommends: $RECOMMENDS   (CONFIRM the SR runtime .deb package name)"
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
@@ -191,7 +236,7 @@ Section: libs
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
-Recommends: $SR_RUNTIME_PKG
+Recommends: $RECOMMENDS
 Installed-Size: $INSTALLED_KB
 Maintainer: Leia Inc / The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-leia-plugin
@@ -206,6 +251,12 @@ Description: DisplayXR Leia SR display processor (Linux plug-in)
  declines, so sim-display drives apps. The plug-in resolves the SR runtime via
  /etc/leia/sr/1/active_runtime.json (registered by the SR runtime installer) —
  no environment variables, no baked build-machine paths.
+ .
+ Transparent apps get the desktop behind their window from a GNOME/Mutter
+ screen capture that excludes the app's own windows. That needs the DisplayXR
+ GNOME Shell extension window-geometry@displayxr.org (version 2 or later),
+ enabled for the user; without it transparency falls back to silhouette
+ intersection.
 EOF
 
 mkdir -p "$DIST_DIR"
