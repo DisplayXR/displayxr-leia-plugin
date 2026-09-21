@@ -61,6 +61,9 @@ cmake --build "$BUILD_DIR" --target cli
 SO="$BUILD_DIR/src/drv_leia_linux/DisplayXR-LeiaSR.so"
 [ -f "$SO" ] || { echo "error: $SO not built" >&2; exit 1; }
 
+echo "==> Unit test: lens-preference ownership (LeiaSR #266)"
+"$BUILD_DIR/src/drv_leia_linux/test_lens_owner_linux"
+
 echo "==> Asserting single-export discipline (#496 / ADR-019)"
 SYMS="$(nm -D --defined-only "$SO" | awk '{print $NF}')"
 if [ "$SYMS" != "xrtPluginNegotiate" ]; then
