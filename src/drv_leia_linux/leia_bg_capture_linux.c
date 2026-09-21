@@ -1,8 +1,9 @@
 // Copyright 2026, Leia Inc / DisplayXR
 // SPDX-License-Identifier: Apache-2.0
-/*! @file  @brief Linux desktop background capture (portal/PipeWire → dma-buf) — runtime#757. @ingroup drv_leia_linux */
+/*! @file  @brief Linux desktop background capture (mutter ScreenCast/PipeWire, window-excluded) — runtime#757. @ingroup drv_leia_linux */
 
 #include "leia_bg_capture_linux.h"
+#include "leia_mutter_capture_linux.h"
 #include "util/u_logging.h"
 #include <stdlib.h>
 #include <string.h>
@@ -14,15 +15,20 @@
 
 /*
  * Implementation notes:
- *   - Run-tested only on the Intel Arc / Ubuntu-24.04 bring-up box; this is
- *     hardware bring-up code and cannot be exercised in CI.
- *   - Modifier negotiation is first-cut: we advertise DRM_FORMAT_MOD_LINEAR +
- *     DRM_FORMAT_MOD_INVALID and let the compositor pick. TODO: narrow the
- *     advertised modifier set to those the Vulkan driver reports as importable
- *     via VkDrmFormatModifierPropertiesListEXT.
- *   - The per-window background UV sub-rect is a TODO: poll() currently returns
- *     the full monitor mapping (origin 0,0 extent 1,1) because the window size
- *     is not threaded into this module yet — only the window's top-left is.
+ *   - Source: org.gnome.Mutter.ScreenCast RecordArea over the 3D panel's FULL
+ *     logical rectangle, with our own windows excluded by the DisplayXR GNOME
+ *     Shell extension (leia_mutter_capture_linux.h explains the three
+ *     services). The PipeWire consumer and Vulkan import below are unchanged
+ *     from the portal era; only where the node id comes from changed.
+ *   - The capture is TRUSTED only while the exclusion is live. GNOME disables
+ *     user extensions whenever the screen shield is up, which removes the
+ *     effect: from that moment every frame contains our own window. The pump
+ *     in poll() tracks the extension's bus name; losing it distrusts the
+ *     capture (the DP falls back to silhouette intersection), regaining it
+ *     re-registers the exclusion and trusts only frames published after that.
+ *   - Our format offer carries no modifier, so mutter delivers MemFd/MemPtr
+ *     frames (the shm path). The dma-buf import is kept for a producer that
+ *     negotiates it anyway.
  */
 
 #include <fcntl.h>
@@ -81,26 +87,30 @@ struct leia_bg_capture_linux {
 	// Loaded dynamically (not in the dispatch table).
 	PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProperties; //!< dma-buf mem-type query
 
-	// Window anchor (screen-space top-left of the app window).
-	int32_t window_screen_left; //!< app window left edge, screen pixels
-	int32_t window_screen_top;  //!< app window top edge, screen pixels
-
-	// D-Bus / portal.
+	// D-Bus. ONE private session-bus connection carries everything that has a
+	// lifetime: the capture exclusion (the extension drops it when this
+	// connection goes away) and the ScreenCast session (mutter tears it down
+	// likewise). Touched from the render thread only (create/poll/destroy).
 	DBusConnection *dbus;      //!< private session-bus connection
-	char *sender_token;        //!< unique-name-derived request-path token
-	char *session_handle;      //!< portal ScreenCast session object path
-	bool match_added;          //!< Request::Response match installed
-	uint32_t token_seq;        //!< monotonic unique-token counter
+	char *session_path;        //!< mutter ScreenCast session object path
+	char *stream_path;         //!< mutter ScreenCast stream object path
 
-	// Captured monitor geometry (screen pixels).
-	int32_t mon_x;             //!< monitor origin x
-	int32_t mon_y;             //!< monitor origin y
-	int32_t mon_w;             //!< monitor width
-	int32_t mon_h;             //!< monitor height
+	// The panel as mutter lays it out (LOGICAL rect recorded, DEVICE size is
+	// the space win_x/win_y/win_w/win_h arrive in). See leia_mutter_panel.
+	struct leia_mutter_panel panel;
+
+	// Trust (render thread only). The capture may be SAMPLED only while our
+	// windows are excluded; see the implementation notes above.
+	bool exclusion_live;       //!< the extension holds our registration right now
+	uint32_t untrusted_through; //!< frames with seq <= this may contain our own window
+	_Atomic uint32_t pool_buffers; //!< PipeWire buffers currently in the pool (frames that can be in flight)
+	bool session_closed;       //!< mutter closed the session (user pressed "stop sharing", ...)
+	bool wants_restart;        //!< the panel moved/rescaled: the recorded area is wrong
+	bool logged_distrust;      //!< one WARN per distrust episode
+	bool poll_ok;              //!< verdict of the last poll()
 
 	// PipeWire.
-	int pw_fd;                 //!< fd from OpenPipeWireRemote
-	uint32_t node_id;          //!< stream node id from Start()
+	uint32_t node_id;          //!< stream node id from PipeWireStreamAdded
 	struct pw_thread_loop *loop; //!< capture thread loop
 	struct pw_context *context;
 	struct pw_core *core;
@@ -119,6 +129,9 @@ struct leia_bg_capture_linux {
 
 	// Latest ready buffer index; written by pw thread, read by render thread.
 	_Atomic int current_buffer; //!< -1 == none
+	//! Publish sequence of the frame each slot holds (pw thread writes, render
+	//! thread reads) — what the trust gate compares against untrusted_through.
+	_Atomic uint32_t slot_seq[DXR_MAX_BUFFERS];
 	VkImageView current_view;   //!< last view poll() selected (render thread only)
 
 	// Frame-flow diagnostics (#109 follow-up). WARN-level, heavily throttled —
@@ -621,581 +634,173 @@ destroy_buffer_slot(struct leia_bg_capture_linux *c, uint32_t slot)
 }
 
 // ---------------------------------------------------------------------------
-// D-Bus / xdg-desktop-portal ScreenCast handshake
+// mutter: exclusion + ScreenCast session + the per-frame trust pump
 // ---------------------------------------------------------------------------
 
-#define PORTAL_BUS "org.freedesktop.portal.Desktop"
-#define PORTAL_OBJ "/org/freedesktop/portal/desktop"
-#define PORTAL_SCREENCAST_IFACE "org.freedesktop.portal.ScreenCast"
-#define PORTAL_REQUEST_IFACE "org.freedesktop.portal.Request"
+#define EXT_OWNER_RULE                                                                                                 \
+	"type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',"      \
+	"arg0='" LEIA_MUTTER_EXT_BUS "'"
+#define MONITORS_CHANGED_RULE "type='signal',interface='org.gnome.Mutter.DisplayConfig',member='MonitorsChanged'"
 
-static void
-make_unique_token(struct leia_bg_capture_linux *c, char *out, size_t out_len)
-{
-	snprintf(out, out_len, "dxr%u", c->token_seq++);
-}
-
-/*! Append `handle_token`/`session_handle_token` (or just handle_token). */
-static void
-append_string_variant(DBusMessageIter *dict, const char *key, const char *value)
-{
-	DBusMessageIter entry, variant;
-	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
-	dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &value);
-	dbus_message_iter_close_container(&entry, &variant);
-	dbus_message_iter_close_container(dict, &entry);
-}
-
-static void
-append_uint32_variant(DBusMessageIter *dict, const char *key, uint32_t value)
-{
-	DBusMessageIter entry, variant;
-	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "u", &variant);
-	dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &value);
-	dbus_message_iter_close_container(&entry, &variant);
-	dbus_message_iter_close_container(dict, &entry);
-}
-
-static void
-append_bool_variant(DBusMessageIter *dict, const char *key, dbus_bool_t value)
-{
-	DBusMessageIter entry, variant;
-	dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
-	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
-	dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &value);
-	dbus_message_iter_close_container(&entry, &variant);
-	dbus_message_iter_close_container(dict, &entry);
-}
-
-/*
- * ── ScreenCast restore-token persistence ──────────────────────────────────
- *
- * The portal Start() call pops an interactive "Share your screen" consent
- * dialog — unacceptable on every launch for an unattended box. ScreenCast v4+
- * supports `persist_mode`/`restore_token` in SelectSources(): with a valid
- * saved token the portal restores the prior grant silently (no dialog), and
- * every Start() response carries a fresh token to persist for the next run.
- * Portals ignore unknown options, so pre-v4 portals just keep showing the
- * dialog — a graceful degrade, no version probe needed.
- *
- * Token lives per-user in $XDG_STATE_HOME/displayxr/screencast_restore_token
- * (fallback ~/.local/state/...). It is a capability grant scoped to this
- * user+app, not a credential.
+/*!
+ * Say ONCE per process, clearly, why there is no captured background — this is
+ * the line a user reads to learn that installing the extension is what makes
+ * transparency correct on GNOME.
  */
-
 static void
-restore_token_path(char *out, size_t out_len)
+log_no_capture_once(enum leia_mutter_exclude_status st)
 {
-	const char *state = getenv("XDG_STATE_HOME");
-	if (state != NULL && state[0] != '\0') {
-		snprintf(out, out_len, "%s/displayxr", state);
+	static bool logged = false;
+	if (logged) {
+		return;
+	}
+	logged = true;
+	if (st == LEIA_MUTTER_EXCLUDE_ABSENT) {
+		U_LOG_W("leia_bg_capture_linux: desktop capture OFF — the DisplayXR GNOME Shell extension "
+		        "(window-geometry@displayxr.org, org.displayxr.WindowGeometry) is not running, so a capture "
+		        "would contain our own window and re-weave it. Transparency falls back to silhouette "
+		        "intersection (edges shrink by the disparity). INSTALL AND ENABLE THE EXTENSION (then log "
+		        "out and back in) to get the real desktop composed under the 3D fringe.");
+	} else if (st == LEIA_MUTTER_EXCLUDE_OUTDATED) {
+		U_LOG_W("leia_bg_capture_linux: desktop capture OFF — the installed window-geometry@displayxr.org "
+		        "extension predates capture exclusion (org.displayxr.CaptureExclusion1, extension version 2). "
+		        "Transparency falls back to silhouette intersection. UPDATE THE EXTENSION (then log out and "
+		        "back in) to get the real desktop composed under the 3D fringe.");
 	} else {
-		const char *home = getenv("HOME");
-		snprintf(out, out_len, "%s/.local/state/displayxr", home != NULL ? home : "/tmp");
+		U_LOG_W("leia_bg_capture_linux: desktop capture OFF — could not exclude our window from capture "
+		        "(%s); transparency falls back to silhouette intersection",
+		        leia_mutter_exclude_status_str(st));
 	}
-}
-
-//! Returns a malloc'd saved token, or NULL if none.
-static char *
-load_restore_token(void)
-{
-	char dir[512];
-	char path[600];
-	restore_token_path(dir, sizeof dir);
-	snprintf(path, sizeof path, "%s/screencast_restore_token", dir);
-
-	FILE *f = fopen(path, "r");
-	if (f == NULL) {
-		return NULL;
-	}
-	char buf[512] = {0};
-	size_t n = fread(buf, 1, sizeof buf - 1, f);
-	fclose(f);
-	// Trim trailing whitespace/newline.
-	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) {
-		buf[--n] = '\0';
-	}
-	return n > 0 ? strdup(buf) : NULL;
-}
-
-static void
-save_restore_token(const char *token)
-{
-	if (token == NULL || token[0] == '\0') {
-		return;
-	}
-	char dir[512];
-	char path[600];
-	restore_token_path(dir, sizeof dir);
-	// Best-effort two-level mkdir (~/.local/state may not exist on minimal setups).
-	char parent[512];
-	snprintf(parent, sizeof parent, "%s", dir);
-	char *slash = strrchr(parent, '/');
-	if (slash != NULL) {
-		*slash = '\0';
-		mkdir(parent, 0700);
-	}
-	mkdir(dir, 0700);
-	snprintf(path, sizeof path, "%s/screencast_restore_token", dir);
-
-	FILE *f = fopen(path, "w");
-	if (f == NULL) {
-		U_LOG_W("leia_bg_capture_linux: cannot persist restore token to %s", path);
-		return;
-	}
-	fprintf(f, "%s\n", token);
-	fclose(f);
-}
-
-/*!
- * Build the expected `/org/freedesktop/portal/desktop/request/<sender>/<token>`
- * object path for a given handle token. Caller frees.
- */
-static char *
-expected_request_path(struct leia_bg_capture_linux *c, const char *token)
-{
-	size_t n = strlen(PORTAL_OBJ) + strlen("/request/") + strlen(c->sender_token) +
-	           1 + strlen(token) + 1;
-	char *path = malloc(n);
-	if (path == NULL) {
-		return NULL;
-	}
-	snprintf(path, n, "%s/request/%s/%s", PORTAL_OBJ, c->sender_token, token);
-	return path;
-}
-
-/*!
- * Pump the bus until the Response signal for @p request_path arrives.
- * Returns the signal message (caller unrefs) with @p *out_code set, or NULL on
- * error/timeout.
- */
-static DBusMessage *
-wait_for_response(struct leia_bg_capture_linux *c, const char *request_path,
-                  uint32_t *out_code)
-{
-	// Bounded spin so a wedged portal can't hang bring-up forever.
-	const int max_iterations = 6000; // ~60s at 10ms slices
-	for (int i = 0; i < max_iterations; i++) {
-		if (!dbus_connection_read_write_dispatch(c->dbus, 10)) {
-			U_LOG_W("leia_bg_capture_linux: dbus connection closed while waiting");
-			return NULL;
-		}
-		DBusMessage *msg;
-		while ((msg = dbus_connection_pop_message(c->dbus)) != NULL) {
-			if (dbus_message_is_signal(msg, PORTAL_REQUEST_IFACE, "Response") &&
-			    dbus_message_get_path(msg) != NULL &&
-			    strcmp(dbus_message_get_path(msg), request_path) == 0) {
-				DBusMessageIter it;
-				if (!dbus_message_iter_init(msg, &it) ||
-				    dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_UINT32) {
-					U_LOG_W("leia_bg_capture_linux: malformed Response signal");
-					dbus_message_unref(msg);
-					return NULL;
-				}
-				dbus_message_iter_get_basic(&it, out_code);
-				return msg; // caller inspects the trailing a{sv} results
-			}
-			dbus_message_unref(msg);
-		}
-	}
-	U_LOG_W("leia_bg_capture_linux: timed out waiting for portal Response");
-	return NULL;
-}
-
-/*!
- * Locate the a{sv} `results` iterator inside a Response signal (2nd arg).
- * Returns true and sets @p out_dict to the array iterator on success.
- */
-static bool
-response_results_iter(DBusMessage *msg, DBusMessageIter *out_dict)
-{
-	DBusMessageIter it;
-	if (!dbus_message_iter_init(msg, &it)) {
-		return false;
-	}
-	// skip the leading response code (u)
-	if (!dbus_message_iter_next(&it)) {
-		return false;
-	}
-	if (dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_ARRAY) {
-		return false;
-	}
-	dbus_message_iter_recurse(&it, out_dict);
-	return true;
-}
-
-/*!
- * Scan an a{sv} dict for a string-valued key. Returns a strdup (caller frees)
- * or NULL if absent.
- */
-static char *
-dict_get_string(DBusMessageIter dict, const char *want_key)
-{
-	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
-		DBusMessageIter entry;
-		dbus_message_iter_recurse(&dict, &entry);
-		const char *key = NULL;
-		dbus_message_iter_get_basic(&entry, &key);
-		if (key != NULL && strcmp(key, want_key) == 0) {
-			dbus_message_iter_next(&entry);
-			if (dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
-				DBusMessageIter var;
-				dbus_message_iter_recurse(&entry, &var);
-				if (dbus_message_iter_get_arg_type(&var) == DBUS_TYPE_STRING) {
-					const char *val = NULL;
-					dbus_message_iter_get_basic(&var, &val);
-					return val ? strdup(val) : NULL;
-				}
-			}
-			return NULL;
-		}
-		dbus_message_iter_next(&dict);
-	}
-	return NULL;
-}
-
-/*!
- * Parse the `streams` a(ua{sv}) result: first stream's node id + position/size.
- * Returns true on success.
- */
-static bool
-parse_streams(struct leia_bg_capture_linux *c, DBusMessageIter dict)
-{
-	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
-		DBusMessageIter entry;
-		dbus_message_iter_recurse(&dict, &entry);
-		const char *key = NULL;
-		dbus_message_iter_get_basic(&entry, &key);
-		if (key != NULL && strcmp(key, "streams") == 0) {
-			dbus_message_iter_next(&entry);
-			if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_VARIANT) {
-				return false;
-			}
-			DBusMessageIter var;
-			dbus_message_iter_recurse(&entry, &var);
-			if (dbus_message_iter_get_arg_type(&var) != DBUS_TYPE_ARRAY) {
-				return false;
-			}
-			DBusMessageIter streams;
-			dbus_message_iter_recurse(&var, &streams);
-			if (dbus_message_iter_get_arg_type(&streams) != DBUS_TYPE_STRUCT) {
-				U_LOG_W("leia_bg_capture_linux: no streams in Start() result");
-				return false;
-			}
-			// First stream: (u node_id, a{sv} props)
-			DBusMessageIter s;
-			dbus_message_iter_recurse(&streams, &s);
-			if (dbus_message_iter_get_arg_type(&s) != DBUS_TYPE_UINT32) {
-				return false;
-			}
-			dbus_message_iter_get_basic(&s, &c->node_id);
-			dbus_message_iter_next(&s);
-			if (dbus_message_iter_get_arg_type(&s) == DBUS_TYPE_ARRAY) {
-				DBusMessageIter props;
-				dbus_message_iter_recurse(&s, &props);
-				while (dbus_message_iter_get_arg_type(&props) ==
-				       DBUS_TYPE_DICT_ENTRY) {
-					DBusMessageIter pe;
-					dbus_message_iter_recurse(&props, &pe);
-					const char *pk = NULL;
-					dbus_message_iter_get_basic(&pe, &pk);
-					dbus_message_iter_next(&pe);
-					if (pk != NULL &&
-					    dbus_message_iter_get_arg_type(&pe) == DBUS_TYPE_VARIANT) {
-						DBusMessageIter pv;
-						dbus_message_iter_recurse(&pe, &pv);
-						if (dbus_message_iter_get_arg_type(&pv) ==
-						    DBUS_TYPE_STRUCT) {
-							DBusMessageIter tup;
-							dbus_message_iter_recurse(&pv, &tup);
-							int32_t a = 0, b = 0;
-							dbus_message_iter_get_basic(&tup, &a);
-							dbus_message_iter_next(&tup);
-							dbus_message_iter_get_basic(&tup, &b);
-							if (strcmp(pk, "position") == 0) {
-								c->mon_x = a;
-								c->mon_y = b;
-							} else if (strcmp(pk, "size") == 0) {
-								c->mon_w = a;
-								c->mon_h = b;
-							}
-						}
-					}
-					dbus_message_iter_next(&props);
-				}
-			}
-			return true;
-		}
-		dbus_message_iter_next(&dict);
-	}
-	U_LOG_W("leia_bg_capture_linux: Start() result had no 'streams'");
-	return false;
-}
-
-/*!
- * Send a portal method-call message that we've already populated, read the
- * synchronous reply carrying the Request object path, then block on that
- * request's Response signal. Returns the Response signal message (caller unrefs)
- * and asserts a zero response code, or NULL on any failure.
- */
-static DBusMessage *
-finish_portal_call(struct leia_bg_capture_linux *c, DBusMessage *call,
-                   const char *handle_token)
-{
-	DBusError err;
-	dbus_error_init(&err);
-
-	DBusMessage *reply = dbus_connection_send_with_reply_and_block(c->dbus, call,
-	                                                               5000, &err);
-	dbus_message_unref(call);
-	if (dbus_error_is_set(&err) || reply == NULL) {
-		U_LOG_W("leia_bg_capture_linux: portal call failed: %s",
-		        dbus_error_is_set(&err) ? err.message : "no reply");
-		dbus_error_free(&err);
-		if (reply) {
-			dbus_message_unref(reply);
-		}
-		return NULL;
-	}
-	// Reply carries the request object path (o). We recompute the expected
-	// path from the handle token to build the match; both must agree, but we
-	// trust the deterministic form for the signal filter.
-	dbus_message_unref(reply);
-
-	char *req_path = expected_request_path(c, handle_token);
-	if (req_path == NULL) {
-		return NULL;
-	}
-	uint32_t code = 1;
-	DBusMessage *resp = wait_for_response(c, req_path, &code);
-	free(req_path);
-	if (resp == NULL) {
-		return NULL;
-	}
-	if (code != 0) {
-		U_LOG_W("leia_bg_capture_linux: portal request denied/failed (code %u)", code);
-		dbus_message_unref(resp);
-		return NULL;
-	}
-	return resp;
 }
 
 static bool
-portal_handshake(struct leia_bg_capture_linux *c)
+mutter_handshake(struct leia_bg_capture_linux *c, uint32_t panel_px_w, uint32_t panel_px_h)
 {
 	DBusError err;
 	dbus_error_init(&err);
 
 	c->dbus = dbus_bus_get_private(DBUS_BUS_SESSION, &err);
 	if (dbus_error_is_set(&err) || c->dbus == NULL) {
-		U_LOG_W("leia_bg_capture_linux: no session bus: %s",
-		        dbus_error_is_set(&err) ? err.message : "(null)");
+		U_LOG_W("leia_bg_capture_linux: no session bus: %s", dbus_error_is_set(&err) ? err.message : "(null)");
 		dbus_error_free(&err);
 		return false;
 	}
 	// We manage the connection's lifetime; don't let dbus exit the process.
 	dbus_connection_set_exit_on_disconnect(c->dbus, FALSE);
 
-	// Derive the sender token: unique name after ':' with '.' → '_'.
-	const char *unique = dbus_bus_get_unique_name(c->dbus);
-	if (unique == NULL) {
-		U_LOG_W("leia_bg_capture_linux: no unique bus name");
+	// Watch the extension's name BEFORE registering, so a disable that races
+	// the registration is still seen by the pump.
+	dbus_bus_add_match(c->dbus, EXT_OWNER_RULE, &err);
+	dbus_error_free(&err);
+	dbus_bus_add_match(c->dbus, MONITORS_CHANGED_RULE, &err);
+	dbus_error_free(&err);
+
+	// 1. Exclusion FIRST — without it every frame would contain our window, so
+	//    there is no point in even starting the stream. Registering before
+	//    Start also means no frame is ever recorded un-excluded.
+	uint32_t windows = 0;
+	const enum leia_mutter_exclude_status st = leia_mutter_capture_exclude(c->dbus, 1000, &windows);
+	if (st != LEIA_MUTTER_EXCLUDE_OK) {
+		log_no_capture_once(st);
 		return false;
 	}
-	const char *p = unique;
-	if (*p == ':') {
-		p++;
-	}
-	c->sender_token = strdup(p);
-	if (c->sender_token == NULL) {
+	c->exclusion_live = true;
+	c->untrusted_through = 0;
+
+	// 2. The panel's LOGICAL rectangle, from mutter's own layout.
+	struct leia_panel_identity id;
+	const bool have_id = leia_mutter_panel_identity_from_sysfs(&id);
+	if (!leia_mutter_find_panel(c->dbus, have_id ? &id : NULL, panel_px_w, panel_px_h, &c->panel)) {
 		return false;
 	}
-	for (char *q = c->sender_token; *q; q++) {
-		if (*q == '.') {
-			*q = '_';
-		}
-	}
 
-	// Match Request::Response signals.
-	dbus_bus_add_match(c->dbus,
-	                   "type='signal',interface='" PORTAL_REQUEST_IFACE
-	                   "',member='Response'",
-	                   &err);
-	if (dbus_error_is_set(&err)) {
-		U_LOG_W("leia_bg_capture_linux: add_match failed: %s", err.message);
-		dbus_error_free(&err);
+	// 3. Record exactly that rectangle.
+	if (!leia_mutter_screencast_start(c->dbus, &c->panel, 3000, &c->session_path, &c->stream_path, &c->node_id)) {
 		return false;
 	}
-	dbus_connection_flush(c->dbus);
-	c->match_added = true;
-
-	char htok[32];
-	char stok[32];
-
-	// --- CreateSession ---
-	{
-		make_unique_token(c, htok, sizeof htok);
-		make_unique_token(c, stok, sizeof stok);
-		DBusMessage *call = dbus_message_new_method_call(
-		    PORTAL_BUS, PORTAL_OBJ, PORTAL_SCREENCAST_IFACE, "CreateSession");
-		if (call == NULL) {
-			return false;
-		}
-		DBusMessageIter args, dict;
-		dbus_message_iter_init_append(call, &args);
-		dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-		append_string_variant(&dict, "handle_token", htok);
-		append_string_variant(&dict, "session_handle_token", stok);
-		dbus_message_iter_close_container(&args, &dict);
-
-		DBusMessage *resp = finish_portal_call(c, call, htok);
-		if (resp == NULL) {
-			return false;
-		}
-		DBusMessageIter results;
-		if (!response_results_iter(resp, &results)) {
-			U_LOG_W("leia_bg_capture_linux: CreateSession: no results");
-			dbus_message_unref(resp);
-			return false;
-		}
-		c->session_handle = dict_get_string(results, "session_handle");
-		dbus_message_unref(resp);
-		if (c->session_handle == NULL) {
-			U_LOG_W("leia_bg_capture_linux: CreateSession: no session_handle");
-			return false;
-		}
-	}
-
-	// --- SelectSources ---
-	{
-		make_unique_token(c, htok, sizeof htok);
-		DBusMessage *call = dbus_message_new_method_call(
-		    PORTAL_BUS, PORTAL_OBJ, PORTAL_SCREENCAST_IFACE, "SelectSources");
-		if (call == NULL) {
-			return false;
-		}
-		DBusMessageIter args, dict;
-		dbus_message_iter_init_append(call, &args);
-		const char *sh = c->session_handle;
-		dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &sh);
-		dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-		append_string_variant(&dict, "handle_token", htok);
-		append_uint32_variant(&dict, "types", 1u);      // MONITOR
-		append_bool_variant(&dict, "multiple", FALSE);
-		append_uint32_variant(&dict, "cursor_mode", 1u); // hidden: a baked-in cursor is not desktop background
-		// Silent re-grant across launches (ScreenCast v4+; ignored by older
-		// portals): 2 = persist until explicitly revoked.
-		append_uint32_variant(&dict, "persist_mode", 2u);
-		char *saved_token = load_restore_token();
-		if (saved_token != NULL) {
-			append_string_variant(&dict, "restore_token", saved_token);
-			U_LOG_I("leia_bg_capture_linux: restoring prior screencast grant");
-			free(saved_token);
-		}
-		dbus_message_iter_close_container(&args, &dict);
-
-		DBusMessage *resp = finish_portal_call(c, call, htok);
-		if (resp == NULL) {
-			return false;
-		}
-		dbus_message_unref(resp);
-	}
-
-	// --- Start ---
-	{
-		make_unique_token(c, htok, sizeof htok);
-		DBusMessage *call = dbus_message_new_method_call(
-		    PORTAL_BUS, PORTAL_OBJ, PORTAL_SCREENCAST_IFACE, "Start");
-		if (call == NULL) {
-			return false;
-		}
-		DBusMessageIter args, dict;
-		dbus_message_iter_init_append(call, &args);
-		const char *sh = c->session_handle;
-		const char *parent = "";
-		dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &sh);
-		dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &parent);
-		dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-		append_string_variant(&dict, "handle_token", htok);
-		dbus_message_iter_close_container(&args, &dict);
-
-		DBusMessage *resp = finish_portal_call(c, call, htok);
-		if (resp == NULL) {
-			return false;
-		}
-		DBusMessageIter results;
-		if (!response_results_iter(resp, &results)) {
-			U_LOG_W("leia_bg_capture_linux: Start: no results");
-			dbus_message_unref(resp);
-			return false;
-		}
-		// Persist the (re)issued restore token so the next launch skips the
-		// consent dialog. Every Start() response carries a fresh one.
-		char *new_token = dict_get_string(results, "restore_token");
-		if (new_token != NULL) {
-			save_restore_token(new_token);
-			free(new_token);
-		}
-		bool ok = parse_streams(c, results);
-		dbus_message_unref(resp);
-		if (!ok) {
-			return false;
-		}
-	}
-
-	// --- OpenPipeWireRemote ---
-	{
-		DBusMessage *call = dbus_message_new_method_call(
-		    PORTAL_BUS, PORTAL_OBJ, PORTAL_SCREENCAST_IFACE, "OpenPipeWireRemote");
-		if (call == NULL) {
-			return false;
-		}
-		DBusMessageIter args, dict;
-		dbus_message_iter_init_append(call, &args);
-		const char *sh = c->session_handle;
-		dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &sh);
-		dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-		dbus_message_iter_close_container(&args, &dict);
-
-		DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-		    c->dbus, call, 5000, &err);
-		dbus_message_unref(call);
-		if (dbus_error_is_set(&err) || reply == NULL) {
-			U_LOG_W("leia_bg_capture_linux: OpenPipeWireRemote failed: %s",
-			        dbus_error_is_set(&err) ? err.message : "no reply");
-			dbus_error_free(&err);
-			if (reply) {
-				dbus_message_unref(reply);
-			}
-			return false;
-		}
-		DBusMessageIter it;
-		if (!dbus_message_iter_init(reply, &it) ||
-		    dbus_message_iter_get_arg_type(&it) != DBUS_TYPE_UNIX_FD) {
-			U_LOG_W("leia_bg_capture_linux: OpenPipeWireRemote: no fd");
-			dbus_message_unref(reply);
-			return false;
-		}
-		int fd = -1;
-		dbus_message_iter_get_basic(&it, &fd);
-		c->pw_fd = fd; // owned by us; dbus dup'd it into the message
-		dbus_message_unref(reply);
-		if (c->pw_fd < 0) {
-			U_LOG_W("leia_bg_capture_linux: OpenPipeWireRemote: bad fd");
-			return false;
-		}
-	}
-
-	// If the portal did not report geometry, fall back to origin 0,0; size
-	// is filled in later from the negotiated video format.
-	U_LOG_I("leia_bg_capture_linux: portal ok — node=%u monitor=%d,%d %dx%d",
-	        c->node_id, c->mon_x, c->mon_y, c->mon_w, c->mon_h);
+	U_LOG_W("leia_bg_capture_linux: mutter RecordArea(%d,%d %ux%u LOGICAL) on panel %s, cursor hidden, our "
+	        "windows excluded (%u mapped now) -> PipeWire node %u; expecting a %ux%u DEVICE-pixel stream",
+	        c->panel.logical_x, c->panel.logical_y, c->panel.logical_w, c->panel.logical_h, c->panel.connector,
+	        windows, c->node_id, c->panel.device_w, c->panel.device_h);
 	return true;
+}
+
+/*!
+ * Non-blocking per-frame pump of our private connection (render thread): track
+ * the extension coming and going, mutter closing the session, and the layout
+ * changing under the recorded area. Rare events log one WARN each.
+ */
+static void
+mutter_pump(struct leia_bg_capture_linux *c)
+{
+	if (c->dbus == NULL) {
+		return;
+	}
+	if (!dbus_connection_read_write(c->dbus, 0)) {
+		if (!c->session_closed) {
+			c->session_closed = true;
+			U_LOG_W("leia_bg_capture_linux: session bus connection lost — capture distrusted");
+		}
+		return;
+	}
+	DBusMessage *msg;
+	while ((msg = dbus_connection_pop_message(c->dbus)) != NULL) {
+		if (dbus_message_is_signal(msg, "org.freedesktop.DBus", "NameOwnerChanged")) {
+			const char *name = NULL, *old_owner = NULL, *new_owner = NULL;
+			if (dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &name, DBUS_TYPE_STRING, &old_owner,
+			                          DBUS_TYPE_STRING, &new_owner, DBUS_TYPE_INVALID) &&
+			    name != NULL && strcmp(name, LEIA_MUTTER_EXT_BUS) == 0) {
+				if (new_owner == NULL || new_owner[0] == '\0') {
+					// Screen lock, logout, or the user disabled it: the effect
+					// is gone and every frame from now on contains our window.
+					c->exclusion_live = false;
+					U_LOG_W("leia_bg_capture_linux: capture-exclusion extension went away (screen lock / "
+					        "disabled) — captured desktop DISTRUSTED, falling back to silhouette intersection");
+				} else {
+					// Back (e.g. unlock): re-register, and trust only frames
+					// published after this point — anything before may hold
+					// our own window.
+					uint32_t w = 0;
+					const enum leia_mutter_exclude_status st = leia_mutter_capture_exclude(c->dbus, 500, &w);
+					// PUBLISH order is not RECORD order: a frame mutter recorded
+					// before the effect was back can still be sitting in the
+					// buffer pool and arrive after this point (seen in the nested
+					// shell test). Mutter can only record into a free pool
+					// buffer, so at most pool-size frames are in flight —
+					// distrust that many more (plus one) before trusting again.
+					const uint32_t in_flight = atomic_load(&c->pool_buffers);
+					c->untrusted_through = atomic_load(&c->dbg_frames) + (in_flight > 0 ? in_flight : 4u) + 1u;
+					c->exclusion_live = (st == LEIA_MUTTER_EXCLUDE_OK);
+					U_LOG_W("leia_bg_capture_linux: capture-exclusion extension is back — re-exclude %s (%u "
+					        "window(s)); trusting frames after #%u (in-flight pool frames skipped)",
+					        leia_mutter_exclude_status_str(st), w, c->untrusted_through);
+				}
+			}
+		} else if (dbus_message_is_signal(msg, "org.gnome.Mutter.ScreenCast.Session", "Closed")) {
+			if (c->session_path != NULL && dbus_message_has_path(msg, c->session_path) && !c->session_closed) {
+				c->session_closed = true;
+				U_LOG_W("leia_bg_capture_linux: mutter closed the ScreenCast session (e.g. the user pressed "
+				        "\"Stop Screen Sharing\") — no captured desktop for the rest of this session; "
+				        "transparency falls back to silhouette intersection");
+			}
+		} else if (dbus_message_is_signal(msg, "org.gnome.Mutter.DisplayConfig", "MonitorsChanged")) {
+			struct leia_mutter_panel now;
+			struct leia_panel_identity id;
+			const bool have_id = leia_mutter_panel_identity_from_sysfs(&id);
+			if (!leia_mutter_find_panel(c->dbus, have_id ? &id : NULL, c->panel.device_w, c->panel.device_h,
+			                            &now) ||
+			    now.logical_x != c->panel.logical_x || now.logical_y != c->panel.logical_y ||
+			    now.logical_w != c->panel.logical_w || now.logical_h != c->panel.logical_h ||
+			    now.device_w != c->panel.device_w || now.device_h != c->panel.device_h) {
+				if (!c->wants_restart) {
+					c->wants_restart = true;
+					U_LOG_W("leia_bg_capture_linux: the panel's layout changed — the recorded area is "
+					        "stale; the capture will be restarted");
+				}
+			}
+		}
+		dbus_message_unref(msg);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,18 +859,18 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	// today; honour whatever was negotiated for forward-compat.
 	c->modifier = info.modifier; // DRM_FORMAT_MOD_LINEAR == 0
 
-	// If the portal never gave us a monitor size, adopt the negotiated one.
-	if (c->mon_w <= 0 || c->mon_h <= 0) {
-		c->mon_w = (int32_t)c->width;
-		c->mon_h = (int32_t)c->height;
-	}
-
 	c->have_format = true;
 	// WARN so it survives field logs (INFO is dropped) — fires once per
 	// (re)negotiation, which is rare and is exactly what we want to see.
-	U_LOG_W("leia_bg_capture_linux: format negotiated %ux%u vkfmt=%d mod=0x%llx",
-	        c->width, c->height, (int)c->vk_format,
-	        (unsigned long long)c->modifier);
+	// UNITS: RecordArea streams area × the highest overlapping monitor scale,
+	// so for an area that is exactly the panel this is the panel's DEVICE
+	// size (up to rounding at a fractional scale). Say so if it is not.
+	U_LOG_W("leia_bg_capture_linux: format negotiated %ux%u vkfmt=%d mod=0x%llx (panel DEVICE %ux%u%s)",
+	        c->width, c->height, (int)c->vk_format, (unsigned long long)c->modifier, c->panel.device_w,
+	        c->panel.device_h,
+	        (c->width == c->panel.device_w && c->height == c->panel.device_h)
+	            ? ", 1:1"
+	            : " — NOT 1:1: window rects are rescaled into the stream");
 
 	// Reply with buffer params: request dma-buf-capable buffers.
 	uint8_t buf[1024];
@@ -1315,6 +920,7 @@ on_add_buffer(void *data, struct pw_buffer *buffer)
 		return;
 	}
 	buffer->user_data = (void *)(uintptr_t)slot;
+	atomic_fetch_add(&c->pool_buffers, 1);
 
 	if (d->type != SPA_DATA_DmaBuf) {
 		// MemFd/MemPtr delivery (what Mutter's Xorg screencast actually
@@ -1346,6 +952,9 @@ on_remove_buffer(void *data, struct pw_buffer *buffer)
 {
 	struct leia_bg_capture_linux *c = data;
 	uint32_t slot = slot_for_buffer(buffer);
+	if (atomic_load(&c->pool_buffers) > 0) {
+		atomic_fetch_sub(&c->pool_buffers, 1);
+	}
 	if (slot >= DXR_MAX_BUFFERS) {
 		return;
 	}
@@ -1433,6 +1042,8 @@ on_process(void *data)
 				atomic_store(&bb->dirty, true);
 			}
 		}
+		const uint32_t seq = atomic_load(&c->dbg_frames) + 1;
+		atomic_store(&c->slot_seq[slot], seq);
 		// Publish the stable slot index; for dma-buf the VkImage import is
 		// fixed for the buffer's lifetime, for shm the frame now sits in the
 		// slot's staging buffer — either way the render thread can proceed
@@ -1526,13 +1137,13 @@ pipewire_start(struct leia_bg_capture_linux *c)
 		U_LOG_W("leia_bg_capture_linux: pw_context_new failed");
 		goto unlock;
 	}
-	// pw_context_connect_fd takes ownership of pw_fd on success.
-	c->core = pw_context_connect_fd(c->context, c->pw_fd, NULL, 0);
+	// The mutter node lives on the user's default PipeWire daemon; unlike the
+	// portal there is no restricted remote fd to go through.
+	c->core = pw_context_connect(c->context, NULL, 0);
 	if (c->core == NULL) {
-		U_LOG_W("leia_bg_capture_linux: pw_context_connect_fd failed");
+		U_LOG_W("leia_bg_capture_linux: pw_context_connect (default socket) failed");
 		goto unlock;
 	}
-	c->pw_fd = -1; // consumed by pw
 
 	c->stream = pw_stream_new(
 	    c->core, "dxr-desktop-capture",
@@ -1577,8 +1188,7 @@ unlock:
 // ---------------------------------------------------------------------------
 
 struct leia_bg_capture_linux *
-leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left,
-                             int32_t window_screen_top)
+leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h)
 {
 	if (vk == NULL) {
 		U_LOG_W("leia_bg_capture_linux: NULL vk_bundle");
@@ -1607,11 +1217,7 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left,
 		return NULL;
 	}
 	c->vk = vk;
-	c->window_screen_left = window_screen_left;
-	c->window_screen_top = window_screen_top;
-	c->pw_fd = -1;
 	c->vk_format = VK_FORMAT_UNDEFINED;
-	c->token_seq = 1;
 	atomic_store(&c->current_buffer, -1);
 
 	// vkGetMemoryFdPropertiesKHR is not in the dispatch table.
@@ -1622,8 +1228,7 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left,
 		goto fail;
 	}
 
-	if (!portal_handshake(c)) {
-		U_LOG_W("leia_bg_capture_linux: portal handshake failed");
+	if (!mutter_handshake(c, panel_px_w, panel_px_h)) {
 		goto fail;
 	}
 
@@ -1632,13 +1237,18 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left,
 		goto fail;
 	}
 
-	U_LOG_I("leia_bg_capture_linux: capture started (window anchor %d,%d)",
-	        window_screen_left, window_screen_top);
+	U_LOG_W("leia_bg_capture_linux: window-excluded desktop capture started (panel %s)", c->panel.connector);
 	return c;
 
 fail:
 	leia_bg_capture_linux_destroy(c);
 	return NULL;
+}
+
+bool
+leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c)
+{
+	return c != NULL && c->wants_restart;
 }
 
 VkImageView
@@ -1675,6 +1285,23 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	if (c == NULL) {
 		return false;
 	}
+	c->poll_ok = false;
+
+	mutter_pump(c);
+
+	// TRUST GATE. A frame is usable only if our windows were excluded when it
+	// was recorded. Declining here makes the DP compose nothing and its
+	// alpha-gate fall back to silhouette intersection for this frame.
+	if (!c->exclusion_live || c->session_closed || c->wants_restart) {
+		if (!c->logged_distrust) {
+			c->logged_distrust = true;
+			U_LOG_W("leia_bg_capture_linux: captured desktop not used (%s)",
+			        c->session_closed ? "session closed"
+			        : c->wants_restart ? "panel layout changed"
+			                           : "capture exclusion not live");
+		}
+		return false;
+	}
 
 	int idx = atomic_load(&c->current_buffer);
 	if (idx < 0 || idx >= DXR_MAX_BUFFERS || !c->buffers[idx].imported) {
@@ -1685,27 +1312,26 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 		}
 		return false; // no frame yet — caller passes the raw atlas through
 	}
+	if (atomic_load(&c->slot_seq[idx]) <= c->untrusted_through) {
+		return false; // recorded while the exclusion was down — may contain us
+	}
+	if (c->logged_distrust) {
+		c->logged_distrust = false;
+		U_LOG_W("leia_bg_capture_linux: captured desktop trusted again");
+	}
 
-	// win_x/win_y (the DP's present_origin) are PANEL-relative, and the portal
-	// session captures exactly the panel monitor — so the window rect is
-	// already in captured-monitor space. Do NOT try to reconcile absolute
-	// desktop coords here: the SR display-info origin (create-time) and the
-	// portal's stream position live in different frames on this stack (the
-	// RandR position override only applies at the plugin get_display_info
-	// layer), and mixing them silently declined every frame (#109).
-	// UNITS. win_x/win_y/win_w/win_h are DEVICE pixels (the runtime's present
-	// origin + window extent). The portal's "size" property (c->mon_w/mon_h) is
-	// the monitor's LOGICAL size — 1920x1080 for a 3840x2160 panel at 200% —
-	// while the negotiated stream (c->width/height) is the monitor's DEVICE
-	// resolution. Dividing device by logical doubled every UV on a scaled
-	// output and made this off-monitor test fire for any window past device
-	// x = 1920, dropping the desktop behind the right half of the panel. So
-	// normalise by the stream extent; the portal size is only a fallback for
-	// the moment before a format is negotiated.
-	const int32_t cap_w = c->width > 0 ? (int32_t)c->width : c->mon_w;
-	const int32_t cap_h = c->height > 0 ? (int32_t)c->height : c->mon_h;
+	// UNITS. win_x/win_y/win_w/win_h are DEVICE pixels relative to the panel's
+	// top-left (the runtime's present origin + the window's target extent).
+	// The stream records exactly the panel, so a window rect maps into it by
+	// normalising with the panel's DEVICE size — never a LOGICAL size (that was
+	// the portal-era bug fixed in #254: 1920x1080 for a 3840x2160 panel at
+	// 200% doubled every UV). The panel's device size comes from mutter's
+	// current mode; the negotiated stream size is the fallback, and the two
+	// agree whenever the scale is exact.
+	const int32_t cap_w = c->panel.device_w > 0 ? (int32_t)c->panel.device_w : (int32_t)c->width;
+	const int32_t cap_h = c->panel.device_h > 0 ? (int32_t)c->panel.device_h : (int32_t)c->height;
 	if (cap_w > 0 && cap_h > 0 && win_w > 0 && win_h > 0) {
-		// Window fully off the captured monitor → decline (raw pass-through).
+		// Window fully off the captured panel → decline (raw pass-through).
 		if (win_x >= cap_w || win_y >= cap_h ||
 		    win_x + (int32_t)win_w <= 0 || win_y + (int32_t)win_h <= 0) {
 			return false;
@@ -1821,6 +1447,7 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 		out_bg_uv_extent[0] = uex;
 		out_bg_uv_extent[1] = uey;
 	}
+	c->poll_ok = true;
 	return true;
 }
 
@@ -1858,42 +1485,31 @@ leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c)
 		destroy_buffer_slot(c, i);
 	}
 
-	// Close a not-yet-consumed PipeWire fd.
-	if (c->pw_fd >= 0) {
-		close(c->pw_fd);
-		c->pw_fd = -1;
-	}
-
-	// D-Bus teardown.
+	// D-Bus teardown. Stop the session explicitly; closing the connection is
+	// ALSO what releases our capture exclusion in the extension and what makes
+	// mutter drop the session if Stop never arrives (crash-safe either way).
 	if (c->dbus != NULL) {
-		if (c->match_added) {
-			DBusError err;
-			dbus_error_init(&err);
-			dbus_bus_remove_match(c->dbus,
-			                      "type='signal',interface='" PORTAL_REQUEST_IFACE
-			                      "',member='Response'",
-			                      &err);
-			dbus_error_free(&err);
-			c->match_added = false;
+		if (c->session_path != NULL) {
+			leia_mutter_screencast_stop(c->dbus, c->session_path);
 		}
 		dbus_connection_close(c->dbus);
 		dbus_connection_unref(c->dbus);
 		c->dbus = NULL;
 	}
 
-	free(c->session_handle);
-	free(c->sender_token);
+	free(c->session_path);
+	free(c->stream_path);
 	free(c);
 }
 
 #else // !DXR_LEIA_HAVE_PIPEWIRE
 
 struct leia_bg_capture_linux *
-leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left, int32_t window_screen_top)
+leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h)
 {
-	(void)vk; (void)window_screen_left; (void)window_screen_top;
+	(void)vk; (void)panel_px_w; (void)panel_px_h;
 	U_LOG_W("leia_bg_capture_linux: built without libpipewire-0.3 / dbus-1 — desktop "
-	        "capture unavailable; transparency uses the 2D-under backdrop only (runtime#757)");
+	        "capture unavailable; transparency falls back to silhouette intersection (runtime#757)");
 	return NULL;
 }
 VkImageView leia_bg_capture_linux_get_view(struct leia_bg_capture_linux *c) { (void)c; return VK_NULL_HANDLE; }
@@ -1902,6 +1518,7 @@ void leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *o
 bool leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c, VkCommandBuffer cmd, int32_t win_x, int32_t win_y,
                                 uint32_t win_w, uint32_t win_h, float o[2], float e[2])
 { (void)c; (void)cmd; (void)win_x; (void)win_y; (void)win_w; (void)win_h; (void)o; (void)e; return false; }
+bool leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c) { (void)c; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 
 #endif // DXR_LEIA_HAVE_PIPEWIRE
