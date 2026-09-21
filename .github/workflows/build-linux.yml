@@ -53,7 +53,7 @@ env:
   # compile). v2.17.1: first line with the rear-depth-budget preview
   # (XRT_DP_VK_HAS_BACKGROUND_PREVIEW), and a vk_bundle layout that matches
   # runtimes v2.16.0..main — see the CMakeLists comment.
-  RUNTIME_REF: v2.17.1
+  RUNTIME_REF: v2.18.0
 
 jobs:
   Build:
