@@ -100,6 +100,7 @@ The fix has two halves:
 |---|---|
 | *(unset)* | Window-excluded capture when the extension (v2+) is present, else silhouette intersection. |
 | `LEIA_DP_DISABLE_BG_CAPTURE=1` | Never capture; silhouette intersection. Same name as the Windows switch, for A/B testing. |
+| `LEIA_DP_CAPTURE_MIN_INTERVAL_MS=N` | Capture delivery cap, as on Windows: unset = 66 ms (≈15 fps), `0` = uncapped (mutter records on every damaging frame, up to the refresh rate). Offered to mutter as the stream's `maxFramerate`, which mutter enforces by skipping records. Each record is a full off-screen re-render of the panel, so this cap also bounds mutter's GPU cost. Measured in the nested shell: 14.7 fps capped vs 36.7 fps uncapped for the same animating window. |
 | `DXR_LEIA_BG_DEBUG=1` | The window shows **only** the captured background, and the alpha gate is skipped. On the panel this is the check that our own window is absent from the capture. |
 | `DXR_LEIA_PANEL_CONNECTOR=<name>` | Force which mutter monitor is the panel (dev/testing), e.g. `HDMI-1`. |
 

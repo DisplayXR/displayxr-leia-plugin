@@ -859,6 +859,12 @@ mono_ns(void)
  * 2^PANEL_PREVIEW_SHIFT into @p dst (BGRA8, alpha 255). Swizzles RGB-order
  * formats to BGRA, and ignores the source X/A byte (BGRx carries garbage).
  */
+#if defined(__GNUC__) && !defined(__clang__)
+// The one hot loop in this module (~4.8 ms for a 3840x2160 panel at -O2, ~26 ms
+// at -O0). It runs on the PipeWire thread, where a Debug build's cost would
+// delay frame delivery, so optimise it regardless of the build type.
+__attribute__((optimize("O2")))
+#endif
 static void
 panel_preview_reduce(const uint8_t *src, uint32_t w, uint32_t h, bool rgb_order, uint8_t *dst, uint32_t pw,
                      uint32_t ph)
@@ -982,6 +988,10 @@ on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	c->width = info.size.width;
 	c->height = info.size.height;
 	c->vk_format = vkf;
+	if (info.max_framerate.num > 0) {
+		U_LOG_W("leia_bg_capture_linux: delivery capped at %u/%u fps (LEIA_DP_CAPTURE_MIN_INTERVAL_MS)",
+		        info.max_framerate.num, info.max_framerate.denom);
+	}
 	c->fmt_rgb_order = (info.format == SPA_VIDEO_FORMAT_RGBA || info.format == SPA_VIDEO_FORMAT_RGBx);
 
 	// spa_video_info_raw carries the negotiated DRM modifier directly in
@@ -1219,6 +1229,27 @@ build_format_params(struct spa_pod_builder *b, const struct spa_pod **params,
 	struct spa_fraction rate_min = SPA_FRACTION(0, 1);
 	struct spa_fraction rate_max = SPA_FRACTION(240, 1);
 
+	// Delivery cap — Windows parity (leia_bg_capture_win.cpp, the WGC
+	// MinUpdateInterval knee measured at 66 ms). Mutter records the area on
+	// every stage update that damages it, and each recording is a full
+	// off-screen re-render of the panel; it honours the negotiated
+	// maxFramerate by skipping records that come too soon. The compose only
+	// reads the latest frame, so the cap costs nothing on a quiet desktop and
+	// bounds both mutter's re-render and our CPU copy under motion; the trade
+	// is fringe freshness, bounded by the cap.
+	// LEIA_DP_CAPTURE_MIN_INTERVAL_MS: unset = 66, 0 = uncapped, N = N ms.
+	long interval_ms = 66;
+	const char *e = getenv("LEIA_DP_CAPTURE_MIN_INTERVAL_MS");
+	if (e != NULL && e[0] != '\0') {
+		interval_ms = atol(e);
+		if (interval_ms < 0 || interval_ms > 1000) {
+			interval_ms = 66;
+		}
+	}
+	struct spa_fraction maxrate_def = interval_ms > 0 ? SPA_FRACTION(1000, (uint32_t)interval_ms) : SPA_FRACTION(240, 1);
+	struct spa_fraction maxrate_min = SPA_FRACTION(1, 1);
+	struct spa_fraction maxrate_max = maxrate_def;
+
 	// SYSMEM-ONLY offer (#109): a format pod carrying a modifier property makes
 	// Mutter's Xorg screen-cast fixate the dma-buf format, but its X11 path
 	// then never actually allocates/delivers dma-buf frames — the stream runs
@@ -1240,7 +1271,9 @@ build_format_params(struct spa_pod_builder *b, const struct spa_pod **params,
 		    SPA_FORMAT_VIDEO_size,
 		    SPA_POD_CHOICE_RANGE_Rectangle(&size_def, &size_min, &size_max), //
 		    SPA_FORMAT_VIDEO_framerate,
-		    SPA_POD_CHOICE_RANGE_Fraction(&rate_def, &rate_min, &rate_max));
+		    SPA_POD_CHOICE_RANGE_Fraction(&rate_def, &rate_min, &rate_max), //
+		    SPA_FORMAT_VIDEO_maxFramerate,
+		    SPA_POD_CHOICE_RANGE_Fraction(&maxrate_def, &maxrate_min, &maxrate_max));
 	}
 
 	return n;
