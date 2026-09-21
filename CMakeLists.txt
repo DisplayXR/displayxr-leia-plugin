@@ -200,7 +200,7 @@ set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
 # Not in v2.17.1: the VK snap_window_rect slot (runtime#1592,
 # XRT_DP_VK_HAS_SNAP_WINDOW_RECT), so drag phase-snap compiles out at this pin
 # (expected; it compiles in automatically at the first pin that carries it).
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.17.1" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.18.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
@@ -264,10 +264,20 @@ else()
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG}")
     endif()
     message(STATUS "Fetching runtime via FetchContent @ ${_dxr_runtime_ref}")
+    # EXCLUDE_FROM_ALL: build only the runtime targets the plug-in links, as the
+    # DXR_RUNTIME_SOURCE_DIR path above already does. Without it the fetched
+    # runtime's own test suite joins the default build, and any test that is not
+    # subproject-safe breaks a plug-in build that never needed it. Supported by
+    # FetchContent_Declare from CMake 3.28; older CMake keeps the previous behaviour.
+    set(_dxr_runtime_fc_exclude "")
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+        set(_dxr_runtime_fc_exclude EXCLUDE_FROM_ALL)
+    endif()
     FetchContent_Declare(
         displayxr_runtime
         GIT_REPOSITORY https://github.com/DisplayXR/displayxr-runtime.git
         GIT_TAG "${_dxr_runtime_ref}"
+        ${_dxr_runtime_fc_exclude}
     )
     FetchContent_MakeAvailable(displayxr_runtime)
 endif()
