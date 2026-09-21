@@ -141,6 +141,9 @@ struct sr_ctx
 	/* Latched system-monitor state (SDK thread → render thread). */
 	atomic_bool user_present;
 	atomic_bool device_ready;
+	//! Monotonic time (ns) the last real eye sample arrived, stamped on OUR
+	//! clock in the SDK callback; 0 = none yet. See the is_tracking comment.
+	_Atomic int64_t last_pair_mono_ns;
 	atomic_bool lens_on;
 	atomic_bool display_info_dirty;
 	atomic_uint_least64_t last_eye_time_us;
@@ -164,6 +167,7 @@ sr_ctx_on_eye_pair(const SrEyePair *pair, void *user_data)
 	 * srWeaverGetPredictedEyePositions (R-T1 same-pair rule); this callback
 	 * only tracks sample freshness for the timestamp out-param. */
 	atomic_store(&g_ctx.last_eye_time_us, pair->timeUs);
+	atomic_store(&g_ctx.last_pair_mono_ns, (int64_t)os_monotonic_get_ns());
 }
 
 static void SR_CALL
@@ -1541,7 +1545,20 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 		/* Event-latched (contract §8 R-T3): flips at raw USER_LOST, i.e.
 		 * earlier than R-T4's grace-period preference — srSDK 1.0.0
 		 * exposes no grace state. */
-		*out_is_tracking = atomic_load(&g_ctx.user_present) && atomic_load(&g_ctx.device_ready) &&
+		/* The SDK announces a viewer only on a TRANSITION (USER_FOUND). A viewer
+		 * already in front of the panel when this client connects is never
+		 * announced, so the event latch alone reported "not tracking" for the
+		 * whole session while real eye samples streamed in — measured on a DS1:
+		 * valid, moving eye positions, zero USER_FOUND events. Anything gated on
+		 * tracking (the eye-tracking state, apps that hold still until the
+		 * tracker locks) then never engaged. So a fresh real sample also counts
+		 * as tracking. USER_LOST still clears user_present immediately, and
+		 * samples stop when the viewer leaves, so freshness lapses within
+		 * kSampleFreshNs rather than latching on. */
+		const int64_t kSampleFreshNs = 250 * 1000 * 1000; /* ~8 samples at 30 Hz */
+		const int64_t last = atomic_load(&g_ctx.last_pair_mono_ns);
+		const bool fresh = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < kSampleFreshNs;
+		*out_is_tracking = (atomic_load(&g_ctx.user_present) || fresh) && atomic_load(&g_ctx.device_ready) &&
 		                   g_ctx.tracker != NULL;
 	}
 	if (out_timestamp_ns != NULL) {
