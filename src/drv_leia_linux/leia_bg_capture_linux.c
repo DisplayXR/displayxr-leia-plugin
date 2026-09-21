@@ -1087,7 +1087,7 @@ portal_handshake(struct leia_bg_capture_linux *c)
 		append_string_variant(&dict, "handle_token", htok);
 		append_uint32_variant(&dict, "types", 1u);      // MONITOR
 		append_bool_variant(&dict, "multiple", FALSE);
-		append_uint32_variant(&dict, "cursor_mode", 2u); // embedded
+		append_uint32_variant(&dict, "cursor_mode", 1u); // hidden: a baked-in cursor is not desktop background
 		// Silent re-grant across launches (ScreenCast v4+; ignored by older
 		// portals): 2 = persist until explicitly revoked.
 		append_uint32_variant(&dict, "persist_mode", 2u);
