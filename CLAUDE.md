@@ -149,13 +149,17 @@ Needs a local runtime checkout (default `../displayxr-runtime`, or set
 `.github/workflows/build-linux.yml`. CI builds on Ubuntu 22.04/24.04/26.04
 containers and asserts single-export + discovery + ABI-green selftest.
 
-**Building against a local runtime checkout is mandatory for anything you
-intend to load** — not a convenience. The runtime's loader compares
-`vk_bundle_abi_size` exactly, and the pinned `DXR_RUNTIME_GIT_TAG_LINUX`
-(`v2.14.6`) headers have a `struct vk_bundle` 8 bytes smaller than runtime
-`main`'s, so a tag-pinned build is hard-rejected at load even though
-`XRT_PLUGIN_API_VERSION_CURRENT` is 5 on both and
+**Build against headers whose `struct vk_bundle` matches the runtime you will
+load into.** The runtime's loader compares `vk_bundle_abi_size` exactly and
+refuses the VK DP on a mismatch (the session runs unwoven), even though
+`XRT_PLUGIN_API_VERSION_CURRENT` is 5 throughout and
 `scripts/check_plugin_abi.py` does not model that struct fingerprint.
+`vk_bundle` changed layout once in this range — at runtime v2.16.0 — and is
+identical from v2.16.0 through `main`. The Linux pin is now `v2.17.1`, so a
+tag-pinned build loads into any runtime v2.16.0..main; the old `v2.14.6` pin
+produced a plug-in 8 bytes short that every runtime >= v2.16.0 refused, which
+is why a local runtime checkout used to be mandatory. Building against the
+exact checkout you load into is still the safest habit.
 
 The installed **`leiasr-runtime` .deb is the SDK dev package** (headers under
 `/opt/leiasr/include/sr/`, `libsrSDK_loader.a`, `lib/cmake/srSDK/`, and it
