@@ -5,28 +5,28 @@
  * @brief  Linux desktop background capture for Leia DP transparency (runtime#757).
  *
  * The Linux analogue of leia_bg_capture_win (WGC). Captures the desktop behind
- * the app window via the xdg-desktop-portal ScreenCast interface → PipeWire, and
- * exposes the latest frame as a Vulkan-sampleable image the compose-under-bg pass
- * samples as the background under each per-view atlas tile.
+ * the app window and exposes the latest frame as a Vulkan-sampleable image the
+ * compose-under-bg pass samples as the background under each per-view atlas
+ * tile.
  *
- * Why portal/PipeWire (not XComposite/XShm): it is the cross-desktop standard
- * (GNOME/KDE/wlroots), hands out dma-buf FDs — zero-copy into Vulkan via
- * VK_EXT_external_memory_dma_buf / VK_EXT_image_drm_format_modifier — and works
- * on both X11 and Wayland, so it survives the display-server transition.
+ * Source (GNOME/mutter only): org.gnome.Mutter.ScreenCast RecordArea over the
+ * 3D panel's full LOGICAL rectangle → PipeWire (default socket) → shm frames
+ * staged into a VkImage (dma-buf import kept for a producer that offers it).
  *
- * The module shares the compositor's VkDevice (via the passed vk_bundle) and owns
- * the dma-buf → VkImage import, so the DP just samples the returned VkImageView.
+ * SELF-CAPTURE. Windows excludes our window with SetWindowDisplayAffinity
+ * (WDA_EXCLUDEFROMCAPTURE). GNOME has no API for it, so the DisplayXR GNOME
+ * Shell extension (displayxr-runtime contrib/gnome-shell/
+ * window-geometry@displayxr.org, version 2+) provides one:
+ * org.displayxr.CaptureExclusion1.Exclude(0) drops every window of this process
+ * from off-screen stage paints — which is exactly what RecordArea renders —
+ * while it keeps drawing on screen. Without that extension a capture would
+ * contain our own previous woven frame, so create() REFUSES to start one and
+ * logs, once, that installing the extension is what enables correct
+ * transparency. The capture is also distrusted whenever the extension
+ * disappears mid-session (GNOME disables extensions on the lock screen).
  *
- * On any failure (no portal, PipeWire unavailable, user denies the ScreenCast
- * permission dialog, unsupported dma-buf modifier), create() returns NULL and the
- * DP stays opaque (or uses the 2D-under backdrop only) — never a hard error.
- *
- * Self-capture note: unlike Windows (SetWindowDisplayAffinity WDA_EXCLUDEFROMCAPTURE)
- * there is no portable X11/PipeWire "exclude this window from capture". The portal
- * restricts capture to the chosen monitor/window; capturing strictly the region
- * behind our surface (and our surface presenting a frame late relative to the
- * ~60 Hz capture) keeps the feedback loop out of the composed result in practice.
- * Documented limitation until a portal window-exclusion hint exists.
+ * On any failure create() returns NULL and the DP falls back to silhouette
+ * intersection — never a hard error.
  *
  * @author David Fattal
  * @ingroup drv_leia_linux
@@ -50,21 +50,29 @@ extern "C" {
 struct leia_bg_capture_linux;
 
 /*!
- * Start a portal ScreenCast session capturing the monitor that contains
- * (@p window_screen_left, @p window_screen_top) — the app window's top-left in
- * root/desktop coordinates, forwarded by the DP from the compositor.
+ * Exclude this process's windows from capture, find the panel in mutter's
+ * layout, and start recording its full logical rectangle.
  *
- * Blocks briefly on the portal handshake (Create/SelectSources/Start →
- * OpenPipeWireRemote); the user may see a one-time ScreenCast permission dialog.
- * The imported VkImage lives on @p vk's device and is owned by this module.
+ * Blocks briefly (DisplayConfig + Exclude + CreateSession/RecordArea/Start and
+ * the wait for the PipeWire node, bounded at ~5 s). No dialog: mutter's own
+ * ScreenCast API does not prompt. It does register a screen-sharing handle, so
+ * GNOME shows its "screen is being shared" indicator while the capture runs.
  *
- * @param vk                 Compositor's Vulkan bundle (device/phys/queue). Not owned.
- * @param window_screen_left App window X in desktop coords (monitor selection).
- * @param window_screen_top  App window Y in desktop coords.
- * @return session, or NULL on any failure (caller stays opaque / 2D-under only).
+ * @param vk          Compositor's Vulkan bundle (device/phys/queue). Not owned.
+ * @param panel_px_w  The panel's DEVICE resolution as the DP knows it — used to
+ * @param panel_px_h  pick the panel if the EDID match fails, and cross-checked.
+ * @return session, or NULL (extension absent/outdated, not GNOME, no PipeWire).
  */
 struct leia_bg_capture_linux *
-leia_bg_capture_linux_create(struct vk_bundle *vk, int32_t window_screen_left, int32_t window_screen_top);
+leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h);
+
+/*!
+ * True once the panel's layout changed under the recorded area (moved,
+ * rescaled, re-moded). The area is fixed at stream creation, so the DP must
+ * destroy and re-create the capture; poll() declines until then.
+ */
+bool
+leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c);
 
 /*!
  * The captured-desktop image as a Vulkan view, in SHADER_READ_ONLY_OPTIMAL,
@@ -76,7 +84,7 @@ VkImageView
 leia_bg_capture_linux_get_view(struct leia_bg_capture_linux *c);
 
 /*!
- * Captured monitor dimensions (px), for the bg_uv mapping and the imported
+ * Captured stream dimensions (DEVICE px of the panel, up to rounding), for the bg_uv mapping and the imported
  * VkImage extent.
  */
 void
@@ -88,15 +96,15 @@ leia_bg_capture_linux_get_size(struct leia_bg_capture_linux *c, uint32_t *out_wi
  * the Windows leia_bg_capture_poll contract so the compose shader's per-tile
  * bg_uv math is identical.
  *
- * @param win_x,win_y  Window top-left relative to the display origin passed at
- *                     create() (the DP's present_origin — (0,0) when
+ * @param win_x,win_y  Window top-left relative to the PANEL's top-left, in
+ *                     DEVICE pixels (the DP's present_origin — (0,0) when
  *                     display-scoped/fullscreen).
- * @param win_w,win_h  Window (present target) size in pixels. 0 ⟹ treat the
- *                     window as covering the whole captured monitor.
+ * @param win_w,win_h  Window (present target) size in DEVICE pixels. 0 ⟹ treat
+ *                     the window as covering the whole captured panel.
  *
- * @return true if a frame is available and the window is on the captured monitor;
- *         false if no frame yet or the window left the monitor (caller skips the
- *         compose for this frame — passes the raw atlas through).
+ * @return true if a TRUSTED frame (recorded while our windows were excluded) is
+ *         available and the window is on the panel; false otherwise (caller
+ *         skips the compose and must not rely on a background this frame).
  */
 bool
 leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c,

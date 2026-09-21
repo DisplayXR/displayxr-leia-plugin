@@ -68,25 +68,40 @@ return float4(mix(b, a.rgb, a.a), 1.0);
 
 `leia_bg_capture_create` calls `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` so WGC does not recursively capture our own woven output back into the background. Requires Windows 10 build 19041+ (2004); on older Windows the bg-capture module fails to create and the DP falls back to chroma-key.
 
-## Linux: no self-capture defense, so no capture by default
+## Linux: a window-excluded mutter capture (GNOME)
 
-Linux has no `WDA_EXCLUDEFROMCAPTURE`. The Linux DP's background source is an xdg-desktop-portal ScreenCast of the whole **monitor** (`src/drv_leia_linux/leia_bg_capture_linux.c`), and neither the portal's ScreenCast options nor `org.gnome.Mutter.ScreenCast` can exclude a window; monitor streams copy scanout directly. The capture therefore records our own window. Our previous **woven** frame is composed under the new frame and woven again, which puts both views into both eyes. This was confirmed on a DS1 panel: with `DXR_LEIA_BG_DEBUG=1` the window showed a recursive tunnel with the app's own content inside the "background".
+Linux has no `WDA_EXCLUDEFROMCAPTURE`, and the first Linux capture (an xdg-desktop-portal ScreenCast of the whole monitor) recorded our own window: the previous **woven** frame was composed under the new one and woven again, putting both views into both eyes (confirmed on a DS1 panel; `DXR_LEIA_BG_DEBUG=1` showed a recursive tunnel).
 
-**Default: silhouette intersection, capture off.** The XCB window uses a 32-bit ARGB visual, so wherever the post-weave alpha-gate writes `alpha = 0`, mutter composites the real desktop behind us and no capture is involved. By default the Linux gate punches where **any** view is transparent (Windows punches only where **every** view is), so it never leaves a pixel that needs a background composed under it. This is the "silhouette intersection" mitigation from [chroma-key-overlay.md §Limits](chroma-key-overlay.md#limits--disocclusion-fringe-near-the-silhouette). The desktop capture is never started, so no ScreenCast stream runs and the user never sees the portal dialog.
+The fix has two halves:
 
-*Cost:* the visible silhouette is the intersection of the per-view silhouettes, so it shrinks by the disparity width at its edges. That is nothing at the display plane and grows with the content's distance in front of or behind it.
+- **The exclusion** lives in the compositor, in the DisplayXR GNOME Shell extension `window-geometry@displayxr.org` (**version 2+**, shipped from `displayxr-runtime` `contrib/gnome-shell/`). Its `org.displayxr.CaptureExclusion1.Exclude(0)` leaves every window of the calling process out of mutter's *off-screen* stage paints, while the window keeps drawing on screen. Runtime spec: `docs/specs/runtime/wayland-window-geometry.md` §6.
+- **The capture** (`src/drv_leia_linux/leia_bg_capture_linux.c`, `leia_mutter_capture_linux.c`) uses `org.gnome.Mutter.ScreenCast` directly instead of the portal. It excludes our windows first, reads the panel's **logical** rectangle from `org.gnome.Mutter.DisplayConfig`, and calls `RecordArea` over the panel's **full** rectangle with the cursor hidden. `RecordArea` renders off-screen, which is what the exclusion keys on; `RecordMonitor` can blit the on-screen view and would contain the window. The PipeWire node is consumed over the default socket, with no portal and no consent dialog. The existing PipeWire consumer and Vulkan staging are unchanged.
+
+**Units.** `RecordArea` takes logical coordinates and streams device pixels: the panel's logical rect × its scale. A 1920×1080 logical rect at 200 % gives 3840×2160, and 2304×1296 at 5/3 gives 3840×2160. The window rect the DP receives is device pixels relative to the panel (present origin + target extent). It is normalised by the panel's device size (mutter's current mode, with the stream size as fallback) to address the stream. This supersedes the portal-era logical/device mix-up that #254 fixed.
+
+**Trust.** The capture is used only while the exclusion is live:
+
+| condition | behaviour |
+|---|---|
+| Extension absent (or the screen was locked at start) | No capture is started. **One WARN** says that installing the extension (then logging out and back in) is what enables correct transparency. Silhouette intersection. |
+| Extension is version 1 (geometry only) | Same, with "update the extension". |
+| Extension disappears mid-session (lock screen / disabled) | Capture distrusted at once. Silhouette intersection. |
+| Extension comes back | The DP re-registers. It then also skips as many frames as the PipeWire pool holds, because a frame recorded before the exclusion was back can still be in flight. It trusts the capture again after that. |
+| mutter closes the session (e.g. *Stop Screen Sharing*) | No capture for the rest of the session. Silhouette intersection. |
+| Panel moved or rescaled | The recorded area is stale. The capture is re-created (at most once a second). |
+
+**Alpha-gate rule, per frame.** When this frame's compose sampled a trusted capture, the gate punches only where **every** view is transparent (the Windows rule). The fringe keeps the captured desktop composed under it, with no halo and no shrink. On any other frame it punches where **any** view is transparent: that is silhouette intersection ([chroma-key-overlay.md §Limits](chroma-key-overlay.md#limits--disocclusion-fringe-near-the-silhouette)), which needs no background, at the cost of edges that shrink by the disparity.
+
+**UX note.** Any mutter ScreenCast session makes GNOME show its "screen is being shared" indicator while a transparent app runs. Its *Stop* button ends our session too, which the DP handles as above.
 
 | env var | effect |
 |---|---|
-| *(unset)* | Silhouette intersection. No capture. |
-| `DXR_LEIA_BG_CAPTURE=1` | Opt in to the portal capture and compose-under (the gate returns to the every-view rule). **This exhibits the self-capture bug on GNOME/mutter.** It is kept for the longer-term fix, a capture that genuinely excludes our window. If the portal/PipeWire declines, the DP logs this and falls back to silhouette intersection. |
-| `DXR_LEIA_BG_DEBUG=1` | Implies `DXR_LEIA_BG_CAPTURE=1`. The window shows **only** the captured background and the alpha-gate is skipped. If the capture does not start, a WARN says there is nothing to show. |
+| *(unset)* | Window-excluded capture when the extension (v2+) is present, else silhouette intersection. |
+| `LEIA_DP_DISABLE_BG_CAPTURE=1` | Never capture; silhouette intersection. Same name as the Windows switch, for A/B testing. |
+| `DXR_LEIA_BG_DEBUG=1` | The window shows **only** the captured background, and the alpha gate is skipped. On the panel this is the check that our own window is absent from the capture. |
+| `DXR_LEIA_PANEL_CONNECTOR=<name>` | Force which mutter monitor is the panel (dev/testing), e.g. `HDMI-1`. |
 
-The session log states the mode once per process:
-```
-leia_lnx_dp: transparency mode = silhouette intersection (punch where ANY view is transparent); desktop capture OFF ...
-leia_lnx_dp: transparency mode = compose-under-capture (desktop capture ON via DXR_LEIA_BG_CAPTURE=1) — WARNING: ...
-```
+The interim `DXR_LEIA_BG_CAPTURE=1` opt-in is gone. It existed only because the portal capture could not exclude our window.
 
 ## Cross-API sync
 
