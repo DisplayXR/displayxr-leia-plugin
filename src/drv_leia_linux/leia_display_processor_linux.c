@@ -1632,6 +1632,26 @@ leia_lnx_dp_snap_window_rect(struct xrt_display_processor_vk *xdp_vk,
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
+/*
+ * Rear depth budget background source (runtime ADR-040 / XR_DXR_depth_budget,
+ * Windows parity with leia_dp_vk_get_background_preview). Pure forward to the
+ * capture module, which produces the preview from the SAME window-excluded
+ * capture compose-under-bg samples; no policy in vendor code. No capture — the
+ * extension is absent, LEIA_DP_DISABLE_BG_CAPTURE, transparency off — reports
+ * "no source", and the runtime keeps clipping at the display plane.
+ */
+static bool
+leia_lnx_dp_get_background_preview(struct xrt_display_processor_vk *xdp_vk, struct xrt_dp_background_preview *out)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp_vk;
+	if (ldp == NULL || !ldp->transparent_enabled || ldp->bg_capture == NULL) {
+		return false;
+	}
+	return leia_bg_capture_linux_get_preview(ldp->bg_capture, out);
+}
+#endif
+
 static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -1803,6 +1823,13 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 #ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
 	// Drag phase-snap (runtime#1588) — Windows parity (D3D11 slot 18).
 	ldp->base.snap_window_rect = leia_lnx_dp_snap_window_rect;
+#endif
+#ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
+	// Rear depth budget (ADR-040): the captured desktop, downsampled, so the
+	// runtime can clip only when the background actually carries a
+	// horizontal-disparity cue. Appended VK-variant slot; struct_size above
+	// (sizeof the variant) covers it only when the headers carry it.
+	ldp->base.get_background_preview = leia_lnx_dp_get_background_preview;
 #endif
 	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the
 	// X11 window position).

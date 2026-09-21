@@ -7,7 +7,7 @@
  * The Linux analogue of leia_bg_capture_win (WGC). Captures the desktop behind
  * the app window and exposes the latest frame as a Vulkan-sampleable image the
  * compose-under-bg pass samples as the background under each per-view atlas
- * tile.
+ * tile — plus a small CPU preview for the runtime's rear depth budget.
  *
  * Source (GNOME/mutter only): org.gnome.Mutter.ScreenCast RecordArea over the
  * 3D panel's full LOGICAL rectangle → PipeWire (default socket) → shm frames
@@ -42,6 +42,7 @@
 // Vulkan types come from the shared vk_bundle path (xrt_vulkan_includes.h via
 // vk/vk_helpers.h in the translation units that use this).
 #include "vk/vk_helpers.h"
+#include "xrt/xrt_display_processor.h" // struct xrt_dp_background_preview
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,6 +74,19 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
  */
 bool
 leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c);
+
+struct xrt_dp_background_preview;
+
+/*!
+ * The rear-depth-budget background preview (runtime xrt_dp_background_preview):
+ * the desktop under the window as of the last poll(), box-filtered by >= 4x to
+ * <= 512 px, BGRA8 top-down. Same contract as leia_bg_capture_get_preview on
+ * Windows: fields written only within the caller's struct_size; bgra BORROWED
+ * until the next process_atlas; false = no source (capture untrusted, no frame,
+ * window off the panel, dma-buf frames). Render thread only.
+ */
+bool
+leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct xrt_dp_background_preview *out);
 
 /*!
  * The captured-desktop image as a Vulkan view, in SHADER_READ_ONLY_OPTIMAL,
