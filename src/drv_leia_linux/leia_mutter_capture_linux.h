@@ -181,6 +181,35 @@ leia_mutter_capture_exclude(struct DBusConnection *conn, int timeout_ms, uint32_
 const char *
 leia_mutter_exclude_status_str(enum leia_mutter_exclude_status s);
 
+struct DBusMessage;
+
+/*
+ * ASYNC halves, for the render thread after create(): send without waiting,
+ * keep the serial, and hand the matching reply (a METHOD_RETURN or ERROR whose
+ * reply_serial equals it, popped by the caller's own non-blocking pump) to the
+ * parser. Nothing here blocks.
+ */
+
+//! Send CaptureExclusion1.Exclude(0); false if it could not be queued.
+bool
+leia_mutter_capture_exclude_send(struct DBusConnection *conn, uint32_t *out_serial);
+
+//! Outcome of an Exclude reply (METHOD_RETURN or ERROR).
+enum leia_mutter_exclude_status
+leia_mutter_capture_exclude_from_reply(struct DBusMessage *reply, uint32_t *out_windows);
+
+//! Send DisplayConfig.GetCurrentState; false if it could not be queued.
+bool
+leia_mutter_request_layout(struct DBusConnection *conn, uint32_t *out_serial);
+
+//! leia_mutter_find_panel's selection, applied to a GetCurrentState reply.
+bool
+leia_mutter_panel_from_reply(struct DBusMessage *reply,
+                             const struct leia_panel_identity *id,
+                             uint32_t expect_w,
+                             uint32_t expect_h,
+                             struct leia_mutter_panel *out);
+
 /*!
  * Start a Mutter ScreenCast session recording @p panel's LOGICAL rectangle,
  * cursor hidden. Blocks until the stream's PipeWireStreamAdded (bounded by

@@ -468,12 +468,43 @@ leia_mutter_find_panel(struct DBusConnection *conn,
 		dbus_error_free(&err);
 		return false;
 	}
+	const bool ok = leia_mutter_panel_from_reply(reply, id, expect_w, expect_h, out);
+	dbus_message_unref(reply);
+	return ok;
+}
 
+bool
+leia_mutter_request_layout(struct DBusConnection *conn, uint32_t *out_serial)
+{
+	DBusMessage *call = dbus_message_new_method_call(DISPLAYCONFIG_BUS, DISPLAYCONFIG_PATH, DISPLAYCONFIG_BUS,
+	                                                 "GetCurrentState");
+	if (call == NULL) {
+		return false;
+	}
+	dbus_uint32_t serial = 0;
+	const bool ok = dbus_connection_send(conn, call, &serial) != FALSE;
+	dbus_connection_flush(conn);
+	dbus_message_unref(call);
+	*out_serial = serial;
+	return ok && serial != 0;
+}
+
+bool
+leia_mutter_panel_from_reply(struct DBusMessage *reply,
+                             const struct leia_panel_identity *id,
+                             uint32_t expect_w,
+                             uint32_t expect_h,
+                             struct leia_mutter_panel *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (reply == NULL || dbus_message_get_type(reply) != DBUS_MESSAGE_TYPE_METHOD_RETURN) {
+		U_LOG_W("leia_mutter: DisplayConfig.GetCurrentState returned an error — not a GNOME/mutter session?");
+		return false;
+	}
 	struct dc_monitor mons[MAX_MONITORS];
 	struct dc_logical lms[MAX_MONITORS];
 	uint32_t nm = 0, nl = 0, layout_mode = 1;
 	const bool parsed = parse_current_state(reply, mons, &nm, lms, &nl, &layout_mode);
-	dbus_message_unref(reply);
 	if (!parsed) {
 		U_LOG_W("leia_mutter: could not parse DisplayConfig.GetCurrentState");
 		return false;
@@ -584,6 +615,33 @@ leia_mutter_find_panel(struct DBusConnection *conn,
 	return true;
 }
 
+static DBusMessage *
+exclude_call(void)
+{
+	DBusMessage *call = dbus_message_new_method_call(LEIA_MUTTER_EXT_BUS, LEIA_MUTTER_EXT_EXCLUDE_PATH,
+	                                                 LEIA_MUTTER_EXT_EXCLUDE_IFACE, "Exclude");
+	if (call != NULL) {
+		uint32_t self = 0; // 0 = "the calling process" — the extension resolves it from the bus
+		dbus_message_append_args(call, DBUS_TYPE_UINT32, &self, DBUS_TYPE_INVALID);
+	}
+	return call;
+}
+
+static enum leia_mutter_exclude_status
+exclude_status_from_error(DBusError *err)
+{
+	if (dbus_error_has_name(err, DBUS_ERROR_UNKNOWN_METHOD) || dbus_error_has_name(err, DBUS_ERROR_UNKNOWN_OBJECT) ||
+	    dbus_error_has_name(err, DBUS_ERROR_UNKNOWN_INTERFACE)) {
+		return LEIA_MUTTER_EXCLUDE_OUTDATED;
+	}
+	if (dbus_error_has_name(err, DBUS_ERROR_SERVICE_UNKNOWN) || dbus_error_has_name(err, DBUS_ERROR_NAME_HAS_NO_OWNER)) {
+		return LEIA_MUTTER_EXCLUDE_ABSENT;
+	}
+	U_LOG_W("leia_mutter: CaptureExclusion1.Exclude failed: %s: %s", err->name ? err->name : "?",
+	        err->message ? err->message : "?");
+	return LEIA_MUTTER_EXCLUDE_ERROR;
+}
+
 enum leia_mutter_exclude_status
 leia_mutter_capture_exclude(struct DBusConnection *conn, int timeout_ms, uint32_t *out_windows)
 {
@@ -594,34 +652,53 @@ leia_mutter_capture_exclude(struct DBusConnection *conn, int timeout_ms, uint32_
 		return LEIA_MUTTER_EXCLUDE_ABSENT;
 	}
 
-	DBusMessage *call = dbus_message_new_method_call(LEIA_MUTTER_EXT_BUS, LEIA_MUTTER_EXT_EXCLUDE_PATH,
-	                                                 LEIA_MUTTER_EXT_EXCLUDE_IFACE, "Exclude");
+	DBusMessage *call = exclude_call();
 	if (call == NULL) {
 		return LEIA_MUTTER_EXCLUDE_ERROR;
 	}
-	uint32_t self = 0; // 0 = "the calling process" — the extension resolves it from the bus
-	dbus_message_append_args(call, DBUS_TYPE_UINT32, &self, DBUS_TYPE_INVALID);
 	DBusMessage *reply = dbus_connection_send_with_reply_and_block(conn, call, timeout_ms, &err);
 	dbus_message_unref(call);
 	if (reply == NULL) {
-		enum leia_mutter_exclude_status st = LEIA_MUTTER_EXCLUDE_ERROR;
-		if (dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_METHOD) ||
-		    dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_OBJECT) ||
-		    dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_INTERFACE)) {
-			st = LEIA_MUTTER_EXCLUDE_OUTDATED;
-		} else if (dbus_error_has_name(&err, DBUS_ERROR_SERVICE_UNKNOWN) ||
-		           dbus_error_has_name(&err, DBUS_ERROR_NAME_HAS_NO_OWNER)) {
-			st = LEIA_MUTTER_EXCLUDE_ABSENT;
-		} else {
-			U_LOG_W("leia_mutter: CaptureExclusion1.Exclude failed: %s: %s", err.name ? err.name : "?",
-			        err.message ? err.message : "?");
-		}
+		const enum leia_mutter_exclude_status st = exclude_status_from_error(&err);
+		dbus_error_free(&err);
+		return st;
+	}
+	const enum leia_mutter_exclude_status st = leia_mutter_capture_exclude_from_reply(reply, out_windows);
+	dbus_message_unref(reply);
+	return st;
+}
+
+bool
+leia_mutter_capture_exclude_send(struct DBusConnection *conn, uint32_t *out_serial)
+{
+	DBusMessage *call = exclude_call();
+	if (call == NULL) {
+		return false;
+	}
+	dbus_uint32_t serial = 0;
+	const bool ok = dbus_connection_send(conn, call, &serial) != FALSE;
+	dbus_connection_flush(conn);
+	dbus_message_unref(call);
+	*out_serial = serial;
+	return ok && serial != 0;
+}
+
+enum leia_mutter_exclude_status
+leia_mutter_capture_exclude_from_reply(struct DBusMessage *reply, uint32_t *out_windows)
+{
+	if (reply == NULL) {
+		return LEIA_MUTTER_EXCLUDE_ERROR;
+	}
+	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+		DBusError err;
+		dbus_error_init(&err);
+		dbus_set_error_from_message(&err, reply);
+		const enum leia_mutter_exclude_status st = exclude_status_from_error(&err);
 		dbus_error_free(&err);
 		return st;
 	}
 	uint32_t windows = 0;
 	dbus_message_get_args(reply, NULL, DBUS_TYPE_UINT32, &windows, DBUS_TYPE_INVALID);
-	dbus_message_unref(reply);
 	if (out_windows != NULL) {
 		*out_windows = windows;
 	}
@@ -852,6 +929,45 @@ leia_mutter_screencast_stop(struct DBusConnection *conn, const char *session)
 {
 	(void)conn;
 	(void)session;
+}
+
+bool
+leia_mutter_capture_exclude_send(struct DBusConnection *conn, uint32_t *out_serial)
+{
+	(void)conn;
+	*out_serial = 0;
+	return false;
+}
+
+enum leia_mutter_exclude_status
+leia_mutter_capture_exclude_from_reply(struct DBusMessage *reply, uint32_t *out_windows)
+{
+	(void)reply;
+	(void)out_windows;
+	return LEIA_MUTTER_EXCLUDE_ABSENT;
+}
+
+bool
+leia_mutter_request_layout(struct DBusConnection *conn, uint32_t *out_serial)
+{
+	(void)conn;
+	*out_serial = 0;
+	return false;
+}
+
+bool
+leia_mutter_panel_from_reply(struct DBusMessage *reply,
+                             const struct leia_panel_identity *id,
+                             uint32_t expect_w,
+                             uint32_t expect_h,
+                             struct leia_mutter_panel *out)
+{
+	(void)reply;
+	(void)id;
+	(void)expect_w;
+	(void)expect_h;
+	memset(out, 0, sizeof(*out));
+	return false;
 }
 
 #endif // DXR_LEIA_HAVE_PIPEWIRE
