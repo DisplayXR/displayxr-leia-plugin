@@ -69,13 +69,15 @@ fail=0
 #     Provides. apt-cache show does not list a pure virtual, so resolve it
 #     through the Provides of what is installed instead.
 SR_RUNTIME_PKG="${SR_RUNTIME_PKG:-leiasr-runtime}"
+# Captured once (and not piped into grep -q, which SIGPIPEs under pipefail).
+ALL_PROVIDES="$(dpkg-query -W -f='${Provides}\n' 2>/dev/null | tr ',' '\n' | sed 's/ //g; s/(.*)//' | sed '/^$/d')"
 for field in Depends Recommends Suggests; do
     for p in $(dpkg-query -W -f="\${$field}" "$PKG" | tr ',|' '\n\n' | sed 's/(.*)//; s/:any//; s/ //g' | sed '/^$/d'); do
         if [ "$p" = "$SR_RUNTIME_PKG" ]; then
             echo "    $field $p: vendor package, not in the Ubuntu archive (expected)"
         elif apt-cache show "$p" >/dev/null 2>&1; then
             echo "    $field $p: available"
-        elif dpkg-query -W -f='${Provides}\n' 2>/dev/null | tr ',' '\n' | sed 's/ //g; s/(.*)//' | grep -qx "$p"; then
+        elif grep -qx "$p" <<<"$ALL_PROVIDES"; then
             echo "    $field $p: satisfied by an installed package's Provides (virtual)"
         else
             echo "error: $field '$p' does not exist on $PRETTY_NAME." >&2
@@ -108,10 +110,17 @@ done
 if command -v displayxr-cli >/dev/null 2>&1; then
     echo "=== displayxr-cli selftest (env-free; plug-in must decline, sim-display claims) ==="
     unset XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH DXR_LEIA_FORCE_PROBE
-    displayxr-cli info || fail=1
+    # Captured, not piped: `cmd | grep -q` under `set -o pipefail` fails on the
+    # SIGPIPE grep sends after its first match, even though the match succeeded.
+    info_out="$(displayxr-cli info 2>&1)" || fail=1
+    echo "$info_out"
     displayxr-cli selftest || { echo "error: displayxr-cli selftest failed on $PRETTY_NAME." >&2; fail=1; }
-    displayxr-cli info 2>&1 | grep -q "id=sim-display" || {
-        echo "error: expected sim-display to claim (no vendor SR runtime here)." >&2; fail=1; }
+    if grep -qE "active plug-in: id=sim-display\b" <<<"$info_out"; then
+        echo "    active plug-in is sim-display: the plug-in declined, as it must without the vendor SR runtime"
+    else
+        echo "error: expected sim-display to claim (no vendor SR runtime here)." >&2
+        fail=1
+    fi
 else
     echo "error: displayxr-cli not installed — pass the runtime .deb as the second argument." >&2
     fail=1
