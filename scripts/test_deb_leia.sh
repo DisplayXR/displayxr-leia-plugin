@@ -7,13 +7,19 @@
 # Two modes:
 #
 #   --stub   (default, runs anywhere with Docker; NO SR SDK needed)
-#            Builds the Track A stub-weaver plug-in .deb, then in a pristine
-#            ubuntu:24.04 installs the RUNTIME .deb + this plug-in .deb together
-#            and asserts COEXISTENCE + discovery ordering:
+#            Builds the Track A stub-weaver plug-in .deb IN AN ubuntu:22.04
+#            BUILDER (the oldest supported release — a package's glibc floor is
+#            its build host's), then installs the RUNTIME .deb + this plug-in
+#            .deb together in a pristine container of EVERY supported release
+#            (22.04, 24.04, 26.04; override with DXR_TEST_RELEASES) and asserts
+#            COEXISTENCE + discovery ordering:
 #              * with DXR_LEIA_FORCE_PROBE=1  -> active plug-in = leia-sr (probe_order 50)
 #              * without it                    -> stub declines -> sim-display claims
 #            This validates the packaging MECHANICS (build, patchelf rpath strip,
-#            Depends, dpkg, install-alongside, probe_order) — NOT real weaving.
+#            versioned Depends, dpkg, install-alongside, probe_order) on every
+#            supported release — NOT real weaving. It is the local twin of CI's
+#            DebStub + DebInstall jobs; scripts/verify_deb_install_linux.sh is
+#            the shared verifier both use.
 #
 #   --sdk    (SR-equipped box only) Builds the real Track B plug-in .deb from
 #            $SRSDK_ROOT. Real-weave / claim-over-sim acceptance needs the SR
@@ -26,7 +32,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="${DXR_RUNTIME_SOURCE_DIR:-$(cd "$ROOT/.." && pwd)/displayxr-runtime}"
-IMAGE="displayxr-deb-builder:ubuntu2404"   # same builder image the runtime test uses
+# Build in the OLDEST supported release, exactly as CI's DebStub job does: a
+# package built on 24.04 needs GLIBC_2.38 and cannot run on 22.04.
+IMAGE="${DXR_DEB_BUILDER_IMAGE:-displayxr-deb-builder:ubuntu2204}"
+RELEASES="${DXR_TEST_RELEASES:-22.04 24.04 26.04}"
 
 MODE="stub"
 for arg in "$@"; do
@@ -52,13 +61,17 @@ fi
 # --- Builder image with patchelf (extends the runtime builder if present) ----
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "==> builder image $IMAGE not found — build it via the runtime's scripts/test_deb_linux.sh first." >&2
+    echo "    (that script builds an ubuntu:22.04 builder; override with DXR_DEB_BUILDER_IMAGE)" >&2
     exit 1
 fi
 
 # 1. Build the runtime .deb + the stub plug-in .deb (repos bind-mounted; both
 #    build out-of-tree so no host build/ cache collides). patchelf added at run.
+#    DXR_DEB_MAX_GLIBC mirrors CI: the builder IS the oldest supported release,
+#    so a floor above it means something dragged a newer toolchain in.
 echo "==> Building runtime .deb + stub plug-in .deb in $IMAGE"
 docker run --rm \
+    -e DXR_DEB_MAX_GLIBC=2.35 \
     -v "$RUNTIME_DIR":/runtime \
     -v "$ROOT":/plugin \
     "$IMAGE" bash -c '
@@ -66,7 +79,8 @@ docker run --rm \
     export DEBIAN_FRONTEND=noninteractive
     # libpipewire-0.3-dev + libdbus-1-dev: package_deb_leia.sh refuses a .deb
     # without the desktop-capture libs linked (the runtime builder image lacks them).
-    apt-get update -qq && apt-get install -y -qq patchelf libpipewire-0.3-dev libdbus-1-dev >/dev/null
+    # dpkg-dev: dpkg-shlibdeps, which derives the versioned Depends.
+    apt-get update -qq && apt-get install -y -qq patchelf libpipewire-0.3-dev libdbus-1-dev dpkg-dev >/dev/null
     git config --global --add safe.directory /runtime
     git config --global --add safe.directory /plugin
     echo "--- runtime .deb ---"
@@ -82,37 +96,30 @@ PL_DEB="$(ls -t "$ROOT"/dist/displayxr-leia-sr_*_*.deb 2>/dev/null | head -1 || 
 echo "==> runtime: $(basename "$RT_DEB")"
 echo "==> plugin:  $(basename "$PL_DEB")"
 
-# 2. Pristine ubuntu:24.04: install BOTH, assert coexistence + probe ordering.
-docker run --rm \
-    -v "$(dirname "$RT_DEB")":/rt:ro \
-    -v "$(dirname "$PL_DEB")":/pl:ro \
-    ubuntu:24.04 bash -c '
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    echo "=== install runtime + leia plug-in together (zero env vars) ==="
-    apt-get install -y -qq "/rt/'"$(basename "$RT_DEB")"'" "/pl/'"$(basename "$PL_DEB")"'"
-
-    echo "=== both DPs present in the shared discovery dir ==="
-    ls -1 /usr/lib/displayxr/plugins/
-
-    echo "=== desktop-capture libs resolved by Depends (plug-in dlopen needs them) ==="
-    dpkg-query -W -f="\${Depends}\n" displayxr-leia-sr
-    ldd /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so | grep -E "libpipewire-0.3|libdbus-1" \
-        || { echo "FAIL: capture libs not linked/resolved"; exit 1; }
-    ldd /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so | grep -q "not found" \
-        && { echo "FAIL: unresolved soname after apt install"; exit 1; } || true
-
-    echo "=== default (no force-probe): stub declines -> sim-display claims ==="
-    out_default="$(displayxr-cli info 2>&1)"; echo "$out_default" | grep -E "active plug-in|Selected|:: Display processor" || true
-    echo "$out_default" | grep -q "id=sim-display" || { echo "FAIL: expected sim-display to claim by default"; exit 1; }
-    echo "ok — sim-display claims by default (graceful fallback)"
-
-    echo "=== force-probe: leia-sr claims at probe_order 50 over sim-display ==="
-    out_forced="$(DXR_LEIA_FORCE_PROBE=1 displayxr-cli info 2>&1)"; echo "$out_forced" | grep -E "active plug-in|probe_order" || true
-    echo "$out_forced" | grep -q "id=leia-sr" || { echo "FAIL: leia-sr did not claim under force-probe"; exit 1; }
-    echo "$out_forced" | grep -q "probe_order=50" || { echo "FAIL: leia-sr not at probe_order 50"; exit 1; }
+# 2. Every supported release, pristine: install BOTH and check them there with
+#    the SAME verifier CI runs (scripts/verify_deb_install_linux.sh), then the
+#    force-probe half of the ordering contract, which is specific to this test.
+for release in $RELEASES; do
     echo ""
-    echo "ACCEPTANCE PASS (stub mechanics) — plug-in .deb coexists with the runtime .deb,"
-    echo "drops into /usr/lib/displayxr/plugins, and is discovered at probe_order 50."
-'
+    echo "############ ubuntu:$release ############"
+    docker run --rm \
+        -v "$ROOT":/w -w /w \
+        -v "$(dirname "$RT_DEB")":/rt:ro \
+        -v "$(dirname "$PL_DEB")":/pl:ro \
+        "ubuntu:$release" bash -c '
+        set -e
+        ./scripts/verify_deb_install_linux.sh "/pl/'"$(basename "$PL_DEB")"'" "/rt/'"$(basename "$RT_DEB")"'"
+
+        echo "=== force-probe: leia-sr claims at probe_order 50 over sim-display ==="
+        out_forced="$(DXR_LEIA_FORCE_PROBE=1 displayxr-cli info 2>&1)"
+        echo "$out_forced" | grep -E "active plug-in|probe_order" || true
+        echo "$out_forced" | grep -q "id=leia-sr" || { echo "FAIL: leia-sr did not claim under force-probe"; exit 1; }
+        echo "$out_forced" | grep -q "probe_order=50" || { echo "FAIL: leia-sr not at probe_order 50"; exit 1; }
+        echo ""
+        echo "ACCEPTANCE PASS (stub mechanics) — plug-in .deb installs beside the runtime .deb,"
+        echo "drops into /usr/lib/displayxr/plugins, and is discovered at probe_order 50."
+    '
+done
+
+echo ""
+echo "==> PASS on: $RELEASES"

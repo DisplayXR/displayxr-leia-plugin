@@ -21,10 +21,18 @@
 # job's release-asset attach) — never plain pushes to main. No versions-bump
 # dispatch here — that stays tag-driven in build-windows.yml.
 #
-# Deb job (runtime #781 Phase 3): builds the REAL Track B srSDK plug-in .deb
-# (Linux SDK pulled from the sr-sdk-v* release) and, on a v* tag, attaches
-# displayxr-leia-sr_<ver>_amd64.deb to the Release for the Linux meta-bundle.
-# Soft-skips until the Linux SDK asset is uploaded to that release (see @George).
+# Packaging jobs (runtime #781 Phase 3; portability fix mirrors the runtime's
+# #1656 / PR #1659). ONE .deb must install AND run on Ubuntu 22.04, 24.04 and
+# 26.04, so both packaging jobs build in an ubuntu:22.04 container — a
+# package's glibc floor is its build host's:
+#   DebStub     Track A (--stub) package. No vendor SDK needed, so it runs on
+#               every PR and is what makes the packaging itself verifiable.
+#   Deb         Track B (real srSDK) package — the shipped artifact. Soft-skips
+#               until the Linux SDK asset is uploaded to the sr-sdk-v* release
+#               (see @George), so it never blocks a PR.
+#   DebInstall  installs the package(s) into pristine 22.04 / 24.04 / 26.04
+#               containers alongside the released runtime .deb and runs them.
+#   DebRelease  attaches the Track B .deb to a v* Release, gated on DebInstall.
 
 name: Build Linux
 
@@ -196,20 +204,112 @@ jobs:
           jq -e '.plugin.id == "leia-sr"' info.json > /dev/null
           echo "OK: leia-sr active, ABI green"
 
+
+  # ---------------------------------------------------------------------------
+  # PACKAGING (leia-plugin: one .deb for Ubuntu 22.04, 24.04 and 26.04)
+  #
+  # v2.7.0 installed on 24.04 only: it was built on the 24.04 runner, so it
+  # needed GLIBC_2.38 / GLIBCXX_3.4.31 behind an UNVERSIONED `libc6`, and it
+  # named `libpipewire-0.3-0t64`, a package that does not exist on jammy.
+  # Mirrors the runtime's fix (displayxr-runtime #1656 / PR #1659): build the
+  # package on the OLDEST supported release, derive VERSIONED Depends with
+  # dpkg-shlibdeps, and prove the result by installing it into a pristine
+  # container of every supported release.
+  #
+  # Two packaging jobs, because only one of them can run without the vendor SDK:
+  #   DebStub  — Track A (stub weaver), ubuntu:22.04 container. No SDK needed,
+  #              so it runs on EVERY PR and is what makes the packaging itself
+  #              CI-verifiable. Its .so links the same system libraries as the
+  #              real one (vulkan, cjson, xcb, xcb-randr, pipewire, dbus), so
+  #              the derived Depends line is representative.
+  #   Deb      — Track B (real srSDK), the shipped artifact. Soft-skips when the
+  #              SDK asset or token is absent, so it never blocks a PR.
+  # DebInstall verifies the Track A package on all three releases, and the
+  # Track B package too whenever that one was actually built.
+  # ---------------------------------------------------------------------------
+
+  # Track A packaging: build the stub-weaver .deb in the OLDEST supported
+  # release's container (glibc 2.35 / GCC 11 floor) and let
+  # package_deb_leia.sh's guards run for real — versioned Depends,
+  # STABLE_SONAMES, and DXR_DEB_MAX_GLIBC refusing a floor above 22.04's.
+  # NOT a shippable artifact (the stub does no weaving); this proves PACKAGING.
+  # 22.04's apt cmake is 3.22.1 = CMakeLists' floor, so no pinned CMake — the
+  # repo's real floor is exercised.
+  DebStub:
+    name: DebStub (Track A packaging, ubuntu:22.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
+    steps:
+      # Bare image, root: git BEFORE checkout, else it falls back to a tarball
+      # with no tags and `git describe` cannot version the .deb.
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates jq \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev glslang-tools \
+            libeigen3-dev libcjson-dev libudev-dev \
+            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            libxrandr-dev \
+            libpipewire-0.3-dev libdbus-1-dev \
+            dpkg-dev fakeroot patchelf binutils
+          cmake --version | head -1
+
+      - name: Checkout plug-in
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe for the .deb version
+
+      - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: DisplayXR/displayxr-runtime
+          ref: ${{ env.RUNTIME_REF }}
+          path: displayxr-runtime
+          fetch-depth: 1
+
+      - name: Build + package the Track A (stub) .deb
+        env:
+          DXR_RUNTIME_SOURCE_DIR: ${{ github.workspace }}/displayxr-runtime
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/package_deb_leia.sh --stub
+          ls -lh dist/displayxr-leia-sr_*_amd64.deb
+
+      - name: Upload stub .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-leia-sr-stub-deb
+          path: dist/displayxr-leia-sr_*_amd64.deb
+          if-no-files-found: error
+
   # Track B (real srSDK) .deb for the Linux meta-bundle (runtime #781 Phase 3).
   # Builds the REAL plug-in .deb using the Linux SR SDK pulled from the
   # sr-sdk-v* release — the same release the Windows build pulls the win64 SDK
   # from — and on a v* tag attaches displayxr-leia-sr_<ver>_amd64.deb to the
-  # GitHub Release. Single artifact on one base (not the tri-LTS matrix), on a
-  # VM (not a container) so sudo apt + softprops/action-gh-release work simply.
+  # GitHub Release. Single artifact on one base (not the tri-LTS matrix).
+  #
+  # Built in the ubuntu:22.04 container for the same reason as DebStub: the
+  # shipped package's glibc floor is its build host's. `base` is published as a
+  # job output so DebInstall knows which releases this artifact can even claim
+  # to install on.
   #
   # GATED ON THE LINUX SDK ASSET EXISTING: until a LeiaSR-SDK-<SR_TAG>-linux64.*
   # is uploaded to the sr-sdk-v<SR_TAG> release on SR_SDK_REPO (produced by the LeiaSR Linux
   # build — see runtime #781 / @George), the download soft-skips and this job is
   # a green no-op. It never blocks a PR.
   Deb:
+    name: Deb (Track B, ubuntu:22.04)
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    outputs:
+      have_sdk: ${{ steps.sdk.outputs.have_sdk }}
+      base: ${{ steps.base.outputs.base }}
     env:
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
       # Linux srSDK release tag. Independent of build-windows.yml's SR_TAG — the
       # Linux srSDK is versioned like the SR runtime (1.37.0.x) and lives in its
       # own sr-sdk-v<SR_TAG> release with the LeiaSR-SDK-<SR_TAG>-linux64.* asset.
@@ -218,20 +318,41 @@ jobs:
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
     steps:
+      # Bare image, root, no sudo. gh is not in jammy's archive and this job
+      # needs it to pull the SDK asset, so add the upstream apt repo.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config glslang-tools jq \
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl gnupg unzip xz-utils jq \
+            build-essential cmake ninja-build pkg-config glslang-tools \
             libvulkan-dev libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+            libxrandr-dev \
             libpipewire-0.3-dev libdbus-1-dev \
-            dpkg-dev fakeroot patchelf
+            dpkg-dev fakeroot patchelf binutils
           # ^ pipewire + dbus: the shipped .deb must carry the portal/PipeWire
           #   desktop-capture producer (compose-under-bg live background,
           #   runtime#757) — v2.0.4 shipped without it because only the
-          #   compile-check job had these. The deb's Depends picks up
-          #   libpipewire-0.3-0/libdbus-1-3 automatically via DT_NEEDED.
+          #   compile-check job had these. package_deb_leia.sh refuses a .deb
+          #   without them, and dpkg-shlibdeps turns them into versioned Depends.
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update
+          apt-get install -y --no-install-recommends gh
+          cmake --version | head -1
+          gh --version | head -1
+
+      - name: Record the build base
+        id: base
+        run: |
+          . /etc/os-release
+          echo "base=$VERSION_ID" >> "$GITHUB_OUTPUT"
+          echo "Track B .deb is built on $PRETTY_NAME"
 
       - name: Checkout plug-in
         uses: actions/checkout@v4
@@ -308,8 +429,87 @@ jobs:
           path: dist/displayxr-leia-sr_*_amd64.deb
           if-no-files-found: error
 
-      - name: Attach .deb to the GitHub Release (tags only)
-        if: steps.sdk.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
+  # Install the packaged plug-in into a PRISTINE container of every supported
+  # release, alongside the latest RELEASED runtime .deb (the plug-in
+  # hard-Depends on displayxr-runtime), and check it there
+  # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
+  # release's archive with --no-install-recommends, every
+  # Depends/Recommends/Suggests name must exist there, `ldd -r` must be clean on
+  # the installed .so, and `displayxr-cli selftest` must pass env-free with the
+  # plug-in installed (its probe declines with no vendor SR runtime present, so
+  # sim-display claims — the graceful-fallback contract).
+  #
+  # The Track A (stub) package is always verified; the Track B package is
+  # verified too whenever it was built, on every release at or above its build
+  # base. A 24.04-built Track B package therefore does NOT get a 22.04 leg —
+  # that gap is reported, not hidden.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.release }})
+    needs: [DebStub, Deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["22.04", "24.04", "26.04"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the Track A (stub) .deb
+        uses: actions/download-artifact@v4
+        with:
+          name: displayxr-leia-sr-stub-deb
+          path: stub-deb
+
+      - name: Download the Track B .deb
+        if: needs.Deb.outputs.have_sdk == 'yes'
+        uses: actions/download-artifact@v4
+        with:
+          name: displayxr-leia-sr-deb
+          path: trackb-deb
+
+      - name: Fetch the latest released runtime .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo DisplayXR/displayxr-runtime \
+            --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+          ls -lh runtime-deb
+
+      - name: Track A — apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+            ./scripts/verify_deb_install_linux.sh stub-deb/*.deb runtime-deb/*.deb
+
+      - name: Track B — apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
+        if: needs.Deb.outputs.have_sdk == 'yes'
+        env:
+          BASE: ${{ needs.Deb.outputs.base }}
+          RELEASE: ${{ matrix.release }}
+        run: |
+          # A package cannot install below the release it was built on, so only
+          # verify from the build base upwards. If BASE is not 22.04, the gap is
+          # the thing to fix — say so loudly rather than passing silently.
+          oldest="$(printf '%s\n%s\n' "$BASE" "$RELEASE" | sort -V | head -1)"
+          if [ "$oldest" = "$RELEASE" ] && [ "$BASE" != "$RELEASE" ]; then
+            echo "::warning::Track B .deb was built on Ubuntu $BASE, so Ubuntu $RELEASE is BELOW its build base and is NOT verified. The shipped plug-in does not install there."
+            exit 0
+          fi
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+            ./scripts/verify_deb_install_linux.sh trackb-deb/*.deb runtime-deb/*.deb
+
+  # Attach the Track B .deb to the GitHub Release on a v* tag — only once
+  # DebInstall has proved it on every release it claims to support.
+  DebRelease:
+    needs: [Deb, DebInstall]
+    if: needs.Deb.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: displayxr-leia-sr-deb
+          path: dist
+
+      - name: Attach .deb to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/displayxr-leia-sr_*_amd64.deb

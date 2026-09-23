@@ -16,6 +16,12 @@
 #
 # Output: dist/displayxr-leia-sr_<ver>_<arch>.deb
 #
+# ONE package for Ubuntu 22.04, 24.04 and 26.04 — build it on the OLDEST of the
+# three (an ubuntu:22.04 container; CI does this) and set DXR_DEB_MAX_GLIBC to
+# that release's glibc (2.35), so a package built on anything newer fails loudly
+# here instead of shipping. See the Depends section below, and
+# scripts/verify_deb_install_linux.sh for the install-side proof.
+#
 # Payload (installed layout):
 #   /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so     (the Leia DP plug-in)
 #   /usr/lib/displayxr/plugins/050-leia-sr.json        (discovery manifest, probe_order 50)
@@ -53,8 +59,8 @@
 # shipped exactly that). So this script REQUIRES both in the built .so's
 # DT_NEEDED and fails otherwise; `--allow-no-capture` is the explicit opt-out.
 # Once linked they are hard runtime requirements (a missing soname fails the
-# plug-in's dlopen outright), and the DT_NEEDED -> package resolution below turns
-# them into Depends: (libpipewire-0.3-0[t64], libdbus-1-3) automatically.
+# plug-in's dlopen outright), and the dpkg-shlibdeps pass below turns them into
+# versioned Depends automatically.
 #
 # The capture additionally needs the DisplayXR GNOME Shell extension (version 2,
 # org.displayxr.CaptureExclusion1) — without it the plug-in declines to capture
@@ -173,8 +179,9 @@ install -m 0644 "$SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so"
 
 # Strip any DT_RUNPATH/DT_RPATH so no build-machine SDK path ships (release
 # contract: resolve libLeiaSR_runtime.so via /etc/leia/sr/1/active_runtime.json).
-patchelf --remove-rpath "$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so"
-echo "==> rpath after strip: '$(patchelf --print-rpath "$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so" 2>/dev/null)'"
+STAGED_SO="$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so"
+patchelf --remove-rpath "$STAGED_SO"
+echo "==> rpath after strip: '$(patchelf --print-rpath "$STAGED_SO" 2>/dev/null)'"
 
 # Discovery manifest — probe_order 50 (vendor), absolute INSTALLED binary_path,
 # NO force-probe (the merged presence probe, leia-plugin #99, claims when the SR
@@ -195,32 +202,98 @@ cat > "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json" <<EOF
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json"
 
-# --- Depends: resolve DT_NEEDED sonames to owning packages (usr-merge-safe:
-# `dpkg -S <bare-soname>`, basename-exact, strip :arch). Same approach as the
-# runtime's package_deb_linux.sh. displayxr-runtime is a hard prereq. ----------
-compute_lib_depends() {
-    local sonames so pkg pkgs=""
-    sonames="$(objdump -p "$SO" 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u)"
-    for so in $sonames; do
-        # Only accept a match whose file lives in a SYSTEM linker dir (/lib,
-        # /usr/lib, incl. multiarch/lib64), EXCLUDING the wrong-arch 32-bit
-        # multiarch trees (i386/lib32/libx32). Two reasons:
-        #   - cube-hw finding (B): the Leia SR runtime bundles copies of common
-        #     .so's under /opt/leiasr/lib, so a bare `dpkg -S <soname>` can
-        #     attribute a system lib to `leiasr-runtime` and wrongly make it a
-        #     hard Depend (it must stay a Recommends).
-        #   - amd64 runners carry i386 multiarch, so `dpkg -S libc.so.6` also
-        #     matches /usr/lib/i386-linux-gnu/libc.so.6 (libc6-i386); picking
-        #     that would add a bogus 32-bit Depend to an amd64 package.
-        pkg="$(dpkg -S "$so" 2>/dev/null \
-               | awk -F': ' -v s="$so" '$2 ~ /^\/(usr\/)?lib(32|64)?\// && $2 !~ /(i386-linux-gnu|\/lib32\/|\/libx32\/)/ {n=split($2,a,"/"); if (a[n]==s){p=$1; sub(/:.*/,"",p); if (p!="leiasr-runtime"){print p; exit}}}')"
-        [ -n "$pkg" ] && pkgs="$pkgs $pkg"
-    done
-    echo "libc6 $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd, - | sed 's/,/, /g'
-}
-LIB_DEPENDS="$(compute_lib_depends)"
+# --- Depends: ONE .deb for Ubuntu 22.04, 24.04 and 26.04 --------------------
+# The v2.7.0 package installed on 24.04 only, and for TWO independent reasons.
+# Both are checked here rather than trusted to the build host (the runtime made
+# the same fix in its #1656 / PR #1659):
+#
+#   1. The glibc / libstdc++ floor is the BUILD host's. v2.7.0 was built on the
+#      24.04 runner, needed GLIBC_2.38 / GLIBCXX_3.4.31, and declared an
+#      UNVERSIONED `libc6` — so apt happily installed it on 22.04 and the
+#      runtime then failed to dlopen the plug-in. Release artifacts are
+#      therefore built on the OLDEST supported release (an ubuntu:22.04
+#      container), and `dpkg-shlibdeps` turns the symbol versions the .so
+#      actually references into VERSIONED Depends, so a package built on a
+#      newer host says `libc6 (>= 2.38)` and apt REFUSES it on 22.04 instead of
+#      installing something that cannot load.
+#      DXR_DEB_MAX_GLIBC (CI sets 2.35 = Ubuntu 22.04 on the jobs that build
+#      there) makes a floor above the oldest supported release a hard error.
+#
+#   2. A system library's PACKAGE NAME is not stable across releases. v2.7.0
+#      declared `libpipewire-0.3-0t64`, which simply does not exist on 22.04
+#      (jammy has `libpipewire-0.3-0`). So every DT_NEEDED soname must be on
+#      STABLE_SONAMES below: the rule is "the package name dpkg-shlibdeps
+#      derives ON THE OLDEST SUPPORTED RELEASE resolves on all three". A newly
+#      linked library fails the build here instead of silently narrowing the
+#      releases the package installs on, and CI's DebInstall matrix
+#      (scripts/verify_deb_install_linux.sh) is what turns each entry from a
+#      claim into a check.
+STABLE_SONAMES=(
+    libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 ld-linux-x86-64.so.2
+    libstdc++.so.6 libgcc_s.so.1
+    libvulkan.so.1                  # libvulkan1
+    libcjson.so.1                   # libcjson1
+    libdbus-1.so.3                  # libdbus-1-3
+    libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
+    # libpipewire-0.3-0 on 22.04; RENAMED to libpipewire-0.3-0t64 on 24.04 and
+    # 26.04 by the time_t transition. It still qualifies, but ONLY in the
+    # oldest-release direction: the t64 package carries
+    # `Provides: libpipewire-0.3-0 (= <version>)`, so the 22.04-derived
+    # `libpipewire-0.3-0 (>= 0.3.x)` is satisfied on 24.04/26.04 through that
+    # versioned Provides. The reverse has no fallback — a 24.04-built package
+    # names libpipewire-0.3-0t64 and is uninstallable on jammy, which is
+    # exactly what v2.7.0 shipped. DebInstall proves both directions.
+    libpipewire-0.3.so.0
+)
+
+command -v dpkg-shlibdeps >/dev/null 2>&1 || { echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2; exit 1; }
+
+bad=""
+for so in $(objdump -p "$STAGED_SO" | awk '/NEEDED/{print $2}' | sort -u); do
+    ok=0
+    for s in "${STABLE_SONAMES[@]}"; do [ "$so" = "$s" ] && ok=1 && break; done
+    [ "$ok" = 1 ] || bad="$bad $so"
+done
+if [ -n "$bad" ]; then
+    echo "error: DT_NEEDED on system libraries not known to resolve under one package name" >&2
+    echo "       across Ubuntu 22.04/24.04/26.04:$bad" >&2
+    echo "       Drop the dependency, link it statically, or add it to STABLE_SONAMES once" >&2
+    echo "       CI's DebInstall matrix proves the 22.04-derived name resolves on all three." >&2
+    exit 1
+fi
+
+# dpkg-shlibdeps wants a debian/control to read; give it a throwaway one. It
+# resolves each soname through the linker search path and the owning package's
+# shlibs/symbols files, so the result carries real version floors.
+SHLIBS_TMP="$(mktemp -d)"
+mkdir -p "$SHLIBS_TMP/debian"
+printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$PKG" "$PKG" >"$SHLIBS_TMP/debian/control"
+LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O "$STAGED_SO" | sed -n 's/^shlibs:Depends=//p')"
+rm -rf "$SHLIBS_TMP"
+[ -n "$LIB_DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
 DEPENDS="displayxr-runtime, $LIB_DEPENDS"
+# cube-hw finding (B): the SR runtime bundles copies of common .so's under
+# /opt/leiasr/lib. On a box whose linker path reaches them, the owning package
+# comes out as the vendor SR package — which must stay a Recommends, never a
+# hard Depend (the plug-in installs and declines its probe without it).
+if echo "$DEPENDS" | grep -q leiasr; then
+    echo "error: Depends names the vendor SR package: $DEPENDS" >&2
+    echo "       (an SR runtime's bundled lib shadowed a system one on this host's linker path)" >&2
+    exit 1
+fi
 echo "==> Depends: $DEPENDS"
+
+GLIBC_FLOOR="$(objdump -T "$STAGED_SO" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+GLIBCXX_FLOOR="$(objdump -T "$STAGED_SO" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+echo "==> glibc floor: GLIBC_$GLIBC_FLOOR, GLIBCXX_${GLIBCXX_FLOOR:-none}"
+if [ -n "${DXR_DEB_MAX_GLIBC:-}" ] &&
+    [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$DXR_DEB_MAX_GLIBC" | sort -V | tail -1)" != "$DXR_DEB_MAX_GLIBC" ]; then
+    echo "error: the plug-in needs GLIBC_$GLIBC_FLOOR, above DXR_DEB_MAX_GLIBC=$DXR_DEB_MAX_GLIBC" >&2
+    echo "       (the oldest supported release). Build the .deb on that release —" >&2
+    echo "       CI does this in an ubuntu:22.04 container." >&2
+    exit 1
+fi
+
 # The GNOME Shell extension that makes window-excluded capture possible is
 # satisfied by the runtime .deb (or any vendor package shipping the publisher).
 RECOMMENDS="$SR_RUNTIME_PKG"

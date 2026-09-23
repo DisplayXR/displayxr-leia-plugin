@@ -149,6 +149,18 @@ Needs a local runtime checkout (default `../displayxr-runtime`, or set
 `.github/workflows/build-linux.yml`. CI builds on Ubuntu 22.04/24.04/26.04
 containers and asserts single-export + discovery + ABI-green selftest.
 
+**The `.deb` is built on the OLDEST supported release (`ubuntu:22.04`), never
+on the runner's default.** A package's glibc floor is its build host's, and
+package names are not stable across releases — v2.7.0 was built on 24.04, so it
+needed `GLIBC_2.38` behind an unversioned `libc6` and named
+`libpipewire-0.3-0t64`, which does not exist on jammy. `package_deb_leia.sh`
+now derives versioned `Depends` with `dpkg-shlibdeps`, fails on a DT_NEEDED
+outside its cross-release `STABLE_SONAMES` list, and honours
+`DXR_DEB_MAX_GLIBC`; CI's `DebInstall` matrix installs and runs the package in
+pristine 22.04/24.04/26.04 containers. Same shape as the runtime's fix
+(displayxr-runtime #1656). Details:
+[`docs/linux-deb-packaging.md`](docs/linux-deb-packaging.md).
+
 **Build against headers whose `struct vk_bundle` matches the runtime you will
 load into.** The runtime's loader compares `vk_bundle_abi_size` exactly and
 refuses the VK DP on a mismatch (the session runs unwoven), even though
