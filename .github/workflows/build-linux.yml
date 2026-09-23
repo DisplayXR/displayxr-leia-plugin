@@ -33,6 +33,15 @@
 #   DebInstall  installs the package(s) into pristine 22.04 / 24.04 / 26.04
 #               containers alongside the released runtime .deb and runs them.
 #   DebRelease  attaches the Track B .deb to a v* Release, gated on DebInstall.
+#   Linux Packaging  aggregator over DebStub + Deb + DebInstall: the single
+#               stable required context for the packaging lane (the DebInstall
+#               matrix names move when the release list changes), so a .deb
+#               that installs but cannot run blocks the merge, not just the
+#               release (runtime #1656 / #1684).
+#
+# Doc-only short-circuit: DetectChanges classifies the change; every job still
+# RUNS (so required contexts always report) but skips its steps on a doc-only
+# PR, the same pattern as the runtime's build-linux.yml.
 
 name: Build Linux
 
@@ -64,7 +73,38 @@ env:
   RUNTIME_REF: v2.18.0
 
 jobs:
+  # Classify the change. Same rule as displayxr-runtime's build-linux.yml:
+  # every heavy job still RUNS (so it reports its status) but gates each step
+  # on docs_only, so a doc-only PR goes green in seconds without building.
+  # Non-PR triggers (workflow_dispatch, v* tags) always build.
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full clone — the diff below uses pull_request.base.sha, which can
+          # be older than the merge commit's first parent.
+          fetch-depth: 0
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   Build:
+    needs: DetectChanges
     runs-on: ubuntu-latest
     container: ubuntu:${{ matrix.ubuntu }}
     strategy:
@@ -72,10 +112,15 @@ jobs:
       matrix:
         ubuntu: ['22.04', '24.04', '26.04']
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
       # Bare container, running as root (no sudo). git + ca-certificates must
       # land BEFORE actions/checkout, or it silently falls back to the tarball
       # API and `git describe` (the plug-in's iface .version, #47) degrades.
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -93,6 +138,7 @@ jobs:
           #   compiled — otherwise this large producer only ever built on the box.
 
       - name: Checkout plug-in
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history for git describe
@@ -101,6 +147,7 @@ jobs:
       # checkout must be the same ref, or the plug-in builds against
       # different ABI headers than CI validates.
       - name: Rule-5 Linux pin self-check
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           tag=$(grep -oP 'set\(DXR_RUNTIME_GIT_TAG_LINUX\s+"\K[^"]+' CMakeLists.txt | head -1)
           if [ "$tag" != "$RUNTIME_REF" ]; then
@@ -110,6 +157,7 @@ jobs:
           echo "Pin OK: $tag"
 
       - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
@@ -118,23 +166,28 @@ jobs:
           fetch-depth: 1
 
       - name: Configure
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime"
 
       - name: Build plug-in
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build
 
       # displayxr-cli is a runtime target inside the same build tree
       # (EXCLUDE_FROM_ALL only skips it from the default target).
       - name: Build displayxr-cli
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --target cli
 
       - name: Unit test — lens-preference ownership (LeiaSR #266)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lens_owner_linux
 
       - name: Assert single export (ADR-019 / #496)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           SO=build/src/drv_leia_linux/DisplayXR-LeiaSR.so
           test -f "$SO" || { echo "::error::$SO not built"; exit 1; }
@@ -146,6 +199,7 @@ jobs:
           fi
 
       - name: Assert no unresolved symbols
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           # The export check above says what the .so PROVIDES; this says whether it
           # can LOAD at all. On Linux a shared library links successfully with
@@ -165,6 +219,7 @@ jobs:
           echo "OK: only xrtPluginNegotiate exported"
 
       - name: Selftest (discovery + ABI + display info)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           CLI=$(find build/runtime-build/src/xrt/targets/cli -maxdepth 1 -name displayxr-cli -type f | head -1)
           test -n "$CLI" || { echo "::error::displayxr-cli not found"; exit 1; }
@@ -237,14 +292,20 @@ jobs:
   # repo's real floor is exercised.
   DebStub:
     name: DebStub (Track A packaging, ubuntu:22.04)
+    needs: DetectChanges
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     env:
       DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — skipping the Track A .deb build."
+
       # Bare image, root: git BEFORE checkout, else it falls back to a tarball
       # with no tags and `git describe` cannot version the .deb.
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -259,11 +320,13 @@ jobs:
           cmake --version | head -1
 
       - name: Checkout plug-in
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # git describe for the .deb version
 
       - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
@@ -272,6 +335,7 @@ jobs:
           fetch-depth: 1
 
       - name: Build + package the Track A (stub) .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           DXR_RUNTIME_SOURCE_DIR: ${{ github.workspace }}/displayxr-runtime
         run: |
@@ -280,6 +344,7 @@ jobs:
           ls -lh dist/displayxr-leia-sr_*_amd64.deb
 
       - name: Upload stub .deb artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: displayxr-leia-sr-stub-deb
@@ -303,6 +368,7 @@ jobs:
   # a green no-op. It never blocks a PR.
   Deb:
     name: Deb (Track B, ubuntu:22.04)
+    needs: DetectChanges
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     outputs:
@@ -318,9 +384,14 @@ jobs:
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — skipping the Track B .deb build."
+
       # Bare image, root, no sudo. gh is not in jammy's archive and this job
       # needs it to pull the SDK asset, so add the upstream apt repo.
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
@@ -348,6 +419,7 @@ jobs:
           gh --version | head -1
 
       - name: Record the build base
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         id: base
         run: |
           . /etc/os-release
@@ -355,11 +427,13 @@ jobs:
           echo "Track B .deb is built on $PRETTY_NAME"
 
       - name: Checkout plug-in
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # git describe for the .deb version
 
       - name: Checkout runtime @ ${{ env.RUNTIME_REF }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           repository: DisplayXR/displayxr-runtime
@@ -368,6 +442,7 @@ jobs:
           fetch-depth: 1
 
       - name: Download the Linux SR SDK from the sr-sdk release
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         id: sdk
         env:
           GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
@@ -413,7 +488,7 @@ jobs:
           echo "SRSDK_ROOT=$root"
 
       - name: Build Track B .deb
-        if: steps.sdk.outputs.have_sdk == 'yes'
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
         env:
           DXR_RUNTIME_SOURCE_DIR: ${{ github.workspace }}/displayxr-runtime
         run: |
@@ -422,7 +497,7 @@ jobs:
           ls -lh dist/displayxr-leia-sr_*_amd64.deb
 
       - name: Upload .deb artifact
-        if: steps.sdk.outputs.have_sdk == 'yes'
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
         uses: actions/upload-artifact@v4
         with:
           name: displayxr-leia-sr-deb
@@ -445,29 +520,36 @@ jobs:
   # that gap is reported, not hidden.
   DebInstall:
     name: DebInstall (Ubuntu ${{ matrix.release }})
-    needs: [DebStub, Deb]
+    needs: [DetectChanges, DebStub, Deb]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         release: ["22.04", "24.04", "26.04"]
     steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
       - uses: actions/checkout@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
 
       - name: Download the Track A (stub) .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/download-artifact@v4
         with:
           name: displayxr-leia-sr-stub-deb
           path: stub-deb
 
       - name: Download the Track B .deb
-        if: needs.Deb.outputs.have_sdk == 'yes'
+        if: needs.DetectChanges.outputs.docs_only != 'true' && needs.Deb.outputs.have_sdk == 'yes'
         uses: actions/download-artifact@v4
         with:
           name: displayxr-leia-sr-deb
           path: trackb-deb
 
       - name: Fetch the latest released runtime .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -476,12 +558,13 @@ jobs:
           ls -lh runtime-deb
 
       - name: Track A — apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
             ./scripts/verify_deb_install_linux.sh stub-deb/*.deb runtime-deb/*.deb
 
       - name: Track B — apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
-        if: needs.Deb.outputs.have_sdk == 'yes'
+        if: needs.DetectChanges.outputs.docs_only != 'true' && needs.Deb.outputs.have_sdk == 'yes'
         env:
           BASE: ${{ needs.Deb.outputs.base }}
           RELEASE: ${{ matrix.release }}
@@ -496,6 +579,71 @@ jobs:
           fi
           docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
             ./scripts/verify_deb_install_linux.sh trackb-deb/*.deb runtime-deb/*.deb
+
+  # Single stable required context for the whole Linux packaging lane —
+  # "Linux Packaging" (mirrors displayxr-runtime's, PR #1684).
+  #
+  # Why an aggregator rather than requiring the legs directly: DebInstall is a
+  # matrix, so its contexts are "DebInstall (Ubuntu 22.04)", "… 24.04",
+  # "… 26.04" — names that change the moment a release is added or dropped, and
+  # a ruleset still demanding a context no job produces blocks every PR forever.
+  # This job's name is fixed, so the matrix can grow or shrink freely.
+  #
+  # The gap it closes: DebInstall proves the Track A (stub) .deb — and the
+  # Track B .deb whenever it was built — installs AND runs on every supported
+  # release, but nothing stopped a PR MERGING with it red — the
+  # runtime #1656 shape (a .deb that apt installs on 22.04 and that then fails
+  # at exec / dlopen) was only caught at release time, if at all.
+  #
+  # Doc-only PRs: DebStub / Deb / DebInstall still RUN on the docs_only path and skip
+  # every step, so this job's needs are satisfied and it reports success in
+  # seconds without asserting anything.
+  #
+  # `if: always()` is load-bearing: without it a failed leg would SKIP this job,
+  # and a skipped check counts as green for a required context — the aggregator
+  # would silently stop gating exactly when it matters.
+  LinuxPackaging:
+    name: Linux Packaging
+    needs: [DetectChanges, DebStub, Deb, DebInstall]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — packaging legs short-circuited; reporting success without asserting."
+
+      - name: Assert every packaging leg succeeded
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          # DetectChanges is included on purpose: if it failed, docs_only is ''
+          # (!= 'true'), so we land here — and must fail rather than green-light
+          # a run whose change classification never happened.
+          RESULT_DETECTCHANGES: ${{ needs.DetectChanges.result }}
+          RESULT_DEBSTUB: ${{ needs.DebStub.result }}
+          # Track B soft-skips its build steps (with a ::warning::) when the
+          # vendor token or Linux SDK asset is absent — fork PRs included — and
+          # still ends 'success', so requiring it cannot deadlock a fork PR.
+          RESULT_DEB: ${{ needs.Deb.result }}
+          # Matrix job: 'success' only when every leg succeeded (fail-fast is
+          # off, so one red release still surfaces here).
+          RESULT_DEBINSTALL: ${{ needs.DebInstall.result }}
+        run: |
+          set -u
+          rc=0
+          for leg in DETECTCHANGES DEBSTUB DEB DEBINSTALL; do
+            var="RESULT_${leg}"
+            result="${!var}"
+            printf '%-14s %s\n' "$leg" "${result:-<missing>}"
+            # Anything that is not an outright success fails the gate —
+            # including 'skipped', which on the non-docs_only path can only
+            # mean a leg was bypassed by a condition it should not have been.
+            [ "$result" = "success" ] || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Linux packaging lane is not green — see the leg results above."
+            exit 1
+          fi
+          echo "All Linux packaging legs succeeded."
 
   # Attach the Track B .deb to the GitHub Release on a v* tag — only once
   # DebInstall has proved it on every release it claims to support.
