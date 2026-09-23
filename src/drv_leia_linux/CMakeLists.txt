@@ -146,6 +146,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_edid_probe_linux.h
     leia_bg_capture_linux.c
     leia_bg_capture_linux.h
+    leia_bg_capture_worker_linux.c
+    leia_bg_capture_worker_linux.h
     leia_mutter_capture_linux.c
     leia_mutter_capture_linux.h
     leia_sr_linux.h

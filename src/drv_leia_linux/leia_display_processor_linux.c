@@ -21,6 +21,7 @@
 #include "leia_sr_linux.h"
 #include "leia_edid_probe_linux.h" // RandR panel desktop position (screen_left/top override)
 #include "leia_bg_capture_linux.h"
+#include "leia_bg_capture_worker_linux.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -76,6 +77,27 @@ struct leia_dp_linux
 	//! session: the capture can be distrusted mid-session (screen lock).
 	bool composed_over_capture;
 	uint64_t bg_capture_retry_ns; //!< earliest time to re-create a capture that asked for a restart
+
+	// --- Lazy transparency (runtime set_transparency_active) -------------
+	// transparent_enabled is the session CAPABILITY; content_active is the
+	// runtime's per-frame verdict that the content actually carries alpha < 1.
+	// The capture, compose-under and alpha-gate run only while BOTH hold.
+	// Defaults to true so a runtime that predates the slot (and never calls it)
+	// gets exactly the old always-on behaviour.
+	bool content_active;
+	//! Starts and stops the capture off the frame thread (D-Bus + PipeWire).
+	struct leia_bg_capture_worker *bg_worker;
+	bool bg_create_inflight; //!< one start at a time
+	//! A start declined (no extension / not GNOME / no PipeWire): do not retry
+	//! until the next idle→active edge — it would only decline again.
+	bool bg_create_declined;
+	//! Captures handed back while the GPU may still sample them: stopped only
+	//! after a few more process_atlas calls (the compositor fences each frame).
+	struct
+	{
+		struct leia_bg_capture_linux *capture;
+		uint32_t frames_left;
+	} bg_graveyard[4];
 
 	// Compose pipeline (lazy, built on the first transparent multi-view frame).
 	VkRenderPass compose_rp;              //!< R8G8B8A8_UNORM intermediate pass
@@ -498,17 +520,129 @@ dp_mono_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-//! Start the capture for the panel this DP weaves. NULL = silhouette fallback.
-static struct leia_bg_capture_linux *
-dp_bg_capture_start(struct leia_dp_linux *ldp)
+/*
+ * Lazy transparency: capture lifecycle.
+ *
+ * The runtime declares the session transparency-capable once
+ * (set_transparent_background) and then reports, on transitions, whether the
+ * content is transparent right now (set_transparency_active). The desktop
+ * capture — a full-panel mutter ScreenCast over PipeWire, re-uploaded every
+ * frame — plus the compose-under and alpha-gate passes run only while both are
+ * true. An opaque frame of a transparency-capable app therefore costs what an
+ * opaque app's frame costs.
+ *
+ * Starting and stopping the capture happens on bg_worker, never on the frame
+ * thread. Until a started capture delivers its first trusted frame, the
+ * alpha-gate runs silhouette intersection (the rule for any frame without a
+ * trusted capture); nothing stale is held over from an earlier capture — the
+ * desktop behind the window has had all the idle time to change.
+ */
+static bool
+dp_transparency_live(const struct leia_dp_linux *ldp)
 {
-	struct leiasr_lnx_display_info info;
-	uint32_t pw = 0, ph = 0;
-	if (leiasr_lnx_query_display_info(&info) && info.valid) {
-		pw = info.pixel_width; // DEVICE px — the space present_origin lives in
-		ph = info.pixel_height;
+	return ldp->transparent_enabled && ldp->content_active;
+}
+
+static bool
+dp_capture_wanted(const struct leia_dp_linux *ldp)
+{
+	return dp_transparency_live(ldp) && !leia_dp_bg_capture_disabled();
+}
+
+//! Hand a capture back; it is stopped once the GPU cannot still be sampling it.
+static void
+dp_capture_bury(struct leia_dp_linux *ldp, struct leia_bg_capture_linux *capture)
+{
+	if (capture == NULL) {
+		return;
 	}
-	return leia_bg_capture_linux_create(ldp->vk, pw, ph);
+	for (uint32_t i = 0; i < ARRAY_SIZE(ldp->bg_graveyard); i++) {
+		if (ldp->bg_graveyard[i].capture == NULL) {
+			ldp->bg_graveyard[i].capture = capture;
+			// The compositor waits each frame's fence before the next
+			// process_atlas; 3 is margin for a frame still in flight.
+			ldp->bg_graveyard[i].frames_left = 3;
+			return;
+		}
+	}
+	// Graveyard full (four stops inside three frames — not a real pattern):
+	// stop it now rather than leak a ScreenCast session.
+	leia_bg_capture_worker_retire(ldp->bg_worker, capture);
+}
+
+//! Stop every buried capture now (DP teardown; the device is idle by then).
+static void
+dp_capture_flush_graveyard(struct leia_dp_linux *ldp)
+{
+	for (uint32_t i = 0; i < ARRAY_SIZE(ldp->bg_graveyard); i++) {
+		if (ldp->bg_graveyard[i].capture != NULL) {
+			leia_bg_capture_worker_retire(ldp->bg_worker, ldp->bg_graveyard[i].capture);
+			ldp->bg_graveyard[i].capture = NULL;
+		}
+	}
+}
+
+/*!
+ * Bring the capture in line with dp_capture_wanted(). Frame thread only; cheap
+ * and non-blocking (at most a mutex and a job post). Called at the top of every
+ * process_atlas and on every state change.
+ */
+static void
+dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
+{
+	if (age_graveyard) {
+		for (uint32_t i = 0; i < ARRAY_SIZE(ldp->bg_graveyard); i++) {
+			if (ldp->bg_graveyard[i].capture != NULL && --ldp->bg_graveyard[i].frames_left == 0) {
+				leia_bg_capture_worker_retire(ldp->bg_worker, ldp->bg_graveyard[i].capture);
+				ldp->bg_graveyard[i].capture = NULL;
+			}
+		}
+	}
+
+	struct leia_bg_capture_linux *created = NULL;
+	if (ldp->bg_create_inflight && leia_bg_capture_worker_poll_created(ldp->bg_worker, &created)) {
+		ldp->bg_create_inflight = false;
+		if (created == NULL) {
+			ldp->bg_create_declined = true; // silhouette intersection until the next activation
+		} else if (dp_capture_wanted(ldp) && ldp->bg_capture == NULL) {
+			ldp->bg_capture = created;
+			U_LOG_W(
+			    "leia_lnx_dp: desktop capture running — compose-under-capture once its first trusted "
+			    "frame arrives");
+		} else {
+			dp_capture_bury(ldp, created); // went idle while it was starting
+		}
+	}
+
+	if (!dp_capture_wanted(ldp)) {
+		if (ldp->bg_capture != NULL) {
+			dp_capture_bury(ldp, ldp->bg_capture);
+			ldp->bg_capture = NULL;
+		}
+		return;
+	}
+
+	if (ldp->bg_capture == NULL && !ldp->bg_create_inflight && !ldp->bg_create_declined &&
+	    dp_mono_ns() >= ldp->bg_capture_retry_ns) {
+		if (ldp->bg_worker == NULL) {
+			ldp->bg_worker = leia_bg_capture_worker_create(ldp->vk);
+		}
+		if (ldp->bg_worker == NULL) {
+			ldp->bg_create_declined = true;
+			U_LOG_W("leia_lnx_dp: could not start the capture worker thread — silhouette intersection");
+			return;
+		}
+		// Panel size is read HERE, on the frame thread, and passed along:
+		// the weaver backend is not called from the worker.
+		struct leiasr_lnx_display_info info;
+		uint32_t pw = 0, ph = 0;
+		if (leiasr_lnx_query_display_info(&info) && info.valid) {
+			pw = info.pixel_width; // DEVICE px — the space present_origin lives in
+			ph = info.pixel_height;
+		}
+		leia_bg_capture_worker_request_create(ldp->bg_worker, pw, ph);
+		ldp->bg_create_inflight = true;
+	}
 }
 
 // Composite the tiled atlas OVER the bound background into the opaque
@@ -527,7 +661,7 @@ compose_pre_weave(struct leia_dp_linux *ldp,
                   uint32_t win_h)
 {
 	struct vk_bundle *vk = ldp->vk;
-	if (!ldp->transparent_enabled) {
+	if (!dp_transparency_live(ldp)) {
 		return VK_NULL_HANDLE;
 	}
 	if (ldp->bg_capture == NULL && ldp->bg2d_view == VK_NULL_HANDLE) {
@@ -547,11 +681,13 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	VkImageView bg = VK_NULL_HANDLE;
 	VkImageView backdrop = VK_NULL_HANDLE;
 	// The panel moved or rescaled under the recorded area: re-create (at most
-	// once a second; creation blocks briefly on D-Bus).
+	// once a second). Both halves run on the capture worker, so the frame
+	// thread never blocks on D-Bus; dp_capture_reconcile posts the new start.
 	if (ldp->bg_capture != NULL && leia_bg_capture_linux_wants_restart(ldp->bg_capture) &&
 	    dp_mono_ns() >= ldp->bg_capture_retry_ns) {
-		leia_bg_capture_linux_destroy(ldp->bg_capture);
-		ldp->bg_capture = dp_bg_capture_start(ldp);
+		dp_capture_bury(ldp, ldp->bg_capture);
+		ldp->bg_capture = NULL;
+		ldp->bg_create_declined = false;
 		ldp->bg_capture_retry_ns = dp_mono_ns() + 1000000000ull;
 	}
 	if (ldp->bg_capture != NULL &&
@@ -1060,7 +1196,7 @@ alpha_gate_run(struct leia_dp_linux *ldp,
                uint32_t tile_rows)
 {
 	struct vk_bundle *vk = ldp->vk;
-	if (!ldp->transparent_enabled || target_image == VK_NULL_HANDLE || atlas_view == VK_NULL_HANDLE) {
+	if (!dp_transparency_live(ldp) || target_image == VK_NULL_HANDLE || atlas_view == VK_NULL_HANDLE) {
 		return;
 	}
 	if (!ag_ensure_pipeline(ldp, target_format)) {
@@ -1223,6 +1359,10 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
 	struct vk_bundle *vk = ldp->vk;
 
+	// Lazy transparency: adopt a capture the worker finished starting, stop
+	// one that is no longer wanted, age the ones waiting on the GPU.
+	dp_capture_reconcile(ldp, /*age_graveyard=*/true);
+
 	// runtime#542: atlas processing follows the CONTENT, not the lens —
 	// the grid the runtime packed decides weave vs flat blit.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
@@ -1370,7 +1510,7 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	// view when compose_pre_weave baked a trusted captured desktop into the
 	// de-occlusion band this frame, else in ANY view (silhouette intersection). Pass the ORIGINAL atlas_view (pre-compose) — that carries the app's
 	// per-view alpha the gate keys on.
-	if (ldp->transparent_enabled && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
+	if (dp_transparency_live(ldp) && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
 		alpha_gate_run(ldp, cmd_buffer, (VkImage)target_image, (VkImageView)atlas_view,
 		               (VkFormat)target_format, target_width, target_height, tile_columns, tile_rows);
 	}
@@ -1518,33 +1658,64 @@ leia_lnx_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, 
 		return;
 	}
 	ldp->transparent_enabled = want;
-	if (want) {
-		// Window-excluded desktop capture (runtime#757). Starts only when the
-		// DisplayXR GNOME Shell extension can exclude our windows; otherwise
-		// the module logs why once and returns NULL, and the alpha-gate runs
-		// silhouette intersection. LEIA_DP_DISABLE_BG_CAPTURE=1 forces that.
-		if (ldp->bg_capture == NULL && !leia_dp_bg_capture_disabled()) {
-			ldp->bg_capture = dp_bg_capture_start(ldp);
-		}
-	} else {
-		if (ldp->bg_capture != NULL) {
-			leia_bg_capture_linux_destroy(ldp->bg_capture);
-			ldp->bg_capture = NULL;
-		}
+	ldp->bg_create_declined = false;
+	// Window-excluded desktop capture (runtime#757). Starts — on the capture
+	// worker, never this thread — only when the DisplayXR GNOME Shell
+	// extension can exclude our windows; otherwise the module logs why once
+	// and the alpha-gate runs silhouette intersection.
+	// LEIA_DP_DISABLE_BG_CAPTURE=1 forces that. Deferred entirely while the
+	// runtime reports the content opaque (set_transparency_active).
+	dp_capture_reconcile(ldp, /*age_graveyard=*/false);
+	if (!want) {
 		compose_release(ldp);
 		ag_release(ldp);
 	}
 	U_LOG_W("leia_lnx_dp: transparency %s",
 	        !want ? "disabled"
-	        : ldp->bg_capture != NULL
-	            ? (dxr_leia_bg_debug() ? "= compose-under-capture (DXR_LEIA_BG_DEBUG: window shows the captured "
-	                                     "background only, alpha-gate skipped)"
-	                                   : "= compose-under-capture (window-excluded desktop capture; silhouette "
-	                                     "intersection on any frame the capture is not trusted)")
+	        : !ldp->content_active
+	            ? "enabled, IDLE until the content is transparent (lazy transparency: no desktop capture, "
+	              "compose-under or alpha-gate on opaque frames)"
+	        : dxr_leia_bg_debug() ? "= compose-under-capture (DXR_LEIA_BG_DEBUG: window shows the captured "
+	                                "background only, alpha-gate skipped)"
 	        : leia_dp_bg_capture_disabled()
 	            ? "= silhouette intersection (LEIA_DP_DISABLE_BG_CAPTURE=1)"
-	            : "= silhouette intersection (no window-excluded desktop capture — see the capture log above)");
+	            : "= compose-under-capture once the window-excluded desktop capture starts; silhouette "
+	              "intersection until then and on any frame the capture is not trusted");
 }
+
+#ifdef XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE
+/*
+ * Lazy transparency (runtime set_transparency_active): the runtime probes the
+ * atlas' alpha every app frame and reports transitions — ACTIVE on the first
+ * frame with alpha < 1, IDLE after a run of fully opaque frames. Idle skips the
+ * compose-under and the alpha-gate (opaque content needs neither: the weave's
+ * flattened alpha is already right) and stops the desktop capture. The
+ * compose/alpha-gate pipelines are kept: a later toggle must not pay their
+ * creation again, and destroying them here could free objects the previous
+ * frame's commands still reference.
+ */
+static void
+leia_lnx_dp_vk_set_transparency_active(struct xrt_display_processor_vk *xdp, bool active)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp;
+	if (ldp->content_active == active) {
+		return;
+	}
+	ldp->content_active = active;
+	if (active) {
+		ldp->bg_create_declined = false; // a new activation earns a new attempt
+	}
+	dp_capture_reconcile(ldp, /*age_graveyard=*/false);
+	if (ldp->transparent_enabled) {
+		U_LOG_W("leia_lnx_dp: content transparency %s",
+		        active ? (leia_dp_bg_capture_disabled()
+		                      ? "ACTIVE — alpha-gate on (silhouette intersection; LEIA_DP_DISABLE_BG_CAPTURE=1)"
+		                      : "ACTIVE — alpha-gate on, desktop capture starting off the frame thread "
+		                        "(silhouette intersection until its first trusted frame)")
+		               : "IDLE — desktop capture stopped; compose-under and alpha-gate skipped");
+	}
+}
+#endif
 
 // Store the runtime's flattened 2D-under backdrop as the background to compose
 // under (#491 part 3). Shared VkDevice, so the view is sampled directly — no
@@ -1645,7 +1816,7 @@ static bool
 leia_lnx_dp_get_background_preview(struct xrt_display_processor_vk *xdp_vk, struct xrt_dp_background_preview *out)
 {
 	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp_vk;
-	if (ldp == NULL || !ldp->transparent_enabled || ldp->bg_capture == NULL) {
+	if (ldp == NULL || !dp_transparency_live(ldp) || ldp->bg_capture == NULL) {
 		return false;
 	}
 	return leia_bg_capture_linux_get_preview(ldp->bg_capture, out);
@@ -1656,9 +1827,14 @@ static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	// WS1 capture (runtime#757): stop the live one, the buried ones and any
+	// start still in flight; destroy() drains the worker's queue and joins it.
 	if (ldp->bg_capture != NULL) {
-		leia_bg_capture_linux_destroy(ldp->bg_capture); // WS1 capture (runtime#757)
+		leia_bg_capture_worker_retire(ldp->bg_worker, ldp->bg_capture);
+		ldp->bg_capture = NULL;
 	}
+	dp_capture_flush_graveyard(ldp);
+	leia_bg_capture_worker_destroy(&ldp->bg_worker);
 	compose_release(ldp);        // transparency resources (runtime#757)
 	ag_release(ldp);             // post-weave alpha-gate (runtime#757)
 	leiasr_lnx_destroy(ldp->sr); // R-W10
@@ -1813,6 +1989,12 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->base.base.is_alpha_native = leia_lnx_dp_is_alpha_native;
 	ldp->base.base.set_background_2d = leia_lnx_dp_set_background_2d;
 	ldp->base.set_transparent_background = leia_lnx_dp_vk_set_transparent_background;
+	// Lazy transparency: ACTIVE until the runtime says otherwise, so a runtime
+	// that predates set_transparency_active keeps the always-on behaviour.
+	ldp->content_active = true;
+#ifdef XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE
+	ldp->base.set_transparency_active = leia_lnx_dp_vk_set_transparency_active;
+#endif
 #ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
 	// Windowed weaving (runtime#757 / LeiaSR#85) — the R-W7 window-scoped phase.
 	// Only wired when built against a runtime whose xrt_display_processor_vk
@@ -1871,17 +2053,25 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	static bool built_logged = false;
 	if (!built_logged) {
 		built_logged = true;
-		U_LOG_W("leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s",
+		U_LOG_W(
+		    "leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s; "
+		    "lazy transparency slot: %s",
 #ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
-		        "YES",
+		    "YES",
 #else
-		        "NO (runtime headers predate XRT_DP_VK_HAS_BACKGROUND_PREVIEW / v2.17.0 — the runtime stays "
-		        "in its no-source, clip-at-the-display-plane state)",
+		    "NO (runtime headers predate XRT_DP_VK_HAS_BACKGROUND_PREVIEW / v2.17.0 — the runtime stays "
+		    "in its no-source, clip-at-the-display-plane state)",
 #endif
 #ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
-		        "YES"
+		    "YES",
 #else
-		        "NO (runtime headers predate XRT_DP_VK_HAS_SNAP_WINDOW_RECT)"
+		    "NO (runtime headers predate XRT_DP_VK_HAS_SNAP_WINDOW_RECT)",
+#endif
+#ifdef XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE
+		    "YES"
+#else
+		    "NO (runtime headers predate XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE — a transparency-capable session "
+		    "runs its desktop capture for its whole lifetime)"
 #endif
 		);
 	}
