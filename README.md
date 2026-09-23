@@ -41,3 +41,4 @@ The vendor-neutral contract (what any plug-in must implement) stays in the runti
 - ADR-019 — vendor plug-in / aux boundary: `displayxr-runtime/docs/adr/ADR-019-vendor-plugin-aux-boundary.md`
 - Plug-in discovery spec: `displayxr-runtime/docs/specs/runtime/plugin-discovery.md`
 - Vendor onboarding guide (post-#263): `displayxr-runtime/docs/guides/vendor-plugin-onboarding.md`
+
