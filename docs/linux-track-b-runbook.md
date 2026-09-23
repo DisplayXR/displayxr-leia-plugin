@@ -215,7 +215,8 @@ Failure signatures:
   …` (WARN, runtime side) — root coordinates are not physical panel pixels (display scaling,
   or XWayland), so nothing is fed and weaving stays display-scoped.
 - `Window handle is invalid in VulkanWeaver::setWindowHandle: weaving is disabled.` (SDK)
-  — no X11 window; native Wayland. See §3.
+  — a window handle was cleared to 0 *after* construction. NOT the native-Wayland case:
+  a weaver *constructed* with `window = 0` weaves unconditionally. See §3.
 
 ## 3. Real weave on the panel
 
@@ -286,21 +287,33 @@ Result at the panel: with the hold off, David reports lookaround "looks good" (n
 continuous). Note the client-side `[filterconfiguration] runtime data root: …` line does
 **not** reach the runtime's stderr, so the visual A/B is the confirmation.
 
-### [26.04 box] Native Wayland does not weave — X11/XWayland only
+### [26.04 box] Native Wayland weaves windowless — the "does not weave" finding was WRONG
 
 Under a *native* Wayland surface there is no X11 `Window`, so the plug-in creates the
-weaver with `window = 0`. On `leiasr-runtime 1.37.0.6048` the Vulkan weaver then logs
+weaver with `window = 0`. An earlier revision of this section recorded that
+`leiasr-runtime 1.37.0.6048` then logs
 
 ```
 Window handle is invalid in VulkanWeaver::setWindowHandle: weaving is disabled.
 ```
 
-and never weaves. `srWeaverSetPresentOrigin` cannot rescue it: the null-window gate fires
-before any phase input is read. Fixing this needs a **LeiaSR change** — let the Linux
-weavers weave with no window once a present origin has been supplied (the gate is Win32
-heritage); logged as a DisplayXR ask on LeiaSR #224/#225. Until then run the app on
-X11 or XWayland. (The 2026-07-08 22.04 run wove windowless on the *prototype* SDK; that
-path is closed on 1.37.)
+and never weaves, and filed a LeiaSR ask (#224/#225) to lift the gate. **That was a
+misreading, withdrawn on LeiaSR#248.** The SDK has two regimes decided by call order
+(`WeaverBaseImpl.ipp:690-706`): a weaver *constructed* with a null window sets
+`constructedWithoutWindow` and **always weaves** — which is what `srCreateWeaverVulkan(...,
+window = 0)` does, and what the plug-in's create path in `leia_sr_linux_sdk.c` does; only
+`setWindowHandle(0)` on a weaver that was *created with* a window disables weaving and logs
+the line above. Confirmed empirically against 1.37 on the same box: `Vulkan weaver created
+(window=0x0 = windowless/display-scoped)`, weave path entered, no `weaving is disabled`
+anywhere. Phase comes from `srWeaverSetPresentOrigin` exactly as on X11 (contract R-W7);
+on Wayland the runtime feeds it from the GNOME geometry publisher (runtime#817), or (0,0)
+when fullscreen on the panel.
+
+What is **not** yet validated is the on-panel Wayland weave itself — phase lock on a real
+3D panel — see runtime#817's checklist. LeiaSR#248 (make windowless an explicit mode
+instead of a constructor accident) is hygiene, not a gate. **No LeiaSR change is required
+for windowless weaving**, whether under native Wayland or under a windowless direct-scanout
+present (runtime#1698).
 
 ## 4. Bring-up toggles (env vars)
 
@@ -357,8 +370,9 @@ enabling client just exited — that case is legitimate, not a bug.
    `leiasr-runtime 1.37.0.6048` (LeiaSR#85 landed) and the plug-in issues it before every
    weave — contract §8 R-W7 flipped from ❌ to ✅. Needed in *every* layout: the Linux
    weaver never tracks the window's desktop position itself.
-6. **Native Wayland cannot weave on 1.37** — `window = 0` trips
-   `VulkanWeaver::setWindowHandle: weaving is disabled` (§3). Carried to LeiaSR #224/#225.
+6. **Native Wayland weaves windowless on 1.37** — `window = 0` at construction takes the
+   always-weave branch; the earlier "weaving is disabled" finding was withdrawn (LeiaSR#248,
+   §3). On-panel Wayland phase is still unvalidated (runtime#817).
 7. **Desktop-position phantom origin under XWayland** — diagnosed, fixed on the runtime side
    (runtime#1579); optional plug-in fallback is #251 (§3).
 
