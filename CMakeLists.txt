@@ -200,7 +200,7 @@ set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
 # Not in v2.17.1: the VK snap_window_rect slot (runtime#1592,
 # XRT_DP_VK_HAS_SNAP_WINDOW_RECT), so drag phase-snap compiles out at this pin
 # (expected; it compiles in automatically at the first pin that carries it).
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.18.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.21.1" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
