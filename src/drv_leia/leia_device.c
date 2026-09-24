@@ -15,10 +15,11 @@
 
 #include "leia_interface.h"
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-/* #187: live SR display queries, used when the probe cache is empty (the common
- * case -- see leia_hmd_create). Guarded because this file is shared with the
- * Linux arm (src/drv_leia_linux), which has no SR SDK. */
-#include "leia_sr_d3d11.h"
+/* The ONE process-wide geometry resolver (readiness-gated, cached, publishes
+ * late geometry into the live device) -- see leia_sr_ready.h. Guarded because
+ * this file is shared with the Linux arm (src/drv_leia_linux), which has its
+ * own probe path and no SR SDK. */
+#include "leia_sr_ready.h"
 #endif
 
 #include "xrt/xrt_device.h"
@@ -128,6 +129,10 @@ leia_hmd_destroy(struct xrt_device *xdev)
 {
 	struct leia_hmd *hmd = leia_hmd(xdev);
 
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	/* Stop late geometry publishes from reaching a freed device. */
+	leiasr_ready_hmd_unregister(xdev);
+#endif
 	u_var_remove_root(hmd);
 	u_device_free(&hmd->base);
 }
@@ -146,9 +151,11 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
  *
  */
 
-//! #187: seconds to wait for the live SR geometry query when the probe cache is
-//! empty. Short on purpose -- SR is already warm by the time a device is created,
-//! so this is a bounded safety net, not a blocking probe.
+//! #187: SR-side verification spin for the live geometry query. This is NOT the
+//! startup wait -- that is the ONE shared readiness budget in leia_sr_ready.cpp
+//! (DXR_LEIA_SR_READY_TIMEOUT_S), which the resolver spends BEFORE creating any
+//! SR context; this bound only covers the fresh-handle isValid/location spin on
+//! an already-identified panel, and is clamped to what is left of the budget.
 #define LEIA_DEVICE_SR_QUERY_TIMEOUT_S 2.0
 
 //! Fallback per-view scale when nothing can tell us better: the 2x1 SBS half.
@@ -187,6 +194,7 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
  * second, hardcoded one.
  */
 static bool g_view_scale_valid = false;
+static bool g_view_scale_fallback_logged = false;
 static float g_view_scale_x = LEIA_DEFAULT_VIEW_SCALE;
 static float g_view_scale_y = LEIA_DEFAULT_VIEW_SCALE;
 
@@ -206,6 +214,9 @@ leia_view_scale_set_from_dims(uint32_t view_w, uint32_t view_h, uint32_t native_
 	g_view_scale_x = (float)view_w / (float)native_w;
 	g_view_scale_y = (float)view_h / (float)native_h;
 	g_view_scale_valid = true;
+	U_LOG_W("Leia per-view scale %.4f x %.4f (derived from the backend's recommended view dimensions %ux%u "
+	        "of %ux%u)",
+	        (double)g_view_scale_x, (double)g_view_scale_y, view_w, view_h, native_w, native_h);
 }
 
 void
@@ -213,23 +224,22 @@ leia_view_scale_get(float *out_scale_x, float *out_scale_y)
 {
 	if (!g_view_scale_valid) {
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-		/* The SR context is warm by here (probe + get_display_info both ran
-		 * first), so this resolves from cached SR state rather than paying
-		 * the full timeout. Result is memoised, so at most one query. */
-		uint32_t view_w = 0, view_h = 0, nat_w = 0, nat_h = 0;
-		float hz = 0.0f;
-		if (leiasr_query_recommended_view_dimensions(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, &view_w, &view_h, &hz,
-		                                             &nat_w, &nat_h)) {
-			leia_view_scale_set_from_dims(view_w, view_h, nat_w, nat_h);
-		}
+		/* Through the ONE resolver: readiness-gated (no SR context while the
+		 * panel is unidentified), bounded by the shared startup budget, and
+		 * its publish seeds this derivation. */
+		(void)leiasr_geometry_resolve(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, "view scale");
 #endif
-		U_LOG_W("Leia per-view scale %.4f x %.4f (%s)", (double)g_view_scale_x, (double)g_view_scale_y,
-		        g_view_scale_valid ? "derived from the backend's recommended view dimensions"
-		                           : "fallback — no backend answer");
-		/* Latch either way: the fallback is the answer for this process too,
-		 * and re-querying every call would re-pay the timeout on a box with
-		 * no SR service. */
-		g_view_scale_valid = true;
+		if (!g_view_scale_valid && !g_view_scale_fallback_logged) {
+			g_view_scale_fallback_logged = true;
+			U_LOG_W("Leia per-view scale %.4f x %.4f (fallback — no backend answer yet; NOT latched, a "
+			        "later SR answer replaces it)",
+			        (double)g_view_scale_x, (double)g_view_scale_y);
+		}
+		/* NOT latched on the fallback path (it used to be): the fallback is
+		 * only the answer until the SR platform identifies the panel, and a
+		 * latched fallback is exactly the boot race this file used to lose.
+		 * Re-querying stays cheap because the resolver returns at once while
+		 * the panel is unidentified and the startup budget is spent. */
 	}
 
 	if (out_scale_x != NULL) {
@@ -240,16 +250,142 @@ leia_view_scale_get(float *out_scale_x, float *out_scale_y)
 	}
 }
 
+/*
+ *
+ * Geometry -> device fields. ONE writer, used at create AND for the late
+ * in-place update (leia_hmd_apply_geometry), so the two can never disagree.
+ *
+ */
+
+struct leia_hmd_geom
+{
+	int pixel_w;
+	int pixel_h;
+	float display_w_m;
+	float display_h_m;
+	float nominal_z_m;
+};
+
+//! The hardcoded 15.6" 4K fallback — only ever the answer until SR identifies
+//! the panel (or forever on a box without the SR SDK).
+static const struct leia_hmd_geom leia_hmd_geom_defaults = {3840, 2160, 0.344f, 0.194f, 0.65f};
+
+/*!
+ * Write geometry into a device: physical size, nominal distance, the static
+ * pose, per-view eye offsets, screens/views/FOV (through
+ * u_device_setup_split_side_by_side) and the blend modes that helper resets.
+ * Requires hmd->base.hmd->view_count to be set.
+ */
+static bool
+leia_hmd_setup_geometry(struct leia_hmd *hmd, const struct leia_hmd_geom *g)
+{
+	hmd->display_width_m = g->display_w_m;
+	hmd->display_height_m = g->display_h_m;
+	hmd->nominal_z_m = g->nominal_z_m;
+
+	// Static pose: centered, at nominal viewing distance.
+	hmd->pose.orientation.w = 1.0f;
+	hmd->pose.position.z = -g->nominal_z_m; // Negative Z = looking at display
+
+	// Display geometry using helper struct.
+	struct u_device_simple_info info;
+	info.display.w_pixels = g->pixel_w;
+	info.display.h_pixels = g->pixel_h;
+	info.display.w_meters = g->display_w_m;
+	info.display.h_meters = g->display_h_m;
+	const float leia_ipd_m = 0.063f; // ~63mm IPD
+	info.lens_horizontal_separation_meters = leia_ipd_m;
+	info.lens_vertical_position_meters = g->display_h_m / 2.0f;
+
+	// Per-view eye-box offsets (display-local space). Leia is currently
+	// stereo (view_count=2); future N-view lenticular modes can extend this
+	// via the SR SDK lookaround filter — see #246 Phase 4.
+	{
+		const float half_ipd = leia_ipd_m / 2.0f;
+		hmd->base.hmd->view_eye_offsets[0] = (struct xrt_vec3){-half_ipd, 0.0f, g->nominal_z_m};
+		hmd->base.hmd->view_eye_offsets[1] = (struct xrt_vec3){half_ipd, 0.0f, g->nominal_z_m};
+		for (uint32_t v = 2; v < XRT_MAX_VIEWS; v++) {
+			hmd->base.hmd->view_eye_offsets[v] = (struct xrt_vec3){0.0f, 0.0f, g->nominal_z_m};
+		}
+	}
+
+	// Compute FOV from display geometry and viewing distance.
+	float half_fov_h = atanf((g->display_w_m / 2.0f) / g->nominal_z_m);
+	float half_fov_v = atanf((g->display_h_m / 2.0f) / g->nominal_z_m);
+	info.fov[0] = half_fov_h * 2.0f;
+	info.fov[1] = half_fov_h * 2.0f;
+
+	(void)half_fov_v; // Used implicitly by u_device_setup_split_side_by_side
+
+	if (!u_device_setup_split_side_by_side(&hmd->base, &info)) {
+		return false;
+	}
+
+	// Advertise ALPHA_BLEND alongside the default OPAQUE that the device
+	// helper installed (it resets the list every time, hence here and not at
+	// create). The Leia DPs deliver alpha-correct output two ways:
+	//   - Standalone (XR_DXR_win32_window_binding + transparentBackgroundEnabled):
+	//     WGC compose-under-bg + post-weave alpha-gate on D3D11/D3D12/VK.
+	//   - Workspace (IPC): service compositor honours
+	//     XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT per layer.
+	// Advertising ALPHA_BLEND lets well-behaved apps discover transparency
+	// support via the standard xrEnumerateEnvironmentBlendModes path instead
+	// of relying on extension detection alone.
+	hmd->base.hmd->blend_modes[hmd->base.hmd->blend_mode_count++] = XRT_BLEND_MODE_ALPHA_BLEND;
+
+	return true;
+}
+
+bool
+leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *geom)
+{
+	if (xdev == NULL || geom == NULL || !geom->valid || geom->pixel_w == 0 || geom->pixel_h == 0 ||
+	    geom->width_m <= 0.0f || geom->height_m <= 0.0f) {
+		return false;
+	}
+	struct leia_hmd *hmd = leia_hmd(xdev);
+
+	struct leia_hmd_geom g;
+	g.pixel_w = (int)geom->pixel_w;
+	g.pixel_h = (int)geom->pixel_h;
+	g.display_w_m = geom->width_m;
+	g.display_h_m = geom->height_m;
+	g.nominal_z_m = geom->nominal_z_m > 0.0f ? geom->nominal_z_m : hmd->nominal_z_m;
+
+	/* The ONE view-scale derivation: seed it (first writer wins) and read the
+	 * statics back directly — NOT through leia_view_scale_get(), whose slow
+	 * path re-enters the resolver that is calling us under its lock. */
+	leia_view_scale_set_from_dims(geom->view_w, geom->view_h, geom->pixel_w, geom->pixel_h);
+	const float sx = g_view_scale_x;
+	const float sy = g_view_scale_y;
+
+	struct xrt_rendering_mode *m3d = &hmd->base.rendering_modes[1];
+	const bool same_geom = hmd->base.hmd->screens[0].w_pixels == g.pixel_w &&
+	                       hmd->base.hmd->screens[0].h_pixels == g.pixel_h &&
+	                       fabsf(hmd->display_width_m - g.display_w_m) < 1e-6f &&
+	                       fabsf(hmd->display_height_m - g.display_h_m) < 1e-6f &&
+	                       fabsf(hmd->nominal_z_m - g.nominal_z_m) < 1e-6f;
+	const bool same_scale = m3d->view_scale_x == sx && m3d->view_scale_y == sy;
+	if (same_geom && same_scale) {
+		return false;
+	}
+
+	if (!same_geom && !leia_hmd_setup_geometry(hmd, &g)) {
+		U_LOG_E("Failed to re-apply Leia display geometry to the live device");
+		return false;
+	}
+	m3d->view_scale_x = sx;
+	m3d->view_scale_y = sy;
+	return true;
+}
+
 struct xrt_device *
 leia_hmd_create(void)
 {
-	// Default values — used when SR SDK is not available.
-	int pixel_w = 3840;
-	int pixel_h = 2160;
+	// Default values — used when the SR SDK is not available, or has not
+	// identified the panel yet (then updated in place once it has).
+	struct leia_hmd_geom g = leia_hmd_geom_defaults;
 	float refresh_hz = 60.0f;
-	float display_w_m = 0.344f;
-	float display_h_m = 0.194f;
-	float nominal_z = 0.65f;
 
 	/*
 	 * Where the real geometry comes from.
@@ -262,58 +398,48 @@ leia_hmd_create(void)
 	 * reported half the size in both axes, which also roughly halves the FOV
 	 * derived from it below (atan(0.172/0.65)=14.8deg vs 28.2deg).
 	 *
-	 * So: prefer the cache when it has something, then fall back to the same live
-	 * SR queries leia_plugin_get_display_info() already uses -- which are correct
-	 * on every panel -- and only then to the hardcoded defaults.
+	 * So: prefer the cache when it has something, then the ONE live geometry
+	 * resolver (leia_sr_ready.h) -- readiness-gated, so it never returns the
+	 * SDK's "default display" placeholders, and bounded by the shared startup
+	 * budget -- and only then the hardcoded defaults. Those defaults are NOT
+	 * final: the device registers with the resolver below, and a late SR
+	 * identification updates it in place through leia_hmd_apply_geometry().
 	 */
 	const char *geom_src = "hardcoded defaults";
 	{
 		struct leiasr_probe_result probe;
 		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
-			pixel_w = (int)probe.pixel_w;
-			pixel_h = (int)probe.pixel_h;
+			g.pixel_w = (int)probe.pixel_w;
+			g.pixel_h = (int)probe.pixel_h;
 			if (probe.refresh_hz > 0.0f) {
 				refresh_hz = probe.refresh_hz;
 			}
-			display_w_m = probe.display_w_m;
-			display_h_m = probe.display_h_m;
+			g.display_w_m = probe.display_w_m;
+			g.display_h_m = probe.display_h_m;
 			if (probe.nominal_z_m > 0.0f) {
-				nominal_z = probe.nominal_z_m;
+				g.nominal_z_m = probe.nominal_z_m;
 			}
 			geom_src = "SR probe cache";
 		}
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 		else {
-			/* The SR context is already warm by here (the plug-in's probe and
-			 * get_display_info both run first), so these resolve from cached SR
-			 * state rather than paying the full timeout. */
-			uint32_t nat_w = 0, nat_h = 0, view_w = 0, view_h = 0;
-			float hz = 0.0f;
-			bool got_px = leiasr_query_recommended_view_dimensions(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, &view_w,
-			                                                       &view_h, &hz, &nat_w, &nat_h);
-			/* Feed the ONE per-view-scale derivation with what we just
-			 * queried, so leia_view_scale_get() below answers from these
-			 * numbers instead of re-querying SR. */
-			if (got_px) {
-				leia_view_scale_set_from_dims(view_w, view_h, nat_w, nat_h);
-			}
-			if (got_px && nat_w > 0 && nat_h > 0) {
-				pixel_w = (int)nat_w;
-				pixel_h = (int)nat_h;
-				if (hz > 0.0f) {
-					refresh_hz = hz;
+			struct leiasr_geometry sg = {0};
+			if (leiasr_geometry_resolve(LEIA_DEVICE_SR_QUERY_TIMEOUT_S, "create_device") &&
+			    leiasr_geometry_get(&sg)) {
+				g.pixel_w = (int)sg.pixel_w;
+				g.pixel_h = (int)sg.pixel_h;
+				if (sg.refresh_hz > 0.0f) {
+					refresh_hz = sg.refresh_hz;
+				}
+				g.display_w_m = sg.width_m;
+				g.display_h_m = sg.height_m;
+				if (sg.nominal_z_m > 0.0f) {
+					g.nominal_z_m = sg.nominal_z_m;
 				}
 				geom_src = "live SR query";
-			}
-			struct leiasr_display_dimensions dims = {0};
-			if (leiasr_static_get_display_dimensions(&dims) && dims.valid && dims.width_m > 0.0f &&
-			    dims.height_m > 0.0f) {
-				display_w_m = dims.width_m;
-				display_h_m = dims.height_m;
-				if (dims.nominal_z_m > 0.0f) {
-					nominal_z = dims.nominal_z_m;
-				}
-				geom_src = "live SR query";
+			} else {
+				geom_src = "hardcoded defaults — SR has not identified the panel yet; "
+				           "the device will be updated in place once it does";
 			}
 		}
 #endif
@@ -323,10 +449,6 @@ leia_hmd_create(void)
 	    (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE);
 	struct leia_hmd *hmd = U_DEVICE_ALLOCATE(struct leia_hmd, flags, 1, 0);
 
-	// Store config.
-	hmd->display_width_m = display_w_m;
-	hmd->display_height_m = display_h_m;
-	hmd->nominal_z_m = nominal_z;
 	hmd->log_level = U_LOGGING_INFO;
 
 	// xrt_device methods.
@@ -344,10 +466,6 @@ leia_hmd_create(void)
 	// Y=1.6 offset — that would double-count the height and place
 	// controllers (which share the qwerty origin) 1.6 m below the head.
 	hmd->base.tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
-
-	// Static pose: centered, at nominal viewing distance.
-	hmd->pose.orientation.w = 1.0f;
-	hmd->pose.position.z = -nominal_z; // Negative Z = looking at display
 
 	hmd->base.hmd->view_count = 2;
 
@@ -389,53 +507,12 @@ leia_hmd_create(void)
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 
-	// Display geometry using helper struct.
-	struct u_device_simple_info info;
-	info.display.w_pixels = pixel_w;
-	info.display.h_pixels = pixel_h;
-	info.display.w_meters = display_w_m;
-	info.display.h_meters = display_h_m;
-	const float leia_ipd_m = 0.063f; // ~63mm IPD
-	info.lens_horizontal_separation_meters = leia_ipd_m;
-	info.lens_vertical_position_meters = display_h_m / 2.0f;
-
-	// Per-view eye-box offsets (display-local space). Leia is currently
-	// stereo (view_count=2); future N-view lenticular modes can extend this
-	// via the SR SDK lookaround filter — see #246 Phase 4.
-	{
-		const float half_ipd = leia_ipd_m / 2.0f;
-		hmd->base.hmd->view_eye_offsets[0] = (struct xrt_vec3){-half_ipd, 0.0f, nominal_z};
-		hmd->base.hmd->view_eye_offsets[1] = (struct xrt_vec3){ half_ipd, 0.0f, nominal_z};
-		for (uint32_t v = 2; v < XRT_MAX_VIEWS; v++) {
-			hmd->base.hmd->view_eye_offsets[v] = (struct xrt_vec3){0.0f, 0.0f, nominal_z};
-		}
-	}
-
-	// Compute FOV from display geometry and viewing distance.
-	float half_fov_h = atanf((display_w_m / 2.0f) / nominal_z);
-	float half_fov_v = atanf((display_h_m / 2.0f) / nominal_z);
-	info.fov[0] = half_fov_h * 2.0f;
-	info.fov[1] = half_fov_h * 2.0f;
-
-	(void)half_fov_v; // Used implicitly by u_device_setup_split_side_by_side
-
-	bool setup_ok = u_device_setup_split_side_by_side(&hmd->base, &info);
-	if (!setup_ok) {
+	// Geometry: physical size, pose, eye offsets, screens/views/FOV, blend modes.
+	if (!leia_hmd_setup_geometry(hmd, &g)) {
 		U_LOG_E("Failed to setup Leia display device info");
 		leia_hmd_destroy(&hmd->base);
 		return NULL;
 	}
-
-	// Advertise ALPHA_BLEND alongside the default OPAQUE that the device
-	// helper installed. The Leia DPs deliver alpha-correct output two ways:
-	//   - Standalone (XR_DXR_win32_window_binding + transparentBackgroundEnabled):
-	//     WGC compose-under-bg + post-weave alpha-gate on D3D11/D3D12/VK.
-	//   - Workspace (IPC): service compositor honours
-	//     XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT per layer.
-	// Advertising ALPHA_BLEND lets well-behaved apps discover transparency
-	// support via the standard xrEnumerateEnvironmentBlendModes path instead
-	// of relying on extension detection alone.
-	hmd->base.hmd->blend_modes[hmd->base.hmd->blend_mode_count++] = XRT_BLEND_MODE_ALPHA_BLEND;
 
 	// No distortion for Leia display.
 	u_distortion_mesh_set_none(&hmd->base);
@@ -449,9 +526,16 @@ leia_hmd_create(void)
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
 	U_LOG_W("Created Leia 3D display: %dx%d px, %.4fx%.4f m, nominal Z=%.2f m, %.1f Hz (geometry from %s)",
-	        pixel_w, pixel_h, display_w_m, display_h_m, nominal_z, refresh_hz, geom_src);
+	        g.pixel_w, g.pixel_h, g.display_w_m, g.display_h_m, g.nominal_z_m, refresh_hz, geom_src);
 
 	(void)refresh_hz; // Logged above; will be used for frame timing later.
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	// Register as the live head device so a late SR identification (the
+	// watcher, a weaver coming up, a runtime get_display_info) updates it in
+	// place. Applies already-published geometry immediately if any exists.
+	leiasr_ready_hmd_register(&hmd->base);
+#endif
 
 	return &hmd->base;
 }
