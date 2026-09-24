@@ -26,6 +26,12 @@ set(LEIA_SOURCES
     leia_sr_predict_trace.cpp
     leia_sr_liveness.h
     leia_sr_liveness.cpp
+    # SR panel readiness + the process-wide geometry cache. Listed
+    # unconditionally: the body is inside #ifdef XRT_HAVE_LEIA_SR_D3D11 (it
+    # gates the static SR queries that live in leia_sr_d3d11.cpp) and compiles
+    # to stubs otherwise.
+    leia_sr_ready.h
+    leia_sr_ready.cpp
     leia_vk_weaver_v2.cpp
     leia_plugin.c
 )

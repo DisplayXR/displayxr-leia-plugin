@@ -42,7 +42,7 @@
 #endif
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia_display_processor_d3d11.h"
-#include "leia_sr_d3d11.h" /* leiasr_query_recommended_view_dimensions + leiasr_static_get_display_dimensions */
+#include "leia_sr_ready.h" /* the ONE geometry resolver behind get_display_info */
 #endif
 #ifdef XRT_HAVE_LEIA_SR_D3D12
 #include "leia_display_processor_d3d12.h"
@@ -140,7 +140,11 @@ static void
 leia_plugin_destroy(struct xrt_plugin_instance *inst)
 {
 	(void)inst;
-	/* No instance state — nothing to free. */
+	/* No instance state — nothing to free. Stop the late-identification
+	 * watcher if one is running (leia_sr_ready.h). */
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	leiasr_ready_shutdown();
+#endif
 }
 
 static void
@@ -165,36 +169,37 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	bool any_populated = false;
 
 	/*
-	 * SR-recommended view dimensions + native panel resolution. Both
-	 * are needed by the compositor for atlas sizing + the per-view
-	 * scale factor stored in xrt_system_compositor_info.
+	 * Contract with the runtime (leia_sr_ready.h): this is called at
+	 * instance create AND again on every client compositor create, so it
+	 * must be cheap and non-blocking once the startup budget is spent —
+	 * `false` immediately while the SR platform has not identified the
+	 * panel, `true` with the real geometry once it has. The runtime re-fills
+	 * its cached info whenever the answer changes. Never report the SDK's
+	 * "default display" placeholders here: a false is strictly better than
+	 * a wrong true, because a false gets retried and a wrong true gets
+	 * cached for the life of the service.
+	 *
+	 * Native panel resolution + physical size + nominal viewer position all
+	 * come from the ONE verified geometry record; SR-recommended view
+	 * dimensions seed the per-view scale in the same publish.
 	 */
-	uint32_t sr_w = 0, sr_h = 0, nat_w = 0, nat_h = 0;
-	float refresh = 0.0f;
-	if (leiasr_query_recommended_view_dimensions(5.0, &sr_w, &sr_h, &refresh, &nat_w, &nat_h) && nat_w > 0 &&
-	    nat_h > 0) {
-		out_info->display_pixel_width = nat_w;
-		out_info->display_pixel_height = nat_h;
-		/* The scale is NOT computed here. It is derived once (see
-		 * leia_view_scale_set_from_dims / leia_view_scale_get) and read back,
-		 * so this scalar and rendering_modes[1].view_scale_x/y can never
-		 * disagree — a disagreement sizes the app's views from one number and
-		 * its tiles/atlas from the other. */
-		leia_view_scale_set_from_dims(sr_w, sr_h, nat_w, nat_h);
+	struct leiasr_geometry g = {0};
+	if (leiasr_geometry_resolve(5.0, "get_display_info") && leiasr_geometry_get(&g)) {
+		out_info->display_pixel_width = g.pixel_w;
+		out_info->display_pixel_height = g.pixel_h;
+		out_info->display_width_m = g.width_m;
+		out_info->display_height_m = g.height_m;
+		out_info->nominal_viewer_x_m = g.nominal_x_m;
+		out_info->nominal_viewer_y_m = g.nominal_y_m;
+		out_info->nominal_viewer_z_m = g.nominal_z_m;
 		any_populated = true;
 	}
+	/* The scale is NOT computed here. It is derived once (see
+	 * leia_view_scale_set_from_dims / leia_view_scale_get) and read back,
+	 * so this scalar and rendering_modes[1].view_scale_x/y can never
+	 * disagree — a disagreement sizes the app's views from one number and
+	 * its tiles/atlas from the other. */
 	leia_view_scale_get(&out_info->recommended_view_scale_x, &out_info->recommended_view_scale_y);
-
-	/* Physical dimensions + nominal viewer position from SR SDK. */
-	struct leiasr_display_dimensions dims = {0};
-	if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
-		out_info->display_width_m = dims.width_m;
-		out_info->display_height_m = dims.height_m;
-		out_info->nominal_viewer_x_m = dims.nominal_x_m;
-		out_info->nominal_viewer_y_m = dims.nominal_y_m;
-		out_info->nominal_viewer_z_m = dims.nominal_z_m;
-		any_populated = true;
-	}
 
 	/* EDID screen position — cached by probe(), zero if not available. */
 	struct leia_display_probe_result edid;

@@ -10,6 +10,7 @@
 #include "leia_sr_d3d11.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_liveness.h"
+#include "leia_sr_ready.h"
 #include "leia_sr_predict_trace.h"
 #include "leia_sr_v2_common.h"
 #include "util/u_logging.h"
@@ -1665,6 +1666,13 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 				} else {
 					U_LOG_W("Leia D3D11 weaver READY (async create, attempt %u)", attempt);
 				}
+				// A weaver came up, so SR has identified the panel: if the
+				// process-wide geometry (head device, get_display_info) is
+				// still on the boot-time fallback, resolve + publish it now —
+				// this retry loop is often the first thing to learn that the
+				// panel woke up. After the READY CAS on purpose: `sr` is no
+				// longer ours to touch, and this only reads shared statics.
+				leiasr_ready_note_weaver_ready();
 				return;
 			}
 			// Destroyed while we were creating — tear down and free.
@@ -1807,6 +1815,9 @@ leiasr_d3d11_create(double max_time,
 	// #158: stamp the SR platform incarnation we connected to.
 	sr->platform_generation = leia_sr_liveness_platform_generation_ex(v2_instance_of(sr));
 	// async_state already defaults to LEIASR_ASYNC_READY on the sync path.
+
+	// Same late-geometry hook as the async worker (see async_create_worker_body).
+	leiasr_ready_note_weaver_ready();
 
 	*out = sr;
 
@@ -2629,35 +2640,56 @@ leiasr_query_recommended_view_dimensions(double max_time,
 		return false;
 	}
 
-	const double start_time = (double)GetTickCount64() / 1000.0;
-
-	// Create temporary SR context
-	SR::SRContext *context = nullptr;
-	while (context == nullptr) {
-		try {
-			context = SR::SRContext::create();
-			break;
-		} catch (SR::ServerNotAvailableException &e) {
-			(void)e;
+	// Readiness gate (leia_sr_ready.h): no SR context at all while the platform
+	// has not identified a panel — a context created now would only ever see
+	// the SDK's "default display", and this function used to spin on it for the
+	// whole max_time, once per caller. Cheap: one file-mapping open.
+	if (!leiasr_display_identified()) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("SR query: panel not identified by the SR platform yet — dimension query declined "
+			        "(will be retried once identified)");
 		}
-
-		U_LOG_D("Waiting for SR context (dimension query)...");
-		Sleep(100);
-
-		double cur_time = (double)GetTickCount64() / 1000.0;
-		if ((cur_time - start_time) > max_time) {
-			break;
-		}
-	}
-
-	if (context == nullptr) {
-		U_LOG_E("Failed to create SR context for dimension query within %.1f seconds", max_time);
 		return false;
 	}
+	max_time = leiasr_ready_clamp(max_time);
 
-	// Get display manager and query dimensions
+	const double start_time = (double)GetTickCount64() / 1000.0;
+
+	// extern "C" boundary: NOTHING may escape. The SDK throws
+	// ServerNotAvailableException while starting up, but also plain
+	// std::runtime_error as routine control flow — the old catch of only the
+	// former let the latter unwind through the C runtime.
+	SR::SRContext *context = nullptr;
 	bool success = false;
 	try {
+		// Create temporary SR context
+		while (context == nullptr) {
+			try {
+				context = SR::SRContext::create();
+				break;
+			} catch (...) {
+				context = nullptr;
+			}
+
+			U_LOG_D("Waiting for SR context (dimension query)...");
+			Sleep(100);
+
+			double cur_time = (double)GetTickCount64() / 1000.0;
+			if ((cur_time - start_time) > max_time) {
+				break;
+			}
+		}
+
+		if (context == nullptr) {
+			U_LOG_E("Failed to create SR context for dimension query within %.1f seconds", max_time);
+			return false;
+		}
+
+		// Get display manager and query dimensions. A FRESH handle each
+		// call, on purpose: the SDK caches the IDisplay* per handle, so one
+		// created before identification stays "default" forever.
 		SR::IDisplayManager *displayManager = SR::GetDisplayManagerInstance(*context);
 		if (displayManager != nullptr) {
 			// Wait for display to be ready
@@ -2714,10 +2746,16 @@ leiasr_query_recommended_view_dimensions(double max_time,
 		}
 	} catch (...) {
 		U_LOG_E("Exception querying SR display dimensions");
+		success = false;
 	}
 
 	// Clean up temporary context
-	SR::SRContext::deleteSRContext(context);
+	if (context != nullptr) {
+		try {
+			SR::SRContext::deleteSRContext(context);
+		} catch (...) {
+		}
+	}
 
 	if (!success) {
 		U_LOG_E("Failed to query SR recommended dimensions within %.1f seconds", max_time);
@@ -2779,6 +2817,13 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 		out_dims->nominal_z_m = g_cached_nominal_z_m;
 		out_dims->valid = true;
 		return true;
+	}
+
+	// Readiness gate (leia_sr_ready.h): never read — and above all never
+	// CACHE — the SDK's "default display" placeholders. The cache below is
+	// only ever filled from an identified panel.
+	if (!leiasr_display_identified()) {
+		return false;
 	}
 
 	// Need to query from SR SDK
@@ -2849,7 +2894,10 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 
 	// Clean up temporary context
 	if (context != nullptr) {
-		SR::SRContext::deleteSRContext(context);
+		try {
+			SR::SRContext::deleteSRContext(context);
+		} catch (...) {
+		}
 	}
 
 	return success;

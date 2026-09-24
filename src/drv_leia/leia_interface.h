@@ -43,6 +43,30 @@ struct leiasr_probe_result
 };
 
 /*!
+ * The verified display geometry, as ONE record — what the SR platform reports
+ * for an IDENTIFIED panel (never the SDK's "default display" placeholders).
+ * Resolved and cached process-wide by leia_sr_ready.cpp; consumed by the head
+ * device (create + late in-place update), the probe cache and
+ * `get_display_info`. Pure C so the Linux arm can share the declaration.
+ *
+ * @ingroup drv_leia
+ */
+struct leiasr_geometry
+{
+	bool valid;           //!< False until a query on an identified panel succeeded
+	uint32_t pixel_w;     //!< Native panel width in pixels
+	uint32_t pixel_h;     //!< Native panel height in pixels
+	uint32_t view_w;      //!< SR-recommended per-view render width in pixels
+	uint32_t view_h;      //!< SR-recommended per-view render height in pixels
+	float refresh_hz;     //!< Panel refresh rate in Hz (0 = unknown)
+	float width_m;        //!< Physical width in meters
+	float height_m;       //!< Physical height in meters
+	float nominal_x_m;    //!< Nominal viewer position (display-local, meters)
+	float nominal_y_m;
+	float nominal_z_m;    //!< Nominal viewing distance in meters (0 = unknown)
+};
+
+/*!
  * EDID-based probe result for Leia/Dimenco display identification.
  *
  * Three-layer detection:
@@ -188,6 +212,26 @@ t_builder_leia_create(void);
  */
 struct xrt_device *
 leia_hmd_create(void);
+
+/*!
+ * Update a LIVE Leia HMD device in place from verified geometry: views/FOV
+ * (through the same u_device_setup_split_side_by_side path creation uses),
+ * `hmd->screens`, physical size, nominal viewer distance / static pose /
+ * eye offsets, and the LeiaSR mode's view scale. The runtime never rebuilds
+ * the head device, so this is how geometry that arrives AFTER creation (SR
+ * identifying the panel late — see leia_sr_ready.h) reaches apps.
+ *
+ * Plain field stores; the caller serialises publishes (leia_sr_ready.cpp holds
+ * its registry mutex around this call).
+ *
+ * @param xdev The device returned by leia_hmd_create().
+ * @param geom Verified geometry; ignored unless `valid` with sane dimensions.
+ * @return true if anything changed.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *geom);
 
 /*!
  * Seed the single per-view-scale derivation from a backend's recommended
