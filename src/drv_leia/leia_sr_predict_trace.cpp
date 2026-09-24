@@ -381,8 +381,8 @@ write_header(leia_sr_predict_trace *rec)
 	fprintf(rec->fp, "# plugin_version=%s\n", rec->plugin_version);
 	fprintf(rec->fp, "# sr_sdk_pin=%s\n", rec->sdk_pin);
 	fprintf(rec->fp, "# sr_runtime_version=%s\n", rec->sr_runtime_version);
-	fprintf(rec->fp, "# note_runtime_version=srGetRuntimeVersion is a hardcoded stub in SDK 1584 (always "
-	                 "1.0.0); sr_sdk_pin is the build we compiled against\n");
+	fprintf(rec->fp, "# note_runtime_version=srGetRuntimeVersion is a hardcoded stub (\"1.0.0\") in SR "
+	                 "runtimes before 1719; sr_sdk_pin is the build we compiled against\n");
 	fprintf(rec->fp, "# sr_api_reason=%s\n", rec->api_reason);
 	fprintf(rec->fp, "# pid=%lu\n", (unsigned long)GetCurrentProcessId());
 	if (gate_known) {

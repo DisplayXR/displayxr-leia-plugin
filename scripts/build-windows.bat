@@ -69,8 +69,12 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: the DECLARATION grep: 88 -> 90 slots, 1564's 88 an exact ordered prefix, APPENDS
 :: ONLY -- 89 pfnWeaverSetTargetTime, 90 pfnGetTimeUs. Slot 75 pfnWeaverSnapToPhase
 :: unchanged in index and name, and its declaration is byte-identical.
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1584
-set SR_V2_DIR=LeiaSR-SDK-1.37.0+1584.e6f6b20ab9-win64-Release
+:: 1719 = currency refresh over 1584, no new API. Acceptance test re-run with the
+:: DECLARATION grep: 90 slots, table IDENTICAL to 1584 (same names, same order), same
+:: 98 headers under include/sr. Behaviour deltas: srLensIsEnabled = physical lens state
+:: (#298), srGetRuntimeVersion returns the real build string, not the "1.0.0" stub (#307).
+set SR_V2_TAG=sr-sdk-v2-1.37.0.1719
+set SR_V2_DIR=LeiaSR-SDK-1.37.0+1719.b390d329dc-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
