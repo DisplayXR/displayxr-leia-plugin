@@ -216,6 +216,19 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	return any_populated;
 }
 
+/*
+ * The last SR-deferral claim probe_displays() reported, so its WARN fires
+ * once per (monitor, EDID identity) rather than once per registry refresh —
+ * the runtime re-runs probe_displays at ~1 Hz while the panel is
+ * unidentified (displayxr-runtime#1722). Cleared whenever a refresh does not
+ * take the deferral path, so a later return to it is logged again. Unguarded
+ * like the EDID probe cache: the runtime serialises registry refreshes.
+ */
+static bool g_leia_sr_claim_logged = false;
+static uint64_t g_leia_sr_claim_monitor_id = 0;
+static uint16_t g_leia_sr_claim_mfr = 0;
+static uint16_t g_leia_sr_claim_prod = 0;
+
 static uint32_t
 leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
                            const struct xrt_display_descriptor *displays,
@@ -314,11 +327,26 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		c->supported_apis = apis;
 		c->serial[0] = '\0';
 
-		U_LOG_W("leia_plugin: EDID table miss with SR present — claiming primary monitor "
-		        "0x%016llx (mfr=0x%04X prod=0x%04X) VERIFIED via SR runtime probe "
-		        "(table stale relative to SR's product-code registry)",
-		        (unsigned long long)displays[pick].monitor_id, displays[pick].edid_manufacturer,
-		        displays[pick].edid_product);
+		const bool same_claim = g_leia_sr_claim_logged &&                              //
+		                        g_leia_sr_claim_monitor_id == displays[pick].monitor_id && //
+		                        g_leia_sr_claim_mfr == displays[pick].edid_manufacturer && //
+		                        g_leia_sr_claim_prod == displays[pick].edid_product;
+		if (!same_claim) {
+			U_LOG_W("leia_plugin: EDID table miss with SR present — claiming primary monitor "
+			        "0x%016llx (mfr=0x%04X prod=0x%04X) VERIFIED via SR runtime probe "
+			        "(table stale relative to SR's product-code registry)",
+			        (unsigned long long)displays[pick].monitor_id, displays[pick].edid_manufacturer,
+			        displays[pick].edid_product);
+			g_leia_sr_claim_logged = true;
+			g_leia_sr_claim_monitor_id = displays[pick].monitor_id;
+			g_leia_sr_claim_mfr = displays[pick].edid_manufacturer;
+			g_leia_sr_claim_prod = displays[pick].edid_product;
+		} else {
+			U_LOG_I("leia_plugin: SR runtime still confirms monitor 0x%016llx — claim unchanged",
+			        (unsigned long long)displays[pick].monitor_id);
+		}
+	} else {
+		g_leia_sr_claim_logged = false;
 	}
 
 	return n;
