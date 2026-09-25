@@ -183,6 +183,10 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityDirectX.lib")
     list(APPEND LEIA_SOURCES
         leia_sr_d3d11.cpp leia_sr_d3d11.h
         leia_display_processor_d3d11.cpp leia_display_processor_d3d11.h
+        # 2D->3D lift via NeurD (docs/lift-neurd.md). NeurD.dll is loaded
+        # dynamically at first use — no NeurD headers, libs or DLLs are needed
+        # to build, and a box without NeurD loads the plug-in unchanged.
+        leia_lift_neurd.cpp leia_lift_neurd.h leia_neurd_abi.h
         leia_sr_d3d12.cpp leia_sr_d3d12.h
         leia_display_processor_d3d12.cpp leia_display_processor_d3d12.h)
     set(LEIA_SR_D3D11_AVAILABLE TRUE)
