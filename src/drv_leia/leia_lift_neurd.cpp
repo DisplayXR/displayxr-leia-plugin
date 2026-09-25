@@ -1145,7 +1145,9 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	out->depth_semantics = 0; // relative: per-frame min-max normalised disparity
 	uint64_t lat = g.latency_ns.load();
 	if (s == G_READY) {
-		std::lock_guard<std::mutex> lock(g.mtx);
+		// No lock: backend/backend_name are written once, before the seq_cst
+		// store that publishes G_READY, and never again — caps must not wait
+		// behind a convert holding g.mtx.
 		snprintf(out->backend, sizeof(out->backend), "%s", g.backend_name);
 		if (lat == 0) {
 			lat = (g.backend == LEIA_NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
