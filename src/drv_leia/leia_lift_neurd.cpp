@@ -186,6 +186,7 @@ struct knobs
 	int32_t autoscaling;  //!< DXR_LEIA_LIFT_SCALE (default 720p)
 	bool scale_forced;    //!< DXR_LEIA_LIFT_SCALE was set: overrides the stream's input_scale
 	float view_gain;      //!< DXR_LEIA_LIFT_VIEW_GAIN (default 1.0)
+	float conv_gain;      //!< DXR_LEIA_LIFT_CONV_GAIN (default 0.4): relative convergence -> NeurD units
 };
 
 bool
@@ -202,6 +203,7 @@ read_knobs()
 	k.backend = BACKEND_DIRECTML;
 	k.autoscaling = NEURD_INPUT_AUTOSCALING_720P;
 	k.view_gain = 1.0f;
+	k.conv_gain = 0.4f;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -248,6 +250,15 @@ read_knobs()
 			k.view_gain = g;
 		} else {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_VIEW_GAIN='%s' out of range [0,10] — using 1.0", e);
+		}
+	}
+	e = std::getenv("DXR_LEIA_LIFT_CONV_GAIN");
+	if (e != nullptr && e[0] != '\0') {
+		float cg = (float)std::atof(e);
+		if (std::isfinite(cg) && cg >= -2.0f && cg <= 2.0f) {
+			k.conv_gain = cg;
+		} else {
+			U_LOG_W("Leia lift: DXR_LEIA_LIFT_CONV_GAIN='%s' out of range [-2,2] — using 0.4", e);
 		}
 	}
 	return k;
@@ -1441,7 +1452,15 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		                prop_i(NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
 		                prop_f(NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain);
 		if (props_ok && !auto_conv) {
-			props_ok = prop_f(NEURD_PROP_CONVERGENCE, clampf(dp.convergence, -0.2f, 0.2f), g.p_conv);
+			// Runtime: convergence = RELATIVE depth placed at the display plane,
+			// [0,1] over the frame's depth range (0 = nearest on the glass, 1 =
+			// farthest). NeurD: a disparity offset in [-0.2, 0.2]. Linear map
+			// about the mid-range, K = DXR_LEIA_LIFT_CONV_GAIN (default 0.4 spans
+			// NeurD's full range; negate K if the sign proves reversed on a
+			// panel). UNCALIBRATED — see docs/lift-neurd.md.
+			const float c = clampf(dp.convergence, 0.0f, 1.0f);
+			const float nd_conv = clampf(l->k.conv_gain * (c - 0.5f), -0.2f, 0.2f);
+			props_ok = prop_f(NEURD_PROP_CONVERGENCE, nd_conv, g.p_conv);
 		}
 		g.props_valid = props_ok;
 		if (!props_ok) {
