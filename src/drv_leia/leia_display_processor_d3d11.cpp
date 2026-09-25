@@ -2265,6 +2265,14 @@ leia_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_h
  * struct_size covers (ADR-020 append-only rule), so a runtime that grows these
  * structs keeps working against this plug-in and vice versa.
  */
+static_assert(LEIA_LIFT_MODE_DEPTH == XRT_DP_LIFT_MODE_DEPTH && LEIA_LIFT_MODE_SBS == XRT_DP_LIFT_MODE_SBS &&
+                  LEIA_LIFT_MODE_NVIEW == XRT_DP_LIFT_MODE_NVIEW,
+              "lift mode bits must match the runtime's XRT_DP_LIFT_MODE_*");
+static_assert(LEIA_LIFT_STATE_UNAVAILABLE == XRT_DP_LIFT_STATE_UNAVAILABLE &&
+                  LEIA_LIFT_STATE_ACTIVATING == XRT_DP_LIFT_STATE_ACTIVATING &&
+                  LEIA_LIFT_STATE_READY == XRT_DP_LIFT_STATE_READY,
+              "lift states must match the runtime's XRT_DP_LIFT_STATE_*");
+
 #define LEIA_LIFT_COVERS(ptr, type, field)                                                                     \
 	((ptr)->struct_size >= offsetof(type, field) + sizeof(((type *)0)->field))
 
