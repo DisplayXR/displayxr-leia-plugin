@@ -26,6 +26,19 @@ carries bit 8.
 | `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
 Every versioned struct is read only as far as its `struct_size` covers.
+`xrt_dp_lift_params.focal_px` (appended) is ignored — it only matters to a
+photo → Gaussians module, and `lift_convert_blob` stays NULL.
+
+### The lift-only DP (`create_dp_d3d11_lift`)
+
+The plug-in fills the optional `xrt_plugin_iface::create_dp_d3d11_lift` factory
+(runtime header macro `XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY`). The runtime creates
+exactly one lift DP per process on a dedicated device, calls only the `lift_*` slots on
+it from its lift thread, and always passes explicit `viewpoints_xyz`. So this DP has
+**no SR weaver, no window, no tracker, no lens control** — just the NeurD handle; every
+non-lift slot is NULL. This is what keeps a lift session from perturbing the lens.
+The weaving DP (`create_dp_d3d11`) still carries the lift slots too (they load nothing
+unless called), which is what a runtime without the lift factory falls back to.
 
 Output layouts (runtime contract): DEPTH = one channel at the inference resolution
 (NeurD writes the normalised disparity replicated into RGB; the unpack keeps R);
@@ -137,7 +150,7 @@ how its `z` relates to viewing distance, so mapping it would be a guess.
 
 Viewpoint source, in order:
 
-1. **Explicit viewpoints** from the runtime (recommended — see *Known limits*) (`viewpoints_xyz`, metres, display space):
+1. **Explicit viewpoints** from the runtime (always sent to the lift-only DP) (`viewpoints_xyz`, metres, display space):
    `view_count` triplets are used 1:1; exactly two are treated as an eye pair.
 2. **Tracked eyes** from the SR eye path, when tracking is live (inter-eye distance
    > 1 mm — the same tracking-loss test as the eye slot).
@@ -153,15 +166,20 @@ default pattern and NVIEW is refused.
 | `xrt_dp_lift_params` | NeurD |
 |---|---|
 | `convergence < 0` | `AUTO_CONVERGENCE = TRUE` |
-| `convergence ≥ 0` | `AUTO_CONVERGENCE = FALSE`, `CONVERGENCE` clamped to NeurD's [−0.2, 0.2] |
+| `convergence` in [0, 1] | `AUTO_CONVERGENCE = FALSE`, `CONVERGENCE = clamp(K · (c − 0.5), ±0.2)`, K = `DXR_LEIA_LIFT_CONV_GAIN` |
 | `strength` | `GAIN_MULTIPLIER` (1 = NeurD's calibrated budget, 0 = flat), clamped [0, 10]; negative → 1.0 |
 | `inpaint` | NeurD always fills disocclusions: 0 → `V1_STRETCH` (cheapest), non-zero → `V1_BLUR` (the DX video path supports V1 only) |
 | `view_count` | NVIEW row width (2..8) |
 
-**Convergence units are not reconciled yet.** The runtime defines `convergence` as
-"relative depth placed at the display plane"; NeurD's `CONVERGENCE` is its own
-disparity offset in [−0.2, 0.2]. The value is passed through clamped; the mapping needs
-calibrating on a panel (auto-convergence, the default, is unaffected).
+**Convergence calibration.** The runtime's `convergence` is the relative depth placed
+at the display plane, normalised to [0, 1] over the frame's depth range (0 = nearest
+content on the glass, 1 = farthest, 0.5 = middle). NeurD's `CONVERGENCE` is its own
+disparity offset in [−0.2, 0.2]. The plug-in maps linearly about mid-range with gain
+K (default 0.4, which spans NeurD's whole range). This is **uncalibrated**: on a panel,
+submit c = 0 and check that the nearest content sits on the glass; if the far content
+does instead, the sign is reversed — set `DXR_LEIA_LIFT_CONV_GAIN=-0.4`; then tune |K|
+until c = 0 and c = 1 put the extremes on the glass. Auto-convergence (the default,
+c < 0) is unaffected.
 
 `xrt_dp_lift_stream_info.input_scale` in (0, 1] (1 = native) picks the smallest NeurD
 autoscaling bucket (720p / 1080p / 1440p / none) that covers `input_scale × input
@@ -183,6 +201,7 @@ Read once per DP at create (`leia_lift_neurd_create`).
 | `DXR_LEIA_LIFT_BACKEND` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). Only DirectML yields a D3D11 device. |
 | `DXR_LEIA_LIFT_SCALE` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
 | `DXR_LEIA_LIFT_VIEW_GAIN` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
+| `DXR_LEIA_LIFT_CONV_GAIN` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
 
 Under the service, remember these are read by `displayxr-service.exe`'s environment,
 not the client's.
@@ -263,17 +282,10 @@ lift-enabled runtime + this plug-in registered:
 
 ## Known limits
 
-- **The runtime's dedicated lift DP gets a full SR weaver.** The runtime calls the
-  lift slots on a DP it creates *for* lift, with a NULL window, and asks that such a DP
-  be cheap. This plug-in cannot tell that DP from a NULL-HWND `_texture` session DP
-  (which must weave), so it creates the usual async SR weaver for it. Two
-  consequences: (1) a second weaver on the shared SR context may briefly perturb the
-  lens (the effect the #625 snap probe guards against), and (2) the tracked eyes the
-  lift reads come from that extra weaver. Recommended: the runtime passes explicit
-  `viewpoints_xyz` (the panel DP's predicted eyes) on every convert, and a follow-up
-  gives the DP a lift-only signal (or makes NULL-window weaver creation lazy, on the
-  first `process_atlas`) so the lift DP never builds a weaver.
-
+- **Fallback path only:** against a runtime without `create_dp_d3d11_lift`, the runtime
+  calls the ordinary factory with a NULL window, which builds an async SR weaver (it
+  cannot be told apart from a NULL-HWND `_texture` DP). That extra weaver can briefly
+  perturb the lens. The lift-only factory removes this on runtimes that have it.
 - Windows / D3D11 only. The D3D12, GL and Vulkan DPs do not implement lift.
 - The activation thread is detached; unloading the plug-in DLL while it runs
   (a first activation in progress) is unsafe. The runtime does not unload plug-ins

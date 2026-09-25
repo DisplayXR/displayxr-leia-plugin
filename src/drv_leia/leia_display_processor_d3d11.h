@@ -35,6 +35,19 @@ leia_dp_factory_d3d11(void *d3d11_device,
                       void *window_handle,
                       struct xrt_display_processor_d3d11 **out_xdp);
 
+#if defined(DXR_LEIA_HAS_NEURD)
+/*!
+ * Lift-only D3D11 DP (xrt_plugin_iface::create_dp_d3d11_lift, ADR-042): no
+ * weaver, no window, only the NeurD lift_* slots. Defined only when the
+ * runtime headers carry the lift slots AND the NeurD headers were fetched.
+ */
+xrt_result_t
+leia_dp_factory_d3d11_lift(void *d3d11_device,
+                           void *d3d11_context,
+                           void *window_handle,
+                           struct xrt_display_processor_d3d11 **out_xdp);
+#endif
+
 /*!
  * Create an @ref xrt_display_processor_d3d11 that wraps a Leia SR SDK
  * D3D11 weaver (leiasr_d3d11_set_input_texture + leiasr_d3d11_weave).

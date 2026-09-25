@@ -66,7 +66,8 @@ struct leia_lift_neurd_stream_desc
 
 struct leia_lift_neurd_params
 {
-	float convergence; //!< <0 = NeurD auto-convergence; else NeurD units, clamped to [-0.2, 0.2].
+	float convergence; //!< <0 = NeurD auto-convergence; else relative depth at the display plane
+	                   //!< in [0,1], mapped to NeurD units by DXR_LEIA_LIFT_CONV_GAIN.
 	float strength;    //!< NeurD gain multiplier: 1 = calibrated budget, 0 = flat; <0 = 1.0; max 10.
 	uint32_t inpaint;  //!< 0 stretch fill, non-zero blur fill.
 	uint32_t view_count; //!< NVIEW only (2..max_views).

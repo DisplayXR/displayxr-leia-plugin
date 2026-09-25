@@ -2694,6 +2694,58 @@ leia_dp_factory_d3d11(void *d3d11_device,
 }
 
 
+#ifdef DXR_LEIA_DP_D3D11_LIFT
+/*
+ *
+ * Lift-only factory — xrt_plugin_iface::create_dp_d3d11_lift (ADR-042).
+ *
+ * The runtime creates exactly one of these per process on a dedicated device
+ * and drives ONLY the lift_* slots on it, from its lift thread, always with
+ * explicit viewpoints. So: no SR weaver (a second weaver on the shared SR
+ * context perturbs the lens), no window, no tracker, no lens control, no blit
+ * shaders — just the NeurD lift handle. Every non-lift slot stays NULL, which
+ * the runtime's slot helpers read as "absent". NeurD itself is still loaded
+ * lazily, on the first lift call.
+ *
+ */
+
+extern "C" xrt_result_t
+leia_dp_factory_d3d11_lift(void *d3d11_device,
+                           void *d3d11_context,
+                           void *window_handle,
+                           struct xrt_display_processor_d3d11 **out_xdp)
+{
+	(void)d3d11_context;
+	(void)window_handle; // always NULL for the lift DP
+	if (out_xdp == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	struct leia_display_processor_d3d11_impl *ldp =
+	    (struct leia_display_processor_d3d11_impl *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d11));
+	ldp->base.destroy = leia_dp_d3d11_destroy; // NULL-safe for every member left unset here
+	ldp->base.lift_get_caps = leia_dp_d3d11_lift_get_caps;
+	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
+	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
+	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
+	// lift_convert_blob (GAUSSIANS) stays NULL: NeurD has no splat path.
+	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
+	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
+	ldp->view_count = 2;
+	ldp->async_zone_publish = true;
+	// leiasr stays NULL: lift_convert then uses only the runtime's explicit
+	// viewpoints (or NeurD's default pattern) — never a tracker.
+
+	*out_xdp = &ldp->base;
+	U_LOG_W("Created Leia D3D11 LIFT-ONLY display processor (no weaver, no window; NeurD loaded on first use)");
+	return XRT_SUCCESS;
+}
+#endif // DXR_LEIA_DP_D3D11_LIFT
+
+
 /*
  *
  * Legacy creation function — wraps an existing leiasr_d3d11 handle.
