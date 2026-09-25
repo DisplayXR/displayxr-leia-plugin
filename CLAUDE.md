@@ -98,7 +98,7 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_display_processor*.{cpp,h}` | Per-API display processors (D3D11, D3D12, GL). Implement `xrt_display_processor_<api>` vtables; the runtime's compositor invokes them per-frame. |
 | `src/drv_leia/leia_sr_*.{cpp,h}` | SR SDK weaver wrappers. The SDK throws `std::runtime_error` as routine internal control flow (~11/frame in some paths) — every call wrapped in try/catch. |
 | `src/drv_leia/leia_bg_capture_win.{cpp,h}` | WGC background capture for compose-under transparency (Leia transparency model). |
-| `src/drv_leia/leia_lift_neurd.{cpp,h}`, `leia_neurd_abi.h` | 2D→3D lift slots on the D3D11 DP, backed by a dynamically loaded NeurD.dll (absent ⇒ caps unavailable, nothing loaded). Slots compile only against runtime headers with `XRT_DP_D3D11_HAS_LIFT`. See [`docs/lift-neurd.md`](docs/lift-neurd.md). |
+| `src/drv_leia/leia_lift_neurd.{cpp,h}` | 2D→3D lift slots on the D3D11 DP, backed by a dynamically loaded NeurD.dll (absent ⇒ caps unavailable, nothing loaded). Compiles only with the private NeurD headers (fetched at build time, below) AND runtime headers with `XRT_DP_D3D11_HAS_LIFT`; otherwise the slots stay NULL. See [`docs/lift-neurd.md`](docs/lift-neurd.md). |
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
 | `src/drv_leia_linux/leia_sr_linux.h` | **Linux weaver-backend seam** — interface shaped 1:1 by `docs/leia-linux-sdk-contract.md` (every declaration cites its R-* requirement). Track B implements it against the real SDK. |
 | `src/drv_leia_linux/leia_sr_stub.c` | Track A stub backend: canned panel info + passthrough SBS blit, `TODO(Track B)` at every body. |
@@ -134,6 +134,15 @@ run by `.github/workflows/lint.yml` on every PR, asserts all five pins
 (`SR_TAG`, `SR_VKSTAMP_TAG`, `SR_V2_TAG`, `SR_V2_DIR`, `SR_SDK_REPO`) are
 declared exactly once and identically in both files, and that
 `SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build.
+
+**NeurD headers (2D→3D lift) follow the same rule.** They are Leia-private
+and come from the private **`LeiaInc/media_sdk`** repo at `NEURD_SDK_REF`
+(pinned next to the SR pins in both files, also checked by
+`check_sr_pins.py`), fetched by `scripts/fetch-neurd-headers.ps1` into the
+gitignored `NeurD-SDK-<ref>/`. **Never commit or mirror them.** Your `gh`
+account (and CI's `LEIALOFT_GITHUB_TOKEN`) needs read access to
+`media_sdk`; without it the fetch fails SOFT and the plug-in builds without
+lift. Details: [`docs/lift-neurd.md`](docs/lift-neurd.md).
 
 ### Linux
 ```bash
