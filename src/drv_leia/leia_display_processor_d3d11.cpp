@@ -56,11 +56,13 @@
  * 2D->3D lift (runtime feat/lift-ext, XRT_DP_D3D11_HAS_LIFT) — four appended
  * slots backed by NeurD (leia_lift_neurd.cpp, docs/lift-neurd.md). Same
  * coupled-addition pattern: against older runtime headers the slots compile out
- * and struct_size tells the runtime they are absent. The NeurD module itself is
- * runtime-header-independent and always built; it never loads NeurD.dll until
- * a lift slot is actually called.
+ * and struct_size tells the runtime they are absent. The NeurD module also
+ * needs the real NeurD headers, fetched at build time from the private
+ * media_sdk repo (DXR_LEIA_HAS_NEURD); without them the slots stay NULL and the
+ * runtime reports lift unavailable. Even when built, NeurD.dll is loaded only
+ * when a lift slot is first called.
  */
-#if defined(XRT_DP_D3D11_HAS_LIFT)
+#if defined(XRT_DP_D3D11_HAS_LIFT) && defined(DXR_LEIA_HAS_NEURD)
 #define DXR_LEIA_DP_D3D11_LIFT 1
 #include "leia_lift_neurd.h"
 #include <cstddef> // offsetof
@@ -2517,7 +2519,11 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
 	U_LOG_W("Leia D3D11 DP: lift slots WIRED (NeurD, loaded on first use)");
 #else
+#if !defined(XRT_DP_D3D11_HAS_LIFT)
 	U_LOG_W("Leia D3D11 DP: lift slots NOT COMPILED (runtime headers predate XRT_DP_D3D11_HAS_LIFT)");
+#else
+	U_LOG_W("Leia D3D11 DP: lift slots NOT COMPILED (NeurD headers were not fetched at build time)");
+#endif
 #endif
 }
 

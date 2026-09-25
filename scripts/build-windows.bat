@@ -14,6 +14,7 @@ setlocal enabledelayedexpansion
 ::
 :: Required environment (auto-fetched if missing):
 ::   LEIASR_SDKROOT       — extracted LeiaSR-SDK-*-win64 dir
+::   NEURD_SDK_ROOT       — dir with include\NeurD.h (+ generated NeurD_version.h); default: fetched
 ::
 :: Optional environment:
 ::   DXR_RUNTIME_SOURCE_DIR — path to a local displayxr-runtime checkout.
@@ -44,6 +45,17 @@ set SR_TAG=1.35.0.2011
 :: Leia's PRIVATE artifact repo -- it is Leia SDK material and must not be
 :: publicly reachable. `gh auth status` must show an account with read access.
 set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
+:: --- NeurD pins (2D->3D lift, docs/lift-neurd.md) -----------------------
+:: The lift module compiles against the REAL NeurD headers, fetched from the
+:: PRIVATE LeiaInc/media_sdk repo at NEURD_SDK_REF into the gitignored
+:: NeurD-SDK-<ref>\include (never committed -- Leia-private, like the SR SDK).
+:: Same gh auth as the SR fetch. KEEP IN SYNC with build-windows.yml
+:: (scripts/check_sr_pins.py asserts it). Pin a media_sdk RELEASE TAG; v0.4.6
+:: is the newest tag and its headers are byte-identical to dev@25a713d93 (the
+:: tip the module was written against). A failed fetch is SOFT: lift compiles
+:: out, nothing else changes.
+set NEURD_SDK_REF=v0.4.6
+set NEURD_SDK_REPO=LeiaInc/media_sdk
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
 set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
@@ -205,10 +217,26 @@ if not exist "%LEIASR_V2_SDKROOT%\lib\srSDK_loader.lib" (
     echo SR v2 SDK ready.
 )
 
+:: --- NeurD headers (optional; soft failure) ---
+:: An existing NEURD_SDK_ROOT (e.g. a local media_sdk\sdk drop with a generated
+:: NeurD_version.h) takes priority; otherwise fetch the pinned headers.
+if "%NEURD_SDK_ROOT%"=="" (
+    set NEURD_SDK_ROOT=%REPO%NeurD-SDK-%NEURD_SDK_REF%
+)
+if not exist "%NEURD_SDK_ROOT%\include\NeurD_version.h" (
+    echo === Fetching NeurD headers ^(%NEURD_SDK_REPO%@%NEURD_SDK_REF%^) ===
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%fetch-neurd-headers.ps1" -Repo %NEURD_SDK_REPO% -Ref %NEURD_SDK_REF% -Dest "%NEURD_SDK_ROOT%"
+    if !ERRORLEVEL! NEQ 0 (
+        echo WARN: NeurD headers unavailable -- building WITHOUT 2D->3D lift.
+        set NEURD_SDK_ROOT=
+    )
+)
+
 echo.
 echo === Dependencies ready ===
 echo   LEIASR_SDKROOT=%LEIASR_SDKROOT%
 echo   LEIASR_V2_SDKROOT=%LEIASR_V2_SDKROOT%
+echo   NEURD_SDK_ROOT=%NEURD_SDK_ROOT%
 echo   DXR_RUNTIME_SOURCE_DIR=%DXR_RUNTIME_SOURCE_DIR%
 echo.
 
@@ -253,6 +281,9 @@ REM because the two SDKs are independent drops and the migration needs both
 REM present at once. Unset simply builds the v1-only plug-in, which is the
 REM shipping configuration until a win64 v2 drop is generally available.
 REM   set LEIASR_V2_SDKROOT=C:\path\to\LeiaSR-SDK-...-win64-Release
+if not "%NEURD_SDK_ROOT%"=="" (
+    set CMAKE_ARGS=!CMAKE_ARGS! -DNEURD_SDK_ROOT="%NEURD_SDK_ROOT%"
+)
 if not "%LEIASR_V2_SDKROOT%"=="" (
     set CMAKE_ARGS=!CMAKE_ARGS! -DLEIASR_V2_SDKROOT="%LEIASR_V2_SDKROOT%"
     echo Building WITH the SR v2 C API ^(LEIASR_V2_SDKROOT set^).

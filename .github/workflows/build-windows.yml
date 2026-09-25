@@ -85,6 +85,12 @@ jobs:
       # Read with LEIALOFT_GITHUB_TOKEN — the same secret the Android arm uses
       # for LeiaInc/CNSDK. Fork PRs have no secret and cannot build this arm.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
+      # NeurD headers for the 2D->3D lift module (docs/lift-neurd.md), fetched
+      # from the PRIVATE LeiaInc/media_sdk repo into the gitignored
+      # NeurD-SDK-<ref>/include -- never committed. Pin a media_sdk release tag.
+      # KEEP IN SYNC with scripts/build-windows.bat (check_sr_pins.py asserts).
+      NEURD_SDK_REF: v0.4.6
+      NEURD_SDK_REPO: LeiaInc/media_sdk
       GH_TOKEN: ${{ github.token }}
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
@@ -168,6 +174,21 @@ jobs:
           # The two files the CMake gate keys on — fail here, not at configure.
           foreach ($f in @("include/sr/sr_instance.h", "lib/srSDK_loader.lib")) {
             if (-not (Test-Path "$env:SR_V2_DIR/$f")) { throw "SR v2 SDK missing $f" }
+          }
+
+      # SOFT: without the headers the lift module compiles out and the plug-in
+      # is otherwise identical, so a missing token or an unreachable repo must
+      # not fail the build -- it is surfaced as a warning annotation instead.
+      - name: Fetch NeurD headers
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          ./scripts/fetch-neurd-headers.ps1 -Repo $env:NEURD_SDK_REPO -Ref $env:NEURD_SDK_REF -Dest "NeurD-SDK-$env:NEURD_SDK_REF"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::NeurD headers not fetched ($env:NEURD_SDK_REPO@$env:NEURD_SDK_REF) -- this build ships WITHOUT 2D->3D lift."
+            exit 1
           }
 
       # The plug-in CMake adds the runtime as a subdirectory, so we need
@@ -272,6 +293,8 @@ jobs:
         env:
           LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
           LEIASR_V2_SDKROOT: ${{ github.workspace }}/${{ env.SR_V2_DIR }}
+          # Read by src/drv_leia/CMakeLists.txt; absent dir => lift compiles out.
+          NEURD_SDK_ROOT: ${{ github.workspace }}/NeurD-SDK-${{ env.NEURD_SDK_REF }}
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DDXR_RUNTIME_SOURCE_DIR="${{ github.workspace }}/displayxr-runtime" `

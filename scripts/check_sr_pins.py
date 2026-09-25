@@ -67,7 +67,10 @@ WIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-windows.yml"
 LINUX_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-linux.yml"
 
 # The five pins that must be identical in the .bat and in build-windows.yml.
-PINS = ("SR_TAG", "SR_VKSTAMP_TAG", "SR_V2_TAG", "SR_V2_DIR", "SR_SDK_REPO")
+# NEURD_SDK_REF / NEURD_SDK_REPO pin the private NeurD headers the 2D->3D lift
+# module is built against (docs/lift-neurd.md) -- same two-file duplication,
+# same drift hazard, so they ride the same check.
+PINS = ("SR_TAG", "SR_VKSTAMP_TAG", "SR_V2_TAG", "SR_V2_DIR", "SR_SDK_REPO", "NEURD_SDK_REF", "NEURD_SDK_REPO")
 
 # sr-sdk-v2-1.37.0.1502  ->  ("1.37.0", "1502")
 SR_V2_TAG_RE = re.compile(r"^sr-sdk-v2-(\d+\.\d+\.\d+)\.(\d+)$")

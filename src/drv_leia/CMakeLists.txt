@@ -183,10 +183,6 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityDirectX.lib")
     list(APPEND LEIA_SOURCES
         leia_sr_d3d11.cpp leia_sr_d3d11.h
         leia_display_processor_d3d11.cpp leia_display_processor_d3d11.h
-        # 2D->3D lift via NeurD (docs/lift-neurd.md). NeurD.dll is loaded
-        # dynamically at first use — no NeurD headers, libs or DLLs are needed
-        # to build, and a box without NeurD loads the plug-in unchanged.
-        leia_lift_neurd.cpp leia_lift_neurd.h leia_neurd_abi.h
         leia_sr_d3d12.cpp leia_sr_d3d12.h
         leia_display_processor_d3d12.cpp leia_display_processor_d3d12.h)
     set(LEIA_SR_D3D11_AVAILABLE TRUE)
@@ -200,6 +196,33 @@ if(EXISTS "${SR_PATH}/lib/SimulatedRealityOpenGL.lib")
         leia_sr_gl.cpp leia_sr_gl.h
         leia_display_processor_gl.cpp leia_display_processor_gl.h)
     set(LEIA_SR_GL_AVAILABLE TRUE)
+endif()
+
+# --- NeurD 2D->3D lift (optional, additive) ---------------------------------
+# docs/lift-neurd.md. The module compiles against the REAL NeurD headers, which
+# are Leia-private and are never committed here: scripts/build-windows.bat and
+# build-windows.yml fetch them from LeiaInc/media_sdk at NEURD_SDK_REF (pinned
+# next to the SR pins) into a gitignored NeurD-SDK-<ref>/include. NeurD.dll is
+# still loaded dynamically at first use — no import lib, no link dependency.
+# Headers absent (no token / offline / fork PR) => the module compiles OUT, the
+# DP's lift slots stay NULL, the runtime reports lift unavailable, and the rest
+# of the plug-in builds exactly as before. Never a hard failure.
+set(LEIA_NEURD_AVAILABLE FALSE)
+if(NOT DEFINED NEURD_SDK_ROOT AND DEFINED ENV{NEURD_SDK_ROOT})
+    set(NEURD_SDK_ROOT "$ENV{NEURD_SDK_ROOT}")
+endif()
+if(LEIA_SR_D3D11_AVAILABLE AND NEURD_SDK_ROOT
+   AND EXISTS "${NEURD_SDK_ROOT}/include/NeurD.h"
+   AND EXISTS "${NEURD_SDK_ROOT}/include/NeurD_version.h"
+   AND EXISTS "${NEURD_SDK_ROOT}/include/_NeurD_detail.h"
+   AND EXISTS "${NEURD_SDK_ROOT}/include/_NeurD_table.h")
+    set(LEIA_NEURD_AVAILABLE TRUE)
+    list(APPEND LEIA_SOURCES leia_lift_neurd.cpp leia_lift_neurd.h)
+    message(STATUS "NeurD headers found at ${NEURD_SDK_ROOT} - enabling the D3D11 2D->3D lift slots")
+elseif(LEIA_SR_D3D11_AVAILABLE)
+    message(STATUS "NeurD headers NOT found (NEURD_SDK_ROOT='${NEURD_SDK_ROOT}') - 2D->3D lift compiled OUT; "
+                   "the plug-in is otherwise unchanged. Fetch them with scripts/build-windows.bat "
+                   "(needs gh auth with read access to LeiaInc/media_sdk).")
 endif()
 
 # Windows Graphics Capture for compose-under-bg transparency. The GL DP imports
@@ -342,6 +365,11 @@ if(LEIA_SR_D3D11_AVAILABLE)
         ${SR_PATH}/lib/SimulatedRealityDirectX.lib
         d3d11 d3dcompiler dxgi)
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE XRT_HAVE_LEIA_SR_D3D11)
+endif()
+
+if(LEIA_NEURD_AVAILABLE)
+    target_include_directories(DisplayXR-LeiaSR PRIVATE "${NEURD_SDK_ROOT}/include")
+    target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_NEURD)
 endif()
 
 if(LEIA_SR_D3D12_AVAILABLE)

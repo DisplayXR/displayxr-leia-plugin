@@ -3,8 +3,8 @@
 The Leia D3D11 display processor implements the runtime's **lift** slots — convert a
 single 2D RGBA frame into depth, a side-by-side stereo pair, or an N-view grid — by
 driving Leia's **NeurD** library. Source: `src/drv_leia/leia_lift_neurd.{h,cpp}`
-(module), `src/drv_leia/leia_neurd_abi.h` (NeurD binary interface), and the slot glue
-at the bottom of `src/drv_leia/leia_display_processor_d3d11.cpp`.
+(module) and the slot glue at the bottom of `src/drv_leia/leia_display_processor_d3d11.cpp`,
+built against the real NeurD headers fetched at build time (see *Building*).
 
 The runtime owns the lift *policy* — which content is lifted, the async worker thread,
 the result mailbox/ring, and how the output reaches the compositor. The plug-in owns
@@ -38,10 +38,11 @@ the widest that fits D3D11's 16384-texel limit; a wider request fails with a WAR
 
 - **Dynamic load only.** `NeurD.dll` is found in NeurD's own loader order: `PATH` →
   `NEURD_PATH` (full path to the DLL) → `HKLM\SOFTWARE\LeiaInc\NeurD` (default value =
-  install dir), loaded with `LOAD_WITH_ALTERED_SEARCH_PATH`. No NeurD header, import
-  lib or DLL is needed to build; the binary interface is mirrored in
-  `leia_neurd_abi.h` (append-only function table, every entry version-gated before it
-  is read).
+  install dir), loaded with `LOAD_WITH_ALTERED_SEARCH_PATH`. No import lib: the module
+  resolves only the DLL's `NeurD_load` export and then calls through the returned
+  function table using the **real** `NeurD.h`'s header-inline wrappers and PFN types,
+  which version-gate every entry (an older runtime's table is shorter) — so any NeurD
+  signature drift is a compile error, not a runtime mismatch.
 - **Absent NeurD → nothing changes.** A presence probe (no `LoadLibrary`) runs on the
   first caps/stream call; if the DLL is not found the process state becomes
   *absent*, caps report `modes=0 / state=0`, and the plug-in behaves exactly as before.
@@ -186,7 +187,33 @@ Read once per DP at create (`leia_lift_neurd_create`).
 Under the service, remember these are read by `displayxr-service.exe`'s environment,
 not the client's.
 
-## Building against the runtime
+## Building
+
+Lift compiles in only when BOTH of these hold; otherwise the four slots stay NULL, the
+runtime reports lift unavailable, and the rest of the plug-in is unchanged. Neither
+condition ever fails the plug-in build.
+
+### 1. The NeurD headers (private)
+
+`NeurD.h` and its closure (`_NeurD_detail.h`, `_NeurD_table.h`, and a generated
+`NeurD_version.h`) are **Leia-private** and are never committed here. They are fetched
+from the private **`LeiaInc/media_sdk`** repo at a pinned ref by
+`scripts/fetch-neurd-headers.ps1` into the gitignored `NeurD-SDK-<ref>/include`,
+exactly like the SR SDK:
+
+| | |
+|---|---|
+| Pins | `NEURD_SDK_REF` + `NEURD_SDK_REPO` in `scripts/build-windows.bat` **and** `.github/workflows/build-windows.yml` (`jobs.Build.env`), kept equal by `scripts/check_sr_pins.py` (lint.yml). |
+| Current pin | `v0.4.6` — the newest media_sdk release tag; its headers are byte-identical to `dev@25a713d93` (the tip this module was written against). Move it to a newer **release tag** when the module needs a newer NeurD API. |
+| Auth | `gh` with read access to `LeiaInc/media_sdk` (`gh auth login`, or `GH_TOKEN`). CI uses `secrets.LEIALOFT_GITHUB_TOKEN`, the SR SDK token — that token must be granted read on `media_sdk`. |
+| Failure | Soft. The .bat prints a WARN and builds without lift; CI emits a `::warning::` annotation (`continue-on-error`) and ships without lift. CMake prints `NeurD headers NOT found ... lift compiled OUT`. |
+| Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |
+
+`NeurD_version.h` is generated the way media_sdk's CMake does it, from
+`sdk/NeurD_version.h.in` and the top-level `project(mediasdk VERSION x.y.z)` at the same
+ref; it is the table version the module requests from `NeurD_load`.
+
+### 2. Runtime headers with the lift slots
 
 The slots compile only when the runtime headers define `XRT_DP_D3D11_HAS_LIFT`. The
 Windows pin `DXR_RUNTIME_GIT_TAG` is currently `v2.16.9`, which predates it — a pinned
@@ -197,9 +224,16 @@ To build with lift before the runtime tags it, use a local runtime checkout — 
 is committed:
 
 ```bat
+:: gh must be able to read LeiaInc/media_sdk (and the SR SDK repo, as always)
+gh auth status
 set DXR_RUNTIME_SOURCE_DIR=C:\dev\displayxr-runtime.wt-lift
 scripts\build-windows.bat build
 ```
+
+Confirm the configure output says `NeurD headers found ... enabling the D3D11 2D->3D lift
+slots`, and at runtime the service log says `lift slots WIRED`. Set
+`DXR_RUNTIME_SOURCE_DIR` explicitly: the script otherwise auto-detects a sibling
+`displayxr-runtime` checkout, which may not carry the lift headers.
 
 or `cmake -DDXR_RUNTIME_GIT_TAG=feat/lift-ext ...` for a fetched build. **Do not commit
 a branch or SHA pin**: `installer/CMakeLists.txt` derives `MIN_RUNTIME_VERSION` from

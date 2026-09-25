@@ -14,7 +14,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 | Display processor (per API) | `leia_display_processor.{cpp,h}` (base), `leia_display_processor_d3d11.{cpp,h}`, `leia_display_processor_d3d12.{cpp,h}`, `leia_display_processor_gl.{cpp,h}` |
 | Weaver (per API) | `leia_sr.{cpp,h}` (base + eye tracking), `leia_sr_d3d11.{cpp,h}`, `leia_sr_d3d12.{cpp,h}`, `leia_sr_gl.{cpp,h}` |
 | Background capture (transparency) | `leia_bg_capture_win.{cpp,h}` |
-| 2D→3D lift (NeurD, D3D11) | `leia_lift_neurd.{cpp,h}`, `leia_neurd_abi.h` |
+| 2D→3D lift (NeurD, D3D11) | `leia_lift_neurd.{cpp,h}` (+ private NeurD headers fetched at build time) |
 | Shaders | `shaders/` |
 
 ## Docs in this directory
