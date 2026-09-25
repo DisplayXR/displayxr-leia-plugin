@@ -52,6 +52,20 @@
 #define DXR_LEIA_DP_D3D11_BACKEND_STATE 1
 #endif
 
+/*
+ * 2D->3D lift (runtime feat/lift-ext, XRT_DP_D3D11_HAS_LIFT) — four appended
+ * slots backed by NeurD (leia_lift_neurd.cpp, docs/lift-neurd.md). Same
+ * coupled-addition pattern: against older runtime headers the slots compile out
+ * and struct_size tells the runtime they are absent. The NeurD module itself is
+ * runtime-header-independent and always built; it never loads NeurD.dll until
+ * a lift slot is actually called.
+ */
+#if defined(XRT_DP_D3D11_HAS_LIFT)
+#define DXR_LEIA_DP_D3D11_LIFT 1
+#include "leia_lift_neurd.h"
+#include <cstddef> // offsetof
+#endif
+
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
 static const char *blit_vs_source = R"(
@@ -471,6 +485,12 @@ struct leia_display_processor_d3d11_impl
 	//! it over the live desktop. NULL ⟹ no backdrop (desktop-only).
 	ID3D11ShaderResourceView *backdrop_srv; //!< NOT owned (compositor-owned).
 	uint32_t backdrop_w, backdrop_h;
+
+#ifdef DXR_LEIA_DP_D3D11_LIFT
+	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
+	//! DLL load — destroyed in leia_dp_d3d11_destroy). NULL only on OOM.
+	struct leia_lift_neurd *lift;
+#endif
 };
 
 static inline struct leia_display_processor_d3d11_impl *
@@ -2238,6 +2258,114 @@ leia_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_h
 }
 #endif
 
+#ifdef DXR_LEIA_DP_D3D11_LIFT
+/*
+ * 2D->3D lift slots. Thin translation of the runtime's xrt_dp_lift_* contract
+ * onto leia_lift_neurd; every size-versioned struct is read only as far as its
+ * struct_size covers (ADR-020 append-only rule), so a runtime that grows these
+ * structs keeps working against this plug-in and vice versa.
+ */
+#define LEIA_LIFT_COVERS(ptr, type, field)                                                                     \
+	((ptr)->struct_size >= offsetof(type, field) + sizeof(((type *)0)->field))
+
+static bool
+leia_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	if (out == NULL || out->struct_size < offsetof(struct xrt_dp_lift_caps, state) + sizeof(uint32_t)) {
+		return false;
+	}
+	struct leia_lift_neurd_caps c = {};
+	if (!leia_lift_neurd_get_caps(ldp->lift, &c)) {
+		return false;
+	}
+	struct xrt_dp_lift_caps full = {};
+	full.struct_size = out->struct_size;
+	full.modes = c.modes;
+	full.max_streams = c.max_streams;
+	full.max_views = c.max_views;
+	full.depth_semantics = c.depth_semantics;
+	full.state = c.state;
+	full.typical_latency_ns = c.typical_latency_ns;
+	static_assert(sizeof(full.backend) <= sizeof(c.backend), "backend name buffers");
+	memcpy(full.backend, c.backend, sizeof(full.backend));
+	full.backend[sizeof(full.backend) - 1] = '\0';
+	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
+	return true;
+}
+
+static bool
+leia_dp_d3d11_lift_stream_create(struct xrt_display_processor_d3d11 *xdp,
+                                 const struct xrt_dp_lift_stream_info *info,
+                                 uint64_t *out_id)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	if (info == NULL || out_id == NULL || !LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, mode)) {
+		return false;
+	}
+	struct leia_lift_neurd_stream_desc d = {};
+	d.mode = info->mode;
+	d.content_hint = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, content_hint) ? info->content_hint : 0;
+	d.input_scale = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, input_scale) ? info->input_scale : 0.0f;
+	return leia_lift_neurd_stream_create(ldp->lift, &d, out_id);
+}
+
+static void
+leia_dp_d3d11_lift_stream_destroy(struct xrt_display_processor_d3d11 *xdp, uint64_t id)
+{
+	leia_lift_neurd_stream_destroy(leia_dp_d3d11(xdp)->lift, id);
+}
+
+static bool
+leia_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
+                           uint64_t id,
+                           void *d3d11_context,
+                           void *input_resource,
+                           uint32_t w,
+                           uint32_t h,
+                           const struct xrt_dp_lift_params *p,
+                           const float *viewpoints_xyz,
+                           uint32_t viewpoint_floats,
+                           void **out_resource,
+                           uint32_t *out_w,
+                           uint32_t *out_h,
+                           uint32_t *out_format)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+
+	struct leia_lift_neurd_params lp = {-1.0f, 1.0f, 0, 2};
+	if (p != NULL) {
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, convergence)) {
+			lp.convergence = p->convergence;
+		}
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, strength)) {
+			lp.strength = p->strength;
+		}
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, inpaint)) {
+			lp.inpaint = p->inpaint;
+		}
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, view_count)) {
+			lp.view_count = p->view_count;
+		}
+	}
+
+	// Tracked eyes (metres, display space) — the same source the runtime's
+	// get_predicted_eye_positions slot reads; the wrapper is exception-safe.
+	// Only consulted when the runtime did not pass explicit viewpoints.
+	float left[3] = {0, 0, 0}, right[3] = {0, 0, 0};
+	bool eyes_valid = false;
+	if ((viewpoints_xyz == NULL || viewpoint_floats == 0) && ldp->leiasr != NULL &&
+	    leiasr_d3d11_get_predicted_eye_positions(ldp->leiasr, left, right)) {
+		const float dx = right[0] - left[0], dy = right[1] - left[1], dz = right[2] - left[2];
+		eyes_valid = (dx * dx + dy * dy + dz * dz) > 1e-6f; // same tracking-loss test as the eye slot
+	}
+
+	return leia_lift_neurd_convert(ldp->lift, id, d3d11_context, input_resource, w, h, &lp,
+	                               (viewpoint_floats > 0) ? viewpoints_xyz : NULL, viewpoint_floats, left, right,
+	                               eyes_valid, out_resource, out_w, out_h, out_format);
+}
+#endif // DXR_LEIA_DP_D3D11_LIFT
+
 static void
 leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
@@ -2255,6 +2383,12 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (ldp->blit_cb != NULL) {
 		ldp->blit_cb->Release();
 	}
+
+#ifdef DXR_LEIA_DP_D3D11_LIFT
+	// Before the weaver: lift streams hold bridge resources on the service
+	// device; the NeurD instance itself stays up for the process (see module).
+	leia_lift_neurd_destroy(&ldp->lift);
+#endif
 
 	compose_release_resources(ldp);
 	ck_release_resources(ldp);
@@ -2366,6 +2500,16 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #endif
 #ifdef DXR_LEIA_DP_D3D11_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_d3d11_get_backend_state; // #158 SR restart self-heal (slot 21)
+#endif
+#ifdef DXR_LEIA_DP_D3D11_LIFT
+	ldp->base.lift_get_caps = leia_dp_d3d11_lift_get_caps; // 2D->3D lift (NeurD)
+	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
+	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
+	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
+	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
+	U_LOG_W("Leia D3D11 DP: lift slots WIRED (NeurD, loaded on first use)");
+#else
+	U_LOG_W("Leia D3D11 DP: lift slots NOT COMPILED (runtime headers predate XRT_DP_D3D11_HAS_LIFT)");
 #endif
 }
 
