@@ -47,7 +47,13 @@
  */
 
 #include "leia_lift_neurd.h"
-#include "leia_neurd_abi.h"
+// The REAL NeurD header, fetched at build time from the private LeiaInc/media_sdk
+// repo at the pinned NEURD_SDK_REF (never committed here; see docs/lift-neurd.md).
+// Only its types, PFN typedefs and header-inline table wrappers are used — the
+// wrappers dispatch through the table NeurD_load returns and version-check each
+// entry — so there is no import lib and no link dependency on NeurD, and any
+// NeurD signature drift is a compile error in this file.
+#include <NeurD.h>
 
 #include "util/u_logging.h"
 
@@ -67,6 +73,11 @@
 #include <new>
 #include <thread>
 #include <vector>
+
+//! Table entry @p name is present in the LOADED runtime (version test first, so
+//! an older, physically shorter table is never read past its end). The
+//! NEURD_<name>_INTRODUCED_IN constants come from the real header.
+#define LEIA_NEURD_HAS(nd, name) ((nd) != nullptr && (nd)->version >= NEURD_##name##_INTRODUCED_IN && (nd)->name != nullptr)
 
 namespace {
 
@@ -124,32 +135,32 @@ clampf(float v, float lo, float hi)
 }
 
 const char *
-status_str(enum leia_neurd_status s)
+status_str(enum NeurD_status s)
 {
 	switch (s) {
-	case LEIA_NEURD_SUCCESS: return "SUCCESS";
-	case LEIA_NEURD_IN_PROGRESS: return "IN_PROGRESS";
-	case LEIA_NEURD_GENERIC_ERROR: return "GENERIC_ERROR";
-	case LEIA_NEURD_INVALID_ARG: return "INVALID_ARG";
-	case LEIA_NEURD_INVALID_LICENSE: return "INVALID_LICENSE";
-	case LEIA_NEURD_UNAVAILABLE_OUTDATED_RUNTIME: return "UNAVAILABLE_OUTDATED_RUNTIME";
-	case LEIA_NEURD_NOT_INITIALIZED: return "NOT_INITIALIZED";
-	case LEIA_NEURD_LICENSE_NETWORK_ERROR: return "LICENSE_NETWORK_ERROR";
-	case LEIA_NEURD_INVALID_MODEL: return "INVALID_MODEL";
-	case LEIA_NEURD_FILESYSTEM_ERROR: return "FILESYSTEM_ERROR";
-	case LEIA_NEURD_NETWORK_ERROR: return "NETWORK_ERROR";
-	case LEIA_NEURD_ABORTED: return "ABORTED";
+	case NEURD_SUCCESS: return "SUCCESS";
+	case NEURD_IN_PROGRESS: return "IN_PROGRESS";
+	case NEURD_GENERIC_ERROR: return "GENERIC_ERROR";
+	case NEURD_INVALID_ARG: return "INVALID_ARG";
+	case NEURD_INVALID_LICENSE: return "INVALID_LICENSE";
+	case NEURD_UNAVAILABLE_OUTDATED_RUNTIME: return "UNAVAILABLE_OUTDATED_RUNTIME";
+	case NEURD_NOT_INITIALIZED: return "NOT_INITIALIZED";
+	case NEURD_LICENSE_NETWORK_ERROR: return "LICENSE_NETWORK_ERROR";
+	case NEURD_INVALID_MODEL: return "INVALID_MODEL";
+	case NEURD_FILESYSTEM_ERROR: return "FILESYSTEM_ERROR";
+	case NEURD_NETWORK_ERROR: return "NETWORK_ERROR";
+	case NEURD_ABORTED: return "ABORTED";
 	default: return "UNKNOWN";
 	}
 }
 
 const char *
-backend_str(enum leia_neurd_backend b)
+backend_str(enum NeurD_backend b)
 {
 	switch (b) {
-	case LEIA_NEURD_BACKEND_CUDA: return "cuda";
-	case LEIA_NEURD_BACKEND_DIRECTML: return "directml";
-	case LEIA_NEURD_BACKEND_OPENVINO: return "openvino";
+	case NEURD_BACKEND_CUDA: return "cuda";
+	case NEURD_BACKEND_DIRECTML: return "directml";
+	case NEURD_BACKEND_OPENVINO: return "openvino";
 	default: return "unknown";
 	}
 }
@@ -163,9 +174,9 @@ backend_str(enum leia_neurd_backend b)
 enum backend_choice
 {
 	BACKEND_AUTO = -1,
-	BACKEND_CUDA = LEIA_NEURD_BACKEND_CUDA,
-	BACKEND_DIRECTML = LEIA_NEURD_BACKEND_DIRECTML,
-	BACKEND_OPENVINO = LEIA_NEURD_BACKEND_OPENVINO,
+	BACKEND_CUDA = NEURD_BACKEND_CUDA,
+	BACKEND_DIRECTML = NEURD_BACKEND_DIRECTML,
+	BACKEND_OPENVINO = NEURD_BACKEND_OPENVINO,
 };
 
 struct knobs
@@ -189,7 +200,7 @@ read_knobs()
 	struct knobs k = {};
 	k.enabled = true;
 	k.backend = BACKEND_DIRECTML;
-	k.autoscaling = LEIA_NEURD_AUTOSCALING_720P;
+	k.autoscaling = NEURD_INPUT_AUTOSCALING_720P;
 	k.view_gain = 1.0f;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
@@ -218,13 +229,13 @@ read_knobs()
 	if (e != nullptr && e[0] != '\0') {
 		k.scale_forced = true;
 		if (env_ieq(e, "none") || env_ieq(e, "native") || env_ieq(e, "0")) {
-			k.autoscaling = LEIA_NEURD_AUTOSCALING_NONE;
+			k.autoscaling = NEURD_INPUT_AUTOSCALING_NONE;
 		} else if (env_ieq(e, "720") || env_ieq(e, "720p")) {
-			k.autoscaling = LEIA_NEURD_AUTOSCALING_720P;
+			k.autoscaling = NEURD_INPUT_AUTOSCALING_720P;
 		} else if (env_ieq(e, "1080") || env_ieq(e, "1080p")) {
-			k.autoscaling = LEIA_NEURD_AUTOSCALING_1080P;
+			k.autoscaling = NEURD_INPUT_AUTOSCALING_1080P;
 		} else if (env_ieq(e, "1440") || env_ieq(e, "1440p")) {
-			k.autoscaling = LEIA_NEURD_AUTOSCALING_1440P;
+			k.autoscaling = NEURD_INPUT_AUTOSCALING_1440P;
 		} else {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_SCALE='%s' not recognised (720|1080|1440|none) — using 720", e);
 		}
@@ -318,11 +329,11 @@ struct global
 	std::atomic<uint32_t> streams_live{0};
 
 	int requested_backend = BACKEND_DIRECTML; //!< First acquirer's choice (NeurD's forced backend is sticky).
-	int32_t default_autoscaling = LEIA_NEURD_AUTOSCALING_720P;
+	int32_t default_autoscaling = NEURD_INPUT_AUTOSCALING_720P;
 
 	HMODULE lib = nullptr;
-	const struct leia_neurd_table *nd = nullptr;
-	enum leia_neurd_backend backend = LEIA_NEURD_BACKEND_DIRECTML;
+	struct NeurD const *nd = nullptr;
+	enum NeurD_backend backend = NEURD_BACKEND_DIRECTML;
 	char backend_name[32] = {};
 
 	ID3D11Device *nd_dev = nullptr; //!< NeurD-owned: never Released.
@@ -503,7 +514,7 @@ compile_cs(ID3D11Device *dev, const char *src, const char *name)
 bool
 setup_nd_device_locked()
 {
-	g.nd_dev = static_cast<ID3D11Device *>(g.nd->get_dx_device());
+	g.nd_dev = static_cast<ID3D11Device *>(NeurD_get_dx_device(g.nd));
 	if (g.nd_dev == nullptr) {
 		U_LOG_W("Leia lift: NeurD backend '%s' exposes no D3D11 device — the D3D11 lift path needs the "
 		        "DirectML backend (DXR_LEIA_LIFT_BACKEND=directml). Lift unavailable.",
@@ -563,9 +574,9 @@ activation_worker()
 				g.worker_running.store(false);
 				return;
 			}
-			auto load = reinterpret_cast<leia_neurd_load_fn>(reinterpret_cast<void *>(GetProcAddress(lib, "NeurD_load")));
-			struct leia_neurd_load_request req = {LEIA_NEURD_BUILT_AGAINST};
-			const struct leia_neurd_table *nd = load != nullptr ? load(&req) : nullptr;
+			auto load = reinterpret_cast<PFN_NeurD_load>(reinterpret_cast<void *>(GetProcAddress(lib, "NeurD_load")));
+			struct NeurD_load_request req = {NEURD_VERSION};
+			struct NeurD const *nd = load != nullptr ? load(&req) : nullptr;
 			if (nd == nullptr) {
 				U_LOG_W("Leia lift: NeurD.dll (%s) has no usable NeurD_load — lift unavailable", where);
 				// Deliberately no FreeLibrary: NeurD may have spun threads.
@@ -574,15 +585,15 @@ activation_worker()
 				return;
 			}
 			U_LOG_W("Leia lift: loaded NeurD %u.%u.%u from %s (plug-in built against %u.%u.%u)",
-			        LEIA_NEURD_VERSION_MAJOR(nd->version), LEIA_NEURD_VERSION_MINOR(nd->version),
-			        LEIA_NEURD_VERSION_PATCH(nd->version), where,
-			        LEIA_NEURD_VERSION_MAJOR(LEIA_NEURD_BUILT_AGAINST),
-			        LEIA_NEURD_VERSION_MINOR(LEIA_NEURD_BUILT_AGAINST),
-			        LEIA_NEURD_VERSION_PATCH(LEIA_NEURD_BUILT_AGAINST));
-			if (LEIA_NEURD_VERSION_MAJOR(nd->version) != 0 ||
-			    !LEIA_NEURD_HAS(nd, convert_stream_dx, 0, 3, 11) || !LEIA_NEURD_HAS(nd, get_dx_device, 0, 4, 3) ||
-			    !LEIA_NEURD_HAS(nd, create_stream, 0, 3, 11) || !LEIA_NEURD_HAS(nd, set_prop_1i, 0, 2, 1) ||
-			    !LEIA_NEURD_HAS(nd, set_prop_1f, 0, 2, 1)) {
+			        NEURD_GET_VERSION_MAJOR(nd->version), NEURD_GET_VERSION_MINOR(nd->version),
+			        NEURD_GET_VERSION_PATCH(nd->version), where,
+			        NEURD_GET_VERSION_MAJOR(NEURD_VERSION),
+			        NEURD_GET_VERSION_MINOR(NEURD_VERSION),
+			        NEURD_GET_VERSION_PATCH(NEURD_VERSION));
+			if (NEURD_GET_VERSION_MAJOR(nd->version) != 0 ||
+			    !LEIA_NEURD_HAS(nd, convert_stream_dx) || !LEIA_NEURD_HAS(nd, get_dx_device) ||
+			    !LEIA_NEURD_HAS(nd, create_stream) || !LEIA_NEURD_HAS(nd, set_prop_1i) ||
+			    !LEIA_NEURD_HAS(nd, set_prop_1f)) {
 				U_LOG_W("Leia lift: NeurD runtime too old/new for the D3D11 stream path (need 0.4.3+, "
 				        "major 0) — lift unavailable");
 				g.state.store(G_FAILED);
@@ -591,43 +602,43 @@ activation_worker()
 			}
 			g.lib = lib;
 			g.nd = nd;
-			if (LEIA_NEURD_HAS(nd, set_logger_callback, 0, 2, 5)) {
-				nd->set_logger_callback(neurd_log_cb);
+			if (LEIA_NEURD_HAS(nd, set_logger_callback)) {
+				NeurD_set_logger_callback(nd, neurd_log_cb);
 			}
 		}
 
-		const struct leia_neurd_table *nd = g.nd;
+		struct NeurD const *nd = g.nd;
 
 		// Properties that must precede init (NeurD reads some at init time):
 		// the defaults this plug-in wants for every stream.
-		nd->set_prop_1i(LEIA_NEURD_PROP_OUTPUT_TYPE, LEIA_NEURD_OUTPUT_SBS);
-		nd->set_prop_1i(LEIA_NEURD_PROP_INPUT_AUTOSCALING, g.default_autoscaling);
-		nd->set_prop_1i(LEIA_NEURD_PROP_INPAINT_TYPE, LEIA_NEURD_INPAINT_V1_STRETCH);
+		NeurD_set_prop_1i(nd, NEURD_PROP_OUTPUT_TYPE, NEURD_OUTPUT_IMAGE_TYPE_SBS);
+		NeurD_set_prop_1i(nd, NEURD_PROP_INPUT_AUTOSCALING, g.default_autoscaling);
+		NeurD_set_prop_1i(nd, NEURD_PROP_INPAINT_TYPE, NEURD_INPAINT_TYPE_V1_STRETCH);
 
 		// Backend must be forced immediately before init. NeurD keeps a forced
 		// backend across deinit, so this is effectively set once per process.
-		if (g.requested_backend != BACKEND_AUTO && LEIA_NEURD_HAS(nd, set_backend, 0, 3, 4)) {
-			enum leia_neurd_status bs = nd->set_backend((enum leia_neurd_backend)g.requested_backend);
-			if (bs != LEIA_NEURD_SUCCESS) {
-				U_LOG_W("Leia lift: NeurD_set_backend(%s) -> %s", backend_str((enum leia_neurd_backend)g.requested_backend),
+		if (g.requested_backend != BACKEND_AUTO && LEIA_NEURD_HAS(nd, set_backend)) {
+			enum NeurD_status bs = NeurD_set_backend(nd, (enum NeurD_backend)g.requested_backend);
+			if (bs != NEURD_SUCCESS) {
+				U_LOG_W("Leia lift: NeurD_set_backend(%s) -> %s", backend_str((enum NeurD_backend)g.requested_backend),
 				        status_str(bs));
 			}
 		}
 
-		enum leia_neurd_status st;
-		if (LEIA_NEURD_HAS(nd, init_with_options, 0, 4, 6)) {
-			struct leia_neurd_init_options opts = {};
+		enum NeurD_status st;
+		if (LEIA_NEURD_HAS(nd, init_with_options)) {
+			struct NeurD_init_options opts = {};
 			opts.struct_size = sizeof(opts);
-			opts.photo_model_id = LEIA_NEURD_MODEL_PHOTO_RELATIVE_QUALITY;
-			opts.video_model_id = LEIA_NEURD_MODEL_VIDEO_RELATIVE_FAST;
-			st = nd->init_with_options(1 /* multithreaded: we call from the runtime's lift thread */, &opts);
-		} else if (LEIA_NEURD_HAS(nd, init, 0, 2, 2)) {
-			st = nd->init(1);
+			opts.photo_model_id = NEURD_MODEL_PHOTO_RELATIVE_QUALITY;
+			opts.video_model_id = NEURD_MODEL_VIDEO_RELATIVE_FAST;
+			st = NeurD_init_with_options(nd, 1 /* multithreaded: we call from the runtime's lift thread */, &opts);
+		} else if (LEIA_NEURD_HAS(nd, init)) {
+			st = NeurD_init(nd, 1);
 		} else {
-			st = LEIA_NEURD_UNAVAILABLE_OUTDATED_RUNTIME;
+			st = NEURD_UNAVAILABLE_OUTDATED_RUNTIME;
 		}
 
-		if (st == LEIA_NEURD_LICENSE_NETWORK_ERROR || st == LEIA_NEURD_NETWORK_ERROR) {
+		if (st == NEURD_LICENSE_NETWORK_ERROR || st == NEURD_NETWORK_ERROR) {
 			g.next_retry_ms.store(now_ms() + kActivationRetryMs);
 			U_LOG_W("Leia lift: NeurD licence activation needs the network (%s) — reporting ACTIVATING, "
 			        "retrying in %llus",
@@ -636,24 +647,24 @@ activation_worker()
 			g.worker_running.store(false);
 			return;
 		}
-		if (st != LEIA_NEURD_SUCCESS) {
+		if (st != NEURD_SUCCESS) {
 			U_LOG_W("Leia lift: NeurD init failed: %s — lift unavailable", status_str(st));
 			g.state.store(G_FAILED);
 			g.worker_running.store(false);
 			return;
 		}
 
-		enum leia_neurd_backend be = (g.requested_backend == BACKEND_AUTO)
-		                                 ? LEIA_NEURD_BACKEND_DIRECTML
-		                                 : (enum leia_neurd_backend)g.requested_backend;
-		if (LEIA_NEURD_HAS(nd, get_backend, 0, 3, 4)) {
-			nd->get_backend(&be);
+		enum NeurD_backend be = (g.requested_backend == BACKEND_AUTO)
+		                                 ? NEURD_BACKEND_DIRECTML
+		                                 : (enum NeurD_backend)g.requested_backend;
+		if (LEIA_NEURD_HAS(nd, get_backend)) {
+			NeurD_get_backend(nd, &be);
 		}
 
 		std::lock_guard<std::mutex> lock(g.mtx);
 		g.backend = be;
 		snprintf(g.backend_name, sizeof(g.backend_name), "neurd-%s", backend_str(be));
-		g.interactive_unavailable = !LEIA_NEURD_HAS(nd, convert_stream_dx_interactive, 0, 4, 5);
+		g.interactive_unavailable = !LEIA_NEURD_HAS(nd, convert_stream_dx_interactive);
 		g.props_valid = false;
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
 		if (next == G_READY) {
@@ -734,7 +745,7 @@ struct lift_stream
 	uint32_t mode;
 	uint32_t content_hint;
 	float input_scale;
-	struct leia_neurd_stream *ns; //!< Created lazily on first convert (NeurD must be READY).
+	struct NeurD_stream *ns; //!< Created lazily on first convert (NeurD must be READY).
 
 	ID3D11Device *dev; //!< Caller's device (AddRef'd) the bridges are opened on.
 	ID3D11Query *our_done;
@@ -789,8 +800,8 @@ release_stream_locked(lift_stream *s)
 	release_out_bridge(s);
 	safe_release(s->our_done);
 	safe_release(s->dev);
-	if (s->ns != nullptr && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, destroy_stream, 0, 3, 11)) {
-		g.nd->destroy_stream(s->ns);
+	if (s->ns != nullptr && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, destroy_stream)) {
+		NeurD_destroy_stream(g.nd, s->ns);
 	}
 	s->ns = nullptr;
 }
@@ -954,7 +965,7 @@ groups16(uint32_t n)
 
 //! Copy/unpack NeurD's output into the stream's output bridge (NeurD device).
 bool
-stage_output(lift_stream *s, const struct leia_neurd_image &out)
+stage_output(lift_stream *s, const struct NeurD_image &out)
 {
 	auto *res = static_cast<ID3D11Resource *>(out.data);
 	if (res == nullptr || out.width <= 0 || out.height <= 0) {
@@ -1027,13 +1038,13 @@ stage_output(lift_stream *s, const struct leia_neurd_image &out)
 
 //! Apply one global NeurD property only if it changed. Called with g.mtx held.
 bool
-prop_i(enum leia_neurd_prop p, int32_t v, int32_t &cache)
+prop_i(enum NeurD_prop p, int32_t v, int32_t &cache)
 {
 	if (g.props_valid && cache == v) {
 		return true;
 	}
-	enum leia_neurd_status st = g.nd->set_prop_1i(p, v);
-	if (st != LEIA_NEURD_SUCCESS) {
+	enum NeurD_status st = NeurD_set_prop_1i(g.nd, p, v);
+	if (st != NEURD_SUCCESS) {
 		U_LOG_W("Leia lift: NeurD_set_prop_1i(%d, %d) -> %s", (int)p, (int)v, status_str(st));
 		cache = -1;
 		return false;
@@ -1043,13 +1054,13 @@ prop_i(enum leia_neurd_prop p, int32_t v, int32_t &cache)
 }
 
 bool
-prop_f(enum leia_neurd_prop p, float v, float &cache)
+prop_f(enum NeurD_prop p, float v, float &cache)
 {
 	if (g.props_valid && cache == v) {
 		return true;
 	}
-	enum leia_neurd_status st = g.nd->set_prop_1f(p, v);
-	if (st != LEIA_NEURD_SUCCESS) {
+	enum NeurD_status st = NeurD_set_prop_1f(g.nd, p, v);
+	if (st != NEURD_SUCCESS) {
 		U_LOG_W("Leia lift: NeurD_set_prop_1f(%d, %f) -> %s", (int)p, (double)v, status_str(st));
 		cache = -1.0f;
 		return false;
@@ -1070,15 +1081,15 @@ autoscale_for(const lift_stream *s, const struct knobs &k, uint32_t in_h)
 	// Smallest NeurD bucket that still covers the requested inference height.
 	float target = s->input_scale * (float)in_h;
 	if (target <= 720.0f) {
-		return LEIA_NEURD_AUTOSCALING_720P;
+		return NEURD_INPUT_AUTOSCALING_720P;
 	}
 	if (target <= 1080.0f) {
-		return LEIA_NEURD_AUTOSCALING_1080P;
+		return NEURD_INPUT_AUTOSCALING_1080P;
 	}
 	if (target <= 1440.0f) {
-		return LEIA_NEURD_AUTOSCALING_1440P;
+		return NEURD_INPUT_AUTOSCALING_1440P;
 	}
-	return LEIA_NEURD_AUTOSCALING_NONE;
+	return NEURD_INPUT_AUTOSCALING_NONE;
 }
 
 } // namespace
@@ -1139,10 +1150,10 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **plift)
 		l->streams.clear();
 		if (l->acquired) {
 			l->acquired = false;
-			if (--g.refcount == 0 && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, shrink_memory_pool, 0, 3, 10)) {
+			if (--g.refcount == 0 && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, shrink_memory_pool)) {
 				// Last user gone: give NeurD's pools back but stay initialised
 				// (re-init = licence + model load; DPs are recreated on focus change).
-				g.nd->shrink_memory_pool();
+				NeurD_shrink_memory_pool(g.nd);
 				g.props_valid = false;
 			}
 		}
@@ -1178,13 +1189,13 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 		// behind a convert holding g.mtx.
 		snprintf(out->backend, sizeof(out->backend), "%s", g.backend_name);
 		if (lat == 0) {
-			lat = (g.backend == LEIA_NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
-			      : (g.backend == LEIA_NEURD_BACKEND_CUDA)   ? kPriorLatencyCudaNs
+			lat = (g.backend == NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
+			      : (g.backend == NEURD_BACKEND_CUDA)   ? kPriorLatencyCudaNs
 			                                                 : kPriorLatencyOtherNs;
 		}
 	} else {
 		snprintf(out->backend, sizeof(out->backend), "neurd-%s",
-		         l->k.backend == BACKEND_AUTO ? "auto" : backend_str((enum leia_neurd_backend)l->k.backend));
+		         l->k.backend == BACKEND_AUTO ? "auto" : backend_str((enum NeurD_backend)l->k.backend));
 		if (lat == 0) {
 			lat = kPriorLatencyDirectMlNs;
 		}
@@ -1286,7 +1297,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 
 	try {
 		std::lock_guard<std::mutex> lock(g.mtx);
-		const struct leia_neurd_table *nd = g.nd;
+		struct NeurD const *nd = g.nd;
 
 		lift_stream *s = nullptr;
 		for (lift_stream *it : l->streams) {
@@ -1360,8 +1371,8 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 
 		// ---- Lazily create the NeurD stream.
 		if (s->ns == nullptr) {
-			enum leia_neurd_status cs = nd->create_stream(&s->ns);
-			if (cs != LEIA_NEURD_SUCCESS || s->ns == nullptr) {
+			enum NeurD_status cs = NeurD_create_stream(nd, &s->ns);
+			if (cs != NEURD_SUCCESS || s->ns == nullptr) {
 				in_tex->Release();
 				s->ns = nullptr;
 				LIFT_WARN_ONCE("Leia lift: NeurD_create_stream -> %s", status_str(cs));
@@ -1403,9 +1414,9 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		}
 		uint32_t views = 2;
 		uint32_t cols = 2, rows = 1;
-		int32_t out_type = LEIA_NEURD_OUTPUT_SBS;
+		int32_t out_type = NEURD_OUTPUT_IMAGE_TYPE_SBS;
 		if (s->mode == LEIA_LIFT_MODE_DEPTH) {
-			out_type = LEIA_NEURD_OUTPUT_DEPTH;
+			out_type = NEURD_OUTPUT_IMAGE_TYPE_DEPTH;
 			views = 1;
 			cols = rows = 1;
 		} else if (s->mode == LEIA_LIFT_MODE_NVIEW) {
@@ -1419,18 +1430,18 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		const float gain = (dp.strength >= 0.0f) ? clampf(dp.strength, 0.0f, 10.0f) : 1.0f;
 		// NeurD always fills disocclusions; non-zero picks the blur fill, 0 the
 		// cheaper edge stretch.
-		const int32_t inpaint = (dp.inpaint != 0) ? LEIA_NEURD_INPAINT_V1_BLUR : LEIA_NEURD_INPAINT_V1_STRETCH;
+		const int32_t inpaint = (dp.inpaint != 0) ? NEURD_INPAINT_TYPE_V1_BLUR : NEURD_INPAINT_TYPE_V1_STRETCH;
 
-		bool props_ok = prop_i(LEIA_NEURD_PROP_OUTPUT_TYPE, out_type, g.p_out_type) &&
-		                prop_i(LEIA_NEURD_PROP_OUTPUT_TILES_W, (int32_t)cols, g.p_tiles_w) &&
-		                prop_i(LEIA_NEURD_PROP_OUTPUT_TILES_H, (int32_t)rows, g.p_tiles_h) &&
-		                prop_i(LEIA_NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
-		                prop_i(LEIA_NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, l->k, h),
+		bool props_ok = prop_i(NEURD_PROP_OUTPUT_TYPE, out_type, g.p_out_type) &&
+		                prop_i(NEURD_PROP_OUTPUT_TILES_W, (int32_t)cols, g.p_tiles_w) &&
+		                prop_i(NEURD_PROP_OUTPUT_TILES_H, (int32_t)rows, g.p_tiles_h) &&
+		                prop_i(NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
+		                prop_i(NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, l->k, h),
 		                       g.p_autoscale) &&
-		                prop_i(LEIA_NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
-		                prop_f(LEIA_NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain);
+		                prop_i(NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
+		                prop_f(NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain);
 		if (props_ok && !auto_conv) {
-			props_ok = prop_f(LEIA_NEURD_PROP_CONVERGENCE, clampf(dp.convergence, -0.2f, 0.2f), g.p_conv);
+			props_ok = prop_f(NEURD_PROP_CONVERGENCE, clampf(dp.convergence, -0.2f, 0.2f), g.p_conv);
 		}
 		g.props_valid = props_ok;
 		if (!props_ok) {
@@ -1491,33 +1502,33 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		}
 
 		// ---- 5. Convert (blocking).
-		struct leia_neurd_image nin = {};
+		struct NeurD_image nin = {};
 		nin.data = s->in_buf;
 		nin.width = (int32_t)w;
 		nin.height = (int32_t)h;
 		nin.stride = (int32_t)(w * 4);
-		nin.pix_fmt = LEIA_NEURD_PIXEL_FORMAT_RGBA8;
-		struct leia_neurd_image nout = {};
-		enum leia_neurd_status st;
+		nin.pix_fmt = NEURD_PIXEL_FORMAT_RGBA8;
+		struct NeurD_image nout = {};
+		enum NeurD_status st;
 		if (!vp.empty() && !g.interactive_unavailable) {
-			st = nd->convert_stream_dx_interactive(s->ns, &nin, vp.data(), (int)vp.size(),
-			                                       LEIA_NEURD_PIXEL_FORMAT_RGBA8, &nout);
-			if (st == LEIA_NEURD_UNAVAILABLE_OUTDATED_RUNTIME) {
+			st = NeurD_convert_stream_dx_interactive(nd, s->ns, &nin, vp.data(), (int)vp.size(),
+			                                       NEURD_PIXEL_FORMAT_RGBA8, &nout);
+			if (st == NEURD_UNAVAILABLE_OUTDATED_RUNTIME) {
 				g.interactive_unavailable = true;
 				U_LOG_W("Leia lift: NeurD interactive convert unavailable — tracked viewpoints ignored");
 			}
-			if (st != LEIA_NEURD_SUCCESS && s->mode == LEIA_LIFT_MODE_SBS) {
+			if (st != NEURD_SUCCESS && s->mode == LEIA_LIFT_MODE_SBS) {
 				LIFT_WARN_ONCE("Leia lift: interactive convert -> %s; retrying with the default pattern",
 				               status_str(st));
-				st = nd->convert_stream_dx(s->ns, &nin, LEIA_NEURD_PIXEL_FORMAT_RGBA8, &nout);
+				st = NeurD_convert_stream_dx(nd, s->ns, &nin, NEURD_PIXEL_FORMAT_RGBA8, &nout);
 			}
 		} else if (s->mode == LEIA_LIFT_MODE_NVIEW && g.interactive_unavailable) {
 			LIFT_WARN_ONCE("Leia lift: N-view needs NeurD >= 0.4.5 (interactive convert)");
 			return false;
 		} else {
-			st = nd->convert_stream_dx(s->ns, &nin, LEIA_NEURD_PIXEL_FORMAT_RGBA8, &nout);
+			st = NeurD_convert_stream_dx(nd, s->ns, &nin, NEURD_PIXEL_FORMAT_RGBA8, &nout);
 		}
-		if (st != LEIA_NEURD_SUCCESS || nout.data == nullptr) {
+		if (st != NEURD_SUCCESS || nout.data == nullptr) {
 			LIFT_WARN_ONCE("Leia lift: NeurD convert failed: %s", status_str(st));
 			return false;
 		}
