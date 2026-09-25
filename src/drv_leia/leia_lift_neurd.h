@@ -60,14 +60,15 @@ struct leia_lift_neurd_stream_desc
 {
 	uint32_t mode;         //!< One LEIA_LIFT_MODE_* value.
 	uint32_t content_hint; //!< 0 video, 1 photo (advisory; the DX path is video-model only).
-	float input_scale;     //!< (0,1] fraction of input height to infer at; <=0 = knob default.
+	float input_scale;     //!< (0,1] fraction of input height to infer at (1 = native);
+	                       //!< outside that, or DXR_LEIA_LIFT_SCALE set = the knob.
 };
 
 struct leia_lift_neurd_params
 {
 	float convergence; //!< <0 = NeurD auto-convergence; else NeurD units, clamped to [-0.2, 0.2].
-	float strength;    //!< NeurD gain multiplier; <=0 = 1.0; clamped to [0.1, 10].
-	uint32_t inpaint;  //!< 0 stretch, 1 blur.
+	float strength;    //!< NeurD gain multiplier: 1 = calibrated budget, 0 = flat; <0 = 1.0; max 10.
+	uint32_t inpaint;  //!< 0 stretch fill, non-zero blur fill.
 	uint32_t view_count; //!< NVIEW only (2..max_views).
 };
 
@@ -114,7 +115,8 @@ leia_lift_neurd_stream_destroy(struct leia_lift_neurd *lift, uint64_t id);
  *                       default pattern is used.
  * @param out_resource   ID3D11Texture2D* on the caller's device, owned by the
  *                       stream, valid until the next convert on this stream.
- * @param out_format     DXGI_FORMAT (always R8G8B8A8_UNORM today).
+ * @param out_format     DXGI_FORMAT: R8G8B8A8_UNORM (SBS / NVIEW, N views in one
+ *                       row, view 0 leftmost) or R8_UNORM (DEPTH).
  */
 bool
 leia_lift_neurd_convert(struct leia_lift_neurd *lift,

@@ -86,7 +86,10 @@ constexpr float kIpdRefM = 0.063f;
 constexpr float kViewpointClamp = 3.0f;
 //! NeurD's MAX_STREAMS.
 constexpr uint32_t kMaxStreams = 32;
-constexpr uint32_t kMaxViews = 16;
+//! N views go side by side in ONE row (runtime contract), so the output is
+//! N x inference-width wide; 8 x 2560 (1440p) still fits D3D11's 16384 limit.
+constexpr uint32_t kMaxViews = 8;
+constexpr uint32_t kMaxTexDim = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 //! Retry period for a licence activation that failed on the network.
 constexpr uint64_t kActivationRetryMs = 15000;
 //! Upper bound for any CPU drain of a GPU queue (device-lost guard).
@@ -170,6 +173,7 @@ struct knobs
 	bool enabled;         //!< DXR_LEIA_LIFT (default on)
 	int backend;          //!< DXR_LEIA_LIFT_BACKEND (default directml)
 	int32_t autoscaling;  //!< DXR_LEIA_LIFT_SCALE (default 720p)
+	bool scale_forced;    //!< DXR_LEIA_LIFT_SCALE was set: overrides the stream's input_scale
 	float view_gain;      //!< DXR_LEIA_LIFT_VIEW_GAIN (default 1.0)
 };
 
@@ -212,6 +216,7 @@ read_knobs()
 
 	e = std::getenv("DXR_LEIA_LIFT_SCALE");
 	if (e != nullptr && e[0] != '\0') {
+		k.scale_forced = true;
 		if (env_ieq(e, "none") || env_ieq(e, "native") || env_ieq(e, "0")) {
 			k.autoscaling = LEIA_NEURD_AUTOSCALING_NONE;
 		} else if (env_ieq(e, "720") || env_ieq(e, "720p")) {
@@ -272,6 +277,20 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )";
 
+// NeurD's RGBA8 depth buffer -> single-channel R8 bridge (DEPTH contract: one
+// channel). NeurD writes the normalised disparity replicated into RGB; R is kept.
+const char *kUnpackR8Cs = R"(
+cbuffer P : register(b0) { uint W; uint H; uint StrideBytes; uint Pad; };
+RWByteAddressBuffer Src : register(u0);
+RWTexture2D<unorm float> Dst : register(u1);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= W || id.y >= H) return;
+	Dst[id.xy] = (float)(Src.Load(id.y * StrideBytes + id.x * 4) & 0xFF) / 255.0;
+}
+)";
+
 /*
  *
  * Process-wide NeurD instance.
@@ -311,6 +330,7 @@ struct global
 	ID3D11Query *nd_done = nullptr;
 	ID3D11ComputeShader *cs_pack = nullptr;
 	ID3D11ComputeShader *cs_unpack = nullptr;
+	ID3D11ComputeShader *cs_unpack_r8 = nullptr;
 	ID3D11Buffer *cb = nullptr;
 	LUID nd_luid = {};
 
@@ -496,16 +516,18 @@ setup_nd_device_locked()
 	D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
 	g.cs_pack = compile_cs(g.nd_dev, kPackCs, "leia_lift_pack");
 	g.cs_unpack = compile_cs(g.nd_dev, kUnpackCs, "leia_lift_unpack");
+	g.cs_unpack_r8 = compile_cs(g.nd_dev, kUnpackR8Cs, "leia_lift_unpack_r8");
 	D3D11_BUFFER_DESC bd = {};
 	bd.ByteWidth = 16;
 	bd.Usage = D3D11_USAGE_DYNAMIC;
 	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	if (g.cs_pack == nullptr || g.cs_unpack == nullptr || FAILED(g.nd_dev->CreateQuery(&qd, &g.nd_done)) ||
+	if (g.cs_pack == nullptr || g.cs_unpack == nullptr || g.cs_unpack_r8 == nullptr || FAILED(g.nd_dev->CreateQuery(&qd, &g.nd_done)) ||
 	    FAILED(g.nd_dev->CreateBuffer(&bd, nullptr, &g.cb))) {
 		U_LOG_W("Leia lift: bridge setup on NeurD's device failed — lift unavailable");
 		safe_release(g.cs_pack);
 		safe_release(g.cs_unpack);
+		safe_release(g.cs_unpack_r8);
 		safe_release(g.nd_done);
 		safe_release(g.cb);
 		safe_release(g.nd_ctx);
@@ -728,6 +750,7 @@ struct lift_stream
 
 	// Output bridge.
 	uint32_t out_w, out_h;
+	DXGI_FORMAT out_fmt; //!< R8G8B8A8_UNORM, or R8_UNORM for DEPTH
 	ID3D11Texture2D *out_nd;
 	ID3D11Texture2D *out_ours;
 	ID3D11UnorderedAccessView *out_uav;
@@ -755,6 +778,7 @@ release_out_bridge(lift_stream *s)
 	safe_release(s->out_ours);
 	safe_release(s->out_nd);
 	s->out_w = s->out_h = 0;
+	s->out_fmt = DXGI_FORMAT_UNKNOWN;
 }
 
 //! Called with g.mtx held.
@@ -848,13 +872,19 @@ ensure_in_bridge(lift_stream *s, uint32_t w, uint32_t h, DXGI_FORMAT family)
 }
 
 bool
-ensure_out_bridge(lift_stream *s, uint32_t w, uint32_t h)
+ensure_out_bridge(lift_stream *s, uint32_t w, uint32_t h, DXGI_FORMAT fmt)
 {
-	if (s->out_nd != nullptr && s->out_w == w && s->out_h == h) {
+	if (s->out_nd != nullptr && s->out_w == w && s->out_h == h && s->out_fmt == fmt) {
 		return true;
 	}
 	release_out_bridge(s);
-	if (!make_shared_tex(s->dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM,
+	if (w > kMaxTexDim || h > kMaxTexDim) {
+		LIFT_WARN_ONCE("Leia lift: output %ux%u exceeds the D3D11 texture limit (%u) — lower view_count or "
+		               "DXR_LEIA_LIFT_SCALE",
+		               w, h, kMaxTexDim);
+		return false;
+	}
+	if (!make_shared_tex(s->dev, w, h, fmt,
 	                     D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, &s->out_nd, &s->out_ours) ||
 	    FAILED(g.nd_dev->CreateUnorderedAccessView(s->out_nd, nullptr, &s->out_uav))) {
 		LIFT_WARN_ONCE("Leia lift: output bridge texture %ux%u failed", w, h);
@@ -863,6 +893,7 @@ ensure_out_bridge(lift_stream *s, uint32_t w, uint32_t h)
 	}
 	s->out_w = w;
 	s->out_h = h;
+	s->out_fmt = fmt;
 	return true;
 }
 
@@ -931,12 +962,15 @@ stage_output(lift_stream *s, const struct leia_neurd_image &out)
 	}
 	const uint32_t w = (uint32_t)out.width;
 	const uint32_t h = (uint32_t)out.height;
-	if (!ensure_out_bridge(s, w, h)) {
-		return false;
-	}
 
 	ID3D11Texture2D *tex = nullptr;
 	if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex)) && tex != nullptr) {
+		// A texture result is copied as-is (RGBA8 even for DEPTH; out_format
+		// says so). NeurD's stream path returns buffers; this is defensive.
+		if (!ensure_out_bridge(s, w, h, DXGI_FORMAT_R8G8B8A8_UNORM)) {
+			tex->Release();
+			return false;
+		}
 		// Region copy: NeurD's internal texture may exceed the reported size.
 		D3D11_BOX box = {0, 0, 0, w, h, 1};
 		g.nd_ctx->CopySubresourceRegion(s->out_nd, 0, 0, 0, 0, tex, 0, &box);
@@ -947,6 +981,11 @@ stage_output(lift_stream *s, const struct leia_neurd_image &out)
 	ID3D11Buffer *buf = nullptr;
 	if (FAILED(res->QueryInterface(__uuidof(ID3D11Buffer), (void **)&buf)) || buf == nullptr) {
 		LIFT_WARN_ONCE("Leia lift: NeurD output is neither a texture nor a buffer");
+		return false;
+	}
+	const bool depth = (s->mode == LEIA_LIFT_MODE_DEPTH);
+	if (!ensure_out_bridge(s, w, h, depth ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM)) {
+		buf->Release();
 		return false;
 	}
 	D3D11_BUFFER_DESC bd = {};
@@ -978,7 +1017,7 @@ stage_output(lift_stream *s, const struct leia_neurd_image &out)
 		return false;
 	}
 	ID3D11UnorderedAccessView *uavs[2] = {s->out_src_uav, s->out_uav};
-	g.nd_ctx->CSSetShader(g.cs_unpack, nullptr, 0);
+	g.nd_ctx->CSSetShader(depth ? g.cs_unpack_r8 : g.cs_unpack, nullptr, 0);
 	g.nd_ctx->CSSetConstantBuffers(0, 1, &g.cb);
 	g.nd_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
 	g.nd_ctx->Dispatch(groups16(w), groups16(h), 1);
@@ -1019,25 +1058,14 @@ prop_f(enum leia_neurd_prop p, float v, float &cache)
 	return true;
 }
 
-//! Grid for N views: cols = ceil(sqrt(N)), rows = ceil(N/cols), row-major.
-void
-nview_grid(uint32_t n, uint32_t *cols, uint32_t *rows)
-{
-	if (n <= 3) {
-		*cols = n;
-		*rows = 1;
-		return;
-	}
-	uint32_t c = (uint32_t)std::ceil(std::sqrt((double)n));
-	*cols = c;
-	*rows = (n + c - 1) / c;
-}
 
 int32_t
-autoscale_for(const lift_stream *s, int32_t knob_default, uint32_t in_h)
+autoscale_for(const lift_stream *s, const struct knobs &k, uint32_t in_h)
 {
-	if (!(s->input_scale > 0.0f) || s->input_scale > 1.0f) {
-		return knob_default;
+	// An explicit DXR_LEIA_LIFT_SCALE is a developer override and wins; else
+	// the stream's input_scale (1 = native) picks the bucket; else the default.
+	if (k.scale_forced || !(s->input_scale > 0.0f) || s->input_scale > 1.0f) {
+		return k.autoscaling;
 	}
 	// Smallest NeurD bucket that still covers the requested inference height.
 	float target = s->input_scale * (float)in_h;
@@ -1381,18 +1409,23 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			views = 1;
 			cols = rows = 1;
 		} else if (s->mode == LEIA_LIFT_MODE_NVIEW) {
+			// Runtime contract: N views side by side in ONE row, view 0 leftmost.
 			views = std::min(std::max(dp.view_count, 2u), kMaxViews);
-			nview_grid(views, &cols, &rows);
+			cols = views;
+			rows = 1;
 		}
 		const bool auto_conv = !(dp.convergence >= 0.0f);
-		const float gain = (dp.strength > 0.0f) ? clampf(dp.strength, 0.1f, 10.0f) : 1.0f;
-		const int32_t inpaint = (dp.inpaint == 1) ? LEIA_NEURD_INPAINT_V1_BLUR : LEIA_NEURD_INPAINT_V1_STRETCH;
+		// strength: 1 = NeurD's calibrated budget, 0 = flat; negative/NaN = default.
+		const float gain = (dp.strength >= 0.0f) ? clampf(dp.strength, 0.0f, 10.0f) : 1.0f;
+		// NeurD always fills disocclusions; non-zero picks the blur fill, 0 the
+		// cheaper edge stretch.
+		const int32_t inpaint = (dp.inpaint != 0) ? LEIA_NEURD_INPAINT_V1_BLUR : LEIA_NEURD_INPAINT_V1_STRETCH;
 
 		bool props_ok = prop_i(LEIA_NEURD_PROP_OUTPUT_TYPE, out_type, g.p_out_type) &&
 		                prop_i(LEIA_NEURD_PROP_OUTPUT_TILES_W, (int32_t)cols, g.p_tiles_w) &&
 		                prop_i(LEIA_NEURD_PROP_OUTPUT_TILES_H, (int32_t)rows, g.p_tiles_h) &&
 		                prop_i(LEIA_NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
-		                prop_i(LEIA_NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, l->k.autoscaling, h),
+		                prop_i(LEIA_NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, l->k, h),
 		                       g.p_autoscale) &&
 		                prop_i(LEIA_NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
 		                prop_f(LEIA_NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain);
@@ -1497,7 +1530,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		*out_resource = static_cast<ID3D11Resource *>(s->out_ours);
 		*out_w = s->out_w;
 		*out_h = s->out_h;
-		*out_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+		*out_format = (uint32_t)s->out_fmt;
 	} catch (...) {
 		// std::vector / std::mutex can throw; nothing may escape into the C runtime.
 		LIFT_WARN_ONCE("Leia lift: exception in convert — frame dropped");

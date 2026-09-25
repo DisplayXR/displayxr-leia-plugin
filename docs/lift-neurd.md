@@ -12,22 +12,27 @@ only "turn this texture into that texture, now".
 
 ## Contract (runtime side)
 
-Four slots appended to `struct xrt_display_processor_d3d11`, announced by
-`XRT_DP_D3D11_HAS_LIFT` (runtime branch `feat/lift-ext`):
+Slots appended to `struct xrt_display_processor_d3d11` (runtime `xrt_dp_lift.h`,
+ADR-042), announced by `XRT_DP_D3D11_HAS_LIFT` (runtime branch `feat/lift-ext`). The
+plug-in fills the four texture-mode slots; the fifth, `lift_convert_blob`
+(GAUSSIANS, photo → splats), is left NULL — NeurD has no splat path — so `modes` never
+carries bit 8.
 
 | Slot | Plug-in behaviour |
 |---|---|
-| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 16, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
+| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
 | `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
-| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device, `DXGI_FORMAT_R8G8B8A8_UNORM`, owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
+| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
 Every versioned struct is read only as far as its `struct_size` covers.
 
-Output layouts: DEPTH = one tile at the inference resolution; SBS = 2×1; NVIEW with
-N views = `cols = N` for N ≤ 3, else `cols = ceil(sqrt(N))`, `rows = ceil(N/cols)`,
-row-major (4 → 2×2). Extra grid slots repeat the last view. Tile size = the
-*inference* resolution (after autoscaling), not the input size — use `out_w/out_h`.
+Output layouts (runtime contract): DEPTH = one channel at the inference resolution
+(NeurD writes the normalised disparity replicated into RGB; the unpack keeps R);
+SBS = 2 views side by side; NVIEW = `view_count` views side by side in **one row**,
+view 0 leftmost. Tile size = the *inference* resolution (after autoscaling), not the
+input size — use `out_w/out_h`. One row is why `max_views` is 8: 8 × 2560 (1440p) is
+the widest that fits D3D11's 16384-texel limit; a wider request fails with a WARN.
 
 ## Process model
 
@@ -131,7 +136,7 @@ how its `z` relates to viewing distance, so mapping it would be a guess.
 
 Viewpoint source, in order:
 
-1. **Explicit viewpoints** from the runtime (`viewpoints_xyz`, metres, display space):
+1. **Explicit viewpoints** from the runtime (recommended — see *Known limits*) (`viewpoints_xyz`, metres, display space):
    `view_count` triplets are used 1:1; exactly two are treated as an eye pair.
 2. **Tracked eyes** from the SR eye path, when tracking is live (inter-eye distance
    > 1 mm — the same tracking-loss test as the eye slot).
@@ -148,13 +153,19 @@ default pattern and NVIEW is refused.
 |---|---|
 | `convergence < 0` | `AUTO_CONVERGENCE = TRUE` |
 | `convergence ≥ 0` | `AUTO_CONVERGENCE = FALSE`, `CONVERGENCE` clamped to NeurD's [−0.2, 0.2] |
-| `strength` | `GAIN_MULTIPLIER`, clamped [0.1, 10]; ≤ 0 → 1.0 |
-| `inpaint` | 0 → `V1_STRETCH`, 1 → `V1_BLUR` (the DX video path supports V1 only) |
-| `view_count` | NVIEW grid (2..16) |
+| `strength` | `GAIN_MULTIPLIER` (1 = NeurD's calibrated budget, 0 = flat), clamped [0, 10]; negative → 1.0 |
+| `inpaint` | NeurD always fills disocclusions: 0 → `V1_STRETCH` (cheapest), non-zero → `V1_BLUR` (the DX video path supports V1 only) |
+| `view_count` | NVIEW row width (2..8) |
 
-`xrt_dp_lift_stream_info.input_scale` in (0, 1] picks the smallest NeurD autoscaling
-bucket (720p / 1080p / 1440p / none) that covers `input_scale × input height`;
-otherwise the `DXR_LEIA_LIFT_SCALE` default applies. `content_hint` is recorded but
+**Convergence units are not reconciled yet.** The runtime defines `convergence` as
+"relative depth placed at the display plane"; NeurD's `CONVERGENCE` is its own
+disparity offset in [−0.2, 0.2]. The value is passed through clamped; the mapping needs
+calibrating on a panel (auto-convergence, the default, is unaffected).
+
+`xrt_dp_lift_stream_info.input_scale` in (0, 1] (1 = native) picks the smallest NeurD
+autoscaling bucket (720p / 1080p / 1440p / none) that covers `input_scale × input
+height`; outside that range the 720p default applies, and an explicitly set
+`DXR_LEIA_LIFT_SCALE` overrides every stream. `content_hint` is recorded but
 advisory: NeurD's DX stream path always runs its video model (photo mode is an
 init-time, process-wide property).
 
@@ -169,7 +180,7 @@ Read once per DP at create (`leia_lift_neurd_create`).
 |---|---|---|
 | `DXR_LEIA_LIFT` | on | `0` / `off` → caps `modes=0, state=0`; NeurD is never probed or loaded. |
 | `DXR_LEIA_LIFT_BACKEND` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). Only DirectML yields a D3D11 device. |
-| `DXR_LEIA_LIFT_SCALE` | `720` | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. NeurD's own default is 1440p; 720p is chosen for latency. Per-stream `input_scale` overrides. |
+| `DXR_LEIA_LIFT_SCALE` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
 | `DXR_LEIA_LIFT_VIEW_GAIN` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
 
 Under the service, remember these are read by `displayxr-service.exe`'s environment,
@@ -217,6 +228,17 @@ lift-enabled runtime + this plug-in registered:
    `LICENSE_NETWORK_ERROR` WARN; reconnect → ready within ~15 s of the next call.
 
 ## Known limits
+
+- **The runtime's dedicated lift DP gets a full SR weaver.** The runtime calls the
+  lift slots on a DP it creates *for* lift, with a NULL window, and asks that such a DP
+  be cheap. This plug-in cannot tell that DP from a NULL-HWND `_texture` session DP
+  (which must weave), so it creates the usual async SR weaver for it. Two
+  consequences: (1) a second weaver on the shared SR context may briefly perturb the
+  lens (the effect the #625 snap probe guards against), and (2) the tracked eyes the
+  lift reads come from that extra weaver. Recommended: the runtime passes explicit
+  `viewpoints_xyz` (the panel DP's predicted eyes) on every convert, and a follow-up
+  gives the DP a lift-only signal (or makes NULL-window weaver creation lazy, on the
+  first `process_atlas`) so the lift DP never builds a weaver.
 
 - Windows / D3D11 only. The D3D12, GL and Vulkan DPs do not implement lift.
 - The activation thread is detached; unloading the plug-in DLL while it runs
