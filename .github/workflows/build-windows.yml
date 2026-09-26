@@ -77,8 +77,11 @@ jobs:
       # the same 98 headers. Behaviour deltas only: srLensIsEnabled reports the
       # physical lens state (#298); srGetRuntimeVersion returns the real build
       # string instead of the "1.0.0" stub (#307) -- logged, never parsed here.
-      SR_V2_TAG: sr-sdk-v2-1.37.0.1719
-      SR_V2_DIR: LeiaSR-SDK-1.37.0+1719.b390d329dc-win64-Release
+      # 1758 = first 1.38.0, currency refresh over 1719, no new API: 90 slot
+      # declarations, table IDENTICAL; only include/sr/version.h differs. SR
+      # Service stop no longer crashes/hangs (LeiaSR #327).
+      SR_V2_TAG: sr-sdk-v2-1.38.0.1758
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+1758.f48e989e22-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
