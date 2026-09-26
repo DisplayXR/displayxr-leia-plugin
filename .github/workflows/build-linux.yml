@@ -199,6 +199,10 @@ jobs:
           ICD=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
           VK_ICD_FILENAMES="$ICD" ./build/src/drv_leia_linux/test_compose_color_linux
 
+      - name: Unit test — stereo camera source parsing (runtime ADR-043, L1)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_stereo_camera_parse
+
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
