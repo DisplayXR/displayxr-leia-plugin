@@ -427,3 +427,12 @@ leiasr_lnx_get_hardware_3d_state(struct leiasr_lnx *lnx, bool *out_is_3d)
 	*out_is_3d = lnx->hw_3d;
 	return true;
 }
+
+bool
+leiasr_lnx_has_sr_snap(const char **out_reason)
+{
+	if (out_reason != NULL) {
+		*out_reason = "Track A stub weaver (no SR SDK, no lens lattice)";
+	}
+	return false;
+}

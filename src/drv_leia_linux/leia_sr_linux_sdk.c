@@ -1671,12 +1671,32 @@ leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
 	return true;
 #else
 	/* Built against an SDK tree that does not declare (or cannot link)
-	 * srWeaverSnapToPhase: the feature compiles out to identity — the same
-	 * answer the trampoline gives on an older runtime. See the build-time
-	 * message in drv_leia_linux/CMakeLists.txt. */
+	 * srWeaverSnapToPhase — only reachable with the explicit
+	 * -DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON opt-out (#271). The feature compiles out
+	 * to identity, the same answer the trampoline gives on an older runtime.
+	 * Not logged per call: the DP says it once at creation, via
+	 * leiasr_lnx_has_sr_snap(). See drv_leia_linux/CMakeLists.txt. */
 	(void)lnx;
 	(void)origin_x;
 	(void)origin_y;
+	return false;
+#endif
+}
+
+bool
+leiasr_lnx_has_sr_snap(const char **out_reason)
+{
+#ifdef DXR_LEIA_LNX_HAVE_SR_SNAP
+	(void)out_reason;
+	return true;
+#else
+	if (out_reason != NULL) {
+		/* Do NOT spell the SR function name here: the release check greps
+		 * the .so's strings for it to prove the call is compiled in (#271). */
+		*out_reason = "built against an SR SDK without the drag-snap call "
+		              "(-DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON; needs srWeaver SnapToPhase + SetPresentOrigin, "
+		              "LeiaSR#85)";
+	}
 	return false;
 #endif
 }

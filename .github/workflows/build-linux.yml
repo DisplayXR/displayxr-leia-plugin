@@ -379,7 +379,15 @@ jobs:
       # Linux srSDK release tag. Independent of build-windows.yml's SR_TAG — the
       # Linux srSDK is versioned like the SR runtime (1.37.0.x) and lives in its
       # own sr-sdk-v<SR_TAG> release with the LeiaSR-SDK-<SR_TAG>-linux64.* asset.
-      SR_TAG: 1.37.0.41935
+      #
+      # MUST ship srWeaverSnapToPhase + srWeaverSetPresentOrigin (LeiaSR#85) in
+      # its sr/sr_weaver.h + libsrSDK_loader.a (#271): v2.7.3 was built against
+      # 1.37.0.41935, which predates the snap call, and shipped a plug-in whose
+      # window drags never phase-snap. The build now REFUSES such an SDK
+      # (CMake FATAL_ERROR + the symbol check below). Build numbers are not
+      # ordered across SR branches — 41935 is older than 10693 in API terms —
+      # so check the header, not the number, when moving this pin.
+      SR_TAG: 1.37.0.10693
       # Private Leia artifact repo hosting every sr-sdk-v* release (see
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
@@ -462,6 +470,13 @@ jobs:
             fi
           done
           if [ -z "$got" ]; then
+            # A v* release tag with no SDK would publish a release with no
+            # Linux .deb at all (DebRelease just skips) — refuse that loudly.
+            case "$GITHUB_REF" in
+              refs/tags/v*)
+                echo "::error::No LeiaSR-SDK-$SR_TAG-linux64.* on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — a release tag cannot ship without the Track B .deb."
+                exit 1 ;;
+            esac
             echo "::warning::No LeiaSR-SDK-$SR_TAG-linux64.* on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
             echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -495,6 +510,31 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/package_deb_leia.sh
           ls -lh dist/displayxr-leia-sr_*_amd64.deb
+
+      # Release check (#271): the SHIPPED .so must carry srWeaverSnapToPhase.
+      # v2.7.3's .deb had zero occurrences — the SDK pin predated the call and
+      # the build compiled a silent identity stub, so window drags never
+      # phase-snapped. CMake and package_deb_leia.sh both refuse that now; this
+      # inspects the artifact itself, after packaging, because the artifact is
+      # what users get. Opt-out: set DXR_LEIA_LNX_ALLOW_NO_SNAP=ON on the job
+      # (and pass --allow-no-snap above) — never for a release.
+      - name: Assert drag phase-snap in the shipped .so (#271)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
+        run: |
+          deb=$(ls dist/displayxr-leia-sr_*_amd64.deb | head -1)
+          rm -rf _debx && dpkg-deb -x "$deb" _debx
+          SO=_debx/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so
+          test -f "$SO" || { echo "::error::$SO missing from $deb"; exit 1; }
+          hits=$(strings "$SO" | grep -c srWeaverSnapToPhase || true)
+          echo "srWeaverSnapToPhase string hits in $SO: $hits"
+          if [ "$hits" -gt 0 ]; then
+            echo "OK: drag phase-snap compiled in"
+          elif [ "${DXR_LEIA_LNX_ALLOW_NO_SNAP:-OFF}" = "ON" ]; then
+            echo "::warning::srWeaverSnapToPhase absent from $SO (DXR_LEIA_LNX_ALLOW_NO_SNAP=ON) — window drags will NOT phase-snap. Not releasable."
+          else
+            echo "::error::srWeaverSnapToPhase absent from the shipped $SO — window drags would never phase-snap (#271). Move SR_TAG to a Linux SDK that ships it."
+            exit 1
+          fi
 
       - name: Upload .deb artifact
         if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'

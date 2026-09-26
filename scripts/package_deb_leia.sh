@@ -13,6 +13,8 @@
 #   ./scripts/package_deb_leia.sh --stub          # mechanics test, no SR SDK
 #   ./scripts/package_deb_leia.sh --no-build       # package an existing build/
 #   ./scripts/package_deb_leia.sh --allow-no-capture  # permit a capture-less build
+#   ./scripts/package_deb_leia.sh --allow-no-snap     # permit a Track B build without
+#                                                     # srWeaverSnapToPhase (NOT releasable, #271)
 #
 # Output: dist/displayxr-leia-sr_<ver>_<arch>.deb
 #
@@ -103,12 +105,14 @@ SR_RUNTIME_PKG="${SR_RUNTIME_PKG:-leiasr-runtime}"
 WEAVER="sdk"       # Track B (real srSDK). --stub switches to Track A.
 NO_BUILD=0
 ALLOW_NO_CAPTURE=0
+ALLOW_NO_SNAP=0
 for arg in "$@"; do
     case "$arg" in
     --stub) WEAVER="stub" ;;
     --no-build) NO_BUILD=1 ;;
     --allow-no-capture) ALLOW_NO_CAPTURE=1 ;;
-    *) echo "Unknown option: $arg (supported: --stub --no-build --allow-no-capture)" >&2; exit 2 ;;
+    --allow-no-snap) ALLOW_NO_SNAP=1 ;;
+    *) echo "Unknown option: $arg (supported: --stub --no-build --allow-no-capture --allow-no-snap)" >&2; exit 2 ;;
     esac
 done
 
@@ -133,7 +137,8 @@ if [ -z "$(find_so)" ]; then
         -DCMAKE_BUILD_TYPE=Release \
         -DDXR_RUNTIME_SOURCE_DIR="$RUNTIME_DIR" \
         -DDXR_LEIA_LINUX_WEAVER="$WEAVER" \
-        -DDXR_LEIA_SDK_DEV_RPATH=OFF
+        -DDXR_LEIA_SDK_DEV_RPATH=OFF \
+        -DDXR_LEIA_LNX_ALLOW_NO_SNAP="$([ "$ALLOW_NO_SNAP" = 1 ] && echo ON || echo OFF)"
     echo "==> Building DisplayXR-LeiaSR.so"
     cmake --build "$BUILD_DIR" --target DisplayXR-LeiaSR
 fi
@@ -158,6 +163,25 @@ else
     echo "       Install libpipewire-0.3-dev + libdbus-1-dev and rebuild (delete $BUILD_DIR" >&2
     echo "       first — CMake caches the failed pkg-config probe), or pass --allow-no-capture." >&2
     exit 1
+fi
+
+# Drag phase-snap gate (#271): a Track B .so must carry the srWeaverSnapToPhase
+# trampoline. v2.7.3 shipped without it (the SDK pin predated the call and the
+# build compiled a silent identity stub), so dragged windows never snapped.
+# CMake now refuses that configure; this re-checks the artifact itself, which
+# is what actually ships (and what `--no-build` would otherwise wave through).
+if [ "$WEAVER" = "sdk" ]; then
+    SNAP_HITS="$(strings "$SO" | grep -c srWeaverSnapToPhase || true)"
+    if [ "$SNAP_HITS" -gt 0 ]; then
+        echo "==> Drag phase-snap: srWeaverSnapToPhase present ($SNAP_HITS string hits)"
+    elif [ "$ALLOW_NO_SNAP" = 1 ]; then
+        echo "==> WARNING: srWeaverSnapToPhase NOT in $SO — --allow-no-snap set; this .deb's"
+        echo "    window drags will not phase-snap. Do not release it."
+    else
+        echo "error: $SO has no srWeaverSnapToPhase — window drags would never phase-snap (#271)." >&2
+        echo "       Build against an SR SDK that ships it (SRSDK_ROOT), or pass --allow-no-snap." >&2
+        exit 1
+    fi
 fi
 
 # Version: git describe → Debian-legal upstream version (same rule as the runtime).

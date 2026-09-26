@@ -89,9 +89,17 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     # the call, and does this loader archive actually carry the trampoline?
     # check_symbol_exists takes the symbol's address, so it compiles AND links
     # — a header-new/archive-old SDK root fails it here, at configure time,
-    # instead of at link time with --no-undefined. An SDK root that predates
-    # the call compiles the feature out to identity rather than failing the
-    # build.
+    # instead of at link time with --no-undefined.
+    #
+    # An SDK root that predates the call is a CONFIGURE ERROR (#271). It used
+    # to compile the feature out to identity silently, and v2.7.3's .deb shipped
+    # exactly that: built against an SDK pin without the call, every drag-lattice
+    # request declined, windows stuttered in 3D, and nothing was logged anywhere.
+    # A plug-in that cannot snap is not releasable for windowed apps. Bring-up
+    # against an older SDK is still possible, but it has to be asked for by name.
+    option(DXR_LEIA_LNX_ALLOW_NO_SNAP
+        "Allow a Track B build against an SR SDK without srWeaverSnapToPhase (window drags will NOT phase-snap; never for release)"
+        OFF)
     include(CheckSymbolExists)
     get_target_property(_srsdk_snap_inc srSDK::loader_dynamic INTERFACE_INCLUDE_DIRECTORIES)
     set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
@@ -103,10 +111,20 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
         target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_SNAP=1)
         message(STATUS "DisplayXR-LeiaSR: drag phase-snap ENABLED "
                        "(srWeaverSnapToPhase declared + linkable from ${_srsdk_snap_inc})")
+    elseif(DXR_LEIA_LNX_ALLOW_NO_SNAP)
+        message(WARNING "DisplayXR-LeiaSR: drag phase-snap COMPILED OUT (DXR_LEIA_LNX_ALLOW_NO_SNAP=ON) — "
+                        "no srWeaverSnapToPhase in ${_srsdk_snap_inc} (or no trampoline in this loader "
+                        "archive). Window drags will NOT phase-snap. Do not release this build (#271).")
     else()
-        message(STATUS "DisplayXR-LeiaSR: drag phase-snap COMPILED OUT — no srWeaverSnapToPhase in "
-                       "${_srsdk_snap_inc} (or no trampoline in this loader archive); "
-                       "window drags will not phase-snap")
+        message(FATAL_ERROR "DisplayXR-LeiaSR: the SR SDK at ${_srsdk_snap_inc} lacks srWeaverSnapToPhase "
+                            "(declared in sr/sr_weaver.h AND linkable from srSDK::loader's libsrSDK_loader.a). "
+                            "Window drags cannot phase-snap without it (runtime#1588, #271). "
+                            "Minimum SR SDK: one that ships srWeaverSnapToPhase + srWeaverSetPresentOrigin "
+                            "(LeiaSR#85), e.g. the 1.37.0.10693 Linux SDK. The 1.37.0.41935 linux64 SDK "
+                            "predates it despite its higher build number (different branch). "
+                            "Point SRSDK_ROOT at a newer SDK (in a FRESH build dir: the probe result is cached "
+                            "in CMakeCache.txt), or pass -DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON for a non-release "
+                            "bring-up build.")
     endif()
 
     # DEV-ONLY convenience: bake the SDK lib dir as DT_RUNPATH so the static
