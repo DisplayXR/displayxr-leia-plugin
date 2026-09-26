@@ -73,6 +73,9 @@ elif [ "$rc" != 0 ]; then
     exit "$rc"
 fi
 
+echo "==> Unit test: stereo camera source parsing (runtime ADR-043, L1)"
+"$BUILD_DIR/src/drv_leia_linux/test_stereo_camera_parse"
+
 echo "==> Asserting single-export discipline (#496 / ADR-019)"
 SYMS="$(nm -D --defined-only "$SO" | awk '{print $NF}')"
 if [ "$SYMS" != "xrtPluginNegotiate" ]; then

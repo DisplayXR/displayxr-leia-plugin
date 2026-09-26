@@ -290,3 +290,14 @@ target_include_directories(test_compose_color_linux PRIVATE ${CMAKE_CURRENT_SOUR
 target_link_libraries(test_compose_color_linux PRIVATE Vulkan::Vulkan m)
 add_test(NAME test_compose_color_linux COMMAND test_compose_color_linux)
 set_tests_properties(test_compose_color_linux PROPERTIES SKIP_RETURN_CODE 77)
+
+# --- Host unit test: stereo camera source parsing (runtime ADR-043, L1) ---
+# The Windows provider's platform-neutral half (SR raw-camera frame header,
+# JPEG SOF, device-serial block, the OpenCV-YAML calibration subset, eye
+# order). No SDK, no Win32 — so the Linux job runs it for the Windows arm.
+add_executable(test_stereo_camera_parse
+    ../drv_leia/tests/test_stereo_camera_parse.c
+    ../drv_leia/leia_stereo_camera_parse.c)
+target_include_directories(test_stereo_camera_parse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+target_link_libraries(test_stereo_camera_parse PRIVATE m)
+add_test(NAME test_stereo_camera_parse COMMAND test_stereo_camera_parse)
