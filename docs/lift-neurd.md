@@ -20,7 +20,7 @@ carries bit 8.
 
 | Slot | Plug-in behaviour |
 |---|---|
-| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
+| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0; NVIEW is dropped once READY on a NeurD without interactive convert (< 0.4.5). `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
 | `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
 | `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
@@ -82,10 +82,35 @@ Each transition logs one WARN (`Leia lift: ...`).
 ### Backend
 
 `NeurD_set_backend` is called immediately before init; NeurD keeps a forced backend for
-the process, so the **first** DP to activate NeurD decides it. The D3D11 path needs
-NeurD's D3D11 device (`NeurD_get_dx_device`), which only the **DirectML** backend
-provides — CUDA and OpenVINO return none, and lift then reports unavailable with a WARN
-naming the fix. Hence the default is `directml`, not NeurD's own `auto`.
+the process, so the **first** DP to activate NeurD decides it. On NeurD 0.4.3+ the D3D11
+path needs NeurD's D3D11 device (`NeurD_get_dx_device`), which only the **DirectML**
+backend provides — CUDA and OpenVINO return none, and lift then reports unavailable with
+a WARN naming the fix. Hence the default is `directml`, not NeurD's own `auto`. NeurD
+0.3.x is the other way round — see below.
+
+### NeurD 0.3.x
+
+Supported from **0.3.11** (the first release with the stream API: `create_stream`,
+`convert_stream_dx`, `set_prop_1i/1f`). The function table is append-only, so a plug-in
+built against the 0.4.x header loads a 0.3.x `NeurD.dll` unchanged, and every newer entry
+is version-gated (`LEIA_NEURD_HAS`).
+
+- **`NeurD_get_dx_device` is optional** (added in 0.4.3). Without it the plug-in creates
+  its own D3D11 device on the **default adapter** (as NeurD's own example does), builds
+  the bridge on it, and releases it itself. 0.3.x's DX convert takes the device from the
+  input buffer (`GetDevice`) and returns its output as an `R8G8B8A8_UNORM` texture on that
+  same device, so the bridge is otherwise unchanged. One WARN names the case and the LUID.
+- **CUDA backend required for the DX path on 0.3.x.** Its DX convert is implemented on
+  CUDA↔D3D11 interop; the DirectML build's DX path is not verified. Set
+  `DXR_LEIA_LIFT_BACKEND=cuda` in the **service's** environment (`displayxr-service.exe`
+  reads its own env, not the client's). The default adapter must be the NVIDIA GPU for
+  the interop to bind — on a hybrid box, pin the service to the dGPU.
+- **SBS and DEPTH only.** N-view needs interactive convert (0.4.5+); caps drop NVIEW once
+  ready, and tracked-eye viewpoints are ignored (SBS uses NeurD's default pattern).
+  Because 0.3.x hands back a texture, DEPTH arrives as `R8G8B8A8_UNORM` (copied as-is),
+  not `R8_UNORM`; `lift_convert`'s `out_format` reports which.
+- **Default models only** — `init_with_options` (model selection) is newer; `NeurD_init`
+  is used instead.
 
 ## Threading
 
@@ -198,7 +223,7 @@ Read once per DP at create (`leia_lift_neurd_create`).
 | Env | Default | Effect |
 |---|---|---|
 | `DXR_LEIA_LIFT` | on | `0` / `off` → caps `modes=0, state=0`; NeurD is never probed or loaded. |
-| `DXR_LEIA_LIFT_BACKEND` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). Only DirectML yields a D3D11 device. |
+| `DXR_LEIA_LIFT_BACKEND` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). On NeurD 0.4.3+ only DirectML yields a D3D11 device; on 0.3.x use `cuda` (see *NeurD 0.3.x*). |
 | `DXR_LEIA_LIFT_SCALE` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
 | `DXR_LEIA_LIFT_VIEW_GAIN` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
 | `DXR_LEIA_LIFT_CONV_GAIN` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
