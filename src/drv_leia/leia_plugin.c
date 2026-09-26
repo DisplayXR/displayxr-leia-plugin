@@ -54,6 +54,9 @@
 #ifdef XRT_HAVE_LEIA_SR_GL
 #include "leia_display_processor_gl.h"
 #endif
+/* Stereo camera source (runtime ADR-043): only when the runtime headers
+ * announce the slots, so a pin that predates them still builds. */
+#include "leia_stereo_camera.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -477,6 +480,22 @@ static struct xrt_plugin_iface g_leia_iface = {
 
 #ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
     .get_platform_state = leia_plugin_get_platform_state,
+#endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
+    /*
+     * The SR eye tracker's camera as a runtime stereo camera source
+     * (XR_DXR_stereo_camera, runtime ADR-043, phase L1). Read from the SR
+     * raw-camera shared memory by POLLING (never the auto-reset event),
+     * calibration of the ACTIVE device's serial, tracker keep-alive while
+     * open. See leia_stereo_camera.cpp. All six or none (the runtime checks).
+     */
+    .stereo_camera_enumerate = leia_stereo_camera_enumerate,
+    .stereo_camera_get_calibration = leia_stereo_camera_get_calibration,
+    .stereo_camera_open = leia_stereo_camera_open,
+    .stereo_camera_wait_frame = leia_stereo_camera_wait_frame,
+    .stereo_camera_release_frame = leia_stereo_camera_release_frame,
+    .stereo_camera_close = leia_stereo_camera_close,
 #endif
 };
 
