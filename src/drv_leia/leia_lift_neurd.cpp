@@ -536,6 +536,41 @@ compile_cs(ID3D11Device *dev, const char *src, const char *name)
 	return cs;
 }
 
+/*!
+ * DXR_LEIA_LIFT_INTERACTIVE_MIN ("0.4.4"): demo-only override of the version at
+ * which convert_stream_dx_interactive is trusted. The 0.4.4 internal-interactive
+ * NeurD package reports 0.4.4 but carries the (header: 0.4.5) interactive
+ * entries. Only NeurD_load is exported and a stock 0.4.4 table is too short to
+ * read that slot, so the version is the only discriminator — hence opt-in.
+ * Clamped to >= 0.4.4. Returns false when unset or unparsable.
+ */
+bool
+interactive_min_from_env(uint64_t *out)
+{
+	const char *e = std::getenv("DXR_LEIA_LIFT_INTERACTIVE_MIN");
+	if (e == nullptr || e[0] == '\0') {
+		return false;
+	}
+	// Strict "MAJ.MIN.PAT" (no sscanf: MSVC C4996).
+	unsigned long part[3] = {0, 0, 0};
+	const char *c = e;
+	bool ok = true;
+	for (int i = 0; i < 3 && ok; i++) {
+		char *end = nullptr;
+		part[i] = std::strtoul(c, &end, 10);
+		ok = end != c && *end == (i < 2 ? '.' : '\0');
+		c = end + (i < 2 ? 1 : 0);
+	}
+	if (!ok) {
+		U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN='%s' not a version (e.g. 0.4.4) — ignored", e);
+		return false;
+	}
+	const uint64_t floor_v = NEURD_MAKE_VERSION(0, 4, 4);
+	const uint64_t v = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
+	*out = (v < floor_v) ? floor_v : v;
+	return true;
+}
+
 //! Drop g.nd_dev: Released only when the plug-in created it. Called with g.mtx held.
 void
 release_nd_dev_locked()
@@ -732,7 +767,16 @@ activation_worker()
 		std::lock_guard<std::mutex> lock(g.mtx);
 		g.backend = be;
 		snprintf(g.backend_name, sizeof(g.backend_name), "neurd-%s", backend_str(be));
-		g.interactive_unavailable = !LEIA_NEURD_HAS(nd, convert_stream_dx_interactive);
+		uint64_t interactive_min = NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
+		if (interactive_min_from_env(&interactive_min)) {
+			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u — assuming interactive convert on NeurD "
+			        "%u.%u.%u (only for the internal-interactive dev package; a stock 0.4.4 will crash here)",
+			        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min),
+			        (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
+			        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), (unsigned)NEURD_GET_VERSION_MAJOR(nd->version),
+			        (unsigned)NEURD_GET_VERSION_MINOR(nd->version), (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
+		}
+		g.interactive_unavailable = !(nd->version >= interactive_min && nd->convert_stream_dx_interactive != nullptr);
 		g.props_valid = false;
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
 		if (next == G_READY) {
