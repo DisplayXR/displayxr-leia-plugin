@@ -307,6 +307,9 @@ void main(uint3 id : SV_DispatchThreadID)
 
 // NeurD's RGBA8 depth buffer -> single-channel R8 bridge (DEPTH contract: one
 // channel). NeurD writes the normalised disparity replicated into RGB; R is kept.
+// Polarity: NeurD is disparity-like (near = HIGH); the lift spec's RELATIVE is
+// larger = FARTHER, so the value is flipped here. Dst is an R8_UNORM UAV, so
+// 1 - v stays in [0,1].
 const char *kUnpackR8Cs = R"(
 cbuffer P : register(b0) { uint W; uint H; uint StrideBytes; uint Pad; };
 RWByteAddressBuffer Src : register(u0);
@@ -315,7 +318,7 @@ RWTexture2D<unorm float> Dst : register(u1);
 void main(uint3 id : SV_DispatchThreadID)
 {
 	if (id.x >= W || id.y >= H) return;
-	Dst[id.xy] = (float)(Src.Load(id.y * StrideBytes + id.x * 4) & 0xFF) / 255.0;
+	Dst[id.xy] = 1.0 - (float)(Src.Load(id.y * StrideBytes + id.x * 4) & 0xFF) / 255.0;
 }
 )";
 
@@ -1088,6 +1091,9 @@ stage_output(lift_stream *s, const struct NeurD_image &out)
 
 	ID3D11Texture2D *tex = nullptr;
 	if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex)) && tex != nullptr) {
+		// NOTE: DEPTH on this path is NOT polarity-flipped (still NeurD's
+		// near = high) — only kUnpackR8Cs flips. Only NeurD 0.3.x's CUDA DX
+		// path returns a texture.
 		// A texture result is copied as-is (RGBA8 even for DEPTH; out_format
 		// says so). NeurD's stream path returns buffers; this is defensive.
 		if (!ensure_out_bridge(s, w, h, DXGI_FORMAT_R8G8B8A8_UNORM)) {
@@ -1298,7 +1304,7 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	}
 	out->max_streams = kMaxStreams;
 	out->max_views = kMaxViews;
-	out->depth_semantics = 0; // relative: per-frame min-max normalised disparity
+	out->depth_semantics = 0; // relative: per-frame min-max normalised depth, larger = farther (NeurD's near=high disparity is flipped in kUnpackR8Cs)
 	uint64_t lat = g.latency_ns.load();
 	if (s == G_READY) {
 		// No lock: backend/backend_name are written once, before the seq_cst
