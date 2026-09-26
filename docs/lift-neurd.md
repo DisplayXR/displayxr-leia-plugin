@@ -23,7 +23,7 @@ carries bit 8.
 | `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0; NVIEW is dropped once READY on a NeurD without interactive convert (< 0.4.5). `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
 | `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
-| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
+| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
 Every versioned struct is read only as far as its `struct_size` covers.
 `xrt_dp_lift_params.focal_px` (appended) is ignored — it only matters to a
@@ -108,7 +108,8 @@ is version-gated (`LEIA_NEURD_HAS`).
 - **SBS and DEPTH only.** N-view needs interactive convert (0.4.5+); caps drop NVIEW once
   ready, and tracked-eye viewpoints are ignored (SBS uses NeurD's default pattern).
   Because 0.3.x hands back a texture, DEPTH arrives as `R8G8B8A8_UNORM` (copied as-is),
-  not `R8_UNORM`; `lift_convert`'s `out_format` reports which.
+  not `R8_UNORM`; `lift_convert`'s `out_format` reports which. That texture path is **not**
+  polarity-flipped: DEPTH stays NeurD's near = high, contrary to RELATIVE (known gap).
 - **Default models only** — `init_with_options` (model selection) is newer; `NeurD_init`
   is used instead.
 
