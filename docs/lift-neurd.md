@@ -20,10 +20,10 @@ carries bit 8.
 
 | Slot | Plug-in behaviour |
 |---|---|
-| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS\|NVIEW (1\|2\|4) once NeurD is present, else 0; NVIEW is dropped once READY on a NeurD without interactive convert (< 0.4.5). `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
+| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.6 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
 | `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
-| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS/NVIEW, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
+| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
 Every versioned struct is read only as far as its `struct_size` covers.
 `xrt_dp_lift_params.focal_px` (appended) is ignored — it only matters to a
@@ -42,8 +42,10 @@ unless called), which is what a runtime without the lift factory falls back to.
 
 Output layouts (runtime contract): DEPTH = one channel at the inference resolution
 (NeurD writes the normalised disparity replicated into RGB; the unpack keeps R);
-SBS = 2 views side by side; NVIEW = `view_count` views side by side in **one row**,
-view 0 leftmost. Tile size = the *inference* resolution (after autoscaling), not the
+SBS = 2 views side by side. (NVIEW — `view_count` views in one row — is not offered
+by this module; see *N-view* below.) Every convert checks NeurD's actual layout
+(output aspect ÷ input aspect = tile count) against the mode and drops a frame that
+doesn't match, so a result can never be mislabelled. Tile size = the *inference* resolution (after autoscaling), not the
 input size — use `out_w/out_h`. One row is why `max_views` is 8: 8 × 2560 (1440p) is
 the widest that fits D3D11's 16384-texel limit; a wider request fails with a WARN.
 
@@ -105,8 +107,8 @@ is version-gated (`LEIA_NEURD_HAS`).
   `DXR_LEIA_LIFT_BACKEND=cuda` in the **service's** environment (`displayxr-service.exe`
   reads its own env, not the client's). The default adapter must be the NVIDIA GPU for
   the interop to bind — on a hybrid box, pin the service to the dGPU.
-- **SBS and DEPTH only.** N-view needs interactive convert (0.4.5+); caps drop NVIEW once
-  ready, and tracked-eye viewpoints are ignored (SBS uses NeurD's default pattern).
+- **SBS and DEPTH only** (as on every NeurD today — see *N-view*); without interactive
+  convert (0.4.5+) tracked-eye viewpoints are ignored (SBS uses NeurD's default pattern).
   Because 0.3.x hands back a texture, DEPTH arrives as `R8G8B8A8_UNORM` (copied as-is),
   not `R8_UNORM`; `lift_convert`'s `out_format` reports which. That texture path is **not**
   polarity-flipped: DEPTH stays NeurD's near = high, contrary to RELATIVE (known gap).
@@ -185,7 +187,25 @@ Viewpoint source, in order:
 
 For N views from an eye pair, views are spaced one eye baseline apart and centred on
 the eye midpoint. If NeurD predates the interactive API (< 0.4.5), SBS falls back to the
-default pattern and NVIEW is refused.
+default pattern. (The N-view paths are unreachable today: NVIEW streams are refused.)
+
+## N-view
+
+**Not available on NeurD ≤ 0.4.6.** NeurD's `Config::adjust()` runs on every convert
+(including the interactive one) and re-derives the tile grid from the output type —
+SBS → 2×1, TB → 1×2, DEPTH → 1×1 — and the public `NEURD_PROP_OUTPUT_TYPE` accepts only
+those, so `OUTPUT_TILES_W/H` are overridden. Panel-verified: a 4-view request came back
+as a plain 2-tile SBS. Caps never advertise NVIEW, and `lift_stream_create(NVIEW)` fails
+with a WARN. What works: SBS with explicit viewpoints (two, from the runtime or tracked
+eyes).
+
+### Asks for Leia media_sdk
+
+- A tiled / multiview output type usable with `convert_stream_dx_interactive`
+  (N viewpoints → N tiles in one convert).
+- A public release of the 0.4.4 *internal-interactive* build (interactive entries in a
+  build whose reported version matches its table).
+- A working 0.4.6 package.
 
 ## Parameters
 
@@ -195,7 +215,7 @@ default pattern and NVIEW is refused.
 | `convergence` in [0, 1] | `AUTO_CONVERGENCE = FALSE`, `CONVERGENCE = clamp(K · (c − 0.5), ±0.2)`, K = `DXR_LEIA_LIFT_CONV_GAIN` |
 | `strength` | `GAIN_MULTIPLIER` (1 = NeurD's calibrated budget, 0 = flat), clamped [0, 10]; negative → 1.0 |
 | `inpaint` | NeurD always fills disocclusions: 0 → `V1_STRETCH` (cheapest), non-zero → `V1_BLUR` (the DX video path supports V1 only) |
-| `view_count` | NVIEW row width (2..8) |
+| `view_count` | NVIEW row width — unused (NVIEW not offered on NeurD) |
 
 **Convergence calibration.** The runtime's `convergence` is the relative depth placed
 at the display plane, normalised to [0, 1] over the frame's depth range (0 = nearest
@@ -318,9 +338,7 @@ lift-enabled runtime + this plug-in registered:
   (a first activation in progress) is unsafe. The runtime does not unload plug-ins
   mid-session today.
 - Caps are frozen once READY: the runtime (`d3d11_lift.cpp`) polls `lift_get_caps` only
-  while the module is not READY. If interactive convert later reports
-  `NEURD_UNAVAILABLE_OUTDATED_RUNTIME` at convert time, the plug-in latches it and refuses
-  N-view, but the runtime keeps the NVIEW bit it read at READY; N-view requests then fail
-  per convert rather than being rejected at stream creation.
+  while the module is not READY. A convert-time `NEURD_UNAVAILABLE_OUTDATED_RUNTIME`
+  latch (SBS then falls back to the default pattern) is therefore not reflected in caps.
 - NeurD's 32-stream limit is process-wide and shared with anything else in the
   service process that uses NeurD.
