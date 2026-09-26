@@ -173,7 +173,11 @@ backend_str(enum NeurD_backend b)
 
 /*
  *
- * Env knobs (read once per DP handle, at leia_lift_neurd_create).
+ * Knobs (read once per DP handle, at leia_lift_neurd_create). Each comes from
+ * the environment, else HKLM\SOFTWARE\DisplayXR\Leia\Lift (REG_SZ, same
+ * grammar), else its default. The registry exists because a respawned service
+ * (tray relaunch, HKLM Run at logon, crash restart) starts with the logon env
+ * and would otherwise lose env-only knobs silently.
  *
  */
 
@@ -185,20 +189,169 @@ enum backend_choice
 	BACKEND_OPENVINO = NEURD_BACKEND_OPENVINO,
 };
 
+enum knob_src
+{
+	KSRC_DEFAULT = 0,
+	KSRC_ENV,
+	KSRC_REG,
+};
+
+const char *
+knob_src_str(knob_src s)
+{
+	switch (s) {
+	case KSRC_ENV: return "env";
+	case KSRC_REG: return "reg";
+	default: return "default";
+	}
+}
+
 struct knobs
 {
-	bool enabled;         //!< DXR_LEIA_LIFT (default on)
-	int backend;          //!< DXR_LEIA_LIFT_BACKEND (default directml)
-	int32_t autoscaling;  //!< DXR_LEIA_LIFT_SCALE (default 720p)
-	bool scale_forced;    //!< DXR_LEIA_LIFT_SCALE was set: overrides the stream's input_scale
-	float view_gain;      //!< DXR_LEIA_LIFT_VIEW_GAIN (default 1.0)
-	float conv_gain;      //!< DXR_LEIA_LIFT_CONV_GAIN (default 0.4): relative convergence -> NeurD units
+	bool enabled;             //!< DXR_LEIA_LIFT (default on; env only)
+	int backend;              //!< DXR_LEIA_LIFT_BACKEND / Backend (default directml)
+	int32_t autoscaling;      //!< DXR_LEIA_LIFT_SCALE / Scale (default 720p)
+	bool scale_forced;        //!< Scale was set: overrides the stream's input_scale
+	float view_gain;          //!< DXR_LEIA_LIFT_VIEW_GAIN / ViewGain (default 1.0)
+	float conv_gain;          //!< DXR_LEIA_LIFT_CONV_GAIN / ConvGain (default 0.4): relative convergence -> NeurD units
+	uint64_t interactive_min; //!< DXR_LEIA_LIFT_INTERACTIVE_MIN / InteractiveMin; 0 = unset (header's INTRODUCED_IN)
+	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min;
 };
 
 bool
 env_ieq(const char *a, const char *b)
 {
 	return _stricmp(a, b) == 0;
+}
+
+const wchar_t *const kLiftRegKey = L"SOFTWARE\\DisplayXR\\Leia\\Lift";
+
+/*!
+ * One knob's raw string: env @p env_name if set and non-empty, else REG_SZ
+ * @p reg_name under @p reg (may be NULL), else absent. @p out is UTF-8.
+ */
+knob_src
+knob_lookup(HKEY reg, const char *env_name, const wchar_t *reg_name, char *out, size_t cap)
+{
+	out[0] = '\0';
+	const char *e = std::getenv(env_name);
+	if (e != nullptr && e[0] != '\0') {
+		snprintf(out, cap, "%s", e);
+		return KSRC_ENV;
+	}
+	if (reg == nullptr) {
+		return KSRC_DEFAULT;
+	}
+	wchar_t w[128] = {};
+	DWORD cb = sizeof(w); // bytes, incl. the terminator RegGetValueW guarantees
+	LSTATUS r = RegGetValueW(reg, nullptr, reg_name, RRF_RT_REG_SZ, nullptr, w, &cb);
+	if (r == ERROR_FILE_NOT_FOUND) {
+		return KSRC_DEFAULT;
+	}
+	if (r != ERROR_SUCCESS) {
+		U_LOG_W("Leia lift: HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift\\%ls unreadable (error %ld, REG_SZ <= 127 chars "
+		        "expected) — ignored",
+		        reg_name, (long)r);
+		return KSRC_DEFAULT;
+	}
+	if (w[0] == L'\0') {
+		return KSRC_DEFAULT;
+	}
+	int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, nullptr, nullptr);
+	if (n <= 0) {
+		out[0] = '\0';
+		return KSRC_DEFAULT;
+	}
+	return KSRC_REG;
+}
+
+// ---- One grammar per knob, shared by both sources. Each returns false on a
+// value it does not recognise (caller WARNs and keeps the default).
+
+bool
+parse_backend(const char *v, int *out)
+{
+	if (env_ieq(v, "auto")) {
+		*out = BACKEND_AUTO;
+	} else if (env_ieq(v, "cuda")) {
+		*out = BACKEND_CUDA;
+	} else if (env_ieq(v, "directml") || env_ieq(v, "dml")) {
+		*out = BACKEND_DIRECTML;
+	} else if (env_ieq(v, "openvino")) {
+		*out = BACKEND_OPENVINO;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+bool
+parse_scale(const char *v, int32_t *out)
+{
+	if (env_ieq(v, "none") || env_ieq(v, "native") || env_ieq(v, "0")) {
+		*out = NEURD_INPUT_AUTOSCALING_NONE;
+	} else if (env_ieq(v, "720") || env_ieq(v, "720p")) {
+		*out = NEURD_INPUT_AUTOSCALING_720P;
+	} else if (env_ieq(v, "1080") || env_ieq(v, "1080p")) {
+		*out = NEURD_INPUT_AUTOSCALING_1080P;
+	} else if (env_ieq(v, "1440") || env_ieq(v, "1440p")) {
+		*out = NEURD_INPUT_AUTOSCALING_1440P;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+bool
+parse_float_in(const char *v, float lo, float hi, float *out)
+{
+	char *end = nullptr;
+	float f = std::strtof(v, &end);
+	if (end == v || *end != '\0' || !std::isfinite(f) || f < lo || f > hi) {
+		return false;
+	}
+	*out = f;
+	return true;
+}
+
+//! Strict "MAJ.MIN.PAT" (no sscanf: MSVC C4996), clamped to >= 0.4.4.
+bool
+parse_interactive_min(const char *v, uint64_t *out)
+{
+	unsigned long part[3] = {0, 0, 0};
+	const char *c = v;
+	bool ok = true;
+	for (int i = 0; i < 3 && ok; i++) {
+		char *end = nullptr;
+		part[i] = std::strtoul(c, &end, 10);
+		ok = end != c && *end == (i < 2 ? '.' : '\0');
+		c = end + (i < 2 ? 1 : 0);
+	}
+	if (!ok) {
+		return false;
+	}
+	const uint64_t floor_v = NEURD_MAKE_VERSION(0, 4, 4);
+	const uint64_t ver = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
+	*out = (ver < floor_v) ? floor_v : ver;
+	return true;
+}
+
+const char *
+scale_str(int32_t a)
+{
+	switch (a) {
+	case NEURD_INPUT_AUTOSCALING_NONE: return "none";
+	case NEURD_INPUT_AUTOSCALING_720P: return "720";
+	case NEURD_INPUT_AUTOSCALING_1080P: return "1080";
+	case NEURD_INPUT_AUTOSCALING_1440P: return "1440";
+	default: return "?";
+	}
+}
+
+const char *
+backend_choice_str(int b)
+{
+	return b == BACKEND_AUTO ? "auto" : backend_str((enum NeurD_backend)b);
 }
 
 struct knobs
@@ -210,62 +363,74 @@ read_knobs()
 	k.autoscaling = NEURD_INPUT_AUTOSCALING_720P;
 	k.view_gain = 1.0f;
 	k.conv_gain = 0.4f;
+	k.interactive_min = 0;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
 		k.enabled = false;
 	}
 
-	e = std::getenv("DXR_LEIA_LIFT_BACKEND");
-	if (e != nullptr && e[0] != '\0') {
-		if (env_ieq(e, "auto")) {
-			k.backend = BACKEND_AUTO;
-		} else if (env_ieq(e, "cuda")) {
-			k.backend = BACKEND_CUDA;
-		} else if (env_ieq(e, "directml") || env_ieq(e, "dml")) {
-			k.backend = BACKEND_DIRECTML;
-		} else if (env_ieq(e, "openvino")) {
-			k.backend = BACKEND_OPENVINO;
+	// Explicit 64-bit view: the service is 64-bit, but a WOW64 host must not
+	// be redirected to Wow6432Node.
+	HKEY reg = nullptr;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kLiftRegKey, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &reg) != ERROR_SUCCESS) {
+		reg = nullptr;
+	}
+
+	char v[256];
+	knob_src src;
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_BACKEND", L"Backend", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_backend(v, &k.backend)) {
+			k.src_backend = src;
 		} else {
-			U_LOG_W("Leia lift: DXR_LEIA_LIFT_BACKEND='%s' not recognised (auto|directml|cuda|openvino) — "
-			        "using directml",
-			        e);
+			U_LOG_W("Leia lift: backend '%s' (%s) not recognised (auto|directml|cuda|openvino) — using directml", v,
+			        knob_src_str(src));
 		}
 	}
 
-	e = std::getenv("DXR_LEIA_LIFT_SCALE");
-	if (e != nullptr && e[0] != '\0') {
-		k.scale_forced = true;
-		if (env_ieq(e, "none") || env_ieq(e, "native") || env_ieq(e, "0")) {
-			k.autoscaling = NEURD_INPUT_AUTOSCALING_NONE;
-		} else if (env_ieq(e, "720") || env_ieq(e, "720p")) {
-			k.autoscaling = NEURD_INPUT_AUTOSCALING_720P;
-		} else if (env_ieq(e, "1080") || env_ieq(e, "1080p")) {
-			k.autoscaling = NEURD_INPUT_AUTOSCALING_1080P;
-		} else if (env_ieq(e, "1440") || env_ieq(e, "1440p")) {
-			k.autoscaling = NEURD_INPUT_AUTOSCALING_1440P;
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_SCALE", L"Scale", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		k.scale_forced = true; // as before: a set-but-unrecognised value still forces 720
+		if (parse_scale(v, &k.autoscaling)) {
+			k.src_scale = src;
 		} else {
-			U_LOG_W("Leia lift: DXR_LEIA_LIFT_SCALE='%s' not recognised (720|1080|1440|none) — using 720", e);
+			U_LOG_W("Leia lift: scale '%s' (%s) not recognised (720|1080|1440|none) — using 720", v,
+			        knob_src_str(src));
 		}
 	}
 
-	e = std::getenv("DXR_LEIA_LIFT_VIEW_GAIN");
-	if (e != nullptr && e[0] != '\0') {
-		float g = (float)std::atof(e);
-		if (std::isfinite(g) && g >= 0.0f && g <= 10.0f) {
-			k.view_gain = g;
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_VIEW_GAIN", L"ViewGain", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, 0.0f, 10.0f, &k.view_gain)) {
+			k.src_view_gain = src;
 		} else {
-			U_LOG_W("Leia lift: DXR_LEIA_LIFT_VIEW_GAIN='%s' out of range [0,10] — using 1.0", e);
+			U_LOG_W("Leia lift: view gain '%s' (%s) not a number in [0,10] — using 1.0", v, knob_src_str(src));
 		}
 	}
-	e = std::getenv("DXR_LEIA_LIFT_CONV_GAIN");
-	if (e != nullptr && e[0] != '\0') {
-		float cg = (float)std::atof(e);
-		if (std::isfinite(cg) && cg >= -2.0f && cg <= 2.0f) {
-			k.conv_gain = cg;
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_CONV_GAIN", L"ConvGain", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, -2.0f, 2.0f, &k.conv_gain)) {
+			k.src_conv_gain = src;
 		} else {
-			U_LOG_W("Leia lift: DXR_LEIA_LIFT_CONV_GAIN='%s' out of range [-2,2] — using 0.4", e);
+			U_LOG_W("Leia lift: conv gain '%s' (%s) not a number in [-2,2] — using 0.4", v, knob_src_str(src));
 		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_INTERACTIVE_MIN", L"InteractiveMin", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_interactive_min(v, &k.interactive_min)) {
+			k.src_interactive_min = src;
+		} else {
+			U_LOG_W("Leia lift: interactive min '%s' (%s) not a version (e.g. 0.4.4) — ignored", v,
+			        knob_src_str(src));
+		}
+	}
+
+	if (reg != nullptr) {
+		RegCloseKey(reg);
 	}
 	return k;
 }
@@ -350,6 +515,7 @@ struct global
 
 	int requested_backend = BACKEND_DIRECTML; //!< First acquirer's choice (NeurD's forced backend is sticky).
 	int32_t default_autoscaling = NEURD_INPUT_AUTOSCALING_720P;
+	struct knobs k0 = {}; //!< First acquirer's knobs (logged + interactive_min at activation).
 
 	HMODULE lib = nullptr;
 	struct NeurD const *nd = nullptr;
@@ -541,41 +707,6 @@ compile_cs(ID3D11Device *dev, const char *src, const char *name)
 		return nullptr;
 	}
 	return cs;
-}
-
-/*!
- * DXR_LEIA_LIFT_INTERACTIVE_MIN ("0.4.4"): demo-only override of the version at
- * which convert_stream_dx_interactive is trusted. The 0.4.4 internal-interactive
- * NeurD package reports 0.4.4 but carries the (header: 0.4.5) interactive
- * entries. Only NeurD_load is exported and a stock 0.4.4 table is too short to
- * read that slot, so the version is the only discriminator — hence opt-in.
- * Clamped to >= 0.4.4. Returns false when unset or unparsable.
- */
-bool
-interactive_min_from_env(uint64_t *out)
-{
-	const char *e = std::getenv("DXR_LEIA_LIFT_INTERACTIVE_MIN");
-	if (e == nullptr || e[0] == '\0') {
-		return false;
-	}
-	// Strict "MAJ.MIN.PAT" (no sscanf: MSVC C4996).
-	unsigned long part[3] = {0, 0, 0};
-	const char *c = e;
-	bool ok = true;
-	for (int i = 0; i < 3 && ok; i++) {
-		char *end = nullptr;
-		part[i] = std::strtoul(c, &end, 10);
-		ok = end != c && *end == (i < 2 ? '.' : '\0');
-		c = end + (i < 2 ? 1 : 0);
-	}
-	if (!ok) {
-		U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN='%s' not a version (e.g. 0.4.4) — ignored", e);
-		return false;
-	}
-	const uint64_t floor_v = NEURD_MAKE_VERSION(0, 4, 4);
-	const uint64_t v = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
-	*out = (v < floor_v) ? floor_v : v;
-	return true;
 }
 
 /*!
@@ -791,14 +922,27 @@ activation_worker()
 		std::lock_guard<std::mutex> lock(g.mtx);
 		g.backend = be;
 		snprintf(g.backend_name, sizeof(g.backend_name), "neurd-%s", backend_str(be));
+		const struct knobs &k0 = g.k0;
 		uint64_t interactive_min = NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
-		if (interactive_min_from_env(&interactive_min)) {
-			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u — assuming interactive convert on NeurD "
+		if (k0.interactive_min != 0) {
+			interactive_min = k0.interactive_min;
+		}
+		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) scale=%s(%s) view_gain=%.2f(%s) "
+		        "conv_gain=%.2f(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
+		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
+		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
+		        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
+		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
+		        knob_src_str(k0.src_conv_gain));
+		if (k0.interactive_min != 0) {
+			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u (%s) — assuming interactive convert on NeurD "
 			        "%u.%u.%u (only for the internal-interactive dev package; a stock 0.4.4 will crash here)",
 			        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min),
 			        (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
-			        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), (unsigned)NEURD_GET_VERSION_MAJOR(nd->version),
-			        (unsigned)NEURD_GET_VERSION_MINOR(nd->version), (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
+			        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
+			        (unsigned)NEURD_GET_VERSION_MAJOR(nd->version), (unsigned)NEURD_GET_VERSION_MINOR(nd->version),
+			        (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
 		}
 		g.interactive_unavailable = !(nd->version >= interactive_min && nd->convert_stream_dx_interactive != nullptr);
 		g.interactive_direct_slot = !g.interactive_unavailable.load() &&
@@ -819,7 +963,7 @@ activation_worker()
  * touch, and (re)start the activation worker when due.
  */
 void
-kick(int requested_backend, int32_t default_autoscaling)
+kick(const struct knobs &k)
 {
 	uint32_t s = g.state.load();
 	if (s == G_UNPROBED) {
@@ -846,8 +990,9 @@ kick(int requested_backend, int32_t default_autoscaling)
 		return;
 	}
 	if (s == G_UNPROBED) {
-		g.requested_backend = requested_backend;
-		g.default_autoscaling = default_autoscaling;
+		g.requested_backend = k.backend;
+		g.default_autoscaling = k.autoscaling;
+		g.k0 = k;
 	}
 	g.state.store(G_LOADING);
 	try {
@@ -1312,7 +1457,7 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	if (l == nullptr || !l->k.enabled) {
 		return true; // modes 0 / UNAVAILABLE — a valid answer, not a failure.
 	}
-	kick(l->k.backend, l->k.autoscaling);
+	kick(l->k);
 
 	uint32_t s = g.state.load();
 	out->state = public_state(s);
@@ -1364,7 +1509,7 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 		LIFT_WARN_ONCE("Leia lift: stream_create with unsupported mode %u", desc->mode);
 		return false;
 	}
-	kick(l->k.backend, l->k.autoscaling);
+	kick(l->k);
 	if (public_state(g.state.load()) == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return false;
 	}
@@ -1436,7 +1581,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 	}
 	*out_resource = nullptr;
 
-	kick(l->k.backend, l->k.autoscaling);
+	kick(l->k);
 	if (g.state.load() != G_READY) {
 		return false; // ACTIVATING or UNAVAILABLE — caps says which.
 	}
