@@ -186,6 +186,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lens_owner_linux
 
+      - name: Unit test — stereo camera source parsing (runtime ADR-043, L1)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_stereo_camera_parse
+
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
