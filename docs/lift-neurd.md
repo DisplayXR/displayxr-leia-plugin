@@ -104,8 +104,8 @@ is version-gated (`LEIA_NEURD_HAS`).
   same device, so the bridge is otherwise unchanged. One WARN names the case and the LUID.
 - **CUDA backend required for the DX path on 0.3.x.** Its DX convert is implemented on
   CUDA↔D3D11 interop; the DirectML build's DX path is not verified. Set
-  `DXR_LEIA_LIFT_BACKEND=cuda` in the **service's** environment (`displayxr-service.exe`
-  reads its own env, not the client's). The default adapter must be the NVIDIA GPU for
+  backend `cuda` — `DXR_LEIA_LIFT_BACKEND=cuda` in the **service's** environment, or
+  better the `Backend` registry value (see *Knobs*), which survives service respawns. The default adapter must be the NVIDIA GPU for
   the interop to bind — on a hybrid box, pin the service to the dGPU.
 - **SBS and DEPTH only** (as on every NeurD today — see *N-view*); without interactive
   convert (0.4.5+) tracked-eye viewpoints are ignored (SBS uses NeurD's default pattern).
@@ -239,19 +239,39 @@ inference resolution.
 
 ## Knobs
 
-Read once per DP at create (`leia_lift_neurd_create`).
+Read once per DP at create (`leia_lift_neurd_create`). Each knob comes from the
+**environment**, else the **registry** (`HKLM\SOFTWARE\DisplayXR\Leia\Lift`, REG_SZ,
+64-bit view, same grammar as the env var), else its default — env > registry > default.
+At activation one WARN lists every knob's effective value and where it came from:
 
-| Env | Default | Effect |
-|---|---|---|
-| `DXR_LEIA_LIFT` | on | `0` / `off` → caps `modes=0, state=0`; NeurD is never probed or loaded. |
-| `DXR_LEIA_LIFT_BACKEND` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). On NeurD 0.4.3+ only DirectML yields a D3D11 device; on 0.3.x use `cuda` (see *NeurD 0.3.x*). |
-| `DXR_LEIA_LIFT_SCALE` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
-| `DXR_LEIA_LIFT_VIEW_GAIN` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
-| `DXR_LEIA_LIFT_CONV_GAIN` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
-| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. Read at activation; one WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). |
+```
+Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
+```
 
-Under the service, remember these are read by `displayxr-service.exe`'s environment,
-not the client's.
+**Why the registry.** Under the service the knobs are read from `displayxr-service.exe`'s
+environment, not the client's. Any respawn — tray relaunch, the HKLM `Run` key at logon,
+a crash restart — starts the service with the logon environment, and env-only knobs
+vanish silently (the only tell was "interactive viewpoints UNAVAILABLE"). A registry
+value survives every respawn. Env still wins when set, so `.bat`-driven runs behave as
+before; with neither set, nothing changes.
+
+| Env | Registry value | Default | Effect |
+|---|---|---|---|
+| `DXR_LEIA_LIFT` | — (env only) | on | `0` / `off` → caps `modes=0, state=0`; NeurD is never probed or loaded. |
+| `DXR_LEIA_LIFT_BACKEND` | `Backend` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). On NeurD 0.4.3+ only DirectML yields a D3D11 device; on 0.3.x use `cuda` (see *NeurD 0.3.x*). |
+| `DXR_LEIA_LIFT_SCALE` | `Scale` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
+| `DXR_LEIA_LIFT_VIEW_GAIN` | `ViewGain` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
+| `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
+| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). |
+
+The two demo knobs, set once on the box (elevated prompt), then restart the service:
+
+```bat
+reg add "HKLM\SOFTWARE\DisplayXR\Leia\Lift" /v Backend /t REG_SZ /d directml /f /reg:64
+reg add "HKLM\SOFTWARE\DisplayXR\Leia\Lift" /v InteractiveMin /t REG_SZ /d 0.4.4 /f /reg:64
+```
+
+`scripts\set-lift-knobs.bat` does exactly this (`--clear` deletes the key).
 
 ## Building
 
