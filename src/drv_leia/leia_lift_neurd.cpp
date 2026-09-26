@@ -370,6 +370,10 @@ struct global
 	uint64_t next_stream_id = 1;
 	//! Written under g.mtx; atomic because caps reads it lock-free.
 	std::atomic<bool> interactive_unavailable{false};
+	//! DXR_LEIA_LIFT_INTERACTIVE_MIN admitted a NeurD older than the header's
+	//! INTRODUCED_IN: call the table slot directly (the inline wrapper would
+	//! re-check 0.4.5 and return OUTDATED_RUNTIME). Set at activation.
+	bool interactive_direct_slot = false;
 
 	//! Last-applied global NeurD properties (avoid a worker round-trip per prop per frame).
 	bool props_valid = false;
@@ -572,6 +576,23 @@ interactive_min_from_env(uint64_t *out)
 	const uint64_t v = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
 	*out = (v < floor_v) ? floor_v : v;
 	return true;
+}
+
+/*!
+ * NeurD_convert_stream_dx_interactive, honouring DXR_LEIA_LIFT_INTERACTIVE_MIN:
+ * the header's inline wrapper re-checks version >= INTRODUCED_IN (0.4.5), so
+ * when the override admitted an older-reporting runtime the table slot is
+ * called directly (same arguments minus @p nd). Called with g.mtx held.
+ */
+enum NeurD_status
+nd_convert_stream_dx_interactive(struct NeurD const *nd, struct NeurD_stream *stream, struct NeurD_image const *input,
+                                 const float *viewpoints_xyz, int size, enum NeurD_pixel_format output_pix_fmt,
+                                 struct NeurD_image *output)
+{
+	if (g.interactive_direct_slot && nd->convert_stream_dx_interactive != nullptr) {
+		return nd->convert_stream_dx_interactive(stream, input, viewpoints_xyz, size, output_pix_fmt, output);
+	}
+	return NeurD_convert_stream_dx_interactive(nd, stream, input, viewpoints_xyz, size, output_pix_fmt, output);
 }
 
 //! Drop g.nd_dev: Released only when the plug-in created it. Called with g.mtx held.
@@ -780,6 +801,8 @@ activation_worker()
 			        (unsigned)NEURD_GET_VERSION_MINOR(nd->version), (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
 		}
 		g.interactive_unavailable = !(nd->version >= interactive_min && nd->convert_stream_dx_interactive != nullptr);
+		g.interactive_direct_slot = !g.interactive_unavailable.load() &&
+		                            nd->version < NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
 		g.props_valid = false;
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
 		if (next == G_READY) {
@@ -1642,8 +1665,8 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		struct NeurD_image nout = {};
 		enum NeurD_status st;
 		if (!vp.empty() && !g.interactive_unavailable) {
-			st = NeurD_convert_stream_dx_interactive(nd, s->ns, &nin, vp.data(), (int)vp.size(),
-			                                       NEURD_PIXEL_FORMAT_RGBA8, &nout);
+			st = nd_convert_stream_dx_interactive(nd, s->ns, &nin, vp.data(), (int)vp.size(),
+			                                      NEURD_PIXEL_FORMAT_RGBA8, &nout);
 			if (st == NEURD_UNAVAILABLE_OUTDATED_RUNTIME) {
 				g.interactive_unavailable = true;
 				U_LOG_W("Leia lift: NeurD interactive convert unavailable — tracked viewpoints ignored");
