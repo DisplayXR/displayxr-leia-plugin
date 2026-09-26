@@ -228,7 +228,7 @@ Read once per DP at create (`leia_lift_neurd_create`).
 | `DXR_LEIA_LIFT_SCALE` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
 | `DXR_LEIA_LIFT_VIEW_GAIN` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
 | `DXR_LEIA_LIFT_CONV_GAIN` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
-| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. Read at activation; one WARN when in effect. |
+| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. Read at activation; one WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). |
 
 Under the service, remember these are read by `displayxr-service.exe`'s environment,
 not the client's.
@@ -317,5 +317,10 @@ lift-enabled runtime + this plug-in registered:
 - The activation thread is detached; unloading the plug-in DLL while it runs
   (a first activation in progress) is unsafe. The runtime does not unload plug-ins
   mid-session today.
+- Caps are frozen once READY: the runtime (`d3d11_lift.cpp`) polls `lift_get_caps` only
+  while the module is not READY. If interactive convert later reports
+  `NEURD_UNAVAILABLE_OUTDATED_RUNTIME` at convert time, the plug-in latches it and refuses
+  N-view, but the runtime keeps the NVIEW bit it read at READY; N-view requests then fail
+  per convert rather than being rejected at stream creation.
 - NeurD's 32-stream limit is process-wide and shared with anything else in the
   service process that uses NeurD.
