@@ -20,7 +20,7 @@
  *    decides when to shrink NeurD's memory pool.
  *
  *  - Device bridge (the LeiaMeet DxStereoConverter pattern). NeurD runs on ITS
- *    OWN D3D11 device (NeurD_get_dx_device), possibly on a different adapter
+ *    OWN D3D11 device (NeurD_get_dx_device, 0.4.3+), possibly on a different adapter
  *    than the runtime's service device on hybrid boxes. NeurD's DX input must
  *    be a raw RGBA8 ID3D11Buffer with D3D11_RESOURCE_MISC_SHARED, and NeurD
  *    hands its output back on the input buffer's device. Buffers do not share
@@ -37,6 +37,12 @@
  *
  *    Every hop is CPU-drained with an event query: NeurD's DirectML work runs
  *    on its own queue, unordered against any D3D11 context.
+ *
+ *    NeurD 0.3.11-0.4.2 has the stream API but no get_dx_device. There the
+ *    plug-in creates the "NeurD device" itself (default adapter, like the SDK's
+ *    own example) and owns it; NeurD 0.3.x's CUDA DX path runs its D3D11-CUDA
+ *    interop on whatever device the input buffer lives on and hands back an
+ *    RGBA8 texture on that same device, so the bridge is unchanged.
  *
  *  - NeurD properties are process-global, so the (set props -> convert) pair
  *    must be atomic across streams: one process-wide mutex serialises every
@@ -347,7 +353,8 @@ struct global
 	enum NeurD_backend backend = NEURD_BACKEND_DIRECTML;
 	char backend_name[32] = {};
 
-	ID3D11Device *nd_dev = nullptr; //!< NeurD-owned: never Released.
+	ID3D11Device *nd_dev = nullptr; //!< NeurD-owned (never Released) unless nd_dev_owned.
+	bool nd_dev_owned = false;      //!< nd_dev is the plug-in's own device (NeurD < 0.4.3): Release it.
 	ID3D11DeviceContext *nd_ctx = nullptr;
 	ID3D11Query *nd_done = nullptr;
 	ID3D11ComputeShader *cs_pack = nullptr;
@@ -358,7 +365,8 @@ struct global
 
 	int refcount = 0;
 	uint64_t next_stream_id = 1;
-	bool interactive_unavailable = false;
+	//! Written under g.mtx; atomic because caps reads it lock-free.
+	std::atomic<bool> interactive_unavailable{false};
 
 	//! Last-applied global NeurD properties (avoid a worker round-trip per prop per frame).
 	bool props_valid = false;
@@ -528,16 +536,59 @@ compile_cs(ID3D11Device *dev, const char *src, const char *name)
 	return cs;
 }
 
+//! Drop g.nd_dev: Released only when the plug-in created it. Called with g.mtx held.
+void
+release_nd_dev_locked()
+{
+	if (g.nd_dev_owned) {
+		safe_release(g.nd_dev);
+	}
+	g.nd_dev = nullptr;
+	g.nd_dev_owned = false;
+}
+
 //! Build the NeurD-device side of the bridge. Called with g.mtx held.
 bool
 setup_nd_device_locked()
 {
-	g.nd_dev = static_cast<ID3D11Device *>(NeurD_get_dx_device(g.nd));
-	if (g.nd_dev == nullptr) {
-		U_LOG_W("Leia lift: NeurD backend '%s' exposes no D3D11 device — the D3D11 lift path needs the "
-		        "DirectML backend (DXR_LEIA_LIFT_BACKEND=directml). Lift unavailable.",
-		        g.backend_name);
-		return false;
+	if (LEIA_NEURD_HAS(g.nd, get_dx_device)) {
+		g.nd_dev = static_cast<ID3D11Device *>(NeurD_get_dx_device(g.nd));
+		g.nd_dev_owned = false;
+		if (g.nd_dev == nullptr) {
+			U_LOG_W("Leia lift: NeurD backend '%s' exposes no D3D11 device — the D3D11 lift path needs the "
+			        "DirectML backend (DXR_LEIA_LIFT_BACKEND=directml). Lift unavailable.",
+			        g.backend_name);
+			return false;
+		}
+	} else {
+		// NeurD < 0.4.3: no get_dx_device. NeurD takes the device from the
+		// input buffer (GetDevice) and returns its output on that device, so
+		// the plug-in supplies the device — default adapter, as NeurD's own
+		// example does.
+		ID3D11Device *dev = nullptr;
+		ID3D11DeviceContext *ctx = nullptr;
+		HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+		                               nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx);
+		if (FAILED(hr) || dev == nullptr || ctx == nullptr) {
+			U_LOG_W("Leia lift: NeurD < 0.4.3 and D3D11CreateDevice for the plug-in's bridge device failed "
+			        "(0x%08x) — lift unavailable",
+			        (unsigned)hr);
+			safe_release(ctx);
+			safe_release(dev);
+			return false;
+		}
+		// GetImmediateContext below takes its own reference.
+		ctx->Release();
+		g.nd_dev = dev;
+		g.nd_dev_owned = true;
+		LUID l = {};
+		const bool have_luid = device_luid(dev, &l);
+		U_LOG_W("Leia lift: NeurD < 0.4.3: no get_dx_device — using the plug-in's own D3D11 device on the "
+		        "default adapter (LUID %08lx:%08lx)%s",
+		        have_luid ? (unsigned long)l.HighPart : 0UL, have_luid ? (unsigned long)l.LowPart : 0UL,
+		        g.backend == NEURD_BACKEND_CUDA ? ""
+		                                        : " — NeurD 0.3.x's DX path needs the CUDA backend "
+		                                          "(DXR_LEIA_LIFT_BACKEND=cuda); converts may fail");
 	}
 	g.nd_dev->GetImmediateContext(&g.nd_ctx);
 	enable_mt_protection(g.nd_ctx, "NeurD");
@@ -560,7 +611,7 @@ setup_nd_device_locked()
 		safe_release(g.nd_done);
 		safe_release(g.cb);
 		safe_release(g.nd_ctx);
-		g.nd_dev = nullptr;
+		release_nd_dev_locked();
 		return false;
 	}
 	if (device_luid(g.nd_dev, &g.nd_luid)) {
@@ -609,10 +660,9 @@ activation_worker()
 			        NEURD_GET_VERSION_MINOR(NEURD_VERSION),
 			        NEURD_GET_VERSION_PATCH(NEURD_VERSION));
 			if (NEURD_GET_VERSION_MAJOR(nd->version) != 0 ||
-			    !LEIA_NEURD_HAS(nd, convert_stream_dx) || !LEIA_NEURD_HAS(nd, get_dx_device) ||
-			    !LEIA_NEURD_HAS(nd, create_stream) || !LEIA_NEURD_HAS(nd, set_prop_1i) ||
-			    !LEIA_NEURD_HAS(nd, set_prop_1f)) {
-				U_LOG_W("Leia lift: NeurD runtime too old/new for the D3D11 stream path (need 0.4.3+, "
+			    !LEIA_NEURD_HAS(nd, convert_stream_dx) || !LEIA_NEURD_HAS(nd, create_stream) ||
+			    !LEIA_NEURD_HAS(nd, set_prop_1i) || !LEIA_NEURD_HAS(nd, set_prop_1f)) {
+				U_LOG_W("Leia lift: NeurD runtime too old/new for the D3D11 stream path (need 0.3.11+, "
 				        "major 0) — lift unavailable");
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
@@ -1196,7 +1246,12 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	if (out->state == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return true;
 	}
-	out->modes = LEIA_LIFT_MODE_DEPTH | LEIA_LIFT_MODE_SBS | LEIA_LIFT_MODE_NVIEW;
+	out->modes = LEIA_LIFT_MODE_DEPTH | LEIA_LIFT_MODE_SBS;
+	// N-view needs interactive convert (NeurD 0.4.5+). Known only once READY;
+	// before that, advertise it optimistically (it may still turn out absent).
+	if (s != G_READY || !g.interactive_unavailable.load()) {
+		out->modes |= LEIA_LIFT_MODE_NVIEW;
+	}
 	out->max_streams = kMaxStreams;
 	out->max_views = kMaxViews;
 	out->depth_semantics = 0; // relative: per-frame min-max normalised disparity
