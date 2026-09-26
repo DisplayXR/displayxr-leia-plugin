@@ -48,6 +48,10 @@ layout(push_constant) uniform PC {
 	// (origin 0,0 / extent 1,1) when the canvas fills the target.
 	vec2  canvas_uv_origin;
 	vec2  canvas_uv_extent;
+	// Gate viewport size in pixels. When an atlas tile is the same size
+	// (1:1 — the batched weave's full-window tiles) the atlas is read by
+	// integer texel index instead of filtered.
+	vec2  canvas_px;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -58,11 +62,30 @@ void main()
 	// #121 â€” in_uv is canvas-local (= atlas tile-local); bb_uv is window-local.
 	vec2 bb_uv = pc.canvas_uv_origin + in_uv * pc.canvas_uv_extent;
 
+	// When an atlas tile is the same size as this viewport (the batched weave:
+	// full-window tiles), read the texel by integer index. textureLod at a
+	// texel centre is NOT exact: the sampler converts the coordinate to 8-bit
+	// fixed point and the fp32 centre can land one LSB low, so the bilinear
+	// footprint picks up 1/256 of the neighbouring column -- enough for the
+	// `> 0.0` test to declare a fully transparent column opaque when its
+	// neighbour is opaque (an opaque BLACK 1-px line just OUTSIDE a woven
+	// canvas). Scaled tiles keep the filtered read -- unchanged behaviour there.
+	vec2 tile_px = vec2(textureSize(atlas, 0)) / vec2(pc.tile_count);
+	bool exact = all(lessThan(abs(tile_px - pc.canvas_px), vec2(0.5)));
+
 	bool all_transparent = true;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-			vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
-			if (textureLod(atlas, uv_at_tile, 0.0).a > 0.0) {
+			float a;
+			if (exact) {
+				// in_uv * canvas_px == pixel index + 0.5 (to fp error); truncate.
+				ivec2 px = ivec2(vec2(tx, ty) * tile_px + in_uv * pc.canvas_px);
+				a = texelFetch(atlas, px, 0).a;
+			} else {
+				vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
+				a = textureLod(atlas, uv_at_tile, 0.0).a;
+			}
+			if (a > 0.0) {
 				all_transparent = false;
 			}
 		}

@@ -812,13 +812,14 @@ alpha_gate_ensure_pipeline(leia_dp_cnsdk *impl, VkFormat target_format)
 		}
 	}
 
-	// Pipeline layout: 32-byte push constant (uvec2 tile_count + uint has_backdrop
-	// + uint mode + vec4 canvas — the canvas sub-rect for XR_DXR_display_zones, #568).
+	// Pipeline layout: 40-byte push constant (uvec2 tile_count + uint has_backdrop
+	// + uint mode + vec4 canvas — the canvas sub-rect for XR_DXR_display_zones, #568
+	// + vec2 canvas_px — band size in px, exact-texel read when a tile is 1:1).
 	{
 		VkPushConstantRange pc = {};
 		pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 		pc.offset = 0;
-		pc.size = 32;
+		pc.size = 40;
 		VkPipelineLayoutCreateInfo pli = {};
 		pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 		pli.setLayoutCount = 1;
@@ -2173,6 +2174,7 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		uint32_t has_backdrop;
 		uint32_t mode;
 		float    canvas[4];   // normalized (offset.x, offset.y, extent.x, extent.y)
+		float    canvas_px[2]; // band size in px (exact-texel read when a tile is 1:1)
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
@@ -2191,9 +2193,13 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		push.canvas[1] = (float)canvas_offset_y / (float)h;
 		push.canvas[2] = (float)canvas_width   / (float)w;
 		push.canvas[3] = (float)canvas_height  / (float)h;
+		push.canvas_px[0] = (float)canvas_width;
+		push.canvas_px[1] = (float)canvas_height;
 	} else {
 		push.canvas[0] = 0.0f; push.canvas[1] = 0.0f;
 		push.canvas[2] = 1.0f; push.canvas[3] = 1.0f;
+		push.canvas_px[0] = (float)w;
+		push.canvas_px[1] = (float)h;
 	}
 	vk->vkCmdPushConstants(cmd, impl->ag_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
