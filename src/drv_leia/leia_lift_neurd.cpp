@@ -458,7 +458,14 @@ neurd_log_cb(const char *msg, int size)
 	while (size > 0 && (msg[size - 1] == '\n' || msg[size - 1] == '\r')) {
 		size--;
 	}
-	U_LOG_I("NeurD: %.*s", size, msg);
+	// Until the module is READY these are one-off activation/init lines (licence, model paths,
+	// adapter) and the only place NeurD says WHY an init failed — surface them at the default
+	// log level. Once READY they can be per-stream chatter, so drop back to INFO.
+	if (g.state.load() != G_READY) {
+		U_LOG_W("NeurD: %.*s", size, msg);
+	} else {
+		U_LOG_I("NeurD: %.*s", size, msg);
+	}
 }
 
 bool
