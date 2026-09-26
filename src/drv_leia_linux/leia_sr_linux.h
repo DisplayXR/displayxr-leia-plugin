@@ -369,6 +369,22 @@ leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
                          int32_t *out_x,
                          int32_t *out_y);
 
+/*!
+ * Whether THIS BUILD carries the SR-side drag phase-snap call (#271).
+ *
+ * Build-time truth, not run-time: true when the backend was compiled with
+ * `srWeaverSnapToPhase` (sdk backend + DXR_LEIA_LNX_HAVE_SR_SNAP). A true
+ * here can still meet an SR runtime that predates the call — that case is
+ * logged by @ref leiasr_lnx_snap_to_phase on first use. A false here means
+ * every snap returns identity no matter which runtime is installed, so the DP
+ * logs it once at creation instead of letting drags stutter silently.
+ *
+ * @param[out] out_reason Optional. On false, a static human-readable reason
+ *             (NULL-safe; untouched on true).
+ */
+bool
+leiasr_lnx_has_sr_snap(const char **out_reason);
+
 
 /*
  *

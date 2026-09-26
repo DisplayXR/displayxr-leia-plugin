@@ -2050,12 +2050,23 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 
 	// Which optional runtime slots this build carries — they compile in or out
 	// with the runtime headers the plug-in was pinned to, so say it once.
+	//
+	// The drag phase-snap needs BOTH halves: the runtime slot (runtime headers)
+	// AND srWeaverSnapToPhase on the SR side (SR SDK). The line used to report
+	// only the runtime half, so v2.7.3 said "YES" while every snap returned
+	// identity (#271) — the SR half is stated here too, and its absence gets
+	// its own WARN below. Never spell the SR function name in these always-
+	// compiled strings: CI and package_deb_leia.sh detect the compiled-in call
+	// by grepping the .so's strings for it, and a literal here would satisfy
+	// that check on a build that cannot snap.
 	static bool built_logged = false;
 	if (!built_logged) {
 		built_logged = true;
+		const char *sr_snap_reason = NULL;
+		const bool sr_snap = leiasr_lnx_has_sr_snap(&sr_snap_reason);
 		U_LOG_W(
-		    "leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s; "
-		    "lazy transparency slot: %s",
+		    "leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s "
+		    "(SR-side snap call: %s); lazy transparency slot: %s",
 #ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
 		    "YES",
 #else
@@ -2067,6 +2078,7 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 #else
 		    "NO (runtime headers predate XRT_DP_VK_HAS_SNAP_WINDOW_RECT)",
 #endif
+		    sr_snap ? "YES" : "NO",
 #ifdef XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE
 		    "YES"
 #else
@@ -2074,6 +2086,11 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 		    "runs its desktop capture for its whole lifetime)"
 #endif
 		);
+		if (!sr_snap) {
+			U_LOG_W("leia_lnx_dp: drag phase-snap UNAVAILABLE — %s; every snap returns the raw target, so "
+			        "dragged windows will not phase-snap (3D stutters while moving)",
+			        sr_snap_reason != NULL ? sr_snap_reason : "unknown reason");
+		}
 	}
 
 	*out_xdp = &ldp->base.base;

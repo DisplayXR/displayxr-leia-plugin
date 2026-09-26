@@ -39,8 +39,15 @@ chase. It ships everything the plug-in configures against under `/opt/leiasr`:
 | CMake config package | `/opt/leiasr/lib/cmake/srSDK/srSDKConfig.cmake` |
 | active-runtime registration | `/etc/leia/sr/1/active_runtime.json` (written by this .deb) |
 
-So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`) pins `1.37.0.41935`; the build-number
-difference against `1.37.0.6048` is a **non-issue** (same 1.37.0 / API 1.0.0 surface).
+So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`, `Deb` job `SR_TAG`) pins `1.37.0.10693`.
+**The SDK must ship `srWeaverSnapToPhase` + `srWeaverSetPresentOrigin` (LeiaSR#85)** —
+configure now fails without the snap call (#271) unless you pass
+`-DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON` (bring-up only; the plug-in then logs
+`drag phase-snap UNAVAILABLE` at DP creation and dragged windows never snap). SR build
+numbers are **not ordered across branches**: the earlier CI pin `1.37.0.41935` has the
+higher number but predates the call, and v2.7.3's `.deb` shipped without drag snapping
+because of it. Check `grep srWeaverSnapToPhase <sdk>/include/sr/sr_weaver.h`, not the
+number.
 The old `leiasr-prototype-sdk.zip` (2026-07-06) is dead — it predates
 `SR_WEAVER_BACKEND_VULKAN_BIT` and hasn't compiled since #92. Do NOT commit any SDK
 material anywhere — it is commercial-licensed.
