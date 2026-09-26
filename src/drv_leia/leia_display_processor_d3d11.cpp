@@ -247,6 +247,8 @@ cbuffer Constants : register(b0) {
 	float2 canvas_uv_extent;  // canvas sub-rect size on the window, normalized
 	float2 bg_uv_origin;      // #116 — window TL on monitor, normalized
 	float2 bg_uv_extent;      // #116 — window size on monitor, normalized
+	float2 canvas_px;         // gate viewport size in pixels (exact-texel read when a tile is 1:1)
+	float2 _pad_px;
 };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 float4 main(VSOut i) : SV_Target {
@@ -254,11 +256,33 @@ float4 main(VSOut i) : SV_Target {
 	// over the canvas), so it maps directly to the woven tiger's tile-local UV in
 	// the atlas. The back buffer is full-window, so map i.uv into the window via
 	// the canvas rect. Default (no sub-rect) is origin=(0,0) extent=(1,1) → identity.
+	// When an atlas tile is the same size as this viewport (the batched weave:
+	// full-window tiles), read the texel by integer index. SampleLevel at a
+	// texel centre is NOT exact: the sampler converts the coordinate to 8-bit
+	// fixed point and the fp32 centre can land one LSB low, so the bilinear
+	// footprint picks up 1/256 of the neighbouring column -- enough for the
+	// `> 0.0` test to declare a fully transparent column opaque when its
+	// neighbour is opaque. On screen: an opaque BLACK 1-px line just OUTSIDE a
+	// woven browser canvas, on whichever edge the rounding happens to fall
+	// (runtime dump: atlas column alpha 0, gate output alpha 255, rgb 1).
+	// Scaled tiles keep the filtered read -- unchanged behaviour there.
+	uint atlas_w, atlas_h;
+	atlas.GetDimensions(atlas_w, atlas_h);
+	float2 tile_px = float2(atlas_w, atlas_h) / float2(tile_count);
+	bool exact = all(abs(tile_px - canvas_px) < 0.5);
 	bool all_transparent = true;
 	for (uint ty = 0; ty < tile_count.y; ty++) {
 		for (uint tx = 0; tx < tile_count.x; tx++) {
-			float2 uv_at_tile = (float2(tx, ty) + i.uv) / float2(tile_count);
-			if (atlas.SampleLevel(samp, uv_at_tile, 0).a > 0.0) {
+			float a;
+			if (exact) {
+				// i.uv * canvas_px == pixel index + 0.5 (to fp error); truncate.
+				int2 px = int2(float2(tx, ty) * tile_px + i.uv * canvas_px);
+				a = atlas.Load(int3(px, 0)).a;
+			} else {
+				float2 uv_at_tile = (float2(tx, ty) + i.uv) / float2(tile_count);
+				a = atlas.SampleLevel(samp, uv_at_tile, 0).a;
+			}
+			if (a > 0.0) {
 				all_transparent = false;
 			}
 		}
@@ -312,6 +336,8 @@ struct AlphaGateConstants {
 	float    canvas_uv_extent[2];
 	float    bg_uv_origin[2];  // #116
 	float    bg_uv_extent[2];  // #116
+	float    canvas_px[2];     // gate viewport size in px (exact-texel read when a tile is 1:1)
+	float    pad_px[2];
 };
 
 
@@ -1259,6 +1285,10 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		cb->bg_uv_origin[1] = ldp->bg_uv_last[1];
 		cb->bg_uv_extent[0] = ldp->bg_uv_last[2];
 		cb->bg_uv_extent[1] = ldp->bg_uv_last[3];
+		cb->canvas_px[0] = (float)vp_w;
+		cb->canvas_px[1] = (float)vp_h;
+		cb->pad_px[0] = 0.0f;
+		cb->pad_px[1] = 0.0f;
 		ctx->Unmap(ldp->alpha_gate_constants, 0);
 	}
 
