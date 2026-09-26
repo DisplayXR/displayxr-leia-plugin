@@ -52,10 +52,32 @@ layout(push_constant) uniform PC {
 	// atlas lookup INSIDE the band to band-local UV (the CNSDK weave landed the
 	// eyes 1:1 in the band via leia_interlacer_set_viewport).
 	vec4  canvas;         // (offset.x, offset.y, extent.x, extent.y), all 0..1
+	// Canvas band size in pixels. When an atlas tile is the same size (1:1)
+	// the atlas is read by integer texel index instead of filtered.
+	vec2  canvas_px;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_color;
+
+// Atlas sample for tile (tx, ty) at band-local UV. When a tile is the same size
+// as the band (`exact`), read the texel by integer index. textureLod at a texel
+// centre is NOT exact: the sampler converts the coordinate to 8-bit fixed point
+// and the fp32 centre can land one LSB low, so the bilinear footprint picks up
+// 1/256 of the neighbouring column -- enough for an `a > 0.0` test to declare a
+// fully transparent column opaque when its neighbour is opaque (an opaque 1-px
+// line just OUTSIDE the woven content). Scaled tiles keep the filtered read --
+// unchanged behaviour there.
+vec4 atlas_tile(uint tx, uint ty, vec2 uv_band, vec2 tile_px, bool exact)
+{
+	if (exact) {
+		// uv_band * canvas_px == pixel index + 0.5 (to fp error); truncate.
+		ivec2 px = ivec2(vec2(tx, ty) * tile_px + uv_band * pc.canvas_px);
+		return texelFetch(atlas, px, 0);
+	}
+	vec2 uv_at_tile = (vec2(tx, ty) + uv_band) / vec2(pc.tile_count);
+	return textureLod(atlas, uv_at_tile, 0.0);
+}
 
 void main()
 {
@@ -76,6 +98,9 @@ void main()
 	vec2 uv_band = (in_uv - pc.canvas.xy) / pc.canvas.zw;
 
 	vec3 woven = texture(backbuffer, in_uv).rgb;
+
+	vec2 tile_px = vec2(textureSize(atlas, 0)) / vec2(pc.tile_count);
+	bool exact = all(lessThan(abs(tile_px - pc.canvas_px), vec2(0.5)));
 
 	if (pc.mode == 1u) {
 		// ── Woven per-pixel view-selection (#568 de-occlusion fix) ──
@@ -102,8 +127,7 @@ void main()
 		float sel_a = 1.0;
 		for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 			for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-				vec2 uv_at_tile = (vec2(tx, ty) + uv_band) / vec2(pc.tile_count);
-				vec4 s = textureLod(atlas, uv_at_tile, 0.0);
+				vec4 s = atlas_tile(tx, ty, uv_band, tile_px, exact);
 				float d = distance(woven, s.rgb);
 				if (d < best_d) {
 					best_d = d;
@@ -131,8 +155,7 @@ void main()
 	bool all_transparent = true;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-			vec2 uv_at_tile = (vec2(tx, ty) + uv_band) / vec2(pc.tile_count);
-			if (textureLod(atlas, uv_at_tile, 0.0).a > 0.0) {
+			if (atlas_tile(tx, ty, uv_band, tile_px, exact).a > 0.0) {
 				all_transparent = false;
 			}
 		}

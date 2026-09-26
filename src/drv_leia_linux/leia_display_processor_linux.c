@@ -1049,9 +1049,9 @@ ag_ensure_pipeline(struct leia_dp_linux *ldp, VkFormat target_format)
 	}
 
 	// Push constants: uvec2 tile_count + uint has_backdrop + uint punch_any + vec2
-	// strip_uv_scale = 24 bytes (matches alpha_gate.frag).
+	// strip_uv_scale + vec2 canvas_px = 32 bytes (matches alpha_gate.frag).
 	{
-		VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 24};
+		VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 32};
 		VkPipelineLayoutCreateInfo pli = {
 		    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		    .setLayoutCount = 1,
@@ -1306,6 +1306,7 @@ alpha_gate_run(struct leia_dp_linux *ldp,
 		uint32_t has_backdrop;
 		uint32_t punch_any; //!< 1 = punch where ANY view is transparent
 		float strip_uv_scale[2];
+		float canvas_px[2]; //!< gate viewport size in px (exact-texel read when a tile is 1:1)
 	} push = {0};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
@@ -1319,6 +1320,8 @@ alpha_gate_run(struct leia_dp_linux *ldp,
 	push.punch_any = ldp->composed_over_capture ? 0u : 1u;
 	push.strip_uv_scale[0] = 1.0f; // strip sized exactly (w,h) — no high-water-mark
 	push.strip_uv_scale[1] = 1.0f;
+	push.canvas_px[0] = (float)w;
+	push.canvas_px[1] = (float)h;
 	vk->vkCmdPushConstants(cmd, ldp->ag_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};

@@ -52,6 +52,9 @@ layout(push_constant) uniform PC {
 	// (w, h) sub-rect holds this frame's copy. Scale screen UV into that
 	// sub-rect: (w/alloc_w, h/alloc_h). (1,1) when the image matches exactly.
 	vec2  strip_uv_scale;
+	// Gate viewport size in pixels. When an atlas tile is the same size
+	// (1:1) the atlas is read by integer texel index instead of filtered.
+	vec2  canvas_px;
 } pc;
 
 layout(location = 0) in vec2 in_uv;
@@ -59,12 +62,32 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
+	// When an atlas tile is the same size as this viewport (1:1), read the
+	// texel by integer index. textureLod at a texel centre is NOT exact: the
+	// sampler converts the coordinate to 8-bit fixed point and the fp32 centre
+	// can land one LSB low, so the bilinear footprint picks up 1/256 of the
+	// neighbouring column -- enough for the `> 0.0` test to call a fully
+	// transparent column opaque when its neighbour is opaque (an opaque 1-px
+	// line just OUTSIDE the woven content; with punch_any it also keeps a
+	// transparent column's neighbour from punching). Scaled tiles keep the
+	// filtered read -- unchanged behaviour there.
+	vec2 tile_px = vec2(textureSize(atlas, 0)) / vec2(pc.tile_count);
+	bool exact = all(lessThan(abs(tile_px - pc.canvas_px), vec2(0.5)));
+
 	bool all_transparent = true;
 	bool any_transparent = false;
 	for (uint ty = 0u; ty < pc.tile_count.y; ty++) {
 		for (uint tx = 0u; tx < pc.tile_count.x; tx++) {
-			vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
-			if (textureLod(atlas, uv_at_tile, 0.0).a > 0.0) {
+			float a;
+			if (exact) {
+				// in_uv * canvas_px == pixel index + 0.5 (to fp error); truncate.
+				ivec2 px = ivec2(vec2(tx, ty) * tile_px + in_uv * pc.canvas_px);
+				a = texelFetch(atlas, px, 0).a;
+			} else {
+				vec2 uv_at_tile = (vec2(tx, ty) + in_uv) / vec2(pc.tile_count);
+				a = textureLod(atlas, uv_at_tile, 0.0).a;
+			}
+			if (a > 0.0) {
 				all_transparent = false;
 			} else {
 				any_transparent = true;

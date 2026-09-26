@@ -1014,12 +1014,12 @@ compose_init_pipeline(struct leia_display_processor *ldp)
 		// Push constants: uvec2 tile_count + uint has_backdrop + uint flatten +
 		// vec2 strip_uv_scale (#602) + vec2 bg_uv_origin + vec2 bg_uv_extent
 		// (#116) + vec2 canvas_uv_origin + vec2 canvas_uv_extent (#121)
-		// = 56 bytes.
+		// + vec2 canvas_px (exact-texel read when a tile is 1:1) = 64 bytes.
 		{
 			VkPushConstantRange pc = {
 			    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 			    .offset = 0,
-			    .size = 56,
+			    .size = 64,
 			};
 			VkPipelineLayoutCreateInfo pli = {
 			    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -1456,6 +1456,7 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 		float bg_uv_extent[2];   // #116
 		float canvas_uv_origin[2]; // #121
 		float canvas_uv_extent[2]; // #121
+		float canvas_px[2];        // gate viewport size in px (exact-texel read when a tile is 1:1)
 	} push = {};
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
@@ -1474,6 +1475,8 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	push.canvas_uv_origin[1] = cu_oy;
 	push.canvas_uv_extent[0] = cu_ex;
 	push.canvas_uv_extent[1] = cu_ey;
+	push.canvas_px[0] = (float)vp_w;
+	push.canvas_px[1] = (float)vp_h;
 	vk->vkCmdPushConstants(cmd, ldp->alpha_gate_pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
