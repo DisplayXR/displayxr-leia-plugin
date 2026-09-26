@@ -40,6 +40,16 @@ set(LEIA_SOURCES
     leia_platform_state.h
     leia_platform_state.c
     leia_sr_delayload_win.c
+
+    # Stereo camera source (runtime ADR-043, L1). Listed unconditionally: the
+    # provider TU is inside #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA (the
+    # runtime headers announce the slots), so an older runtime pin compiles it
+    # to an empty object. The parser is platform-neutral and host-tested
+    # (tests/test_stereo_camera_parse.c, run by the Linux CI job).
+    leia_stereo_camera.h
+    leia_stereo_camera.cpp
+    leia_stereo_camera_parse.h
+    leia_stereo_camera_parse.c
     leia_plugin.c
 )
 
