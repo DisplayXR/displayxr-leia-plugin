@@ -1319,12 +1319,11 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	if (out->state == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return true;
 	}
+	// Never NVIEW: NeurD's Config::adjust() re-derives the tile grid from the
+	// output type on every convert (SBS 2x1, TB 1x2, DEPTH 1x1), and the public
+	// OUTPUT_TYPE prop accepts only 0..2, so OUTPUT_TILES_W/H are overridden —
+	// N > 2 tiles per convert is impossible through the public API (<= 0.4.6).
 	out->modes = LEIA_LIFT_MODE_DEPTH | LEIA_LIFT_MODE_SBS;
-	// N-view needs interactive convert (NeurD 0.4.5+). Known only once READY;
-	// before that, advertise it optimistically (it may still turn out absent).
-	if (s != G_READY || !g.interactive_unavailable.load()) {
-		out->modes |= LEIA_LIFT_MODE_NVIEW;
-	}
 	out->max_streams = kMaxStreams;
 	out->max_views = kMaxViews;
 	out->depth_semantics = 0; // relative: per-frame min-max normalised depth, larger = farther (NeurD's near=high disparity is flipped in kUnpackR8Cs)
@@ -1356,7 +1355,12 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	if (l == nullptr || desc == nullptr || out_id == nullptr || !l->k.enabled) {
 		return false;
 	}
-	if (desc->mode != LEIA_LIFT_MODE_DEPTH && desc->mode != LEIA_LIFT_MODE_SBS && desc->mode != LEIA_LIFT_MODE_NVIEW) {
+	if (desc->mode == LEIA_LIFT_MODE_NVIEW) {
+		LIFT_WARN_ONCE("Leia lift: N-view not supported — NeurD public API tiles are fixed by output type; "
+		               "N-view needs a tiled output type (ask Leia)");
+		return false;
+	}
+	if (desc->mode != LEIA_LIFT_MODE_DEPTH && desc->mode != LEIA_LIFT_MODE_SBS) {
 		LIFT_WARN_ONCE("Leia lift: stream_create with unsupported mode %u", desc->mode);
 		return false;
 	}
@@ -1684,6 +1688,23 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		}
 		if (st != NEURD_SUCCESS || nout.data == nullptr) {
 			LIFT_WARN_ONCE("Leia lift: NeurD convert failed: %s", status_str(st));
+			return false;
+		}
+
+		// ---- 5b. Trust NeurD's actual layout, not the requested one: tiles in
+		// the one-row output = output aspect / input aspect (robust to NeurD's
+		// inference autoscaling). A mismatch would be mislabelled downstream.
+		if (nout.width <= 0 || nout.height <= 0) {
+			LIFT_WARN_ONCE("Leia lift: NeurD output has no size (%dx%d)", nout.width, nout.height);
+			return false;
+		}
+		const double tiles_f =
+		    ((double)nout.width * (double)h) / ((double)nout.height * (double)w);
+		const uint32_t tiles = (uint32_t)(tiles_f + 0.5);
+		if (tiles != cols * rows) {
+			LIFT_WARN_ONCE("Leia lift: NeurD returned %dx%d (%u tile(s)) for a %ux%u input, expected %u — "
+			               "frame dropped",
+			               nout.width, nout.height, tiles, w, h, cols * rows);
 			return false;
 		}
 
