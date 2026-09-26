@@ -73,8 +73,11 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: DECLARATION grep: 90 slots, table IDENTICAL to 1584 (same names, same order), same
 :: 98 headers under include/sr. Behaviour deltas: srLensIsEnabled = physical lens state
 :: (#298), srGetRuntimeVersion returns the real build string, not the "1.0.0" stub (#307).
-set SR_V2_TAG=sr-sdk-v2-1.37.0.1719
-set SR_V2_DIR=LeiaSR-SDK-1.37.0+1719.b390d329dc-win64-Release
+:: 1758 = first 1.38.0, currency refresh over 1719, no new API: DECLARATION grep 90 slots,
+:: table IDENTICAL to 1719; only include/sr/version.h differs. SR Service stop no longer
+:: crashes/hangs (LeiaSR #327), which the service reconnect-after-restart path relies on.
+set SR_V2_TAG=sr-sdk-v2-1.38.0.1758
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+1758.f48e989e22-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
