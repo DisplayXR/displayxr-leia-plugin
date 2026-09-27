@@ -406,3 +406,45 @@ leia_scam_swap_halves_gray8(uint8_t *img, uint32_t width, uint32_t height, uint3
 		memcpy(row + h, tmp, h);
 	}
 }
+
+
+/*
+ *
+ * Rate meter + keep-alive pair accounting.
+ *
+ */
+
+bool
+leia_scam_rate_push(struct leia_scam_rate *r, int64_t t_ns)
+{
+	if (r->first_ns == 0 || t_ns <= r->last_ns || t_ns - r->last_ns > LEIA_SCAM_RATE_GAP_NS) {
+		r->first_ns = t_ns;
+		r->last_ns = t_ns;
+		r->intervals = 0;
+		return false;
+	}
+	r->last_ns = t_ns;
+	if (++r->intervals < LEIA_SCAM_RATE_WINDOW) {
+		return false;
+	}
+	r->rate = (float)((double)r->intervals * 1e9 / (double)(r->last_ns - r->first_ns));
+	r->first_ns = t_ns;
+	r->intervals = 0;
+	return true;
+}
+
+bool
+leia_scam_pair_count_push(struct leia_scam_pair_count *c, uint64_t frame_id, double left_z, double right_z)
+{
+	c->polls++;
+	if (c->have_last && frame_id == c->last_frame_id) {
+		return false;
+	}
+	c->have_last = true;
+	c->last_frame_id = frame_id;
+	c->new_frames++;
+	if (left_z > 0.0 && right_z > 0.0) {
+		c->with_eyes++;
+	}
+	return true;
+}
