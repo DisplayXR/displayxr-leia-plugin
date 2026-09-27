@@ -181,6 +181,52 @@ leia_scam_calibration_for_runtime(const struct leia_scam_calibration *c,
 void
 leia_scam_swap_halves_gray8(uint8_t *img, uint32_t width, uint32_t height, uint32_t pitch);
 
+/*
+ * Source-rate meter. The SR tracking camera's rate is not published anywhere
+ * the plug-in can read (the channel header has no rate and no timestamp), and
+ * the field showed it is NOT the 30 Hz once assumed: 58-64 Hz on an SR laptop.
+ * So the plug-in measures it over the first LEIA_SCAM_RATE_WINDOW frames of
+ * each open and advertises that at the next enumerate; until then it
+ * advertises 0 = unknown (the runtime measures too).
+ */
+#define LEIA_SCAM_RATE_WINDOW 60u
+#define LEIA_SCAM_RATE_GAP_NS (500ll * 1000 * 1000) //!< a longer gap restarts the window
+
+struct leia_scam_rate
+{
+	int64_t first_ns, last_ns;
+	uint32_t intervals;
+	float rate; //!< last completed window, Hz; 0 = none yet
+};
+
+/*!
+ * Feed one new frame's arrival time.
+ * @return true exactly when this frame completed a window (@p r->rate updated).
+ */
+bool
+leia_scam_rate_push(struct leia_scam_rate *r, int64_t t_ns);
+
+/*
+ * Keep-alive eye-pair accounting. The SR v2 eye-pair callback is an ECHO of
+ * srEyeTrackerPredict (the SDK publishes to its streams only at the end of
+ * predict; PredictingEyeTracker::predict -> eyePairStreams.update), so a
+ * weaver-less instance whose tracker nobody predicts on sees ZERO callbacks
+ * however many faces the camera sees. The keep-alive therefore polls predict
+ * itself and counts DISTINCT tracker frames (frameId changes).
+ */
+struct leia_scam_pair_count
+{
+	uint64_t last_frame_id;
+	bool have_last;
+	uint64_t polls;      //!< predict calls that succeeded
+	uint64_t new_frames; //!< ...that carried a tracker frame not seen before
+	uint64_t with_eyes;  //!< ...of which both eyes are in front of the display (z > 0)
+};
+
+//! Account one successful predict. @return true if it was a NEW tracker frame.
+bool
+leia_scam_pair_count_push(struct leia_scam_pair_count *c, uint64_t frame_id, double left_z, double right_z);
+
 #ifdef __cplusplus
 }
 #endif

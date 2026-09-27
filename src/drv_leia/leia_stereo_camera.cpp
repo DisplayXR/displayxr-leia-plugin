@@ -21,9 +21,15 @@
  *    the camera; the tracker keeps it.
  *  - **Never wait on the event.** It is AUTO-RESET and shared by every reader:
  *    a wait here would steal the wake-up of another reader (the vendor's own
- *    apps). We do not even open it. We POLL the block at ~64 Hz (2x the 30 Hz
- *    source) and detect a new frame by content fingerprint; the runtime then
- *    fans out with its own per-stream wake handles.
+ *    apps). We do not even open it. We POLL the block every ~4 ms on a
+ *    high-resolution waitable timer (~4x the source; the SR tracking camera
+ *    runs ~60 Hz, NOT the 30 Hz first assumed) and detect a new frame by
+ *    content fingerprint; the runtime then fans out with its own per-stream
+ *    wake handles. Without the high-resolution timer (pre-1803 Windows) the
+ *    poll falls back to Sleep, which lands on the ~15.6 ms tick (~64 Hz).
+ *  - **Rate.** The channel carries no rate, so enumerate advertises the rate
+ *    MEASURED on an earlier open in this process, else 0 = unknown (never a
+ *    guess); the runtime measures independently.
  *  - **Hold the writer's mutex only for a memcpy** of the JPEG (~100-300 KB,
  *    tens of microseconds); decode OUTSIDE it, so the tracker never waits on
  *    our decoder.
@@ -42,6 +48,11 @@
  *    same weaver-less pattern leia_sr_predict_trace.cpp uses, which the SR SDK
  *    owner confirmed legal as a second instance per process). No v2 runtime
  *    => no keep-alive: frames then flow only while some app weaves (WARN once).
+ *    The eye-pair CALLBACK is an echo of srEyeTrackerPredict (the SDK only
+ *    publishes to its streams at the end of predict), so a weaver-less tracker
+ *    nobody predicts on reports zero pairs forever — the first field run said
+ *    "released after 0 eye pairs" with a face in view. The keep-alive thread
+ *    therefore predicts itself (~30 Hz) and counts DISTINCT tracker frames.
  *  - **Nothing throws across the C boundary**: every SDK / OpenCV / STL call
  *    is inside try/catch.
  *
@@ -78,6 +89,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -87,8 +99,14 @@ constexpr const char *k_cam_memory = "Global\\SREyetrackerRawCamera";
 constexpr const char *k_serial_mutex = "Global\\sharedDeviceSerialMutex";
 constexpr const char *k_serial_memory = "Global\\sharedDeviceSerialMemory";
 
-//! Poll period: ~2x the tracker's 30 Hz (Sleep(8) lands on the ~15.6 ms tick).
-constexpr DWORD k_poll_ms = 8;
+//! Poll period on the high-resolution timer (~4x the tracker's ~60 Hz).
+constexpr DWORD k_poll_ms = 4;
+//! CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); older SDK headers lack it.
+constexpr DWORD k_timer_high_res = 0x00000002;
+//! Keep-alive predict poll period, and how often it logs the running count.
+constexpr int64_t k_ka_poll_ns = 33ll * 1000 * 1000;
+constexpr int64_t k_ka_log_ns = 30ll * 1000 * 1000 * 1000;
+constexpr int64_t k_ka_silent_warn_ns = 5ll * 1000 * 1000 * 1000;
 //! How long the writer's mutex may be waited for (it is held for a memcpy).
 constexpr DWORD k_mutex_wait_ms = 20;
 //! No new frame for this long while the block is zeroed = tracker stopped.
@@ -124,6 +142,8 @@ struct resolved_camera
 
 std::mutex g_resolve_mutex;
 resolved_camera g_cam;
+//! Source rate measured on an open in this process; what enumerate advertises.
+std::atomic<float> g_measured_rate{0.0f};
 
 //! Read the primary (first) device serial. Empty string = none.
 void
@@ -272,10 +292,14 @@ struct keepalive
 {
 	std::mutex m;
 	int refs = 0;
-	std::atomic<uint64_t> pairs{0};
 #ifdef DXR_LEIA_HAS_SR_V2
 	SrInstance instance = nullptr;
 	SrEyeTracker tracker = nullptr;
+	std::thread poller;
+	std::atomic<bool> quit{false};
+	//! Written by the poller only; read after join.
+	leia_scam_pair_count count = {};
+	uint64_t predict_failures = 0;
 #endif
 	bool warned_unavailable = false;
 };
@@ -283,11 +307,55 @@ struct keepalive
 keepalive g_ka;
 
 #ifdef DXR_LEIA_HAS_SR_V2
-void SR_CALL
-on_keepalive_pair(const SrEyePair *pair, void *user_data)
+/*!
+ * Predict on the keep-alive's own tracker (nobody else does: that is what makes
+ * the tracker's eye-pair stream flow) and account distinct tracker frames. One
+ * WARN on the first frame with eyes, one if nothing arrives for 5 s, an INFO
+ * running count every 30 s — never per frame.
+ */
+void
+keepalive_poll(keepalive *ka)
 {
-	(void)pair;
-	static_cast<keepalive *>(user_data)->pairs.fetch_add(1, std::memory_order_relaxed);
+	const int64_t t0 = os_monotonic_get_ns();
+	int64_t next_log = t0 + k_ka_log_ns;
+	bool warned_first = false, warned_silent = false;
+	while (!ka->quit.load(std::memory_order_relaxed)) {
+		SrEyePair pair{};
+		SrResult r = SR_ERROR_VALIDATION_FAILURE;
+		try {
+			r = srEyeTrackerPredict(ka->tracker, 0, &pair);
+		} catch (...) {
+		}
+		if (SR_SUCCEEDED(r)) {
+			leia_scam_pair_count_push(&ka->count, pair.frameId, pair.leftEye.z, pair.rightEye.z);
+			if (!warned_first && ka->count.with_eyes > 0) {
+				warned_first = true;
+				U_LOG_W(
+				    "leia stereo camera: keep-alive tracker delivering eye pairs (first after %.1f s)",
+				    (double)(os_monotonic_get_ns() - t0) * 1e-9);
+			}
+		} else {
+			ka->predict_failures++;
+		}
+		int64_t now = os_monotonic_get_ns();
+		if (!warned_silent && ka->count.with_eyes == 0 && now - t0 > k_ka_silent_warn_ns) {
+			warned_silent = true;
+			U_LOG_W(
+			    "leia stereo camera: keep-alive: no eye pair after 5 s (%llu predicts, %llu tracker "
+			    "frames, %llu failed) — no face in view, or the tracker is not running for this instance",
+			    (unsigned long long)ka->count.polls, (unsigned long long)ka->count.new_frames,
+			    (unsigned long long)ka->predict_failures);
+		}
+		if (now >= next_log) {
+			next_log = now + k_ka_log_ns;
+			U_LOG_I(
+			    "leia stereo camera: keep-alive eye pairs so far: %llu with eyes / %llu tracker frames "
+			    "(%llu predicts)",
+			    (unsigned long long)ka->count.with_eyes, (unsigned long long)ka->count.new_frames,
+			    (unsigned long long)ka->count.polls);
+		}
+		Sleep((DWORD)(k_ka_poll_ns / 1000000));
+	}
 }
 #endif
 
@@ -306,7 +374,6 @@ keepalive_acquire()
 	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	try {
-		g_ka.pairs = 0;
 		if (!leia_sr_v2_create_instance(3.0, &g_ka.instance) || g_ka.instance == nullptr) {
 			g_ka.instance = nullptr;
 			throw 1;
@@ -322,20 +389,19 @@ keepalive_acquire()
 			g_ka.tracker = nullptr;
 			throw 2;
 		}
-		r = srEyeTrackerAddCallback(g_ka.tracker, on_keepalive_pair, &g_ka);
-		if (!SR_SUCCEEDED(r)) {
-			U_LOG_W("leia stereo camera: keep-alive srEyeTrackerAddCallback failed (%s)",
-			        leia_sr_v2_result_str(r));
-			throw 3;
-		}
 		// Senses before srInitialize (sr_eye_tracker.h); this starts tracking.
+		// No callback: it would only echo our own predicts (see the file comment).
 		if (!leia_sr_v2_initialize(g_ka.instance)) {
-			srEyeTrackerRemoveCallback(g_ka.tracker, on_keepalive_pair, &g_ka);
 			throw 4;
 		}
+		g_ka.count = {};
+		g_ka.predict_failures = 0;
+		g_ka.quit = false;
+		g_ka.poller = std::thread(keepalive_poll, &g_ka);
 		U_LOG_W(
-		    "leia stereo camera: keep-alive UP (own SR v2 instance + eye tracker) — the tracker stays on "
-		    "while the camera is open");
+		    "leia stereo camera: keep-alive UP (own SR v2 instance + eye tracker, predicting at ~%d Hz) — the "
+		    "tracker stays on while the camera is open",
+		    (int)(1000000000ll / k_ka_poll_ns));
 		return;
 	} catch (...) {
 		if (g_ka.tracker != nullptr) {
@@ -368,16 +434,22 @@ keepalive_release()
 	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	try {
+		if (g_ka.poller.joinable()) {
+			g_ka.quit = true;
+			g_ka.poller.join();
+		}
 		if (g_ka.tracker != nullptr) {
-			srEyeTrackerRemoveCallback(g_ka.tracker, on_keepalive_pair, &g_ka);
 			srDestroyEyeTracker(g_ka.tracker);
 			g_ka.tracker = nullptr;
 		}
 		if (g_ka.instance != nullptr) {
 			srDestroyInstance(g_ka.instance);
 			g_ka.instance = nullptr;
-			U_LOG_W("leia stereo camera: keep-alive released after %llu eye pairs",
-			        (unsigned long long)g_ka.pairs.load());
+			U_LOG_W(
+			    "leia stereo camera: keep-alive released after %llu eye pairs (%llu tracker frames, %llu "
+			    "predicts, %llu failed)",
+			    (unsigned long long)g_ka.count.with_eyes, (unsigned long long)g_ka.count.new_frames,
+			    (unsigned long long)g_ka.count.polls, (unsigned long long)g_ka.predict_failures);
 		}
 	} catch (...) {
 		g_ka.tracker = nullptr;
@@ -409,6 +481,9 @@ struct xrt_plugin_stereo_camera
 	std::vector<uint8_t> jpeg;
 	std::vector<uint8_t> gray;
 	uint32_t gray_w = 0, gray_h = 0;
+
+	HANDLE timer = nullptr; //!< high-resolution poll timer, or null (Sleep fallback)
+	leia_scam_rate rate = {};
 
 	uint64_t last_fp = 0;
 	uint64_t seq = 0;
@@ -601,7 +676,9 @@ leia_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 			}
 			info.eye_width = g_cam.eye_w;
 			info.eye_height = g_cam.eye_h;
-			info.max_frame_rate = 30.0f;
+			// Measured on an earlier open, else 0 = unknown: never a guess (the
+			// first field run advertised a hard-coded 30 Hz for a ~60 Hz camera).
+			info.max_frame_rate = g_measured_rate.load();
 			info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
 			std::memcpy(out, &info,
 			            sz < sizeof(info) ? sz : sizeof(info)); // ADR-020: never past struct_size
@@ -675,6 +752,12 @@ leia_stereo_camera_open(struct xrt_plugin_instance *inst, uint32_t index, struct
 			c->eye_h = g_cam.eye_h;
 		}
 		c->jpeg.reserve(512 * 1024);
+		c->timer = CreateWaitableTimerExW(nullptr, nullptr, k_timer_high_res, TIMER_ALL_ACCESS);
+		if (c->timer == nullptr) {
+			U_LOG_W(
+			    "leia stereo camera: no high-resolution timer (pre-1803 Windows?) — polling on Sleep, "
+			    "~64 Hz at best for a ~60 Hz source");
+		}
 		keepalive_acquire();
 		cam_open_channel(c, os_monotonic_get_ns());
 		*out_cam = c;
@@ -705,6 +788,16 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 					if (cam_decode(c, hdr)) {
 						c->block_empty = false;
 						c->last_new_ns = arrival;
+						if (leia_scam_rate_push(&c->rate, arrival)) {
+							float prev = g_measured_rate.exchange(c->rate.rate);
+							if (prev <= 0.0f) {
+								U_LOG_W(
+								    "leia stereo camera: measured source rate %.1f Hz "
+								    "over %u frames (advertised from the next "
+								    "enumerate)",
+								    c->rate.rate, LEIA_SCAM_RATE_WINDOW);
+							}
+						}
 						std::memset(out, 0, sizeof(*out));
 						out->sequence = ++c->seq;
 						out->time_ns = arrival;
@@ -738,8 +831,19 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 				}
 				return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
 			}
-			int64_t left_ms = (deadline - now) / 1000000;
-			Sleep((DWORD)(left_ms < (int64_t)k_poll_ms ? (left_ms > 0 ? left_ms : 1) : k_poll_ms));
+			int64_t left_ns = deadline - now;
+			int64_t nap_ns =
+			    left_ns < (int64_t)k_poll_ms * 1000000 ? left_ns : (int64_t)k_poll_ms * 1000000;
+			if (nap_ns < 500000) {
+				nap_ns = 500000;
+			}
+			LARGE_INTEGER due;
+			due.QuadPart = -(nap_ns / 100); // relative, 100 ns units
+			if (c->timer != nullptr && SetWaitableTimer(c->timer, &due, 0, nullptr, nullptr, FALSE)) {
+				WaitForSingleObject(c->timer, INFINITE);
+			} else {
+				Sleep((DWORD)((nap_ns + 999999) / 1000000));
+			}
 		}
 	} catch (...) {
 		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
@@ -761,6 +865,10 @@ leia_stereo_camera_close(struct xrt_plugin_stereo_camera *c)
 	try {
 		U_LOG_W("leia stereo camera: closed after %llu frames", (unsigned long long)c->seq);
 		cam_close_channel(c);
+		if (c->timer != nullptr) {
+			CloseHandle(c->timer);
+			c->timer = nullptr;
+		}
 		keepalive_release();
 		delete c;
 	} catch (...) {
