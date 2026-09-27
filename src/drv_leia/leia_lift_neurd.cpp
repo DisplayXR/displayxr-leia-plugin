@@ -215,7 +215,8 @@ struct knobs
 	float view_gain;          //!< DXR_LEIA_LIFT_VIEW_GAIN / ViewGain (default 1.0)
 	float conv_gain;          //!< DXR_LEIA_LIFT_CONV_GAIN / ConvGain (default 0.4): relative convergence -> NeurD units
 	uint64_t interactive_min; //!< DXR_LEIA_LIFT_INTERACTIVE_MIN / InteractiveMin; 0 = unset (header's INTRODUCED_IN)
-	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min;
+	int32_t video_model;      //!< DXR_LEIA_LIFT_VIDEO_MODEL / VideoModel: fast (default) | metric (NeurD >= 0.4.6)
+	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_video_model;
 };
 
 bool
@@ -364,6 +365,7 @@ read_knobs()
 	k.view_gain = 1.0f;
 	k.conv_gain = 0.4f;
 	k.interactive_min = 0;
+	k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -425,6 +427,24 @@ read_knobs()
 			k.src_interactive_min = src;
 		} else {
 			U_LOG_W("Leia lift: interactive min '%s' (%s) not a version (e.g. 0.4.4) — ignored", v,
+			        knob_src_str(src));
+		}
+	}
+
+	// The video streams' depth model (NeurD_init_with_options, 0.4.6+): 'fast' = the relative
+	// real-time model, 'metric' = NEURD_MODEL_VIDEO_METRIC_QUALITY (metric depth, closer to what the
+	// web path's MoGe gives). Photo streams always use the relative photo model (the only one the
+	// photo slot accepts).
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_VIDEO_MODEL", L"VideoModel", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (env_ieq(v, "metric")) {
+			k.video_model = NEURD_MODEL_VIDEO_METRIC_QUALITY;
+			k.src_video_model = src;
+		} else if (env_ieq(v, "fast")) {
+			k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
+			k.src_video_model = src;
+		} else {
+			U_LOG_W("Leia lift: video model '%s' (%s) not recognised (fast|metric) — using fast", v,
 			        knob_src_str(src));
 		}
 	}
@@ -888,7 +908,7 @@ activation_worker()
 			struct NeurD_init_options opts = {};
 			opts.struct_size = sizeof(opts);
 			opts.photo_model_id = NEURD_MODEL_PHOTO_RELATIVE_QUALITY;
-			opts.video_model_id = NEURD_MODEL_VIDEO_RELATIVE_FAST;
+			opts.video_model_id = g.k0.video_model;
 			st = NeurD_init_with_options(nd, 1 /* multithreaded: we call from the runtime's lift thread */, &opts);
 		} else if (LEIA_NEURD_HAS(nd, init)) {
 			st = NeurD_init(nd, 1);
@@ -928,13 +948,15 @@ activation_worker()
 			interactive_min = k0.interactive_min;
 		}
 		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) scale=%s(%s) view_gain=%.2f(%s) "
-		        "conv_gain=%.2f(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		        "conv_gain=%.2f(%s) video_model=%s(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
 		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
 		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
 		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
 		        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
 		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
-		        knob_src_str(k0.src_conv_gain));
+		        knob_src_str(k0.src_conv_gain),
+		        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
+		        knob_src_str(k0.src_video_model));
 		if (k0.interactive_min != 0) {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u (%s) — assuming interactive convert on NeurD "
 			        "%u.%u.%u (only for the internal-interactive dev package; a stock 0.4.4 will crash here)",
