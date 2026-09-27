@@ -101,6 +101,8 @@ constexpr float kIpdRefM = 0.063f;
 //! Clamp for mapped viewpoints — well past any comfortable look-around; stops a
 //! tracker glitch from asking NeurD for a wildly extrapolated view.
 constexpr float kViewpointClamp = 3.0f;
+//! NEURD_PROP_GAIN_MULTIPLIER at strength 1 (DepthGain knob). Panel-calibrated 2026-09-26.
+constexpr float kDefaultDepthGain = 2.0f;
 //! NeurD's MAX_STREAMS.
 constexpr uint32_t kMaxStreams = 32;
 //! N views go side by side in ONE row (runtime contract), so the output is
@@ -216,7 +218,8 @@ struct knobs
 	float conv_gain;          //!< DXR_LEIA_LIFT_CONV_GAIN / ConvGain (default 0.4): relative convergence -> NeurD units
 	uint64_t interactive_min; //!< DXR_LEIA_LIFT_INTERACTIVE_MIN / InteractiveMin; 0 = unset (header's INTRODUCED_IN)
 	int32_t video_model;      //!< DXR_LEIA_LIFT_VIDEO_MODEL / VideoModel: fast (default) | metric (NeurD >= 0.4.6)
-	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_video_model;
+	float depth_gain;         //!< DXR_LEIA_LIFT_DEPTH_GAIN / DepthGain (default 2.0): NeurD gain at strength 1
+	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_video_model, src_depth_gain;
 };
 
 bool
@@ -366,6 +369,7 @@ read_knobs()
 	k.conv_gain = 0.4f;
 	k.interactive_min = 0;
 	k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
+	k.depth_gain = kDefaultDepthGain;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -435,6 +439,16 @@ read_knobs()
 	// real-time model, 'metric' = NEURD_MODEL_VIDEO_METRIC_QUALITY (metric depth, closer to what the
 	// web path's MoGe gives). Photo streams always use the relative photo model (the only one the
 	// photo slot accepts).
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_DEPTH_GAIN", L"DepthGain", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, 0.0f, 10.0f, &k.depth_gain)) {
+			k.src_depth_gain = src;
+		} else {
+			U_LOG_W("Leia lift: depth gain '%s' (%s) not a number in [0,10] — using %.1f", v, knob_src_str(src),
+			        (double)kDefaultDepthGain);
+		}
+	}
+
 	src = knob_lookup(reg, "DXR_LEIA_LIFT_VIDEO_MODEL", L"VideoModel", v, sizeof(v));
 	if (src != KSRC_DEFAULT) {
 		if (env_ieq(v, "metric")) {
@@ -948,7 +962,7 @@ activation_worker()
 			interactive_min = k0.interactive_min;
 		}
 		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) scale=%s(%s) view_gain=%.2f(%s) "
-		        "conv_gain=%.2f(%s) video_model=%s(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		        "conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
 		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
 		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
 		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
@@ -956,7 +970,7 @@ activation_worker()
 		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
 		        knob_src_str(k0.src_conv_gain),
 		        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
-		        knob_src_str(k0.src_video_model));
+		        knob_src_str(k0.src_video_model), (double)k0.depth_gain, knob_src_str(k0.src_depth_gain));
 		if (k0.interactive_min != 0) {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u (%s) — assuming interactive convert on NeurD "
 			        "%u.%u.%u (only for the internal-interactive dev package; a stock 0.4.4 will crash here)",
@@ -1744,7 +1758,11 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		}
 		const bool auto_conv = !(dp.convergence >= 0.0f);
 		// strength: 1 = NeurD's calibrated budget, 0 = flat; negative/NaN = default.
-		const float gain = (dp.strength >= 0.0f) ? clampf(dp.strength, 0.0f, 10.0f) : 1.0f;
+		// The element's strength (1 = nominal) times the depth-gain calibration:
+		// NeurD's own gain 1 read as too weak on the panel (David, 2026-09-26:
+		// strength 2 "stronger, I like this as default").
+		const float strength = (dp.strength >= 0.0f) ? dp.strength : 1.0f;
+		const float gain = clampf(strength * l->k.depth_gain, 0.0f, 10.0f);
 		// NeurD always fills disocclusions; non-zero picks the blur fill, 0 the
 		// cheaper edge stretch.
 		const int32_t inpaint = (dp.inpaint != 0) ? NEURD_INPAINT_TYPE_V1_BLUR : NEURD_INPAINT_TYPE_V1_STRETCH;
