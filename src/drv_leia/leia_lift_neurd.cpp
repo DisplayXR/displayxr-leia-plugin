@@ -1433,7 +1433,13 @@ extern "C" void
 leia_lift_neurd_map_viewpoint(const float in_m[3], float gain, float out_n[3])
 {
 	out_n[0] = clampf(gain * in_m[0] / kIpdRefM, -kViewpointClamp, kViewpointClamp);
-	out_n[1] = clampf(gain * in_m[1] / kIpdRefM, -kViewpointClamp, kViewpointClamp);
+	// A lenticular panel has horizontal parallax only. Passing the tracked eye
+	// HEIGHT made NeurD render the frame as seen from above/below the display
+	// centre: the lifted image shifted vertically with head height (visible
+	// "jumps" as the head moved) and a filled band appeared at the top edge
+	// (David, panel, 2026-09-26). Vertical viewpoint offset is never wanted.
+	(void)in_m[1];
+	out_n[1] = 0.0f;
 	// NeurD's z is a dimensionless depth offset whose relation to viewer
 	// distance is not specified; head z is deliberately not mapped (see doc).
 	out_n[2] = 0.0f;
