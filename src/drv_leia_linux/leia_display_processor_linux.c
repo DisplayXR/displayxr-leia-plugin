@@ -22,6 +22,7 @@
 #include "leia_edid_probe_linux.h" // RandR panel desktop position (screen_left/top override)
 #include "leia_bg_capture_linux.h"
 #include "leia_bg_capture_worker_linux.h"
+#include "leia_compose_push_linux.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -76,6 +77,9 @@ struct leia_dp_linux
 	//! filled and the alpha-gate may use the every-view rule. Per frame, not per
 	//! session: the capture can be distrusted mid-session (screen lock).
 	bool composed_over_capture;
+	//! The runtime's declared atlas encoding (runtime#1484) is LINEAR. The
+	//! compose pass blends in linear light and must know what it is reading.
+	bool atlas_linear;
 	uint64_t bg_capture_retry_ns; //!< earliest time to re-create a capture that asked for a restart
 
 	// --- Lazy transparency (runtime set_transparency_active) -------------
@@ -346,9 +350,10 @@ compose_ensure_pipeline(struct leia_dp_linux *ldp)
 		}
 	}
 
-	// Push constants: 2*vec2 + uvec2 + uvec2 = 32 bytes (matches compose_under_bg.frag).
+	// Push constants: struct leia_compose_push (matches compose_under_bg.frag).
 	{
-		VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = 32};
+		VkPushConstantRange pc = {
+		    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = sizeof(struct leia_compose_push)};
 		VkPipelineLayoutCreateInfo pli = {
 		    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		    .setLayoutCount = 1,
@@ -754,14 +759,7 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ldp->compose_pipeline_layout, 0, 1,
 	                            &ldp->compose_set, 0, NULL);
 
-	struct
-	{
-		float bg_uv_origin[2];
-		float bg_uv_extent[2];
-		uint32_t tile_count[2];
-		uint32_t has_backdrop;
-		uint32_t pad;
-	} push = {0};
+	struct leia_compose_push push = {0};
 	// UV maps the app-window region onto the background: (0,0)-(1,1) for the
 	// canvas-space 2D-under backdrop, or the poll'd window-on-monitor sub-rect
 	// for the captured desktop.
@@ -774,7 +772,13 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	push.has_backdrop = have_backdrop ? 1u : 0u;
 	// DXR_LEIA_BG_DEBUG=1: shader outputs the background ONLY (one-glance
 	// "is the capture black?" check); the caller also skips the alpha-gate.
-	push.pad = dxr_leia_bg_debug() ? 1u : 0u;
+	push.debug_bg_only = dxr_leia_bg_debug() ? 1u : 0u;
+	// Colour (compose_under_bg.frag header): the blend runs in linear light, so
+	// the shader must know how each input is encoded. The atlas + 2D-under
+	// backdrop are the runtime's, in its DECLARED encoding (runtime#1484); the
+	// captured desktop is scanout bytes, sRGB-encoded.
+	push.atlas_linear = ldp->atlas_linear ? 1u : 0u;
+	push.bg_is_atlas_space = ldp->composed_over_capture ? 0u : 1u;
 	vk->vkCmdPushConstants(cmd, ldp->compose_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
 	VkViewport vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
@@ -1747,6 +1751,7 @@ static void
 leia_lnx_dp_set_atlas_encoding(struct xrt_display_processor *xdp, enum xrt_atlas_encoding enc)
 {
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	ldp->atlas_linear = (enc == XRT_ATLAS_ENCODING_LINEAR); // compose-under reads it (same thread as process_atlas)
 	leiasr_lnx_set_atlas_linear(ldp->sr, enc == XRT_ATLAS_ENCODING_LINEAR);
 }
 
