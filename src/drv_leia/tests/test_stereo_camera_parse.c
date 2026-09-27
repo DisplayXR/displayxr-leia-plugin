@@ -233,6 +233,47 @@ test_swap_halves(void)
 	CHECK(memcmp(img, want, 16) == 0);
 }
 
+static void
+test_rate_and_pairs(void)
+{
+	// A 60 Hz source with +-2 ms arrival jitter (the field shape; the old
+	// enumerate claimed 30 Hz).
+	struct leia_scam_rate r;
+	memset(&r, 0, sizeof(r));
+	int64_t t = 1000000000;
+	int done = 0;
+	for (uint32_t i = 0; i <= LEIA_SCAM_RATE_WINDOW; i++) {
+		int64_t j = (i == 0 || i == LEIA_SCAM_RATE_WINDOW) ? 0 : ((i & 1) ? 2000000 : -2000000);
+		done += leia_scam_rate_push(&r, t + j) ? 1 : 0;
+		t += 16666667;
+	}
+	CHECK(done == 1);
+	NEAR(r.rate, 60.0, 0.05);
+	// A suspension gap restarts the window.
+	struct leia_scam_rate g;
+	memset(&g, 0, sizeof(g));
+	t = 1000000000;
+	for (int i = 0; i < 20; i++, t += 33333333) {
+		leia_scam_rate_push(&g, t);
+	}
+	t += 2000000000;
+	for (uint32_t i = 0; i <= LEIA_SCAM_RATE_WINDOW; i++, t += 33333333) {
+		leia_scam_rate_push(&g, t);
+	}
+	NEAR(g.rate, 30.0, 0.05);
+
+	// Pair accounting: repeated predicts of one tracker frame count once.
+	struct leia_scam_pair_count c;
+	memset(&c, 0, sizeof(c));
+	CHECK(leia_scam_pair_count_push(&c, 7, 600.0, 610.0));
+	CHECK(!leia_scam_pair_count_push(&c, 7, 600.0, 610.0));
+	CHECK(leia_scam_pair_count_push(&c, 8, 0.0, 0.0));     // no face: a frame, but no eyes
+	CHECK(leia_scam_pair_count_push(&c, 0, 590.0, 600.0)); // frameId restart is still new
+	CHECK(c.polls == 4);
+	CHECK(c.new_frames == 3);
+	CHECK(c.with_eyes == 2);
+}
+
 int
 main(void)
 {
@@ -240,6 +281,7 @@ main(void)
 	test_serials();
 	test_calibration();
 	test_swap_halves();
+	test_rate_and_pairs();
 	if (g_fail) {
 		fprintf(stderr, "test_stereo_camera_parse: %d failure(s)\n", g_fail);
 		return 1;
