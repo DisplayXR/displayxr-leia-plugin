@@ -130,7 +130,10 @@ jobs:
             libeigen3-dev libcjson-dev libudev-dev \
             libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev \
-            libpipewire-0.3-dev libdbus-1-dev
+            libpipewire-0.3-dev libdbus-1-dev \
+            mesa-vulkan-drivers
+          # ^ mesa-vulkan-drivers: lavapipe, the CPU Vulkan device the compose
+          #   colour test runs the plug-in's shader on (no GPU on the runner).
           # ^ pipewire + dbus: compile-check the mutter/PipeWire desktop-capture
           #   producer (runtime#757, behind DXR_LEIA_HAVE_PIPEWIRE). CI cannot
           #   RUN a mutter/PipeWire session (no compositor), but with the -dev libs
@@ -185,6 +188,16 @@ jobs:
       - name: Unit test — lens-preference ownership (LeiaSR #266)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lens_owner_linux
+
+      # Runs the plug-in's own compose SPIR-V on lavapipe: opaque atlas pixels
+      # must reach the weaver bit-identical with the desktop capture on, alpha < 1
+      # must blend premultiplied in linear light (OpenXR 1.1 §10.6.2). A SKIP
+      # (exit 77, no Vulkan device) is a failure here — lavapipe is installed.
+      - name: Unit test — compose-under-capture colour (OpenXR §10.6.2)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          ICD=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          VK_ICD_FILENAMES="$ICD" ./build/src/drv_leia_linux/test_compose_color_linux
 
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'

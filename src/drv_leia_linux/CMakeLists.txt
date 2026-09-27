@@ -238,3 +238,15 @@ install(TARGETS DisplayXR-LeiaSR
 add_executable(test_lens_owner_linux tests/test_lens_owner_linux.c)
 target_include_directories(test_lens_owner_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_lens_owner_linux COMMAND test_lens_owner_linux)
+
+# --- GPU unit test: compose-under-capture colour contract ----------------
+# Runs the plug-in's own compose SPIR-V on any Vulkan device (Mesa lavapipe in
+# CI) and asserts: an opaque atlas pixel reaches the weaver bit-identical with
+# the desktop capture on; alpha < 1 blends premultiplied, in linear light
+# (OpenXR 1.1 §10.6.2). Offscreen only — no display, panel or SR SDK. Exits 77
+# (skipped) when no Vulkan device exists.
+add_executable(test_compose_color_linux tests/test_compose_color_linux.c ${LEIA_LINUX_SHADER_HEADERS})
+target_include_directories(test_compose_color_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(test_compose_color_linux PRIVATE Vulkan::Vulkan m)
+add_test(NAME test_compose_color_linux COMMAND test_compose_color_linux)
+set_tests_properties(test_compose_color_linux PROPERTIES SKIP_RETURN_CODE 77)

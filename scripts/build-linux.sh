@@ -64,6 +64,15 @@ SO="$BUILD_DIR/src/drv_leia_linux/DisplayXR-LeiaSR.so"
 echo "==> Unit test: lens-preference ownership (LeiaSR #266)"
 "$BUILD_DIR/src/drv_leia_linux/test_lens_owner_linux"
 
+echo "==> Unit test: compose-under-capture colour (OpenXR 1.1 §10.6.2; offscreen, first Vulkan device)"
+rc=0
+"$BUILD_DIR/src/drv_leia_linux/test_compose_color_linux" || rc=$?
+if [ "$rc" = 77 ]; then
+    echo "    skipped: no Vulkan device (install mesa-vulkan-drivers for lavapipe)"
+elif [ "$rc" != 0 ]; then
+    exit "$rc"
+fi
+
 echo "==> Asserting single-export discipline (#496 / ADR-019)"
 SYMS="$(nm -D --defined-only "$SO" | awk '{print $NF}')"
 if [ "$SYMS" != "xrtPluginNegotiate" ]; then
