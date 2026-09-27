@@ -1824,6 +1824,17 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 				}
 			}
 			// SBS untracked: vp stays empty -> NeurD's own default ±0.5 pattern.
+
+			// Which viewpoints this convert used, logged once per change: an A/B of
+			// DXR_LEIA_LIFT_VIEW_GAIN with nobody in front of the tracker lands on the
+			// default pattern and reads as "the gain does nothing".
+			const int vp_src = !vp.empty() ? (eyes_valid ? 1 : 2) : 0;
+			static std::atomic<int> s_last_vp_src{-1};
+			if (s_last_vp_src.exchange(vp_src) != vp_src) {
+				U_LOG_W("Leia lift: viewpoints = %s (mode %d, %u view(s)%s)",
+				        vp_src == 1 ? "TRACKED eyes" : (vp_src == 2 ? "explicit/untracked N-view" : "DEFAULT pattern (no tracked eyes)"),
+				        (int)s->mode, views, vp_src != 0 ? ", view_gain applied" : ", view_gain NOT applied");
+			}
 		}
 
 		// ---- 5. Convert (blocking).
