@@ -448,3 +448,149 @@ leia_scam_pair_count_push(struct leia_scam_pair_count *c, uint64_t frame_id, dou
 	}
 	return true;
 }
+
+
+/*
+ *
+ * Platform device hint.
+ *
+ */
+
+//! Known SR tracking cameras, USB VID:PID. Keep this list SMALL: the name
+//! match below is the fallback for a camera not listed here.
+static const uint16_t k_known_tracking_cameras[][2] = {
+    {0x04f2, 0xb70c},
+};
+
+static int
+hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	return -1;
+}
+
+static bool
+hex4(const char *s, uint16_t *out)
+{
+	unsigned v = 0;
+	for (int i = 0; i < 4; i++) {
+		int n = hex_nibble(s[i]);
+		if (n < 0) {
+			return false;
+		}
+		v = (v << 4) | (unsigned)n;
+	}
+	*out = (uint16_t)v;
+	return true;
+}
+
+static char
+lower_ascii(char c)
+{
+	return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+static bool
+prefix_ci(const char *s, const char *prefix)
+{
+	for (; *prefix != '\0'; s++, prefix++) {
+		if (lower_ascii(*s) != *prefix) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool
+leia_scam_usb_id(const char *s, uint16_t *vid, uint16_t *pid)
+{
+	if (s == NULL) {
+		return false;
+	}
+	size_t len = strlen(s);
+	// Bare "vvvv:pppp".
+	if (len == 9 && s[4] == ':' && hex4(s, vid) && hex4(s + 5, pid)) {
+		return true;
+	}
+	// "vid_vvvv&pid_pppp" anywhere (a path, an instance id; any case).
+	for (size_t i = 0; i + 17 <= len; i++) {
+		if (prefix_ci(s + i, "vid_") && hex4(s + i + 4, vid) && prefix_ci(s + i + 8, "&pid_") &&
+		    hex4(s + i + 13, pid)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+contains_ci(const char *hay, const char *needle)
+{
+	if (hay == NULL) {
+		return false;
+	}
+	for (; *hay != '\0'; hay++) {
+		if (prefix_ci(hay, needle)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+leia_scam_is_tracking_camera(const struct leia_scam_video_device *dev)
+{
+	uint16_t vid = 0, pid = 0;
+	if (leia_scam_usb_id(dev->path, &vid, &pid)) {
+		for (size_t i = 0; i < sizeof(k_known_tracking_cameras) / sizeof(k_known_tracking_cameras[0]); i++) {
+			if (k_known_tracking_cameras[i][0] == vid && k_known_tracking_cameras[i][1] == pid) {
+				return true;
+			}
+		}
+	}
+	return contains_ci(dev->friendly_name, "tracking camera");
+}
+
+bool
+leia_scam_pick_platform_hint(const struct leia_scam_video_device *devs, size_t count, char *out, size_t out_size)
+{
+	if (out == NULL || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	char pick[LEIA_SCAM_HINT_MAX] = {0};
+	bool have = false;
+	for (size_t i = 0; i < count; i++) {
+		if (!leia_scam_is_tracking_camera(&devs[i])) {
+			continue;
+		}
+		char cand[LEIA_SCAM_HINT_MAX];
+		uint16_t vid = 0, pid = 0;
+		if (leia_scam_usb_id(devs[i].path, &vid, &pid)) {
+			snprintf(cand, sizeof(cand), "%04x:%04x", vid, pid);
+		} else if (devs[i].path != NULL && devs[i].path[0] != '\0' && strlen(devs[i].path) < sizeof(cand)) {
+			snprintf(cand, sizeof(cand), "%s", devs[i].path);
+		} else {
+			// A candidate we cannot name makes the choice ambiguous.
+			return false;
+		}
+		if (!have) {
+			snprintf(pick, sizeof(pick), "%s", cand);
+			have = true;
+		} else if (strcmp(pick, cand) != 0) {
+			return false; // two different cameras match: hide none
+		}
+	}
+	if (!have || strlen(pick) >= out_size) {
+		return false;
+	}
+	snprintf(out, out_size, "%s", pick);
+	return true;
+}
