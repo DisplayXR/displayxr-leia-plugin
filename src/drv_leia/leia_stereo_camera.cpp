@@ -81,6 +81,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <windows.h>
+#include <setupapi.h>
 
 #include <atomic>
 #include <cmath>
@@ -138,6 +139,8 @@ struct resolved_camera
 	char serial[LEIA_SCAM_SERIAL_LEN + 1] = {0};
 	uint32_t eye_w = k_default_eye_w, eye_h = k_default_eye_h;
 	leia_scam_eye_calibration cal = {};
+	//! platformDeviceHint: the OS camera the tracker holds, "" if not unambiguous.
+	char platform_hint[LEIA_SCAM_HINT_MAX] = {0};
 };
 
 std::mutex g_resolve_mutex;
@@ -227,6 +230,135 @@ peek_eye_size(uint32_t *eye_w, uint32_t *eye_h)
 	}
 }
 
+/*
+ *
+ * Platform device hint: which OS video-capture device is the tracker's camera.
+ * The choice (known USB VID:PID, else a "tracking camera" friendly name; fill
+ * only when unambiguous) lives in leia_scam_pick_platform_hint and is unit
+ * tested; this is only the SetupAPI enumeration feeding it. SetupAPI rather
+ * than MediaFoundation: it lists the device WITHOUT activating a media source
+ * (which could contend with the tracker), and setupapi is a system library.
+ *
+ */
+
+//! KSCATEGORY_VIDEO_CAMERA (MediaFoundation's enumeration) and KSCATEGORY_VIDEO
+//! (DirectShow's); defined here so ks.h/ksmedia.h are not needed.
+const GUID k_ksc_video_camera = {0xe5323777, 0xf976, 0x4f5b, {0x9b, 0x55, 0xb9, 0x46, 0x99, 0xc4, 0x6e, 0x44}};
+const GUID k_ksc_video = {0x6994ad05, 0x93ef, 0x11d0, {0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
+//! Re-enumerate at most this often while no hint was found (camera not yet attached).
+constexpr int64_t k_hint_retry_ns = 5ll * 1000 * 1000 * 1000;
+
+std::string
+narrow(const wchar_t *w)
+{
+	if (w == nullptr || w[0] == L'\0') {
+		return std::string();
+	}
+	int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+	if (n <= 1) {
+		return std::string();
+	}
+	std::string out((size_t)n - 1, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+	return out;
+}
+
+void
+enum_video_devices(const GUID &cls, std::vector<std::string> &paths, std::vector<std::string> &names)
+{
+	HDEVINFO set = SetupDiGetClassDevsW(&cls, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+	if (set == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	SP_DEVICE_INTERFACE_DATA ifd = {};
+	ifd.cbSize = sizeof(ifd);
+	for (DWORD i = 0; i < 64 && SetupDiEnumDeviceInterfaces(set, nullptr, &cls, i, &ifd); i++) {
+		DWORD need = 0;
+		SetupDiGetDeviceInterfaceDetailW(set, &ifd, nullptr, 0, &need, nullptr);
+		if (need < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) || need > 4096) {
+			continue;
+		}
+		std::vector<uint8_t> buf(need);
+		auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buf.data());
+		detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+		SP_DEVINFO_DATA dev = {};
+		dev.cbSize = sizeof(dev);
+		if (!SetupDiGetDeviceInterfaceDetailW(set, &ifd, detail, need, nullptr, &dev)) {
+			continue;
+		}
+		// The interface's FriendlyName is what MediaFoundation/DirectShow show;
+		// fall back to the device node's friendly name, then its description.
+		wchar_t name[256] = {0};
+		HKEY key = SetupDiOpenDeviceInterfaceRegKey(set, &ifd, 0, KEY_READ);
+		if (key != (HKEY)INVALID_HANDLE_VALUE) {
+			DWORD type = 0, bytes = sizeof(name) - sizeof(wchar_t);
+			if (RegQueryValueExW(key, L"FriendlyName", nullptr, &type, (LPBYTE)name, &bytes) != ERROR_SUCCESS ||
+			    type != REG_SZ) {
+				name[0] = L'\0';
+			}
+			RegCloseKey(key);
+		}
+		if (name[0] == L'\0' &&
+		    !SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_FRIENDLYNAME, nullptr, (PBYTE)name,
+		                                       sizeof(name) - sizeof(wchar_t), nullptr)) {
+			if (!SetupDiGetDeviceRegistryPropertyW(set, &dev, SPDRP_DEVICEDESC, nullptr, (PBYTE)name,
+			                                       sizeof(name) - sizeof(wchar_t), nullptr)) {
+				name[0] = L'\0';
+			}
+		}
+		name[255] = L'\0';
+		paths.push_back(narrow(detail->DevicePath));
+		names.push_back(narrow(name));
+	}
+	SetupDiDestroyDeviceInfoList(set);
+}
+
+//! Last result, kept across resolves: enumeration is not free and the camera
+//! does not move. Re-tried every k_hint_retry_ns while empty. Under g_resolve_mutex.
+std::string g_hint_cache;
+bool g_hint_done = false;
+int64_t g_hint_at_ns = 0;
+
+void
+resolve_platform_hint(char out[LEIA_SCAM_HINT_MAX])
+{
+	out[0] = '\0';
+	const char *ovr = std::getenv("DXR_LEIA_STEREO_CAMERA_PLATFORM_HINT");
+	if (ovr != nullptr) {
+		// Field escape hatch: "-" = hide nothing, anything else is used verbatim.
+		if (std::strcmp(ovr, "-") != 0) {
+			std::snprintf(out, LEIA_SCAM_HINT_MAX, "%s", ovr);
+		}
+		return;
+	}
+	int64_t now = (int64_t)os_monotonic_get_ns();
+	if (g_hint_done && (!g_hint_cache.empty() || now - g_hint_at_ns < k_hint_retry_ns)) {
+		std::snprintf(out, LEIA_SCAM_HINT_MAX, "%s", g_hint_cache.c_str());
+		return;
+	}
+	std::vector<std::string> paths, names;
+	enum_video_devices(k_ksc_video_camera, paths, names);
+	enum_video_devices(k_ksc_video, paths, names);
+	std::vector<leia_scam_video_device> devs(paths.size());
+	for (size_t i = 0; i < paths.size(); i++) {
+		devs[i].path = paths[i].c_str();
+		devs[i].friendly_name = names[i].c_str();
+	}
+	char pick[LEIA_SCAM_HINT_MAX] = {0};
+	leia_scam_pick_platform_hint(devs.data(), devs.size(), pick, sizeof(pick));
+	if (!g_hint_done || g_hint_cache != pick) {
+		// One line per CHANGE of the answer, never per enumerate.
+		U_LOG_W("leia stereo camera: platformDeviceHint = \"%s\" (%zu video-capture interfaces; %s)", pick,
+		        devs.size(),
+		        pick[0] != '\0' ? "the tracker's camera, hidden from capture stacks"
+		                        : "no unambiguous SR tracking camera — nothing hidden");
+	}
+	g_hint_cache = pick;
+	g_hint_done = true;
+	g_hint_at_ns = now;
+	std::snprintf(out, LEIA_SCAM_HINT_MAX, "%s", pick);
+}
+
 void
 resolve_locked()
 {
@@ -253,6 +385,11 @@ resolve_locked()
 	}
 	c.present = true;
 	peek_eye_size(&c.eye_w, &c.eye_h);
+	try {
+		resolve_platform_hint(c.platform_hint);
+	} catch (...) {
+		c.platform_hint[0] = '\0';
+	}
 
 	const char *pd = std::getenv("ProgramData");
 	std::string dir =
@@ -668,7 +805,10 @@ leia_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 			info.struct_size = (uint32_t)sizeof(info);
 			std::snprintf(info.display_name, sizeof(info.display_name), "Leia SR tracking camera");
 			std::snprintf(info.device_identity, sizeof(info.device_identity), "leia-sr:%s", g_cam.serial);
-			info.platform_device_hint[0] = '\0'; // MF symbolic link: open question (roadmap §D)
+			// The OS camera the tracker holds (USB "vvvv:pppp"), so a capture
+			// stack can hide the busy duplicate; "" unless unambiguous.
+			std::snprintf(info.platform_device_hint, sizeof(info.platform_device_hint), "%s",
+			              g_cam.platform_hint);
 			info.flags = XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING |
 			             XRT_PLUGIN_STEREO_CAMERA_USER_FACING | XRT_PLUGIN_STEREO_CAMERA_MONOCHROME;
 			if (g_cam.calibrated) {

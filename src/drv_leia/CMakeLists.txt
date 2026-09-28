@@ -275,7 +275,10 @@ if(WIN32)
     # display-config trio GetDisplayConfigBufferSizes / QueryDisplayConfig /
     # DisplayConfigGetDeviceInfo). It already resolved transitively, but the
     # dependency is real and is now load-bearing — name it.
-    target_link_libraries(DisplayXR-LeiaSR PRIVATE advapi32 version user32)
+    # setupapi for the stereo camera's platformDeviceHint (leia_stereo_camera.cpp:
+    # SetupDiGetClassDevsW over the video-capture interface classes, to name
+    # the OS camera the SR tracker holds). A system library, no new dependency.
+    target_link_libraries(DisplayXR-LeiaSR PRIVATE advapi32 version user32 setupapi)
 endif()
 
 if(LEIA_SR_V2_AVAILABLE)

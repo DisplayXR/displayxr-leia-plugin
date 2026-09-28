@@ -227,6 +227,57 @@ struct leia_scam_pair_count
 bool
 leia_scam_pair_count_push(struct leia_scam_pair_count *c, uint64_t frame_id, double left_z, double right_z);
 
+/*
+ * Platform device hint (XrStereoCameraPropertiesDXR::platformDeviceHint).
+ *
+ * The SR tracker holds the physical camera, so a capture stack that lists it
+ * next to the runtime's stereo camera offers a device that can only ever fail
+ * with "in use". The hint lets it hide that duplicate. The SR SDK does not name
+ * the camera, and "the device currently open BY the tracker process" is not
+ * observable from user mode without enumerating kernel handles, so the
+ * provider enumerates the OS's video-capture devices and picks the SR tracking
+ * camera by, in order:
+ *
+ *   1. its USB VID:PID, from a small list of known SR tracking cameras
+ *      (LEIA_SCAM_KNOWN_TRACKING_CAMERAS); then
+ *   2. its driver's friendly name containing "tracking camera"
+ *      (case-insensitive) — the name the SR tracking camera reports.
+ *
+ * The hint is the USB id in the "vvvv:pppp" form (lower-case hex) — the same
+ * string Chromium's model_id carries for a USB camera, and immune to the
+ * two-interface-class path spelling (MediaFoundation vs DirectShow). A
+ * candidate with no USB id contributes its device path instead. The hint is
+ * filled only when the candidates reduce to exactly ONE distinct value:
+ * hiding the wrong camera (a user's own webcam) is worse than hiding none.
+ */
+
+//! Size of the hint buffer (XR_STEREO_CAMERA_PLATFORM_HINT_MAX_SIZE_DXR).
+#define LEIA_SCAM_HINT_MAX 256u
+
+struct leia_scam_video_device
+{
+	const char *path;          //!< OS device-interface path (\\?\usb#vid_...#{guid}\...), may be NULL
+	const char *friendly_name; //!< driver friendly name, may be NULL
+};
+
+/*!
+ * Extract a USB "vid_XXXX&pid_YYYY" pair (any case) from a device path or
+ * instance id, or accept an already-formed "XXXX:YYYY".
+ */
+bool
+leia_scam_usb_id(const char *s, uint16_t *vid, uint16_t *pid);
+
+//! Is this device an SR tracking camera (known VID:PID, else name match)?
+bool
+leia_scam_is_tracking_camera(const struct leia_scam_video_device *dev);
+
+/*!
+ * Pick the hint from the enumerated devices. Writes "" and returns false
+ * unless exactly one distinct candidate exists.
+ */
+bool
+leia_scam_pick_platform_hint(const struct leia_scam_video_device *devs, size_t count, char *out, size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif
