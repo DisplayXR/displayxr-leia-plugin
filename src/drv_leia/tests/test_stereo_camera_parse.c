@@ -274,6 +274,64 @@ test_rate_and_pairs(void)
 	CHECK(c.with_eyes == 2);
 }
 
+static void
+test_platform_hint(void)
+{
+	uint16_t vid = 0, pid = 0;
+	// Every spelling of the USB id a Windows stack produces.
+	CHECK(leia_scam_usb_id("\\\\?\\usb#vid_04f2&pid_b70c&mi_00#6&1a2b3c&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global",
+	                       &vid, &pid));
+	CHECK(vid == 0x04f2 && pid == 0xb70c);
+	CHECK(leia_scam_usb_id("USB\\VID_04F2&PID_B70C&MI_00\\6&1A2B3C&0&0000", &vid, &pid));
+	CHECK(vid == 0x04f2 && pid == 0xb70c);
+	CHECK(leia_scam_usb_id("04F2:B70C", &vid, &pid));
+	CHECK(vid == 0x04f2 && pid == 0xb70c);
+	CHECK(!leia_scam_usb_id("\\\\?\\root#camera#0000#{e5323777-f976-4f5b-9b55-b94699c46e44}", &vid, &pid));
+	CHECK(!leia_scam_usb_id("vid_04f2&pid_b7", &vid, &pid));
+	CHECK(!leia_scam_usb_id(NULL, &vid, &pid));
+
+	const char *tracker = "\\\\?\\usb#vid_04f2&pid_b70c&mi_00#6&1a2b3c&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
+	const char *webcam = "\\\\?\\usb#vid_0c45&pid_6366&mi_00#6&aaaa&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global";
+	char hint[LEIA_SCAM_HINT_MAX];
+
+	// Known VID:PID next to an ordinary webcam: the tracker, as "vvvv:pppp".
+	struct leia_scam_video_device a[] = {{webcam, "Integrated Webcam"}, {tracker, "USB Camera"}};
+	CHECK(leia_scam_pick_platform_hint(a, 2, hint, sizeof(hint)));
+	CHECK(strcmp(hint, "04f2:b70c") == 0);
+
+	// Unknown VID:PID, found by the driver's friendly name.
+	struct leia_scam_video_device b[] = {{webcam, "Integrated Webcam"},
+	                                     {"\\\\?\\usb#vid_1234&pid_abcd#x#{g}", "Some Tracking Camera"}};
+	CHECK(leia_scam_pick_platform_hint(b, 2, hint, sizeof(hint)));
+	CHECK(strcmp(hint, "1234:abcd") == 0);
+
+	// The same camera seen under two interface classes is ONE candidate.
+	struct leia_scam_video_device c[] = {
+	    {tracker, "Tracking Camera"},
+	    {"\\\\?\\usb#vid_04f2&pid_b70c&mi_00#6&1a2b3c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+	     "Tracking Camera"}};
+	CHECK(leia_scam_pick_platform_hint(c, 2, hint, sizeof(hint)));
+	CHECK(strcmp(hint, "04f2:b70c") == 0);
+
+	// Two different matching cameras: ambiguous, hide none.
+	struct leia_scam_video_device d[] = {{tracker, NULL}, {"\\\\?\\usb#vid_5555&pid_6666#x#{g}", "tracking camera"}};
+	CHECK(!leia_scam_pick_platform_hint(d, 2, hint, sizeof(hint)));
+	CHECK(hint[0] == '\0');
+
+	// No candidate at all (a webcam only, or nothing enumerated).
+	struct leia_scam_video_device e[] = {{webcam, "Integrated Webcam"}};
+	CHECK(!leia_scam_pick_platform_hint(e, 1, hint, sizeof(hint)));
+	CHECK(hint[0] == '\0');
+	CHECK(!leia_scam_pick_platform_hint(NULL, 0, hint, sizeof(hint)));
+
+	// A non-USB candidate is named by its path; an unnamed one is ambiguous.
+	struct leia_scam_video_device f[] = {{"\\\\?\\acpi#int3474#1#{g}", "Tracking Camera"}};
+	CHECK(leia_scam_pick_platform_hint(f, 1, hint, sizeof(hint)));
+	CHECK(strcmp(hint, "\\\\?\\acpi#int3474#1#{g}") == 0);
+	struct leia_scam_video_device g[] = {{NULL, "Tracking Camera"}};
+	CHECK(!leia_scam_pick_platform_hint(g, 1, hint, sizeof(hint)));
+}
+
 int
 main(void)
 {
@@ -282,6 +340,7 @@ main(void)
 	test_calibration();
 	test_swap_halves();
 	test_rate_and_pairs();
+	test_platform_hint();
 	if (g_fail) {
 		fprintf(stderr, "test_stereo_camera_parse: %d failure(s)\n", g_fail);
 		return 1;
