@@ -148,6 +148,19 @@ struct leia_dp_linux
 	} ag_fbs[4];
 	uint32_t ag_fbs_count;
 
+	// --- 2D path encode-on-output (issue #278, sibling of D3D11 #276) -----
+	// The 1x1 path bypasses the weaver with a vkCmdBlitImage, which converts
+	// by the two images' FORMATS and knows nothing of the declared encoding.
+	// For a LINEAR atlas into a non-sRGB target that stores linear values
+	// verbatim (gamma-dark 2D), so we blit into this `_SRGB` sibling of the
+	// target format instead (the blit encodes on write) and copy the bytes
+	// across (vkCmdCopyImage never converts). Allocated on first use only.
+	VkImage flat_enc_image;
+	VkDeviceMemory flat_enc_mem;
+	uint32_t flat_enc_w, flat_enc_h;
+	VkFormat flat_enc_format;
+	bool flat_enc_warned; //!< one WARN when LINEAR arrives and we cannot encode
+
 	//! Windowed weaving (runtime#757 / LeiaSR#85): the app window's client-area
 	//! top-left in panel-relative pixels, pushed each frame by the compositor via
 	//! the set_present_origin slot. (0,0) = full-panel/display-scoped (default).
@@ -1339,6 +1352,177 @@ alpha_gate_run(struct leia_dp_linux *ldp,
 
 /*
  *
+ * 2D path: honour a LINEAR atlas handoff (issue #278, sibling of #276).
+ *
+ * The 1x1 path presents without the weaver, by vkCmdBlitImage. A blit converts
+ * between the two images' creation formats and nothing else: UNORM source ->
+ * UNORM target stores the bytes verbatim, UNORM source -> `_SRGB` target
+ * encodes them. So when the runtime declares the atlas LINEAR (ADR-021,
+ * set_atlas_encoding) the blit is already right into an `_SRGB` target and
+ * shows linear values un-encoded (gamma-dark) into a UNORM one — the case this
+ * section covers. ENCODED never enters it, so the ENCODED blit is untouched.
+ *
+ * The swapchain image is not MUTABLE_FORMAT (the runtime creates it without
+ * VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR), and a blit ignores views anyway,
+ * so we cannot "blit into an _SRGB view of the target". Instead: blit into a
+ * DP-owned image of the target's `_SRGB` sibling format (the hardware applies
+ * the standard sRGB OETF on write, alpha untouched, filtering done on the
+ * linear values), then vkCmdCopyImage it into the target — a copy between
+ * size-compatible formats moves bits and never converts.
+ *
+ */
+
+static bool
+flat_format_is_srgb(VkFormat format)
+{
+	switch (format) {
+	case VK_FORMAT_R8G8B8A8_SRGB:
+	case VK_FORMAT_B8G8R8A8_SRGB:
+	case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+	case VK_FORMAT_R8G8B8_SRGB:
+	case VK_FORMAT_B8G8R8_SRGB:
+	case VK_FORMAT_R8_SRGB:
+	case VK_FORMAT_R8G8_SRGB: return true;
+	default: return false;
+	}
+}
+
+//! The `_SRGB` format with the same texel layout as @p format, or UNDEFINED.
+static VkFormat
+flat_srgb_sibling(VkFormat format)
+{
+	switch (format) {
+	case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+	case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+	case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+	default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+static void
+flat_enc_release(struct leia_dp_linux *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (vk == NULL) {
+		return;
+	}
+	if (ldp->flat_enc_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->flat_enc_image, NULL);
+	}
+	if (ldp->flat_enc_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->flat_enc_mem, NULL);
+	}
+	ldp->flat_enc_image = VK_NULL_HANDLE;
+	ldp->flat_enc_mem = VK_NULL_HANDLE;
+	ldp->flat_enc_w = 0;
+	ldp->flat_enc_h = 0;
+	ldp->flat_enc_format = VK_FORMAT_UNDEFINED;
+}
+
+/*!
+ * The `_SRGB` intermediate for a LINEAR 2D frame into @p target_format, sized
+ * (w, h), or VK_NULL_HANDLE when the target has no 8-bit `_SRGB` sibling or the
+ * device cannot blit into it — the caller then keeps the plain blit (the
+ * pre-#278 behaviour) and one WARN says so.
+ */
+static VkImage
+flat_enc_ensure(struct leia_dp_linux *ldp, VkFormat target_format, uint32_t w, uint32_t h)
+{
+	struct vk_bundle *vk = ldp->vk;
+	const VkFormat srgb = flat_srgb_sibling(target_format);
+	if (srgb == VK_FORMAT_UNDEFINED) {
+		return VK_NULL_HANDLE;
+	}
+	if (ldp->flat_enc_image != VK_NULL_HANDLE && ldp->flat_enc_format == srgb && ldp->flat_enc_w == w &&
+	    ldp->flat_enc_h == h) {
+		return ldp->flat_enc_image;
+	}
+	VkFormatProperties props = {0};
+	vk->vkGetPhysicalDeviceFormatProperties(vk->physical_device, srgb, &props);
+	if ((props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0) {
+		return VK_NULL_HANDLE;
+	}
+	// Same pattern as ag_ensure_strip: a size change means the compositor
+	// recreated its target, so the previous frame's use of this image is done.
+	flat_enc_release(ldp);
+	VkExtent2D ext = {w, h};
+	VkResult res = vk_create_image_simple(vk, ext, srgb,
+	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                                      &ldp->flat_enc_mem, &ldp->flat_enc_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("leia_lnx_dp: 2D encode intermediate (%ux%u, format %d) failed: %d", w, h, srgb, res);
+		flat_enc_release(ldp);
+		return VK_NULL_HANDLE;
+	}
+	ldp->flat_enc_format = srgb;
+	ldp->flat_enc_w = w;
+	ldp->flat_enc_h = h;
+	// One-off lifecycle line (allocation happens once per target size).
+	U_LOG_W("leia_lnx_dp: 2D path encodes the LINEAR atlas via a %ux%u _SRGB intermediate (target format %d)",
+	        w, h, target_format);
+	return ldp->flat_enc_image;
+}
+
+/*!
+ * Blit + copy for a LINEAR atlas into a non-sRGB target. Expects the atlas in
+ * TRANSFER_SRC_OPTIMAL and the target in TRANSFER_DST_OPTIMAL (the caller's
+ * barriers, shared with the plain blit), leaves both there.
+ */
+static void
+flat_enc_blit_copy(struct leia_dp_linux *ldp,
+                   VkCommandBuffer cmd,
+                   VkImage atlas_image,
+                   const VkImageBlit *blit,
+                   VkImage enc_image,
+                   VkImage target_image,
+                   uint32_t w,
+                   uint32_t h)
+{
+	struct vk_bundle *vk = ldp->vk;
+
+	// Discard last frame's contents (fully overwritten) and order after its copy.
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = enc_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+
+	// UNORM -> _SRGB: the blit filters the linear values, then encodes on write.
+	vk->vkCmdBlitImage(cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, enc_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, blit, VK_FILTER_LINEAR);
+
+	VkImageMemoryBarrier to_src = to_dst;
+	to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_src);
+
+	// _SRGB -> UNORM sibling: same texel block, so the copy moves the encoded
+	// bytes as they are.
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {w, h, 1},
+	};
+	vk->vkCmdCopyImage(cmd, enc_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
+
+/*
+ *
  * Vtable callbacks.
  *
  */
@@ -1411,9 +1595,28 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .dstOffsets = {{0, 0, 0}, {(int32_t)target_width, (int32_t)target_height, 1}},
 		};
-		vk->vkCmdBlitImage(cmd_buffer, (VkImage)atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   (VkImage)target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-		                   VK_FILTER_LINEAR);
+		// Issue #278: the declared encoding is read per frame (set_atlas_encoding
+		// runs before every process_atlas). A LINEAR atlas into a target that
+		// does not encode on store goes through the _SRGB intermediate; every
+		// other case — including all ENCODED frames — is the plain blit, as before.
+		VkImage enc_image = VK_NULL_HANDLE;
+		if (ldp->atlas_linear && !flat_format_is_srgb((VkFormat)target_format)) {
+			enc_image = flat_enc_ensure(ldp, (VkFormat)target_format, target_width, target_height);
+			if (enc_image == VK_NULL_HANDLE && !ldp->flat_enc_warned) {
+				U_LOG_W("leia_lnx_dp: LINEAR atlas into target format %d with no blittable 8-bit _SRGB "
+				        "sibling — 2D shows it un-encoded (issue #278)",
+				        (int)target_format);
+				ldp->flat_enc_warned = true;
+			}
+		}
+		if (enc_image != VK_NULL_HANDLE) {
+			flat_enc_blit_copy(ldp, cmd_buffer, (VkImage)atlas_image, &blit, enc_image, (VkImage)target_image,
+			                   target_width, target_height);
+		} else {
+			vk->vkCmdBlitImage(cmd_buffer, (VkImage)atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   (VkImage)target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			                   VK_FILTER_LINEAR);
+		}
 
 		VkImageMemoryBarrier post[2] = {
 		    {
@@ -1845,6 +2048,7 @@ leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 	leia_bg_capture_worker_destroy(&ldp->bg_worker);
 	compose_release(ldp);        // transparency resources (runtime#757)
 	ag_release(ldp);             // post-weave alpha-gate (runtime#757)
+	flat_enc_release(ldp);       // 2D LINEAR-encode intermediate (#278)
 	leiasr_lnx_destroy(ldp->sr); // R-W10
 	free(ldp);
 }
