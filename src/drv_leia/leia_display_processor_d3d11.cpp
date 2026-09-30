@@ -68,7 +68,13 @@ VS_OUTPUT main(uint id : SV_VertexID) {
 }
 )";
 
-// Passthrough pixel shader: samples first tile from atlas, stretches to fill target
+// Passthrough pixel shader: samples first tile from atlas, stretches to fill target.
+//
+// leia-plugin#276: the two flat paths (2D, weaver-not-ready) bypass the weaver,
+// so they must do the output encode the weaver does via
+// leiasr_d3d11_set_srgb_conversion(write=atlas_is_linear) (ADR-021 Model B;
+// this DP declares EITHER). encode_srgb != 0 applies the standard sRGB OETF to
+// straight RGB, alpha untouched; encode_srgb == 0 returns the sample unchanged.
 static const char *blit_ps_source = R"(
 Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
@@ -76,12 +82,22 @@ SamplerState samp : register(s0);
 cbuffer BlitParams : register(b0) {
 	float u_scale;
 	float v_scale;
-	float pad0;
+	float encode_srgb;
 	float pad1;
 };
 
+float3 linear_to_srgb(float3 c) {
+	float3 lo = 12.92 * c;
+	float3 hi = 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+	return (c <= 0.0031308) ? lo : hi;
+}
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	return atlas_tex.Sample(samp, float2(uv.x * u_scale, uv.y * v_scale));
+	float4 c = atlas_tex.Sample(samp, float2(uv.x * u_scale, uv.y * v_scale));
+	if (encode_srgb != 0.0) {
+		c.rgb = linear_to_srgb(c.rgb);
+	}
+	return c;
 }
 )";
 
@@ -362,7 +378,7 @@ struct leia_display_processor_d3d11_impl
 	ID3D11VertexShader *blit_vs;
 	ID3D11PixelShader *blit_ps;
 	ID3D11SamplerState *blit_sampler;
-	ID3D11Buffer *blit_cb; //!< 16 bytes: u_scale, v_scale, pad, pad
+	ID3D11Buffer *blit_cb; //!< 16 bytes: u_scale, v_scale, encode_srgb, pad
 	//! @}
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
@@ -1467,10 +1483,12 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		}
 		uint32_t content_w = (vp_w < atlas_w) ? vp_w : atlas_w;
 		uint32_t content_h = (vp_h < atlas_h) ? vp_h : atlas_h;
-		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
+		struct { float u_scale; float v_scale; float encode_srgb; float pad1; } cb_data;
 		cb_data.u_scale = (atlas_w > 0) ? (float)content_w / (float)atlas_w : 1.0f;
 		cb_data.v_scale = (atlas_h > 0) ? (float)content_h / (float)atlas_h : 1.0f;
-		cb_data.pad0 = 0.0f;
+		// #276: the weaver is bypassed, so this blit owns the LINEAR→sRGB
+		// output encode (same per-frame read as the weaver path above).
+		cb_data.encode_srgb = atlas_is_linear ? 1.0f : 0.0f;
 		cb_data.pad1 = 0.0f;
 		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
 
@@ -1555,12 +1573,13 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		{
 			float u_scale;
 			float v_scale;
-			float pad0;
+			float encode_srgb;
 			float pad1;
 		} cb_data;
 		cb_data.u_scale = (tile_columns > 0) ? 1.0f / (float)tile_columns : 1.0f;
 		cb_data.v_scale = (tile_rows > 0) ? 1.0f / (float)tile_rows : 1.0f;
-		cb_data.pad0 = 0.0f;
+		// #276: the not-ready weaver is not encoding, so this blit must.
+		cb_data.encode_srgb = atlas_is_linear ? 1.0f : 0.0f;
 		cb_data.pad1 = 0.0f;
 		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
 
@@ -2470,7 +2489,7 @@ leia_dp_d3d11_init_blit(struct leia_display_processor_d3d11_impl *ldp)
 		return false;
 	}
 
-	// Create constant buffer (16 bytes: u_scale, v_scale, pad, pad)
+	// Create constant buffer (16 bytes: u_scale, v_scale, encode_srgb, pad)
 	D3D11_BUFFER_DESC cb_desc = {};
 	cb_desc.ByteWidth = 16;
 	cb_desc.Usage = D3D11_USAGE_DEFAULT;
