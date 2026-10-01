@@ -28,8 +28,10 @@
  *    its draw inside. Render-pass compatibility VERIFIED against the SDK
  *    source (LeiaSR v2-vulkan-weaver, vkweaver.cpp RenderPassCache): its
  *    pipeline pass is single color attachment @ outputFormat, samples 1,
- *    loadOp LOAD, COLOR_ATTACHMENT_OPTIMAL in/out, no depth, one subpass —
- *    identical shape to ours, so the passes are compatible by Vulkan §8.2.
+ *    loadOp LOAD, COLOR_ATTACHMENT_OPTIMAL in/out, no depth, one subpass, NO
+ *    subpass dependencies — identical shape to ours, so the passes are
+ *    compatible by Vulkan §8.2. (Ours used to declare two dependencies, which
+ *    compatibility does not exempt: VUID-vkCmdDraw-renderPass-02684, #280.)
  *    In fb=0 mode the weaver skips its own Begin/EndRenderPass entirely and
  *    just binds pipeline + draws. Escape hatch kept: DXR_LEIA_SR_FB_SDK=1
  *    hands the caller framebuffer to the SDK (it then begins its own pass).
@@ -1009,6 +1011,33 @@ sdk_apply_srgb_conversion(struct leiasr_lnx *lnx)
 	}
 }
 
+/*!
+ * Issue #280: the ordering the weave render pass's EXTERNAL->0 subpass
+ * dependency used to provide, as a barrier recorded before the pass begins.
+ * Prior colour-attachment or transfer writes to the target (the runtime's
+ * pre-weave transition, a 2D frame's blit, a previous overlay) happen before
+ * the weave's LOAD and its blended draw. Layout unchanged: the target is in
+ * COLOR_ATTACHMENT_OPTIMAL here (runtime pre-weave barrier), as both passes
+ * that can draw into it declare.
+ */
+static void
+sdk_weave_target_barrier(VkCommandBuffer cmd_buffer, VkImage image)
+{
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
 static VkResult
 sdk_create_render_pass(struct leiasr_lnx *lnx, VkFormat format)
 {
@@ -1035,32 +1064,24 @@ sdk_create_render_pass(struct leiasr_lnx *lnx, VkFormat format)
 	    .colorAttachmentCount = 1,
 	    .pColorAttachments = &att_ref,
 	};
-	VkSubpassDependency deps[2] = {
-	    {
-	        .srcSubpass = VK_SUBPASS_EXTERNAL,
-	        .dstSubpass = 0,
-	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	    },
-	    {
-	        .srcSubpass = 0,
-	        .dstSubpass = VK_SUBPASS_EXTERNAL,
-	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
-	    },
-	};
+	/* NO subpass dependencies (issue #280). The weaver draws with a pipeline
+	 * built against ITS OWN RenderPassCache pass (vkweaver.cpp), which declares
+	 * dependencyCount = 0 (the dependency is commented out there). Render-pass
+	 * compatibility (Vulkan "Render Pass Compatibility") exempts only layouts
+	 * and load/store ops — dependencies must match — so the two dependencies
+	 * this pass used to declare made every weave draw
+	 * VUID-vkCmdDraw-renderPass-02684 ("dependencyCount 2 vs 0"). The ordering
+	 * those dependencies gave is now an explicit barrier in leiasr_lnx_weave
+	 * (sdk_weave_target_barrier); consumers after the pass carry their own
+	 * COLOR_ATTACHMENT_OUTPUT-sourced barrier. */
 	VkRenderPassCreateInfo rp_info = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
 	    .attachmentCount = 1,
 	    .pAttachments = &att,
 	    .subpassCount = 1,
 	    .pSubpasses = &subpass,
-	    .dependencyCount = 2,
-	    .pDependencies = deps,
+	    .dependencyCount = 0,
+	    .pDependencies = NULL,
 	};
 	lnx->render_pass_format = format;
 	return vkCreateRenderPass(lnx->info.device, &rp_info, NULL, &lnx->render_pass);
@@ -1425,6 +1446,9 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	}
 
 	const bool fb_to_sdk = debug_get_bool_option_sr_fb_sdk();
+
+	/* Outside any render pass, before either path begins one (#280). */
+	sdk_weave_target_barrier(cmd_buffer, output->image);
 
 	if (fb_to_sdk) {
 		/* Escape hatch: hand the caller framebuffer to the SDK and let it
