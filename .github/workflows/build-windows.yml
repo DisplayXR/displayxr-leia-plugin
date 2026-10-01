@@ -89,6 +89,13 @@ jobs:
       # for LeiaInc/CNSDK. Fork PRs have no secret and cannot build this arm.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
       GH_TOKEN: ${{ github.token }}
+      # SourceForge serves a bot-check page to CI runners, so vcpkg's pthreads
+      # port (vcpkg_from_sourceforge) fails its hash on every mirror. This
+      # overlay is the same port fetching the identical pthreads4w v3.0.0
+      # commit from GitHub (provenance in its portfile; displayxr-runtime#1776).
+      # Env-var form because vcpkg's manifest/config come from the pinned
+      # runtime checkout; drop it once RUNTIME_REF carries the overlay itself.
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/cmake/vcpkg-overlay-ports
       # ADR-020 rule 5: single source of truth for the runtime ref. The
       # Rule-5 self-check below asserts CMakeLists.txt's DXR_RUNTIME_GIT_TAG
       # equals this value so the FetchContent pin and the workflow checkout
