@@ -160,6 +160,7 @@ struct leia_dp_linux
 	uint32_t flat_enc_w, flat_enc_h;
 	VkFormat flat_enc_format;
 	bool flat_enc_warned; //!< one WARN when LINEAR arrives and we cannot encode
+	bool flat_enc_announced; //!< first intermediate allocation WARNed; later ones are INFO (#280)
 
 	//! Windowed weaving (runtime#757 / LeiaSR#85): the app window's client-area
 	//! top-left in panel-relative pixels, pushed each frame by the compositor via
@@ -1457,9 +1458,18 @@ flat_enc_ensure(struct leia_dp_linux *ldp, VkFormat target_format, uint32_t w, u
 	ldp->flat_enc_format = srgb;
 	ldp->flat_enc_w = w;
 	ldp->flat_enc_h = h;
-	// One-off lifecycle line (allocation happens once per target size).
-	U_LOG_W("leia_lnx_dp: 2D path encodes the LINEAR atlas via a %ux%u _SRGB intermediate (target format %d)",
-	        w, h, target_format);
+	// #280: the first activation is a lifecycle event (WARN); every later
+	// reallocation follows a target resize — a live window drag produced 51 of
+	// them — so it is INFO.
+	if (!ldp->flat_enc_announced) {
+		ldp->flat_enc_announced = true;
+		U_LOG_W("leia_lnx_dp: 2D path encodes the LINEAR atlas via a %ux%u _SRGB intermediate "
+		        "(target format %d); later resizes log at INFO",
+		        w, h, target_format);
+	} else {
+		U_LOG_I("leia_lnx_dp: 2D encode intermediate reallocated at %ux%u (target format %d)", w, h,
+		        target_format);
+	}
 	return ldp->flat_enc_image;
 }
 
@@ -1518,6 +1528,48 @@ flat_enc_blit_copy(struct leia_dp_linux *ldp,
 	};
 	vk->vkCmdCopyImage(cmd, enc_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
+/*!
+ * Issue #280: hand the target back in PRESENT_SRC_KHR.
+ *
+ * That is the layout contract the runtime's vk_native compositor holds a
+ * command-recording DP to: after process_atlas it declares PRESENT_SRC_KHR as
+ * the oldLayout of every post-weave overlay (off-panel 2D bands, Local2D/zones
+ * composite, HUD) and presents without a transition of its own ("Render pass
+ * finalLayout handles transition to PRESENT_SRC_KHR"). sim_display meets it
+ * with finalLayout = PRESENT_SRC_KHR; the Windows Leia DP with an explicit
+ * barrier after the weave (runtime#879). This DP left the target in
+ * COLOR_ATTACHMENT_OPTIMAL, which validation reported as
+ * VUID-VkPresentInfoKHR-pImageIndices-01430 at present and
+ * VUID-VkImageMemoryBarrier-oldLayout-01197 on the runtime's first overlay.
+ *
+ * Every weave-path producer (our render pass, the SDK's own pass in the
+ * DXR_LEIA_SR_FB_SDK mode, the passthrough blit, the alpha-gate) ends in
+ * COLOR_ATTACHMENT_OPTIMAL, and the runtime's pre-weave barrier puts the target
+ * there before process_atlas, so an early-out inside the backend leaves it
+ * there too. The destination scope covers the runtime's overlays (colour
+ * attachment and transfer); the present itself is ordered by the submit.
+ */
+static void
+dp_target_to_present(struct leia_dp_linux *ldp, VkCommandBuffer cmd, VkImage target_image)
+{
+	struct vk_bundle *vk = ldp->vk;
+	VkImageMemoryBarrier to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+	                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = target_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_present);
 }
 
 
@@ -1631,21 +1683,23 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		    {
+		        // #280: straight to PRESENT_SRC_KHR — see dp_target_to_present.
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+		                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .image = (VkImage)target_image,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		};
-		vk->vkCmdPipelineBarrier(
-		    cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0,
-		    NULL, 2, post);
+		vk->vkCmdPipelineBarrier(cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+		                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 2, post);
 		return;
 	}
 
@@ -1723,6 +1777,11 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	if (dp_transparency_live(ldp) && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
 		alpha_gate_run(ldp, cmd_buffer, (VkImage)target_image, (VkImageView)atlas_view,
 		               (VkFormat)target_format, target_width, target_height, tile_columns, tile_rows);
+	}
+
+	// #280: last, after every writer on this path (weave, alpha-gate).
+	if (target_image != (VkImage_XDP)0) {
+		dp_target_to_present(ldp, cmd_buffer, (VkImage)target_image);
 	}
 }
 
