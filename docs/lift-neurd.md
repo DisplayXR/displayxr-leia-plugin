@@ -301,12 +301,12 @@ ref; it is the table version the module requests from `NeurD_load`.
 
 ### 2. Runtime headers with the lift slots
 
-The slots compile only when the runtime headers define `XRT_DP_D3D11_HAS_LIFT`. The
-Windows pin `DXR_RUNTIME_GIT_TAG` is currently `v2.16.9`, which predates it — a pinned
-build ships the plug-in with the lift slots compiled out (it logs
+The slots compile only when the runtime headers define `XRT_DP_D3D11_HAS_LIFT`, which
+first ships in runtime `v2.22.0` — the Windows pin `DXR_RUNTIME_GIT_TAG`. Built against
+older headers the plug-in ships with the lift slots compiled out (it logs
 `lift slots NOT COMPILED`), and the runtime sees them absent via `struct_size`.
 
-To build with lift before the runtime tags it, use a local runtime checkout — nothing
+To build against an unreleased runtime, use a local runtime checkout — nothing
 is committed:
 
 ```bat
