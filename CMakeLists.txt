@@ -162,9 +162,13 @@ endif()
 # This plug-in MUST be built against headers that ship the matching major,
 # or the runtime will log "ABI major mismatch — plugin_api=N, runtime
 # expects M ... skipping (ADR-020 rule 3)" and fall back to sim_display.
+# v2.22.0 (from v2.16.9): the first runtime that ships the D3D11 DP lift slots
+# (XRT_DP_D3D11_HAS_LIFT, runtime#1781) and the lift-only factory
+# (XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY). Appended and struct_size-gated,
+# plug-in ABI still v5; an older pin compiles the NeurD lift module OUT.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.16.9" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.22.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin so it can move independently of the Windows
 # installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
