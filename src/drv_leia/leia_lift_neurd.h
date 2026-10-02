@@ -13,10 +13,7 @@
  * a background thread the first time a DP asks for caps or a stream (never at
  * DP create, never on the caller's thread — first activation runs a licence
  * check over the network). Each DP owns a leia_lift_neurd handle holding its
- * streams; handles ref-count the instance. After IdleUnloadSec (default 300 s)
- * with no stream at all, NeurD is deinit'd and its DLL freed, so its installer
- * can replace the files; the next stream_create reloads it in the background
- * (caps keep reporting READY meanwhile, converts fail until it is back).
+ * streams; handles ref-count the instance.
  *
  * Absent NeurD.dll (or DXR_LEIA_LIFT=0): caps report modes=0 / state=0 and
  * every other entry point returns false. Nothing is loaded.
@@ -94,9 +91,8 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **lift);
 bool
 leia_lift_neurd_get_caps(struct leia_lift_neurd *lift, struct leia_lift_neurd_caps *out);
 
-//! Non-blocking. Succeeds while NeurD is still activating or reloading after an
-//! idle unload (the NeurD stream is created lazily on the first convert once
-//! READY); fails when unavailable / out of slots.
+//! Non-blocking. Succeeds while NeurD is still activating (the NeurD stream is
+//! created lazily on the first convert); fails when unavailable / out of slots.
 bool
 leia_lift_neurd_stream_create(struct leia_lift_neurd *lift,
                               const struct leia_lift_neurd_stream_desc *desc,
