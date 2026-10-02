@@ -107,6 +107,10 @@ constexpr float kDefaultDepthGain = 2.0f;
 //! past its silhouette on the panel (David, 2026-09-26: "the disparity map dilation is a bit too
 //! much, reduce a bit").
 constexpr int32_t kDefaultDilate = 2;
+//! Oldest NeurD lift accepts by default (MinVersion knob). A product decision, deliberately NOT
+//! NEURD_VERSION: only 0.4.6 is hardware-tested, and older ones fail converts with the default
+//! backend instead of reporting unavailable, so callers would not fall back to their own path.
+constexpr uint64_t kDefaultMinNeurDVersion = NEURD_MAKE_VERSION(0, 4, 6);
 //! NeurD's MAX_STREAMS.
 constexpr uint32_t kMaxStreams = 32;
 //! N views go side by side in ONE row (runtime contract), so the output is
@@ -221,11 +225,12 @@ struct knobs
 	float view_gain;          //!< DXR_LEIA_LIFT_VIEW_GAIN / ViewGain (default 1.0)
 	float conv_gain;          //!< DXR_LEIA_LIFT_CONV_GAIN / ConvGain (default 0.4): relative convergence -> NeurD units
 	uint64_t interactive_min; //!< DXR_LEIA_LIFT_INTERACTIVE_MIN / InteractiveMin; 0 = unset (header's INTRODUCED_IN)
+	uint64_t min_version;     //!< DXR_LEIA_LIFT_MIN_VERSION / MinVersion (default 0.4.6): older NeurD is refused
 	int32_t video_model;      //!< DXR_LEIA_LIFT_VIDEO_MODEL / VideoModel: fast (default) | metric (NeurD >= 0.4.6)
 	float depth_gain;         //!< DXR_LEIA_LIFT_DEPTH_GAIN / DepthGain (default 2.0): NeurD gain at strength 1
 	int32_t dilate;           //!< DXR_LEIA_LIFT_DILATE / Dilate (default 2): NEURD_PROP_DILATE_RADIO, px
-	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_video_model, src_depth_gain,
-	    src_dilate;
+	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_min_version,
+	    src_video_model, src_depth_gain, src_dilate;
 };
 
 bool
@@ -324,9 +329,10 @@ parse_float_in(const char *v, float lo, float hi, float *out)
 	return true;
 }
 
-//! Strict "MAJ.MIN.PAT" (no sscanf: MSVC C4996), clamped to >= 0.4.4.
+//! Strict "MAJ.MIN.PAT" (no sscanf: MSVC C4996). Parts wider than
+//! NEURD_MAKE_VERSION's fields are rejected rather than silently masked.
 bool
-parse_interactive_min(const char *v, uint64_t *out)
+parse_version(const char *v, uint64_t *out)
 {
 	unsigned long part[3] = {0, 0, 0};
 	const char *c = v;
@@ -337,11 +343,22 @@ parse_interactive_min(const char *v, uint64_t *out)
 		ok = end != c && *end == (i < 2 ? '.' : '\0');
 		c = end + (i < 2 ? 1 : 0);
 	}
-	if (!ok) {
+	if (!ok || part[0] > 0xffffUL || part[1] > 0xffffUL) {
+		return false;
+	}
+	*out = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
+	return true;
+}
+
+//! parse_version, clamped to >= 0.4.4.
+bool
+parse_interactive_min(const char *v, uint64_t *out)
+{
+	uint64_t ver = 0;
+	if (!parse_version(v, &ver)) {
 		return false;
 	}
 	const uint64_t floor_v = NEURD_MAKE_VERSION(0, 4, 4);
-	const uint64_t ver = NEURD_MAKE_VERSION(part[0], part[1], part[2]);
 	*out = (ver < floor_v) ? floor_v : ver;
 	return true;
 }
@@ -374,6 +391,7 @@ read_knobs()
 	k.view_gain = 1.0f;
 	k.conv_gain = 0.4f;
 	k.interactive_min = 0;
+	k.min_version = kDefaultMinNeurDVersion;
 	k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
 	k.depth_gain = kDefaultDepthGain;
 	k.dilate = kDefaultDilate;
@@ -439,6 +457,19 @@ read_knobs()
 		} else {
 			U_LOG_W("Leia lift: interactive min '%s' (%s) not a version (e.g. 0.4.4) — ignored", v,
 			        knob_src_str(src));
+		}
+	}
+
+	// No clamp: a floor below 0.3.11 just defers to the stream-API check at activation.
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_MIN_VERSION", L"MinVersion", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_version(v, &k.min_version)) {
+			k.src_min_version = src;
+		} else {
+			U_LOG_W("Leia lift: min version '%s' (%s) not a version (e.g. 0.4.6) — using %u.%u.%u", v,
+			        knob_src_str(src), (unsigned)NEURD_GET_VERSION_MAJOR(kDefaultMinNeurDVersion),
+			        (unsigned)NEURD_GET_VERSION_MINOR(kDefaultMinNeurDVersion),
+			        (unsigned)NEURD_GET_VERSION_PATCH(kDefaultMinNeurDVersion));
 		}
 	}
 
@@ -903,6 +934,22 @@ activation_worker()
 			        NEURD_GET_VERSION_MAJOR(NEURD_VERSION),
 			        NEURD_GET_VERSION_MINOR(NEURD_VERSION),
 			        NEURD_GET_VERSION_PATCH(NEURD_VERSION));
+			// Before backend / init / licensing: an unsupported NeurD never initialises.
+			// Self-sufficient WARN — the knobs line below prints only after a good init.
+			if (nd->version < g.k0.min_version) {
+				U_LOG_W("Leia lift: NeurD %u.%u.%u is older than the minimum %u.%u.%u (%s) — lift unavailable; "
+				        "callers fall back to their own conversion path. Install NeurD >= %u.%u.%u, or set "
+				        "MinVersion (HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift) / DXR_LEIA_LIFT_MIN_VERSION to override",
+				        NEURD_GET_VERSION_MAJOR(nd->version), NEURD_GET_VERSION_MINOR(nd->version),
+				        NEURD_GET_VERSION_PATCH(nd->version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version),
+				        knob_src_str(g.k0.src_min_version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
+				// Deliberately no FreeLibrary: NeurD may have spun threads.
+				g.state.store(G_FAILED);
+				g.worker_running.store(false);
+				return;
+			}
 			if (NEURD_GET_VERSION_MAJOR(nd->version) != 0 ||
 			    !LEIA_NEURD_HAS(nd, convert_stream_dx) || !LEIA_NEURD_HAS(nd, create_stream) ||
 			    !LEIA_NEURD_HAS(nd, set_prop_1i) || !LEIA_NEURD_HAS(nd, set_prop_1f)) {
@@ -981,11 +1028,13 @@ activation_worker()
 		if (k0.interactive_min != 0) {
 			interactive_min = k0.interactive_min;
 		}
-		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) scale=%s(%s) view_gain=%.2f(%s) "
-		        "conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) dilate=%d(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) min_version=%u.%u.%u(%s) scale=%s(%s) "
+		        "view_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) dilate=%d(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
 		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
 		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
 		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
+		        (unsigned)NEURD_GET_VERSION_MAJOR(k0.min_version), (unsigned)NEURD_GET_VERSION_MINOR(k0.min_version),
+		        (unsigned)NEURD_GET_VERSION_PATCH(k0.min_version), knob_src_str(k0.src_min_version),
 		        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
 		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
 		        knob_src_str(k0.src_conv_gain),
