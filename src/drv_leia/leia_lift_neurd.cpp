@@ -15,15 +15,9 @@
  *    detached background thread, never on a caller's thread: NeurD_init runs a
  *    licence activation that needs the network on first use. A network failure
  *    is reported as ACTIVATING and retried on later calls, rate-limited.
- *    DP instances come and go on focus changes, and re-init re-runs licensing +
- *    model load, so the DP ref-count only decides when to shrink NeurD's memory
- *    pool. What unloads NeurD is IDLE TIME (IdleUnloadSec, default 300 s): once
- *    a READY NeurD has had no lift stream for that long, a watcher thread
- *    deinits it and FreeLibrary's it, so NeurD's installer can replace the
- *    files the long-lived service would otherwise lock forever. The module then
- *    sits in G_IDLE — caps still say READY (the runtime froze them at READY
- *    anyway), stream_create still succeeds and kicks a full re-activation, and
- *    converts fail fast until NeurD is READY again (~5 s).
+ *    NeurD is never de-initialised once up: DP instances come and go on focus
+ *    changes, and re-init re-runs licensing + model load. The ref-count only
+ *    decides when to shrink NeurD's memory pool.
  *
  *  - Device bridge (the LeiaMeet DxStereoConverter pattern). NeurD runs on ITS
  *    OWN D3D11 device (NeurD_get_dx_device, 0.4.3+), possibly on a different adapter
@@ -81,7 +75,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cwchar>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -126,23 +119,6 @@ constexpr uint32_t kMaxViews = 8;
 constexpr uint32_t kMaxTexDim = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 //! Retry period for a licence activation that failed on the network.
 constexpr uint64_t kActivationRetryMs = 15000;
-//! IdleUnloadSec: default, and the clamp for a non-zero value (0 = never unload).
-constexpr uint32_t kDefaultIdleUnloadSec = 300;
-constexpr uint32_t kIdleUnloadMinSec = 5;
-constexpr uint32_t kIdleUnloadMaxSec = 86400;
-//! The idle watcher re-reads the idle clock at least this often, so it notices a
-//! new stream (and exits) promptly instead of sleeping out a stale deadline.
-constexpr uint64_t kIdleWatchMaxSleepMs = 1000;
-//! Pause between NeurD_deinit and FreeLibrary. Insurance, not a guarantee: NeurD
-//! documents no join of its worker thread (init(multithreaded) runs one), and a
-//! thread still unwinding inside NeurD.dll when it is unmapped would crash.
-constexpr DWORD kUnloadSettleMs = 250;
-//! A PHOTO stream's convert waits this long (polling, no lock held) for a reload
-//! in progress instead of failing: a photo may submit exactly one frame, and the
-//! runtime — whose caps froze at READY — consumes a failed frame for good. Same
-//! order as convert's existing worst case (three kDrainTimeoutMs drains).
-constexpr uint64_t kPhotoReloadWaitMs = 8000;
-constexpr DWORD kReloadPollMs = 20;
 //! Upper bound for any CPU drain of a GPU queue (device-lost guard).
 constexpr uint64_t kDrainTimeoutMs = 2000;
 //! Latency priors (reported until a measurement exists).
@@ -253,9 +229,8 @@ struct knobs
 	int32_t video_model;      //!< DXR_LEIA_LIFT_VIDEO_MODEL / VideoModel: fast (default) | metric (NeurD >= 0.4.6)
 	float depth_gain;         //!< DXR_LEIA_LIFT_DEPTH_GAIN / DepthGain (default 2.0): NeurD gain at strength 1
 	int32_t dilate;           //!< DXR_LEIA_LIFT_DILATE / Dilate (default 2): NEURD_PROP_DILATE_RADIO, px
-	uint32_t idle_unload_sec; //!< DXR_LEIA_LIFT_IDLE_UNLOAD_SEC / IdleUnloadSec (default 300; 0 = never unload)
 	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_min_version,
-	    src_video_model, src_depth_gain, src_dilate, src_idle_unload;
+	    src_video_model, src_depth_gain, src_dilate;
 };
 
 bool
@@ -388,31 +363,6 @@ parse_interactive_min(const char *v, uint64_t *out)
 	return true;
 }
 
-//! IdleUnloadSec: whole seconds. 0 = never unload; anything else is clamped to
-//! [kIdleUnloadMinSec, kIdleUnloadMaxSec] (*clamped says so). False on garbage.
-bool
-parse_idle_unload(const char *v, uint32_t *out, bool *clamped)
-{
-	if (v[0] < '0' || v[0] > '9') { // no sign, no leading blank (strtoull would wrap "-5")
-		return false;
-	}
-	char *end = nullptr;
-	unsigned long long n = std::strtoull(v, &end, 10); // saturates on overflow -> clamped below
-	if (*end != '\0') {
-		return false;
-	}
-	*clamped = false;
-	if (n != 0 && n < kIdleUnloadMinSec) {
-		n = kIdleUnloadMinSec;
-		*clamped = true;
-	} else if (n > kIdleUnloadMaxSec) {
-		n = kIdleUnloadMaxSec;
-		*clamped = true;
-	}
-	*out = (uint32_t)n;
-	return true;
-}
-
 const char *
 scale_str(int32_t a)
 {
@@ -445,7 +395,6 @@ read_knobs()
 	k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
 	k.depth_gain = kDefaultDepthGain;
 	k.dilate = kDefaultDilate;
-	k.idle_unload_sec = kDefaultIdleUnloadSec;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -564,23 +513,6 @@ read_knobs()
 		}
 	}
 
-	// Seconds without any lift stream after which a READY NeurD is deinit'd and
-	// FreeLibrary'd (its installer can then replace the files); 0 = never.
-	src = knob_lookup(reg, "DXR_LEIA_LIFT_IDLE_UNLOAD_SEC", L"IdleUnloadSec", v, sizeof(v));
-	if (src != KSRC_DEFAULT) {
-		bool clamped = false;
-		if (parse_idle_unload(v, &k.idle_unload_sec, &clamped)) {
-			k.src_idle_unload = src;
-			if (clamped) {
-				U_LOG_W("Leia lift: idle unload '%s' (%s) out of range — clamped to %u s (0 = never, else %u..%u)",
-				        v, knob_src_str(src), k.idle_unload_sec, kIdleUnloadMinSec, kIdleUnloadMaxSec);
-			}
-		} else {
-			U_LOG_W("Leia lift: idle unload '%s' (%s) not a whole number of seconds (0 = never) — using %u", v,
-			        knob_src_str(src), kDefaultIdleUnloadSec);
-		}
-	}
-
 	if (reg != nullptr) {
 		RegCloseKey(reg);
 	}
@@ -648,13 +580,11 @@ void main(uint3 id : SV_DispatchThreadID)
 enum gstate : uint32_t
 {
 	G_UNPROBED = 0, //!< Nothing looked at yet.
-	G_ABSENT,       //!< No NeurD.dll found (first probe, or a reload) — permanent for the process.
-	G_LOADING,      //!< Background worker is loading / initialising (first activation or a reload).
+	G_ABSENT,       //!< No NeurD.dll found — permanent for the process.
+	G_LOADING,      //!< Background worker is loading / initialising.
 	G_RETRY_WAIT,   //!< Licence activation hit the network; retry after next_retry_ms.
 	G_READY,        //!< Up; converts allowed.
 	G_FAILED,       //!< Permanent failure (bad licence, no DX device, ABI...).
-	G_UNLOADING,    //!< Was READY; the idle watcher is tearing NeurD down (busy, transient).
-	G_IDLE,         //!< Was READY; unloaded while idle. Caps still READY; a stream reloads it.
 };
 
 struct global
@@ -667,27 +597,10 @@ struct global
 	std::atomic<uint64_t> latency_ns{0}; //!< EMA of full convert wall time; 0 = none yet.
 	std::atomic<uint32_t> streams_live{0};
 
-	// Idle unload. streams_live and idle_since_ms change together under mtx:
-	// idle_since_ms is 0 while a stream exists, else when the last one went (or
-	// when READY was reached with none).
-	std::atomic<uint64_t> idle_unload_ms{0}; //!< First acquirer's IdleUnloadSec; 0 = never unload.
-	std::atomic<uint64_t> idle_since_ms{0};
-	std::atomic<bool> watcher_running{false}; //!< At most one idle watcher thread.
-	std::atomic<bool> reloading{false};       //!< The current activation follows an idle unload.
-
-	//! What caps reports while READY / UNLOADING / IDLE: a copy taken when READY is
-	//! published, so caps never reads fields a reload is rewriting (and never
-	//! waits behind mtx). Leaf lock: nothing is called while it is held.
-	std::mutex caps_mtx;
-	char caps_backend_name[32] = {};
-	enum NeurD_backend caps_backend = NEURD_BACKEND_DIRECTML;
-
 	int requested_backend = BACKEND_DIRECTML; //!< First acquirer's choice (NeurD's forced backend is sticky).
 	int32_t default_autoscaling = NEURD_INPUT_AUTOSCALING_720P;
-	struct knobs k0 = {}; //!< First acquirer's knobs (logged + interactive_min at activation; reused by reloads).
+	struct knobs k0 = {}; //!< First acquirer's knobs (logged + interactive_min at activation).
 
-	//! Both forgotten by the idle unload: after FreeLibrary everything that pointed
-	//! into NeurD (this table, its device, its context) is dangling.
 	HMODULE lib = nullptr;
 	struct NeurD const *nd = nullptr;
 	enum NeurD_backend backend = NEURD_BACKEND_DIRECTML;
@@ -819,16 +732,6 @@ neurd_log_cb(const char *msg, int size)
 	} else {
 		U_LOG_I("NeurD: %.*s", size, msg);
 	}
-}
-
-//! Installed instead of neurd_log_cb before the idle unload. A no-op rather than
-//! NULL: NeurD does not document whether it NULL-checks its logger, and this
-//! function lives in the plug-in, which outlives the NeurD mapping.
-void
-neurd_log_discard(const char *msg, int size)
-{
-	(void)msg;
-	(void)size;
 }
 
 bool
@@ -994,25 +897,17 @@ setup_nd_device_locked()
 	return true;
 }
 
-void
-arm_idle_watcher();
-
 /*!
- * Background worker: load (once per activation cycle) + init (retryable). Runs
- * detached; publishes the outcome through g.state.
+ * Background worker: load (once) + init (retryable). Runs detached; publishes
+ * the outcome through g.state.
  */
 void
 activation_worker()
 {
 	uint32_t next = G_FAILED;
-	const bool reload = g.reloading.load();
 	{
-		// Load happens once per activation cycle: on first use, and again after
-		// an idle unload (which leaves g.nd / g.lib NULL) — the same path both
-		// times, so an upgraded NeurD is picked up and an older one refused.
-		// NOT under g.mtx for the slow part — but nothing else touches g.lib /
-		// g.nd until state says READY (the idle unload starts only FROM READY,
-		// and kick() starts this worker only from UNPROBED / RETRY_WAIT / IDLE).
+		// Load happens once per process. NOT under g.mtx for the slow part —
+		// but nothing else touches g.lib / g.nd until state says READY.
 		if (g.nd == nullptr) {
 			const char *where = "?";
 			HMODULE lib = neurd_load_library(&where);
@@ -1027,17 +922,13 @@ activation_worker()
 			struct NeurD_load_request req = {NEURD_VERSION};
 			struct NeurD const *nd = load != nullptr ? load(&req) : nullptr;
 			if (nd == nullptr) {
-				U_LOG_W("Leia lift: NeurD.dll (%s) has no usable NeurD_load — lift unavailable%s", where,
-				        reload ? " (reload after the idle unload: NeurD may refuse a second load in one "
-				                 "process — set IdleUnloadSec=0 if this repeats)"
-				               : "");
+				U_LOG_W("Leia lift: NeurD.dll (%s) has no usable NeurD_load — lift unavailable", where);
 				// Deliberately no FreeLibrary: NeurD may have spun threads.
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
 			}
-			U_LOG_W("Leia lift: %s NeurD %u.%u.%u from %s (plug-in built against %u.%u.%u)",
-			        reload ? "reloading (after the idle unload)" : "loaded",
+			U_LOG_W("Leia lift: loaded NeurD %u.%u.%u from %s (plug-in built against %u.%u.%u)",
 			        NEURD_GET_VERSION_MAJOR(nd->version), NEURD_GET_VERSION_MINOR(nd->version),
 			        NEURD_GET_VERSION_PATCH(nd->version), where,
 			        NEURD_GET_VERSION_MAJOR(NEURD_VERSION),
@@ -1084,9 +975,7 @@ activation_worker()
 		NeurD_set_prop_1i(nd, NEURD_PROP_INPAINT_TYPE, NEURD_INPAINT_TYPE_V1_STRETCH);
 
 		// Backend must be forced immediately before init. NeurD keeps a forced
-		// backend across deinit; after an idle unload the DLL is mapped afresh,
-		// so it is forced again here — with the same first-activation choice,
-		// which is also what a DLL that never really unmapped still holds.
+		// backend across deinit, so this is effectively set once per process.
 		if (g.requested_backend != BACKEND_AUTO && LEIA_NEURD_HAS(nd, set_backend)) {
 			enum NeurD_status bs = NeurD_set_backend(nd, (enum NeurD_backend)g.requested_backend);
 			if (bs != NEURD_SUCCESS) {
@@ -1139,30 +1028,19 @@ activation_worker()
 		if (k0.interactive_min != 0) {
 			interactive_min = k0.interactive_min;
 		}
-		char idle_str[24];
-		if (k0.idle_unload_sec == 0) {
-			snprintf(idle_str, sizeof(idle_str), "off");
-		} else {
-			snprintf(idle_str, sizeof(idle_str), "%us", k0.idle_unload_sec);
-		}
-		// Once per process: a reload runs with the same first-activation knobs.
-		if (!reload) {
-			U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) min_version=%u.%u.%u(%s) "
-			        "scale=%s(%s) view_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) "
-			        "dilate=%d(%s) idle_unload=%s(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
-			        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
-			        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min),
-			        (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
-			        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
-			        (unsigned)NEURD_GET_VERSION_MAJOR(k0.min_version), (unsigned)NEURD_GET_VERSION_MINOR(k0.min_version),
-			        (unsigned)NEURD_GET_VERSION_PATCH(k0.min_version), knob_src_str(k0.src_min_version),
-			        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
-			        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
-			        knob_src_str(k0.src_conv_gain),
-			        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
-			        knob_src_str(k0.src_video_model), (double)k0.depth_gain, knob_src_str(k0.src_depth_gain),
-			        (int)k0.dilate, knob_src_str(k0.src_dilate), idle_str, knob_src_str(k0.src_idle_unload));
-		}
+		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) min_version=%u.%u.%u(%s) scale=%s(%s) "
+		        "view_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) dilate=%d(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
+		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
+		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
+		        (unsigned)NEURD_GET_VERSION_MAJOR(k0.min_version), (unsigned)NEURD_GET_VERSION_MINOR(k0.min_version),
+		        (unsigned)NEURD_GET_VERSION_PATCH(k0.min_version), knob_src_str(k0.src_min_version),
+		        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
+		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
+		        knob_src_str(k0.src_conv_gain),
+		        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
+		        knob_src_str(k0.src_video_model), (double)k0.depth_gain, knob_src_str(k0.src_depth_gain), (int)k0.dilate,
+		        knob_src_str(k0.src_dilate));
 		if (k0.interactive_min != 0) {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u (%s) — assuming interactive convert on NeurD "
 			        "%u.%u.%u (only for the internal-interactive dev package; a stock 0.4.4 will crash here)",
@@ -1172,67 +1050,29 @@ activation_worker()
 			        (unsigned)NEURD_GET_VERSION_MAJOR(nd->version), (unsigned)NEURD_GET_VERSION_MINOR(nd->version),
 			        (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
 		}
-		// Recomputed on every activation, reloads included: the NeurD now loaded
-		// may be a different (upgraded) version than the one before the unload.
 		g.interactive_unavailable = !(nd->version >= interactive_min && nd->convert_stream_dx_interactive != nullptr);
 		g.interactive_direct_slot = !g.interactive_unavailable.load() &&
 		                            nd->version < NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
 		g.props_valid = false;
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
 		if (next == G_READY) {
-			{
-				std::lock_guard<std::mutex> cl(g.caps_mtx);
-				snprintf(g.caps_backend_name, sizeof(g.caps_backend_name), "%s", g.backend_name);
-				g.caps_backend = g.backend;
-			}
-			// Idle clock: READY with no stream counts as idle from now (a stream
-			// destroyed while this reload ran is not credited — keeps it loaded a
-			// little longer, never shorter).
-			if (g.streams_live.load() == 0) {
-				g.idle_since_ms.store(now_ms());
-			}
-			U_LOG_W("Leia lift: NeurD READY%s — backend %s, interactive viewpoints %s",
-			        reload ? " again after the idle unload" : "", g.backend_name,
+			U_LOG_W("Leia lift: NeurD READY — backend %s, interactive viewpoints %s", g.backend_name,
 			        g.interactive_unavailable ? "UNAVAILABLE (NeurD < 0.4.5)" : "available");
 		}
 	}
-	if (next == G_READY) {
-		g.reloading.store(false); // before READY is visible: the next unload may start a new reload
-	}
 	g.state.store(next);
 	g.worker_running.store(false);
-	if (next == G_READY) {
-		arm_idle_watcher(); // no-op unless idle unload is on and no stream exists
-	}
 }
 
 /*!
  * Advance the process state machine without blocking: probe presence on first
- * touch, and (re)start the activation worker when due. @p reload_ok: the caller
- * is a stream (create / convert), so an idle-unloaded NeurD may be brought back;
- * a caps poll passes false and never re-locks the DLLs.
+ * touch, and (re)start the activation worker when due.
  */
 void
-kick(const struct knobs &k, bool reload_ok)
+kick(const struct knobs &k)
 {
 	uint32_t s = g.state.load();
-	if (s == G_IDLE) {
-		if (!reload_ok) {
-			return;
-		}
-		// A full re-activation, exactly like the first: presence probe here,
-		// then the worker's load + MinVersion + backend + init + licence. NeurD
-		// may have been uninstalled since the unload — that is final, as at
-		// first probe.
-		if (!neurd_present()) {
-			uint32_t expect = G_IDLE;
-			if (g.state.compare_exchange_strong(expect, G_ABSENT)) {
-				U_LOG_W("Leia lift: NeurD.dll no longer found when reloading after the idle unload — lift "
-				        "unavailable until the service restarts (open streams fail their frames)");
-			}
-			return;
-		}
-	} else if (s == G_UNPROBED) {
+	if (s == G_UNPROBED) {
 		// Racing first callers are fine: presence is idempotent and only one
 		// wins the worker_running exchange below.
 		if (!neurd_present()) {
@@ -1248,11 +1088,9 @@ kick(const struct knobs &k, bool reload_ok)
 			return;
 		}
 	} else {
-		return; // ABSENT / LOADING / READY / FAILED / UNLOADING: nothing to do.
+		return; // ABSENT / LOADING / READY / FAILED: nothing to do.
 	}
 
-	// Also refuses while a worker that just published READY has not yet cleared
-	// the flag; the next kick (every create / convert) tries again.
 	bool expect_idle = false;
 	if (!g.worker_running.compare_exchange_strong(expect_idle, true)) {
 		return;
@@ -1261,18 +1099,8 @@ kick(const struct knobs &k, bool reload_ok)
 		g.requested_backend = k.backend;
 		g.default_autoscaling = k.autoscaling;
 		g.k0 = k;
-		g.idle_unload_ms.store((uint64_t)k.idle_unload_sec * 1000ull);
 	}
-	// CAS, not store: a racing caller's presence probe may have moved the state
-	// (e.g. IDLE -> ABSENT) since it was read, and that verdict must stand.
-	uint32_t expect_s = s;
-	if (!g.state.compare_exchange_strong(expect_s, G_LOADING)) {
-		g.worker_running.store(false);
-		return;
-	}
-	if (s == G_IDLE) {
-		g.reloading.store(true); // a licence retry (RETRY_WAIT) of a reload keeps it set
-	}
+	g.state.store(G_LOADING);
 	try {
 		std::thread(activation_worker).detach();
 	} catch (...) {
@@ -1286,253 +1114,12 @@ uint32_t
 public_state(uint32_t s)
 {
 	switch (s) {
-	case G_READY:
-	case G_UNLOADING: // was READY; the runtime has frozen its caps at READY anyway
-	case G_IDLE: return LEIA_LIFT_STATE_READY;
+	case G_READY: return LEIA_LIFT_STATE_READY;
 	case G_UNPROBED:
 	case G_LOADING:
 	case G_RETRY_WAIT: return LEIA_LIFT_STATE_ACTIVATING;
 	default: return LEIA_LIFT_STATE_UNAVAILABLE;
 	}
-}
-
-/*
- *
- * Idle unload (IdleUnloadSec). The runtime keeps its one lift DP for the life
- * of the service and stops polling caps once READY, so neither the DP
- * ref-count nor caps can drive this: the signal is "no lift stream for N
- * seconds". One watcher thread at a time sleeps (no lock held) until that is
- * true, then unloads; it exits as soon as a stream exists or NeurD is not
- * READY, and is re-armed when the last stream goes or READY is reached with
- * none.
- *
- */
-
-//! Every condition for an idle unload except the elapsed time. Lock-free; the
-//! unload re-checks all of it under g.mtx.
-bool
-idle_pending()
-{
-	return g.idle_unload_ms.load() != 0 && g.state.load() == G_READY && g.streams_live.load() == 0 &&
-	       g.idle_since_ms.load() != 0;
-}
-
-/*!
- * Count the modules mapped from @p dir (NeurD's directory, with its trailing
- * backslash; subdirectories included) and list their relative names into
- * @p out, comma-separated, truncated to @p cap. Diagnostic for the idle unload:
- * whatever is still listed after FreeLibrary keeps its file locked.
- * K32EnumProcessModules is resolved at run time (kernel32; no psapi link).
- */
-uint32_t
-modules_mapped_from(const wchar_t *dir, char *out, size_t cap)
-{
-	out[0] = '\0';
-	const size_t dir_len = wcslen(dir);
-	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-	using pfn_enum_modules = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
-	auto enum_modules = k32 == nullptr ? nullptr
-	                                   : reinterpret_cast<pfn_enum_modules>(reinterpret_cast<void *>(
-	                                         GetProcAddress(k32, "K32EnumProcessModules")));
-	HMODULE mods[1024];
-	DWORD need = 0;
-	if (dir_len == 0 || enum_modules == nullptr ||
-	    !enum_modules(GetCurrentProcess(), mods, (DWORD)sizeof(mods), &need)) {
-		return 0;
-	}
-	const DWORD n = std::min<DWORD>(need / (DWORD)sizeof(HMODULE), (DWORD)(sizeof(mods) / sizeof(mods[0])));
-	uint32_t count = 0;
-	size_t used = 0;
-	for (DWORD i = 0; i < n; i++) {
-		// A module unloaded since the enumeration just fails here and is skipped.
-		wchar_t path[MAX_PATH];
-		const DWORD len = GetModuleFileNameW(mods[i], path, MAX_PATH);
-		if (len == 0 || len >= MAX_PATH || len <= dir_len || _wcsnicmp(path, dir, dir_len) != 0) {
-			continue;
-		}
-		count++;
-		char name[MAX_PATH * 3];
-		if (WideCharToMultiByte(CP_UTF8, 0, path + dir_len, -1, name, (int)sizeof(name), nullptr, nullptr) <= 0) {
-			continue;
-		}
-		const int w = snprintf(out + used, cap - used, "%s%s", used != 0 ? ", " : "", name);
-		if (w > 0) {
-			used = std::min(used + (size_t)w, cap - 1); // truncated: keep what fit
-		}
-	}
-	return count;
-}
-
-//! Drop everything this module created on NeurD's device or holds of it (the
-//! bridge shaders, constant buffer, event query, the context reference, and the
-//! device itself when the plug-in owns it). Called with g.mtx held, BEFORE
-//! NeurD_deinit tears the device down. Per-stream bridges need nothing here:
-//! an idle unload happens only with no stream at all.
-void
-release_nd_bridge_locked()
-{
-	safe_release(g.cs_pack);
-	safe_release(g.cs_unpack);
-	safe_release(g.cs_unpack_r8);
-	safe_release(g.cb);
-	safe_release(g.nd_done);
-	safe_release(g.nd_ctx);
-	release_nd_dev_locked();
-	g.nd_luid = {};
-}
-
-/*!
- * Unload an idle NeurD (watcher thread). The decision and the hand-off happen
- * under g.mtx, with the state moved READY -> UNLOADING first; NeurD_deinit and
- * FreeLibrary then run WITHOUT the lock, so a stream create / destroy or a DP
- * destroy never waits behind NeurD's teardown. UNLOADING alone keeps every
- * other NeurD caller out: convert re-checks READY under g.mtx; stream destroy
- * and DP destroy call NeurD only in READY (and no stream can own a NeurD stream
- * now — there were none, and a new one gets its NeurD side only after a
- * reload); caps never calls NeurD; and kick() starts the activation worker only
- * from IDLE, which is published after FreeLibrary has returned.
- */
-void
-idle_unload(uint64_t idle_ms)
-{
-	HMODULE lib = nullptr;
-	struct NeurD const *nd = nullptr;
-	uint64_t idle_for_ms = 0;
-	{
-		std::lock_guard<std::mutex> lock(g.mtx);
-		const uint64_t since = g.idle_since_ms.load();
-		const uint64_t now = now_ms();
-		if (g.state.load() != G_READY || g.streams_live.load() != 0 || since == 0 || now < since + idle_ms) {
-			return; // a stream came (or the clock restarted) meanwhile: the watcher re-evaluates
-		}
-		uint32_t expect = G_READY;
-		if (!g.state.compare_exchange_strong(expect, G_UNLOADING)) {
-			return;
-		}
-		idle_for_ms = now - since;
-		release_nd_bridge_locked();
-		lib = g.lib;
-		nd = g.nd;
-		g.lib = nullptr;
-		g.nd = nullptr;
-		g.props_valid = false; // the next NeurD instance starts from its own defaults
-		g.interactive_direct_slot = false;
-	}
-
-	U_LOG_W("Leia lift: no lift stream for %llus (IdleUnloadSec=%llu) — unloading NeurD so its installer can "
-	        "replace the files; the next stream reloads it",
-	        (unsigned long long)(idle_for_ms / 1000), (unsigned long long)(idle_ms / 1000));
-
-	// NeurD's directory, for the leftover-module diagnostic (before the unmap).
-	wchar_t dir[MAX_PATH] = {};
-	if (lib != nullptr) {
-		const DWORD n = GetModuleFileNameW(lib, dir, MAX_PATH);
-		wchar_t *slash = (n > 0 && n < MAX_PATH) ? wcsrchr(dir, L'\\') : nullptr;
-		if (slash != nullptr) {
-			slash[1] = L'\0';
-		} else {
-			dir[0] = L'\0';
-		}
-	}
-	char names[512];
-	const uint32_t mapped_before = modules_mapped_from(dir, names, sizeof(names));
-
-	const uint64_t t0 = now_ms();
-	if (nd != nullptr) {
-		try {
-			// Logger first (NeurD forgets it with the unmap anyway; this keeps
-			// any teardown-time callback out of the plug-in), then deinit.
-			if (LEIA_NEURD_HAS(nd, set_logger_callback)) {
-				NeurD_set_logger_callback(nd, neurd_log_discard);
-			}
-			if (LEIA_NEURD_HAS(nd, deinit)) {
-				NeurD_deinit(nd);
-			}
-		} catch (...) {
-			U_LOG_W("Leia lift: exception from NeurD teardown — unloading anyway");
-		}
-	}
-	Sleep(kUnloadSettleMs);
-	if (lib != nullptr) {
-		FreeLibrary(lib);
-	}
-	const uint32_t mapped_after = modules_mapped_from(dir, names, sizeof(names));
-	U_LOG_W("Leia lift: NeurD unloaded (deinit + FreeLibrary, %llu ms); %u of %u module(s) from %ls still mapped%s%s",
-	        (unsigned long long)(now_ms() - t0), mapped_after, mapped_before, dir[0] != L'\0' ? dir : L"?",
-	        mapped_after != 0 ? " (their files stay locked): " : "", mapped_after != 0 ? names : "");
-	g.state.store(G_IDLE);
-}
-
-DWORD WINAPI
-idle_watcher_proc(LPVOID self_ref)
-{
-	try {
-		for (;;) {
-			if (!idle_pending()) {
-				g.watcher_running.store(false);
-				// The last stream may have gone between the test and the store
-				// and found watcher_running still set (so it started no one):
-				// re-test, and take the job back if so.
-				bool expect = false;
-				if (!idle_pending() || !g.watcher_running.compare_exchange_strong(expect, true)) {
-					break;
-				}
-				continue;
-			}
-			const uint64_t idle_ms = g.idle_unload_ms.load();
-			const uint64_t due = g.idle_since_ms.load() + idle_ms;
-			const uint64_t now = now_ms();
-			if (now < due) {
-				Sleep((DWORD)std::min<uint64_t>(due - now, kIdleWatchMaxSleepMs));
-				continue;
-			}
-			idle_unload(idle_ms); // re-checks under g.mtx; READY -> IDLE, or nothing
-		}
-	} catch (...) {
-		// Only std::mutex::lock can throw here, before any state change.
-		g.watcher_running.store(false);
-	}
-	if (self_ref != nullptr) {
-		FreeLibraryAndExitThread(static_cast<HMODULE>(self_ref), 0);
-	}
-	return 0;
-}
-
-/*!
- * Start the idle watcher if an idle unload is pending and none runs (a running
- * one re-reads the idle clock). Lock-free; call it after the last stream goes
- * and after READY is published.
- */
-void
-arm_idle_watcher()
-{
-	if (!idle_pending()) {
-		return;
-	}
-	bool expect = false;
-	if (!g.watcher_running.compare_exchange_strong(expect, true)) {
-		return;
-	}
-	// The watcher sleeps for minutes, so it pins this plug-in DLL (a reference
-	// taken here, dropped by FreeLibraryAndExitThread): an unload of the plug-in
-	// under it would otherwise crash. If the pin fails it still runs, unpinned —
-	// the activation thread's model.
-	HMODULE self = nullptr;
-	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-	                        reinterpret_cast<LPCWSTR>(reinterpret_cast<void *>(&idle_watcher_proc)), &self)) {
-		self = nullptr;
-	}
-	HANDLE th = CreateThread(nullptr, 0, idle_watcher_proc, self, 0, nullptr);
-	if (th == nullptr) {
-		const unsigned long err = (unsigned long)GetLastError();
-		LIFT_WARN_ONCE("Leia lift: could not start the idle-unload watcher (err %lu) — NeurD stays loaded", err);
-		if (self != nullptr) {
-			FreeLibrary(self);
-		}
-		g.watcher_running.store(false);
-		return;
-	}
-	CloseHandle(th);
 }
 
 /*
@@ -1912,65 +1499,6 @@ struct leia_lift_neurd
 	std::vector<lift_stream *> streams;
 };
 
-namespace {
-
-bool
-reload_in_progress(uint32_t s)
-{
-	return s == G_UNLOADING || s == G_IDLE || s == G_LOADING;
-}
-
-/*!
- * convert() found NeurD not READY. For a PHOTO stream with a reload in progress
- * (after an idle unload), wait for it — at most kPhotoReloadWaitMs, polling,
- * holding no lock — and return true once READY. Video streams, and every other
- * state, return false at once. Runs on the runtime's lift thread, which can do
- * nothing useful meanwhile anyway: no stream converts until NeurD is back.
- */
-bool
-wait_reload_if_photo(struct leia_lift_neurd *l, uint64_t id)
-{
-	if (!reload_in_progress(g.state.load())) {
-		return false;
-	}
-	bool photo = false;
-	try {
-		std::lock_guard<std::mutex> lock(g.mtx);
-		for (const lift_stream *it : l->streams) {
-			if (it->id == id) {
-				photo = (it->content_hint == 1);
-				break;
-			}
-		}
-	} catch (...) {
-		return false;
-	}
-	if (!photo) {
-		return false;
-	}
-	const uint64_t deadline = now_ms() + kPhotoReloadWaitMs;
-	for (;;) {
-		const uint32_t s = g.state.load();
-		if (s == G_READY) {
-			return true;
-		}
-		if (!reload_in_progress(s)) {
-			return false; // the reload failed: ABSENT / FAILED / RETRY_WAIT
-		}
-		if (now_ms() >= deadline) {
-			LIFT_WARN_ONCE("Leia lift: NeurD reload took over %llu ms — photo frame not converted",
-			               (unsigned long long)kPhotoReloadWaitMs);
-			return false;
-		}
-		if (s == G_IDLE) {
-			kick(l->k, true); // the unload finished after our first kick: start the reload now
-		}
-		Sleep(kReloadPollMs);
-	}
-}
-
-} // namespace
-
 extern "C" void
 leia_lift_neurd_map_viewpoint(const float in_m[3], float gain, float out_n[3])
 {
@@ -2010,16 +1538,12 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **plift)
 	}
 	struct leia_lift_neurd *l = *plift;
 	*plift = nullptr;
-	bool went_idle = false;
 	{
 		std::lock_guard<std::mutex> lock(g.mtx);
 		for (lift_stream *s : l->streams) {
 			release_stream_locked(s);
 			delete s;
-			if (g.streams_live.fetch_sub(1) == 1) {
-				g.idle_since_ms.store(now_ms());
-				went_idle = true;
-			}
+			g.streams_live.fetch_sub(1);
 		}
 		l->streams.clear();
 		if (l->acquired) {
@@ -2027,14 +1551,10 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **plift)
 			if (--g.refcount == 0 && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, shrink_memory_pool)) {
 				// Last user gone: give NeurD's pools back but stay initialised
 				// (re-init = licence + model load; DPs are recreated on focus change).
-				// Unloading is the idle watcher's call, on time, not on DP count.
 				NeurD_shrink_memory_pool(g.nd);
 				g.props_valid = false;
 			}
 		}
-	}
-	if (went_idle) {
-		arm_idle_watcher();
 	}
 	delete l;
 }
@@ -2049,7 +1569,7 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	if (l == nullptr || !l->k.enabled) {
 		return true; // modes 0 / UNAVAILABLE — a valid answer, not a failure.
 	}
-	kick(l->k, false); // may start a first activation / licence retry; never reloads an idle-unloaded NeurD
+	kick(l->k);
 
 	uint32_t s = g.state.load();
 	out->state = public_state(s);
@@ -2065,21 +1585,15 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	out->max_views = kMaxViews;
 	out->depth_semantics = 0; // relative: per-frame min-max normalised depth, larger = farther (NeurD's near=high disparity is flipped in kUnpackR8Cs)
 	uint64_t lat = g.latency_ns.load();
-	if (out->state == LEIA_LIFT_STATE_READY) {
-		// READY, or UNLOADING / IDLE after an idle unload: report what READY
-		// reported, from the copy taken when READY was published — not from
-		// g.backend_name, which a reload rewrites — under the leaf caps_mtx, so
-		// caps never waits behind a convert holding g.mtx.
-		enum NeurD_backend be;
-		{
-			std::lock_guard<std::mutex> cl(g.caps_mtx);
-			snprintf(out->backend, sizeof(out->backend), "%s", g.caps_backend_name);
-			be = g.caps_backend;
-		}
+	if (s == G_READY) {
+		// No lock: backend/backend_name are written once, before the seq_cst
+		// store that publishes G_READY, and never again — caps must not wait
+		// behind a convert holding g.mtx.
+		snprintf(out->backend, sizeof(out->backend), "%s", g.backend_name);
 		if (lat == 0) {
-			lat = (be == NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
-			      : (be == NEURD_BACKEND_CUDA)   ? kPriorLatencyCudaNs
-			                                     : kPriorLatencyOtherNs;
+			lat = (g.backend == NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
+			      : (g.backend == NEURD_BACKEND_CUDA)   ? kPriorLatencyCudaNs
+			                                                 : kPriorLatencyOtherNs;
 		}
 	} else {
 		snprintf(out->backend, sizeof(out->backend), "neurd-%s",
@@ -2107,11 +1621,7 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 		LIFT_WARN_ONCE("Leia lift: stream_create with unsupported mode %u", desc->mode);
 		return false;
 	}
-	// Starts the reload of an idle-unloaded NeurD. Must still SUCCEED while it
-	// reloads (IDLE / UNLOADING / LOADING): the runtime marks a stream whose
-	// create failed as failed for good. Its NeurD side is created lazily by the
-	// first convert after READY, from the parameters stored here.
-	kick(l->k, true);
+	kick(l->k);
 	if (public_state(g.state.load()) == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return false;
 	}
@@ -2131,7 +1641,6 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	s->input_scale = desc->input_scale;
 	l->streams.push_back(s);
 	g.streams_live.fetch_add(1);
-	g.idle_since_ms.store(0); // not idle: a running watcher sees this and exits
 	if (!l->acquired) {
 		l->acquired = true;
 		g.refcount++;
@@ -2148,24 +1657,15 @@ leia_lift_neurd_stream_destroy(struct leia_lift_neurd *l, uint64_t id)
 	if (l == nullptr) {
 		return;
 	}
-	bool went_idle = false;
-	{
-		std::lock_guard<std::mutex> lock(g.mtx);
-		for (auto it = l->streams.begin(); it != l->streams.end(); ++it) {
-			if ((*it)->id == id) {
-				release_stream_locked(*it);
-				delete *it;
-				l->streams.erase(it);
-				if (g.streams_live.fetch_sub(1) == 1) {
-					g.idle_since_ms.store(now_ms()); // the idle clock starts now
-					went_idle = true;
-				}
-				break;
-			}
+	std::lock_guard<std::mutex> lock(g.mtx);
+	for (auto it = l->streams.begin(); it != l->streams.end(); ++it) {
+		if ((*it)->id == id) {
+			release_stream_locked(*it);
+			delete *it;
+			l->streams.erase(it);
+			g.streams_live.fetch_sub(1);
+			return;
 		}
-	}
-	if (went_idle) {
-		arm_idle_watcher(); // no-op unless NeurD is READY and idle unload is on
 	}
 }
 
@@ -2193,12 +1693,9 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 	}
 	*out_resource = nullptr;
 
-	kick(l->k, true); // also (re)starts the reload of an idle-unloaded NeurD
-	if (g.state.load() != G_READY && !wait_reload_if_photo(l, id)) {
-		// ACTIVATING / UNAVAILABLE (caps says which), or reloading after an idle
-		// unload: a video frame fails, fast and silently — the runtime counts it
-		// and tries the next one, so a ~5 s reload costs ~300 frames, no WARNs.
-		return false;
+	kick(l->k);
+	if (g.state.load() != G_READY) {
+		return false; // ACTIVATING or UNAVAILABLE — caps says which.
 	}
 
 	LARGE_INTEGER qf, q0, q1;
@@ -2207,12 +1704,6 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 
 	try {
 		std::lock_guard<std::mutex> lock(g.mtx);
-		// Re-check under the lock: the idle unload leaves READY only while
-		// holding g.mtx, so from here to the unlock g.nd and NeurD's device stay
-		// valid. (It cannot start while this stream exists anyway — belt and braces.)
-		if (g.state.load() != G_READY || g.nd == nullptr) {
-			return false;
-		}
 		struct NeurD const *nd = g.nd;
 
 		lift_stream *s = nullptr;

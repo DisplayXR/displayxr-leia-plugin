@@ -20,10 +20,10 @@ carries bit 8.
 
 | Slot | Plug-in behaviour |
 |---|---|
-| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.6 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). After an idle unload (see *Process model*) it keeps reporting what it reported when READY — `state` 2, same modes and backend — and loads nothing. |
-| `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating, and while it is unloaded or reloading after an idle unload (it starts the reload) — the NeurD stream is created lazily on the first convert once READY. |
+| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.6 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
+| `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
-| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable, and while NeurD reloads after an idle unload — at once, silently, for a video stream; a **photo** stream (`content_hint` 1) instead waits for the reload, at most 8 s, because a photo may submit only one frame. |
+| `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
 Every versioned struct is read only as far as its `struct_size` covers.
 `xrt_dp_lift_params.focal_px` (appended) is ignored — it only matters to a
@@ -75,27 +75,9 @@ metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERS
 - **One NeurD instance per process** (NeurD's rule). DP handles ref-count it. It is
   loaded and initialised on a **detached background thread**, never on a caller's
   thread and never at DP create (the DP factory runs on the service critical path).
-- **Unloaded when idle, reloaded on demand.** NeurD is loaded on first use (above) and
-  stays up while lift is in use; DP handles coming and going do not unload it (DPs are
-  recreated on focus changes, and re-init re-runs licensing and model load — when the
-  last DP handle goes the plug-in only calls `NeurD_shrink_memory_pool`). What unloads it
-  is **idle time**: once NeurD is READY and no lift stream has existed for `IdleUnloadSec`
-  seconds (default 300, see *Knobs*), a watcher thread releases everything the plug-in
-  holds on NeurD's device, calls `NeurD_deinit` and `FreeLibrary`s `NeurD.dll`. **Why:**
-  the service runs from logon, so without this the NeurD files stay locked for the whole
-  session and NeurD's own installer cannot replace them. Caps keep reporting READY (the
-  runtime froze them at READY anyway, so apps keep choosing the native path), and the
-  next `lift_stream_create` starts a reload in the background — the full first-activation
-  sequence: presence probe, `MinVersion` check, backend, init, licence — so an upgraded
-  NeurD is picked up and an uninstalled or too-old one is detected. The reload takes about
-  **5 s, during which video frames are not converted** (each convert fails at once; the
-  runtime counts it and tries the next frame, no WARN); the stream's NeurD side is then
-  created on its first convert from its stored mode / scale / props, exactly as on a
-  first activation. Two WARNs mark each unload (start, then done — with any module still
-  mapped from NeurD's directory, whose file therefore stays locked); a reload logs like
-  a first activation, marked `reloading (after the idle unload) NeurD x.y.z` and
-  `NeurD READY again`, minus the knobs line.
-  `IdleUnloadSec=0` restores the old behaviour: never unloaded.
+- **Never de-initialised.** DPs are recreated on focus changes; re-init would re-run
+  licensing and model load. When the last DP handle goes the plug-in only calls
+  `NeurD_shrink_memory_pool`.
 
 ### Licensing / activation
 
@@ -160,13 +142,6 @@ is version-gated (`LEIA_NEURD_HAS`).
   enables protection if it is off — the same mechanism the async weaver already relies
   on (`enable_context_multithread_protection`, `leia_sr_d3d11.cpp`). NeurD's own
   immediate context is protected too.
-- **Idle unload.** At most one watcher thread exists, started when the last stream goes
-  (or READY is reached with none); it sleeps holding no lock and exits as soon as a stream
-  appears. The unload moves the state READY → *unloading* and drops the plug-in's
-  resources on NeurD's device under the process mutex, then runs `NeurD_deinit` +
-  `FreeLibrary` outside it, so stream create/destroy never wait on NeurD's teardown;
-  *unloading* alone keeps every NeurD call out (convert re-checks READY under the mutex).
-  The watcher holds a reference on the plug-in DLL for its lifetime.
 
 ## Device bridge
 
@@ -284,11 +259,8 @@ Read once per DP at create (`leia_lift_neurd_create`). Each knob comes from the
 At activation one WARN lists every knob's effective value and where it came from:
 
 ```
-Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) video_model=fast(default) depth_gain=2.00(default) dilate=2(default) idle_unload=300s(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
+Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
 ```
-
-It is printed at the first activation only; a reload after an idle unload reuses the same
-knobs.
 
 That line prints only after a successful init. A NeurD refused by `MinVersion` logs only
 its refusal WARN, which names the minimum and where it came from.
@@ -309,7 +281,6 @@ before; with neither set, nothing changes.
 | `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
 | `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). Only matters when `MinVersion` admits that NeurD (the default 0.4.6 floor refuses 0.4.4 before this is consulted); the two knobs are independent. |
 | `DXR_LEIA_LIFT_MIN_VERSION` | `MinVersion` | `0.4.6` | Oldest NeurD lift accepts, `major.minor.patch`. Older → refused at load (one WARN), lift unavailable exactly as if NeurD were absent, so callers fall back. Lower it only for demos/testing (e.g. `0.4.4`, `0.3.11`); below 0.3.11 changes nothing — the stream-API check still refuses those. Garbage → WARN, default kept. |
-| `DXR_LEIA_LIFT_IDLE_UNLOAD_SEC` | `IdleUnloadSec` | `300` | Whole seconds with **no lift stream** after which a READY NeurD is deinit'd and its DLL freed, so its installer can replace the files; the next stream reloads it (~5 s of unconverted video frames). `0` = never unload (the behaviour before this knob existed). Non-zero values are clamped to 5..86400 with a WARN; garbage → WARN, default kept. Taken from the first DP to activate NeurD, like `Backend`. |
 
 The demo knobs for the 0.4.4 internal-interactive package, set once on the box (elevated
 prompt), then restart the service:
@@ -400,16 +371,6 @@ lift-enabled runtime + this plug-in registered:
    environment of the process that loads the plug-in (the service, under IPC) → the log
    shows `Leia lift: NeurD 0.4.6 is older than the minimum 0.4.7 (env)` and no `READY`,
    and `lift caps` reports `modes=0 state=unavailable`.
-6. Idle unload: set `IdleUnloadSec=15` (registry, then restart the service), run a
-   conversion, then stop it. About 20 s later the log shows `no lift stream for 15s ...
-   unloading NeurD` and `NeurD unloaded (deinit + FreeLibrary, N ms); 0 of M module(s)
-   from <NeurD dir> still mapped`. Confirm independently that no NeurD module is left in
-   the service — `tasklist /m NeurD* /fi "imagename eq displayxr-service.exe"` lists
-   nothing — and that the NeurD files can be renamed or replaced (or the NeurD installer
-   runs). Convert again: the first frames fail silently, the log shows `reloading (after
-   the idle unload) NeurD x.y.z` and `NeurD READY again after the idle unload`, and
-   conversion resumes within ~5 s. With a different NeurD installed in between, the
-   reload line names the new version.
 
 ## Known limits
 
@@ -419,34 +380,10 @@ lift-enabled runtime + this plug-in registered:
   perturb the lens. The lift-only factory removes this on runtimes that have it.
 - Windows / D3D11 only. The D3D12, GL and Vulkan DPs do not implement lift.
 - The activation thread is detached; unloading the plug-in DLL while it runs
-  (a first activation, or a reload after an idle unload, in progress) is unsafe. The
-  runtime does not unload plug-ins mid-session today. The idle watcher, which can sleep
-  for minutes, holds its own reference on the plug-in DLL, so it is safe against that;
-  the process exiting while it sleeps or unloads simply ends it.
+  (a first activation in progress) is unsafe. The runtime does not unload plug-ins
+  mid-session today.
 - Caps are frozen once READY: the runtime (`d3d11_lift.cpp`) polls `lift_get_caps` only
   while the module is not READY. A convert-time `NEURD_UNAVAILABLE_OUTDATED_RUNTIME`
   latch (SBS then falls back to the default pattern) is therefore not reflected in caps.
-- **A failed reload is not reflected in caps either.** If the reload after an idle unload
-  fails — NeurD uninstalled, now older than `MinVersion`, licence invalid, or the network
-  needed — the module falls into the usual *absent* / *failed* / *retry* state, but the
-  runtime still believes READY: the stream that triggered the reload fails every frame
-  until the service restarts (a network retry still recovers on its own every 15 s), and
-  once the state is *absent* / *failed*, later streams are refused at create, which the
-  runtime logs once per stream (`module refused stream ...`). Lift resumes only after a service restart. The runtime offers no
-  way to re-signal caps; the stream refusal is the only signal.
-- **The licence is re-validated on every reload.** A licence whose check needs the network
-  will fail the reload on an offline machine (retry-wait, unconverted frames until it is
-  back online). If that matters more than replacing NeurD's files in-session, set
-  `IdleUnloadSec=0`.
-- NeurD is unloaded only from READY. While it is waiting on a network licence retry, or
-  after it failed or was refused (too old) post-load, `NeurD.dll` stays loaded — and its
-  files locked — until the service restarts, exactly as before this feature.
-- A reload probes NeurD's presence once, when the first stream after the unload is
-  created. If NeurD's installer is mid-way through replacing the files at that moment,
-  the probe or the load can fail, and lift stays unavailable until the service restarts.
-- A **photo** stream's convert waits for a reload (up to 8 s) instead of failing, because
-  its single frame would otherwise be consumed by the runtime; video streams just drop
-  frames. That wait blocks the runtime's lift thread, which converts nothing else during
-  a reload anyway.
 - NeurD's 32-stream limit is process-wide and shared with anything else in the
   service process that uses NeurD.
