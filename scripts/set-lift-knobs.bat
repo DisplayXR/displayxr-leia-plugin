@@ -4,7 +4,7 @@ setlocal
 :: ============================================================
 :: Set the Leia lift demo knobs in the registry (run ELEVATED).
 :: ============================================================
-:: Usage: scripts\set-lift-knobs.bat           write Backend=directml, InteractiveMin=0.4.4
+:: Usage: scripts\set-lift-knobs.bat           write Backend=directml, InteractiveMin=0.4.4, MinVersion=0.4.4
 ::        scripts\set-lift-knobs.bat --clear   delete HKLM\SOFTWARE\DisplayXR\Leia\Lift
 ::
 :: The lift reads each knob from the env var first (DXR_LEIA_LIFT_*), else from
@@ -13,6 +13,8 @@ setlocal
 :: the logon environment and would otherwise drop env-only knobs silently.
 :: InteractiveMin=0.4.4 is ONLY for the NeurD 0.4.4 internal-interactive package;
 :: on a stock NeurD 0.4.4 it crashes the service. See docs\lift-neurd.md.
+:: MinVersion=0.4.4 lowers the default floor (0.4.6) so that package is admitted
+:: at all; without it a NeurD older than 0.4.6 is refused and lift is unavailable.
 :: Restart displayxr-service.exe afterwards for the change to take effect.
 
 set "KEY=HKLM\SOFTWARE\DisplayXR\Leia\Lift"
@@ -41,7 +43,8 @@ if not "%~1"=="" (
 
 reg add "%KEY%" /v Backend /t REG_SZ /d directml /f /reg:64 || exit /b 1
 reg add "%KEY%" /v InteractiveMin /t REG_SZ /d 0.4.4 /f /reg:64 || exit /b 1
-echo Wrote %KEY%: Backend=directml InteractiveMin=0.4.4
+reg add "%KEY%" /v MinVersion /t REG_SZ /d 0.4.4 /f /reg:64 || exit /b 1
+echo Wrote %KEY%: Backend=directml InteractiveMin=0.4.4 MinVersion=0.4.4
 reg query "%KEY%" /reg:64
 echo Restart displayxr-service.exe for the lift to pick these up.
 exit /b 0
