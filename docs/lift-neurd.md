@@ -51,6 +51,17 @@ the widest that fits D3D11's 16384-texel limit; a wider request fails with a WAR
 
 ## Process model
 
+**Supported NeurD versions.** By default the plug-in accepts **NeurD 0.4.6 or newer** —
+the only release tested on hardware. An older `NeurD.dll` is refused right after it is
+loaded, before backend selection, init, licensing or any model load: one WARN names the
+found version and the minimum, and lift reports unavailable (`modes=0 / state=0`) exactly
+as if NeurD were absent, so callers fall back to their own conversion path. (Older NeurD
+would otherwise *look* available and then fail or degrade: 0.3.11–0.4.2 need the CUDA
+backend for the D3D path, 0.4.3–0.4.4 have no head-tracked viewpoints, 0.4.5 lacks the
+metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERSION`, see
+*Knobs*); lower it only for demos and testing. 0.3.11 remains the hard floor of the code
+(see *NeurD 0.3.x*).
+
 - **Dynamic load only.** `NeurD.dll` is found in NeurD's own loader order: `PATH` →
   `NEURD_PATH` (full path to the DLL) → `HKLM\SOFTWARE\LeiaInc\NeurD` (default value =
   install dir), loaded with `LOAD_WITH_ALTERED_SEARCH_PATH`. No import lib: the module
@@ -92,7 +103,10 @@ a WARN naming the fix. Hence the default is `directml`, not NeurD's own `auto`. 
 
 ### NeurD 0.3.x
 
-Supported from **0.3.11** (the first release with the stream API: `create_stream`,
+**Refused by default** — like every NeurD before 0.4.6 (see *Supported NeurD versions*).
+This section describes what happens only when `MinVersion` is lowered to admit it.
+
+The code can drive NeurD from **0.3.11** (the first release with the stream API: `create_stream`,
 `convert_stream_dx`, `set_prop_1i/1f`). The function table is append-only, so a plug-in
 built against the 0.4.x header loads a 0.3.x `NeurD.dll` unchanged, and every newer entry
 is version-gated (`LEIA_NEURD_HAS`).
@@ -245,8 +259,11 @@ Read once per DP at create (`leia_lift_neurd_create`). Each knob comes from the
 At activation one WARN lists every knob's effective value and where it came from:
 
 ```
-Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
+Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
 ```
+
+That line prints only after a successful init. A NeurD refused by `MinVersion` logs only
+its refusal WARN, which names the minimum and where it came from.
 
 **Why the registry.** Under the service the knobs are read from `displayxr-service.exe`'s
 environment, not the client's. Any respawn — tray relaunch, the HKLM `Run` key at logon,
@@ -262,16 +279,20 @@ before; with neither set, nothing changes.
 | `DXR_LEIA_LIFT_SCALE` | `Scale` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
 | `DXR_LEIA_LIFT_VIEW_GAIN` | `ViewGain` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
 | `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
-| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). |
+| `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). Only matters when `MinVersion` admits that NeurD (the default 0.4.6 floor refuses 0.4.4 before this is consulted); the two knobs are independent. |
+| `DXR_LEIA_LIFT_MIN_VERSION` | `MinVersion` | `0.4.6` | Oldest NeurD lift accepts, `major.minor.patch`. Older → refused at load (one WARN), lift unavailable exactly as if NeurD were absent, so callers fall back. Lower it only for demos/testing (e.g. `0.4.4`, `0.3.11`); below 0.3.11 changes nothing — the stream-API check still refuses those. Garbage → WARN, default kept. |
 
-The two demo knobs, set once on the box (elevated prompt), then restart the service:
+The demo knobs for the 0.4.4 internal-interactive package, set once on the box (elevated
+prompt), then restart the service:
 
 ```bat
 reg add "HKLM\SOFTWARE\DisplayXR\Leia\Lift" /v Backend /t REG_SZ /d directml /f /reg:64
+reg add "HKLM\SOFTWARE\DisplayXR\Leia\Lift" /v MinVersion /t REG_SZ /d 0.4.4 /f /reg:64
 reg add "HKLM\SOFTWARE\DisplayXR\Leia\Lift" /v InteractiveMin /t REG_SZ /d 0.4.4 /f /reg:64
 ```
 
-`scripts\set-lift-knobs.bat` does exactly this (`--clear` deletes the key).
+`scripts\set-lift-knobs.bat` writes `Backend` and `InteractiveMin` only — add `MinVersion`
+by hand (`--clear` deletes the whole key).
 
 ## Building
 
@@ -346,6 +367,10 @@ lift-enabled runtime + this plug-in registered:
    `cube_handle_d3d11_win` session weaves exactly as before.
 4. Licence path: first activation offline → `state=activating` with a
    `LICENSE_NETWORK_ERROR` WARN; reconnect → ready within ~15 s of the next call.
+5. Version floor: with NeurD 0.4.6 installed, set `DXR_LEIA_LIFT_MIN_VERSION=0.4.7` in the
+   environment of the process that loads the plug-in (the service, under IPC) → the log
+   shows `Leia lift: NeurD 0.4.6 is older than the minimum 0.4.7 (env)` and no `READY`,
+   and `lift caps` reports `modes=0 state=unavailable`.
 
 ## Known limits
 
