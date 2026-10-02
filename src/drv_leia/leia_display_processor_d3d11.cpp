@@ -2445,7 +2445,7 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 
 #ifdef DXR_LEIA_DP_D3D11_LIFT
 	// Before the weaver: lift streams hold bridge resources on the service
-	// device; the NeurD instance itself stays up for the process (see module).
+	// device; the NeurD instance itself outlives the DP (unloaded only when idle — see module).
 	leia_lift_neurd_destroy(&ldp->lift);
 #endif
 
