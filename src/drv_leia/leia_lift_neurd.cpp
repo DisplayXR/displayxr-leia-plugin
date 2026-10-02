@@ -23,7 +23,9 @@
  *    files the long-lived service would otherwise lock forever. The module then
  *    sits in G_IDLE — caps still say READY (the runtime froze them at READY
  *    anyway), stream_create still succeeds and kicks a full re-activation, and
- *    converts fail fast until NeurD is READY again (~5 s).
+ *    converts fail fast until NeurD is READY again (~5 s). NeurD's OpenSSL
+ *    pins itself and can never unload, so a private copy of it is loaded
+ *    first (ShadowDeps) and that copy is what stays pinned.
  *
  *  - Device bridge (the LeiaMeet DxStereoConverter pattern). NeurD runs on ITS
  *    OWN D3D11 device (NeurD_get_dx_device, 0.4.3+), possibly on a different adapter
@@ -254,8 +256,9 @@ struct knobs
 	float depth_gain;         //!< DXR_LEIA_LIFT_DEPTH_GAIN / DepthGain (default 2.0): NeurD gain at strength 1
 	int32_t dilate;           //!< DXR_LEIA_LIFT_DILATE / Dilate (default 2): NEURD_PROP_DILATE_RADIO, px
 	uint32_t idle_unload_sec; //!< DXR_LEIA_LIFT_IDLE_UNLOAD_SEC / IdleUnloadSec (default 300; 0 = never unload)
+	bool shadow_deps;         //!< DXR_LEIA_LIFT_SHADOW_DEPS / ShadowDeps (default 1): private copy of NeurD's OpenSSL
 	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_min_version,
-	    src_video_model, src_depth_gain, src_dilate, src_idle_unload;
+	    src_video_model, src_depth_gain, src_dilate, src_idle_unload, src_shadow_deps;
 };
 
 bool
@@ -446,6 +449,7 @@ read_knobs()
 	k.depth_gain = kDefaultDepthGain;
 	k.dilate = kDefaultDilate;
 	k.idle_unload_sec = kDefaultIdleUnloadSec;
+	k.shadow_deps = true;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -581,6 +585,21 @@ read_knobs()
 		}
 	}
 
+	// Load a private copy of NeurD's self-pinning OpenSSL before NeurD (see
+	// shadow_self_pinning_deps); 0 = never, NeurD's own file then gets pinned.
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_SHADOW_DEPS", L"ShadowDeps", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (env_ieq(v, "1") || env_ieq(v, "on") || env_ieq(v, "true")) {
+			k.shadow_deps = true;
+			k.src_shadow_deps = src;
+		} else if (env_ieq(v, "0") || env_ieq(v, "off") || env_ieq(v, "false")) {
+			k.shadow_deps = false;
+			k.src_shadow_deps = src;
+		} else {
+			U_LOG_W("Leia lift: shadow deps '%s' (%s) not recognised (1|0) — using 1", v, knob_src_str(src));
+		}
+	}
+
 	if (reg != nullptr) {
 		RegCloseKey(reg);
 	}
@@ -712,6 +731,11 @@ struct global
 	//! re-check 0.4.5 and return OUTDATED_RUNTIME). Set at activation.
 	bool interactive_direct_slot = false;
 
+	//! Private copies loaded by the shadow pre-load (ShadowDeps). Never freed: OpenSSL
+	//! pins itself anyway. Touched only by the activation worker (one at a time).
+	HMODULE shadow_mods[4] = {};
+	uint32_t shadow_count = 0;
+
 	//! Last-applied global NeurD properties (avoid a worker round-trip per prop per frame).
 	bool props_valid = false;
 	int32_t p_out_type = -1, p_tiles_w = -1, p_tiles_h = -1, p_inpaint = -1, p_autoscale = -1, p_autoconv = -1;
@@ -799,6 +823,423 @@ neurd_load_library(const char **out_where)
 		}
 	}
 	return nullptr;
+}
+
+/*
+ *
+ * Shadow pre-load of NeurD's self-pinning dependencies (ShadowDeps).
+ *
+ * OpenSSL 3 pins libcrypto in the process at init (GET_MODULE_HANDLE_EX_FLAG_PIN),
+ * so the idle unload frees every NeurD module but that one, and its file in
+ * NeurD's directory stays locked. The loader satisfies a static import by BASE
+ * NAME with an already-loaded module of that name, wherever it came from — so
+ * before NeurD.dll is (re)loaded, a byte-identical private copy is loaded from a
+ * DisplayXR-owned per-user directory, and that copy is what ends up pinned.
+ * Never in an elevated process: the shadow directory is user-writable, and
+ * loading code from it there would be a DLL-planting path.
+ *
+ */
+
+const wchar_t *const kShadowPatterns[] = {L"libcrypto-*.dll", L"libssl-*.dll"}; // libcrypto first: libssl imports it
+constexpr uint32_t kShadowMaxPerPattern = 4;
+constexpr uint32_t kShadowMaxStaleDirs = 32;
+constexpr uint32_t kShadowMaxFilesPerDir = 16;
+constexpr DWORD kShadowCompareChunk = 64 * 1024;
+
+bool
+path_is_under(const wchar_t *path, const wchar_t *dir)
+{
+	const size_t n = wcslen(dir);
+	return n != 0 && _wcsnicmp(path, dir, n) == 0;
+}
+
+//! Directory of @p file_path, absolute, long-name, with a trailing backslash.
+bool
+dir_of(const wchar_t *file_path, wchar_t *dir, DWORD cap)
+{
+	wchar_t *file_part = nullptr;
+	const DWORD n = GetFullPathNameW(file_path, cap, dir, &file_part);
+	if (n == 0 || n >= cap || file_part == nullptr) {
+		return false;
+	}
+	*file_part = L'\0';
+	const DWORD l = GetLongPathNameW(dir, dir, cap); // in place; a short PATH entry must still compare equal
+	return l != 0 && l < cap;
+}
+
+/*!
+ * Directory of the NeurD.dll neurd_load_library() is about to load, resolved in
+ * the same order: the DLL search path, NEURD_PATH, HKLM\SOFTWARE\LeiaInc\NeurD.
+ * (The worker checks the loaded module's directory against it afterwards.)
+ */
+bool
+neurd_dll_dir(wchar_t *dir, DWORD cap)
+{
+	wchar_t path[MAX_PATH];
+	DWORD n = SearchPathW(nullptr, L"NeurD.dll", nullptr, MAX_PATH, path, nullptr);
+	if (n > 0 && n < MAX_PATH) {
+		return dir_of(path, dir, cap);
+	}
+	n = GetEnvironmentVariableW(L"NEURD_PATH", path, MAX_PATH);
+	if (n > 0 && n < MAX_PATH) {
+		const DWORD a = GetFileAttributesW(path);
+		if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+			return dir_of(path, dir, cap);
+		}
+	}
+	HKEY key = nullptr;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\LeiaInc\\NeurD", 0, KEY_READ, &key) != ERROR_SUCCESS) {
+		return false;
+	}
+	wchar_t inst[MAX_PATH] = {};
+	DWORD cb = sizeof(inst);
+	const LSTATUS r = RegGetValueW(key, nullptr, nullptr, RRF_RT_REG_SZ, nullptr, inst, &cb);
+	RegCloseKey(key);
+	if (r != ERROR_SUCCESS || inst[0] == L'\0') {
+		return false;
+	}
+	const size_t len = wcslen(inst);
+	const wchar_t *sep = (inst[len - 1] == L'\\' || inst[len - 1] == L'/') ? L"" : L"\\";
+	const int w = std::swprintf(path, MAX_PATH, L"%ls%lsNeurD.dll", inst, sep);
+	return w > 0 && w < MAX_PATH && dir_of(path, dir, cap);
+}
+
+//! "%LOCALAPPDATA%\DisplayXR\NeurDShadow\" (not created here).
+bool
+shadow_root(wchar_t *out, DWORD cap)
+{
+	wchar_t lad[MAX_PATH];
+	DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", lad, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) {
+		return false;
+	}
+	while (n > 0 && (lad[n - 1] == L'\\' || lad[n - 1] == L'/')) {
+		lad[--n] = L'\0';
+	}
+	const int w = std::swprintf(out, cap, L"%ls\\DisplayXR\\NeurDShadow\\", lad);
+	return n > 0 && w > 0 && (DWORD)w < cap;
+}
+
+//! Create @p dir if missing; true only if it is then a real directory (not a
+//! junction / symlink — housekeeping deletes inside it).
+bool
+ensure_plain_dir(const wchar_t *dir)
+{
+	if (!CreateDirectoryW(dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+		return false;
+	}
+	const DWORD a = GetFileAttributesW(dir);
+	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+	       (a & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
+/*!
+ * True if this process runs elevated or above medium integrity (SYSTEM, a
+ * service account) — or if that cannot be determined: the shadow is skipped then.
+ */
+bool
+process_is_elevated()
+{
+	HANDLE tok = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return true;
+	}
+	bool elevated = true;
+	TOKEN_ELEVATION e = {};
+	DWORD cb = 0;
+	if (GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &cb) && e.TokenIsElevated == 0) {
+		alignas(8) unsigned char buf[128];
+		if (GetTokenInformation(tok, TokenIntegrityLevel, buf, sizeof(buf), &cb)) {
+			PSID sid = reinterpret_cast<TOKEN_MANDATORY_LABEL *>(buf)->Label.Sid;
+			const UCHAR subs = *GetSidSubAuthorityCount(sid);
+			elevated = subs == 0 || *GetSidSubAuthority(sid, subs - 1u) >= SECURITY_MANDATORY_HIGH_RID;
+		}
+	}
+	CloseHandle(tok);
+	return elevated;
+}
+
+HANDLE
+open_for_read(const wchar_t *path, DWORD share)
+{
+	return CreateFileW(path, GENERIC_READ, share, nullptr, OPEN_EXISTING,
+	                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+}
+
+//! Full byte compare of two open files (from offset 0). False on any read error.
+bool
+files_identical(HANDLE a, HANDLE b)
+{
+	LARGE_INTEGER sa = {}, sb = {}, zero = {};
+	if (!GetFileSizeEx(a, &sa) || !GetFileSizeEx(b, &sb) || sa.QuadPart != sb.QuadPart ||
+	    !SetFilePointerEx(a, zero, nullptr, FILE_BEGIN) || !SetFilePointerEx(b, zero, nullptr, FILE_BEGIN)) {
+		return false;
+	}
+	unsigned char *buf = new (std::nothrow) unsigned char[2 * (size_t)kShadowCompareChunk];
+	if (buf == nullptr) {
+		return false;
+	}
+	bool same = true;
+	for (LONGLONG left = sa.QuadPart; same && left > 0;) {
+		const DWORD want = (DWORD)std::min<LONGLONG>(left, kShadowCompareChunk);
+		DWORD ga = 0, gb = 0;
+		same = ReadFile(a, buf, want, &ga, nullptr) && ReadFile(b, buf + kShadowCompareChunk, want, &gb, nullptr) &&
+		       ga == want && gb == want && memcmp(buf, buf + kShadowCompareChunk, want) == 0;
+		left -= want;
+	}
+	delete[] buf;
+	return same;
+}
+
+//! Original vs the file at @p other: same bytes? (Both opened read-only, briefly.)
+bool
+paths_identical(const wchar_t *orig, const wchar_t *other)
+{
+	HANDLE a = open_for_read(orig, FILE_SHARE_READ | FILE_SHARE_DELETE);
+	HANDLE b = open_for_read(other, FILE_SHARE_READ | FILE_SHARE_DELETE);
+	const bool same = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE && files_identical(a, b);
+	if (a != INVALID_HANDLE_VALUE) {
+		CloseHandle(a);
+	}
+	if (b != INVALID_HANDLE_VALUE) {
+		CloseHandle(b);
+	}
+	return same;
+}
+
+//! One dependency @p base found in @p nd_dir: load its private copy (or note why not).
+void
+shadow_one(const wchar_t *nd_dir, const wchar_t *root, const WIN32_FIND_DATAW &fd)
+{
+	const wchar_t *base = fd.cFileName;
+	wchar_t orig[MAX_PATH];
+	int w = std::swprintf(orig, MAX_PATH, L"%ls%ls", nd_dir, base);
+	if (w <= 0 || w >= MAX_PATH) {
+		return;
+	}
+
+	// Already loaded under that base name: it satisfies NeurD's import whatever we do.
+	HMODULE have = GetModuleHandleW(base);
+	if (have != nullptr) {
+		wchar_t lp[MAX_PATH];
+		const DWORD n = GetModuleFileNameW(have, lp, MAX_PATH);
+		if (n == 0 || n >= MAX_PATH) {
+			return;
+		}
+		if (path_is_under(lp, root)) {
+			// Our copy from an earlier cycle. After a vendor upgrade NeurD's file may
+			// differ from it; the reloaded NeurD then runs against the copy loaded
+			// first (same ABI-major name) — fine until restart, but say so.
+			if (!paths_identical(orig, lp)) {
+				LIFT_WARN_ONCE("Leia lift: NeurD's %ls changed on disk since this process loaded its private copy "
+				               "(%ls). The reloaded NeurD keeps running against the copy loaded first — it works "
+				               "until the service restarts; restart the service to pick up the new library",
+				               base, lp);
+			}
+		} else if (path_is_under(lp, nd_dir)) {
+			LIFT_WARN_ONCE("Leia lift: %ls is already loaded from NeurD's directory (%ls) — that file stays locked "
+			               "until the service restarts",
+			               base, lp);
+		}
+		return;
+	}
+	if (g.shadow_count >= sizeof(g.shadow_mods) / sizeof(g.shadow_mods[0])) {
+		LIFT_WARN_ONCE("Leia lift: too many OpenSSL modules to shadow — %ls not shadowed", base);
+		return;
+	}
+
+	// <root>\<size>-<mtime>\<base>: an upgraded OpenSSL gets its own directory, a
+	// matching copy is reused across service runs. The name is only a cache key;
+	// what is loaded is decided by the byte compare below.
+	wchar_t dir[MAX_PATH], shadow[MAX_PATH];
+	w = std::swprintf(dir, MAX_PATH, L"%ls%08lx%08lx-%08lx%08lx\\", root, (unsigned long)fd.nFileSizeHigh,
+	                  (unsigned long)fd.nFileSizeLow, (unsigned long)fd.ftLastWriteTime.dwHighDateTime,
+	                  (unsigned long)fd.ftLastWriteTime.dwLowDateTime);
+	if (w <= 0 || w >= MAX_PATH || !ensure_plain_dir(dir)) {
+		U_LOG_W("Leia lift: cannot create the shadow directory for %ls under %ls — not shadowed", base, root);
+		return;
+	}
+	w = std::swprintf(shadow, MAX_PATH, L"%ls%ls", dir, base);
+	if (w <= 0 || w >= MAX_PATH) {
+		U_LOG_W("Leia lift: shadow path for %ls too long — not shadowed", base);
+		return;
+	}
+
+	HANDLE src = open_for_read(orig, FILE_SHARE_READ | FILE_SHARE_DELETE);
+	if (src == INVALID_HANDLE_VALUE) {
+		const unsigned long err = (unsigned long)GetLastError();
+		U_LOG_W("Leia lift: cannot read %ls (err %lu) — not shadowed", orig, err);
+		return;
+	}
+	// The copy is opened WITHOUT write/delete sharing and stays open across the
+	// LoadLibrary: the bytes compared are the bytes mapped.
+	HANDLE dst = open_for_read(shadow, FILE_SHARE_READ);
+	if (dst == INVALID_HANDLE_VALUE || !files_identical(src, dst)) {
+		if (dst != INVALID_HANDLE_VALUE) {
+			CloseHandle(dst);
+		}
+		if (!CopyFileW(orig, shadow, FALSE)) {
+			const unsigned long err = (unsigned long)GetLastError();
+			U_LOG_W("Leia lift: copying %ls to %ls failed (err %lu) — not shadowed", orig, shadow, err);
+			CloseHandle(src);
+			return;
+		}
+		dst = open_for_read(shadow, FILE_SHARE_READ);
+		if (dst == INVALID_HANDLE_VALUE || !files_identical(src, dst)) {
+			U_LOG_W("Leia lift: the shadow copy %ls does not match %ls — not loaded", shadow, orig);
+			if (dst != INVALID_HANDLE_VALUE) {
+				CloseHandle(dst);
+			}
+			CloseHandle(src);
+			return;
+		}
+	}
+	CloseHandle(src);
+	HMODULE h = LoadLibraryExW(shadow, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+	const DWORD err = GetLastError();
+	CloseHandle(dst);
+	if (h == nullptr) {
+		U_LOG_W("Leia lift: loading the shadow copy %ls failed (err %lu) — not shadowed; NeurD's own %ls will be "
+		        "pinned",
+		        shadow, (unsigned long)err, base);
+		return;
+	}
+	g.shadow_mods[g.shadow_count++] = h; // never freed
+	U_LOG_W("Leia lift: loaded a private copy of NeurD's %ls from %ls — it is the one the process pins; NeurD's own "
+	        "file stays replaceable",
+	        base, dir);
+}
+
+/*!
+ * Best-effort removal of stale <root>\<key>\ directories (not the ones this
+ * process holds). Bounded; never recurses below <root>\<key>\, skips junctions /
+ * symlinks, ignores every failure (a copy pinned by a running process cannot be
+ * deleted, and that is fine).
+ */
+void
+shadow_housekeeping(const wchar_t *root)
+{
+	wchar_t keep[4][MAX_PATH] = {};
+	uint32_t n_keep = 0;
+	for (uint32_t i = 0; i < g.shadow_count && n_keep < 4; i++) {
+		wchar_t p[MAX_PATH];
+		const DWORD n = GetModuleFileNameW(g.shadow_mods[i], p, MAX_PATH);
+		if (n > 0 && n < MAX_PATH && dir_of(p, keep[n_keep], MAX_PATH)) {
+			n_keep++;
+		}
+	}
+	wchar_t spec[MAX_PATH];
+	int w = std::swprintf(spec, MAX_PATH, L"%ls*", root);
+	if (w <= 0 || w >= MAX_PATH) {
+		return;
+	}
+	WIN32_FIND_DATAW fd;
+	HANDLE f = FindFirstFileW(spec, &fd);
+	if (f == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	uint32_t dirs = 0;
+	do {
+		const DWORD a = fd.dwFileAttributes;
+		if ((a & FILE_ATTRIBUTE_DIRECTORY) == 0 || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+		    wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+			continue;
+		}
+		if (++dirs > kShadowMaxStaleDirs) {
+			break;
+		}
+		wchar_t sub[MAX_PATH];
+		w = std::swprintf(sub, MAX_PATH, L"%ls%ls\\", root, fd.cFileName);
+		if (w <= 0 || w >= MAX_PATH) {
+			continue;
+		}
+		bool in_use = false;
+		for (uint32_t i = 0; i < n_keep; i++) {
+			in_use = in_use || _wcsicmp(sub, keep[i]) == 0;
+		}
+		if (in_use) {
+			continue;
+		}
+		wchar_t sub_spec[MAX_PATH];
+		w = std::swprintf(sub_spec, MAX_PATH, L"%ls*", sub);
+		WIN32_FIND_DATAW ff;
+		HANDLE inner = (w > 0 && w < MAX_PATH) ? FindFirstFileW(sub_spec, &ff) : INVALID_HANDLE_VALUE;
+		if (inner != INVALID_HANDLE_VALUE) {
+			uint32_t files = 0;
+			do {
+				if ((ff.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+					continue; // no recursion; a link is never followed
+				}
+				if (++files > kShadowMaxFilesPerDir) {
+					break;
+				}
+				wchar_t victim[MAX_PATH];
+				w = std::swprintf(victim, MAX_PATH, L"%ls%ls", sub, ff.cFileName);
+				if (w > 0 && w < MAX_PATH) {
+					DeleteFileW(victim);
+				}
+			} while (FindNextFileW(inner, &ff));
+			FindClose(inner);
+		}
+		RemoveDirectoryW(sub); // fails while anything is left in it: ignored
+	} while (FindNextFileW(f, &fd));
+	FindClose(f);
+}
+
+/*!
+ * Before NeurD.dll is (re)loaded from @p nd_dir: load a private copy of each
+ * self-pinning dependency found there (kShadowPatterns) that is not loaded yet,
+ * then tidy stale copies. Every failure is a WARN and the load goes on without
+ * the shadow — this never stands in lift's way. Activation worker only.
+ */
+void
+shadow_self_pinning_deps(const wchar_t *nd_dir)
+{
+	if (process_is_elevated()) {
+		LIFT_WARN_ONCE("Leia lift: process is elevated — NOT loading NeurD's OpenSSL from the user-writable shadow "
+		               "directory (ShadowDeps); NeurD's own copy will be pinned and stay locked until the process "
+		               "exits");
+		return;
+	}
+	wchar_t root[MAX_PATH], parent[MAX_PATH];
+	if (!shadow_root(root, MAX_PATH)) {
+		LIFT_WARN_ONCE("Leia lift: LOCALAPPDATA unset or too long — NeurD's OpenSSL not shadowed");
+		return;
+	}
+	// <LOCALAPPDATA>\DisplayXR\ then <...>\NeurDShadow\ — both must be plain directories.
+	const size_t root_len = wcslen(root);
+	wcsncpy_s(parent, MAX_PATH, root, root_len - wcslen(L"NeurDShadow\\"));
+	if (!ensure_plain_dir(parent) || !ensure_plain_dir(root)) {
+		LIFT_WARN_ONCE("Leia lift: cannot create %ls (or it is a link) — NeurD's OpenSSL not shadowed", root);
+		return;
+	}
+	for (const wchar_t *pattern : kShadowPatterns) {
+		wchar_t spec[MAX_PATH];
+		const int w = std::swprintf(spec, MAX_PATH, L"%ls%ls", nd_dir, pattern);
+		if (w <= 0 || w >= MAX_PATH) {
+			continue;
+		}
+		WIN32_FIND_DATAW fd;
+		HANDLE f = FindFirstFileW(spec, &fd);
+		if (f == INVALID_HANDLE_VALUE) {
+			continue;
+		}
+		uint32_t found = 0;
+		do {
+			// FindFirstFile also matches 8.3 short names: insist on a real *.dll file.
+			const size_t len = wcslen(fd.cFileName);
+			if ((fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 || len < 4 ||
+			    _wcsicmp(fd.cFileName + len - 4, L".dll") != 0) {
+				continue;
+			}
+			if (++found > kShadowMaxPerPattern) {
+				break;
+			}
+			shadow_one(nd_dir, root, fd);
+		} while (FindNextFileW(f, &fd));
+		FindClose(f);
+	}
+	shadow_housekeeping(root);
 }
 
 void
@@ -1014,6 +1455,18 @@ activation_worker()
 		// g.nd until state says READY (the idle unload starts only FROM READY,
 		// and kick() starts this worker only from UNPROBED / RETRY_WAIT / IDLE).
 		if (g.nd == nullptr) {
+			// First activation AND every reload: put private copies of NeurD's
+			// self-pinning OpenSSL in place before NeurD's own imports resolve.
+			wchar_t nd_dir[MAX_PATH] = {};
+			bool shadowed = false;
+			if (g.k0.shadow_deps) {
+				shadowed = neurd_dll_dir(nd_dir, MAX_PATH);
+				if (shadowed) {
+					shadow_self_pinning_deps(nd_dir);
+				} else {
+					LIFT_WARN_ONCE("Leia lift: cannot resolve NeurD.dll's directory — its OpenSSL is not shadowed");
+				}
+			}
 			const char *where = "?";
 			HMODULE lib = neurd_load_library(&where);
 			if (lib == nullptr) {
@@ -1022,6 +1475,17 @@ activation_worker()
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
+			}
+			if (shadowed) {
+				// The loader's search may have picked another NeurD.dll than our
+				// resolution did; then the shadowing looked in the wrong place.
+				wchar_t got[MAX_PATH], got_dir[MAX_PATH];
+				const DWORD n = GetModuleFileNameW(lib, got, MAX_PATH);
+				if (n > 0 && n < MAX_PATH && dir_of(got, got_dir, MAX_PATH) && _wcsicmp(got_dir, nd_dir) != 0) {
+					LIFT_WARN_ONCE("Leia lift: NeurD.dll loaded from %ls but its OpenSSL was looked up in %ls — "
+					               "its own OpenSSL may end up pinned (file locked until restart)",
+					               got_dir, nd_dir);
+				}
 			}
 			auto load = reinterpret_cast<PFN_NeurD_load>(reinterpret_cast<void *>(GetProcAddress(lib, "NeurD_load")));
 			struct NeurD_load_request req = {NEURD_VERSION};
@@ -1149,7 +1613,8 @@ activation_worker()
 		if (!reload) {
 			U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) min_version=%u.%u.%u(%s) "
 			        "scale=%s(%s) view_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) "
-			        "dilate=%d(%s) idle_unload=%s(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+			        "dilate=%d(%s) idle_unload=%s(%s) shadow_deps=%s(%s) "
+			        "[env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
 			        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
 			        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min),
 			        (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
@@ -1161,7 +1626,8 @@ activation_worker()
 			        knob_src_str(k0.src_conv_gain),
 			        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
 			        knob_src_str(k0.src_video_model), (double)k0.depth_gain, knob_src_str(k0.src_depth_gain),
-			        (int)k0.dilate, knob_src_str(k0.src_dilate), idle_str, knob_src_str(k0.src_idle_unload));
+			        (int)k0.dilate, knob_src_str(k0.src_dilate), idle_str, knob_src_str(k0.src_idle_unload),
+			        k0.shadow_deps ? "on" : "off", knob_src_str(k0.src_shadow_deps));
 		}
 		if (k0.interactive_min != 0) {
 			U_LOG_W("Leia lift: DXR_LEIA_LIFT_INTERACTIVE_MIN=%u.%u.%u (%s) — assuming interactive convert on NeurD "
@@ -1321,13 +1787,19 @@ idle_pending()
  * Count the modules mapped from @p dir (NeurD's directory, with its trailing
  * backslash; subdirectories included) and list their relative names into
  * @p out, comma-separated, truncated to @p cap. Diagnostic for the idle unload:
- * whatever is still listed after FreeLibrary keeps its file locked.
+ * whatever is still listed after FreeLibrary keeps its file locked. Modules
+ * under the ShadowDeps directory are never counted, even should NeurD's
+ * directory contain it: those are our copies, not NeurD's files.
  * K32EnumProcessModules is resolved at run time (kernel32; no psapi link).
  */
 uint32_t
 modules_mapped_from(const wchar_t *dir, char *out, size_t cap)
 {
 	out[0] = '\0';
+	wchar_t shadow[MAX_PATH];
+	if (!shadow_root(shadow, MAX_PATH)) {
+		shadow[0] = L'\0';
+	}
 	const size_t dir_len = wcslen(dir);
 	HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
 	using pfn_enum_modules = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
@@ -1347,7 +1819,8 @@ modules_mapped_from(const wchar_t *dir, char *out, size_t cap)
 		// A module unloaded since the enumeration just fails here and is skipped.
 		wchar_t path[MAX_PATH];
 		const DWORD len = GetModuleFileNameW(mods[i], path, MAX_PATH);
-		if (len == 0 || len >= MAX_PATH || len <= dir_len || _wcsnicmp(path, dir, dir_len) != 0) {
+		if (len == 0 || len >= MAX_PATH || len <= dir_len || _wcsnicmp(path, dir, dir_len) != 0 ||
+		    path_is_under(path, shadow)) {
 			continue;
 		}
 		count++;

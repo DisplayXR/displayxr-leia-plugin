@@ -96,6 +96,27 @@ metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERS
   a first activation, marked `reloading (after the idle unload) NeurD x.y.z` and
   `NeurD READY again`, minus the knobs line.
   `IdleUnloadSec=0` restores the old behaviour: never unloaded.
+- **NeurD's OpenSSL is loaded from a private copy (`ShadowDeps`).** One NeurD dependency
+  cannot be unloaded by anyone: OpenSSL 3 pins `libcrypto-3-x64.dll` in the process when
+  it initialises (it is a static import of NeurD's DirectML backend, `dnn_dml.dll`), so
+  after an idle unload that one file in NeurD's directory would stay locked and NeurD's
+  installer would still fail on it. Windows satisfies a static import by **base name** with
+  a module of that name that is already loaded, wherever it came from. So before every
+  load of `NeurD.dll` (first activation and each reload), for each `libcrypto-*.dll` /
+  `libssl-*.dll` in the directory of the `NeurD.dll` about to be loaded (resolved in the
+  same PATH → `NEURD_PATH` → registry order) that is not loaded yet, the plug-in copies it
+  to `%LOCALAPPDATA%\DisplayXR\NeurDShadow\<size>-<mtime>\<same name>` and loads that copy
+  by full path. It is the copy that gets pinned; every file in NeurD's directory stays
+  replaceable. The copy is loaded only if it is **byte-identical** to NeurD's file at that
+  moment (full compare, file held open without write/delete sharing through the load),
+  else it is re-copied; a matching copy is reused across service runs, and stale
+  `<size>-<mtime>` directories are removed best-effort. **Never in an elevated process**
+  (or above medium integrity): the shadow directory is user-writable, so loading code from
+  it there would open a DLL-planting path — the shadow is skipped with one WARN and
+  NeurD's own OpenSSL is pinned as before. `displayxr-service` runs at the user's medium
+  integrity, which is the case this is for. Any failure (no `LOCALAPPDATA`, copy, compare
+  or load fails) is one WARN and NeurD loads without the shadow. `ShadowDeps=0` turns it
+  off.
 
 ### Licensing / activation
 
@@ -284,7 +305,7 @@ Read once per DP at create (`leia_lift_neurd_create`). Each knob comes from the
 At activation one WARN lists every knob's effective value and where it came from:
 
 ```
-Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) video_model=fast(default) depth_gain=2.00(default) dilate=2(default) idle_unload=300s(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
+Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) video_model=fast(default) depth_gain=2.00(default) dilate=2(default) idle_unload=300s(default) shadow_deps=on(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
 ```
 
 It is printed at the first activation only; a reload after an idle unload reuses the same
@@ -310,6 +331,7 @@ before; with neither set, nothing changes.
 | `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). Only matters when `MinVersion` admits that NeurD (the default 0.4.6 floor refuses 0.4.4 before this is consulted); the two knobs are independent. |
 | `DXR_LEIA_LIFT_MIN_VERSION` | `MinVersion` | `0.4.6` | Oldest NeurD lift accepts, `major.minor.patch`. Older → refused at load (one WARN), lift unavailable exactly as if NeurD were absent, so callers fall back. Lower it only for demos/testing (e.g. `0.4.4`, `0.3.11`); below 0.3.11 changes nothing — the stream-API check still refuses those. Garbage → WARN, default kept. |
 | `DXR_LEIA_LIFT_IDLE_UNLOAD_SEC` | `IdleUnloadSec` | `300` | Whole seconds with **no lift stream** after which a READY NeurD is deinit'd and its DLL freed, so its installer can replace the files; the next stream reloads it (~5 s of unconverted video frames). `0` = never unload (the behaviour before this knob existed). Non-zero values are clamped to 5..86400 with a WARN; garbage → WARN, default kept. Taken from the first DP to activate NeurD, like `Backend`. |
+| `DXR_LEIA_LIFT_SHADOW_DEPS` | `ShadowDeps` | `1` | `1` = before loading NeurD, load a private, byte-identical copy of its self-pinning OpenSSL (`libcrypto-*.dll`, `libssl-*.dll`) from `%LOCALAPPDATA%\DisplayXR\NeurDShadow\`, so no file in NeurD's directory stays locked after an idle unload (skipped in an elevated process). `0` = never; NeurD's own OpenSSL is then pinned and its file locked until the service restarts. |
 
 The demo knobs for the 0.4.4 internal-interactive package, set once on the box (elevated
 prompt), then restart the service:
@@ -403,10 +425,13 @@ lift-enabled runtime + this plug-in registered:
 6. Idle unload: set `IdleUnloadSec=15` (registry, then restart the service), run a
    conversion, then stop it. About 20 s later the log shows `no lift stream for 15s ...
    unloading NeurD` and `NeurD unloaded (deinit + FreeLibrary, N ms); 0 of M module(s)
-   from <NeurD dir> still mapped`. Confirm independently that no NeurD module is left in
-   the service — `tasklist /m NeurD* /fi "imagename eq displayxr-service.exe"` lists
-   nothing — and that the NeurD files can be renamed or replaced (or the NeurD installer
-   runs). Convert again: the first frames fail silently, the log shows `reloading (after
+   from <NeurD dir> still mapped` — it must say **0**: with `ShadowDeps` on, no module
+   from NeurD's directory may remain (the first activation's log shows `loaded a private
+   copy of NeurD's libcrypto-3-x64.dll from %LOCALAPPDATA%\DisplayXR\NeurDShadow\...`, and
+   that copy is the one still loaded). Confirm independently that no module from NeurD's
+   directory is left in the service (Process Explorer, or `tasklist /m` on its DLL names)
+   and that **every** file in NeurD's directory can be opened for exclusive write /
+   renamed / replaced — `libcrypto-*.dll` included — or the NeurD installer runs. Convert again: the first frames fail silently, the log shows `reloading (after
    the idle unload) NeurD x.y.z` and `NeurD READY again after the idle unload`, and
    conversion resumes within ~5 s. With a different NeurD installed in between, the
    reload line names the new version.
@@ -441,6 +466,20 @@ lift-enabled runtime + this plug-in registered:
 - NeurD is unloaded only from READY. While it is waiting on a network licence retry, or
   after it failed or was refused (too old) post-load, `NeurD.dll` stays loaded — and its
   files locked — until the service restarts, exactly as before this feature.
+- **OpenSSL shadow (`ShadowDeps`) limits.** In an elevated (or above-medium-integrity)
+  process the shadow is skipped, so NeurD's own `libcrypto-*.dll` is pinned and its file
+  stays locked until that process exits. If an OpenSSL of the same name was already loaded
+  before (by anything, from anywhere), nothing is shadowed — if it came from NeurD's
+  directory (a process that started without this code path), that file stays locked until
+  the service restarts (one WARN). **After a NeurD upgrade that ships a different
+  OpenSSL**, the reloaded NeurD keeps using the copy pinned at the first load (same
+  base name, so the same ABI major) until the service restarts — detected at reload with
+  one WARN; restart the service to pick up the new library. The shadow copy itself is
+  loaded with the default DLL search for its own imports (system DLLs only for
+  libcrypto); if one of those exists only in NeurD's directory, the copy fails to load and
+  NeurD's own is used (one WARN). Stale `NeurDShadow\<key>` directories are removed
+  best-effort (at most 32 directories × 16 files per activation; a copy pinned by another
+  running process cannot be deleted and is left).
 - A reload probes NeurD's presence once, when the first stream after the unload is
   created. If NeurD's installer is mid-way through replacing the files at that moment,
   the probe or the load can fail, and lift stays unavailable until the service restarts.
