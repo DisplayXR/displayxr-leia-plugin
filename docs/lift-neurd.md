@@ -78,6 +78,15 @@ metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERS
 - **Never de-initialised.** DPs are recreated on focus changes; re-init would re-run
   licensing and model load. When the last DP handle goes the plug-in only calls
   `NeurD_shrink_memory_pool`.
+- **Consequence for NeurD's installer.** Once anything has used lift, `NeurD.dll` and its
+  dependencies stay mapped in the long-lived `displayxr-service.exe` until that process
+  exits, so their files cannot be replaced while it runs. Unloading NeurD when idle was
+  tried (v2.8.2) and withdrawn: a reload costs 8-10 s of unconverted frames on the next
+  conversion, and OpenSSL pins `libcrypto-3-x64.dll` in the process regardless. The
+  installer is the place to handle it: close the processes holding its DLLs
+  (`displayxr-service.exe`), replace the files, then start the service again
+  **non-elevated** (e.g. `explorer.exe "<Runtime>\displayxr-service.exe"` from an elevated
+  installer) — a service started elevated cannot be reached by normal-integrity apps.
 
 ### Licensing / activation
 
