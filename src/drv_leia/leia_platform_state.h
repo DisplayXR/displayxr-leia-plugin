@@ -15,8 +15,12 @@
  *                         cannot be resolved/loaded.
  *   INCOMPATIBLE          SR client DLLs load but lack an export this build
  *                         imports (platform too old/new for this plug-in).
- *   PLATFORM_NOT_RUNNING  key present, `Global\sharedDeviceSerialMemory`
- *                         absent (SR Service down / starting).
+ *   PLATFORM_NOT_RUNNING  key present, and the SCM does not report the
+ *                         `SR Service` service SERVICE_RUNNING, or its
+ *                         `Global\sharedDeviceSerialMemory` section is
+ *                         absent (down / starting). The SCM state is the
+ *                         authority: the section survives a stopped service
+ *                         while another SR client holds it (#294).
  *   NO_DISPLAY            platform running, no Leia panel attached: no EDID
  *                         table match AND (a panel matched earlier in this
  *                         process, i.e. it was unplugged, OR SR reports no
@@ -25,7 +29,8 @@
  *                         match, or SR has identified a panel our frozen EDID
  *                         table does not know).
  *
- * Every function here is a presence check — registry, named mapping, EDID —
+ * Every function here is a presence check — registry, SCM query (cached
+ * <= 1 s), named mapping, EDID —
  * and returns well inside the ~100 ms probe budget. Nothing waits for SR.
  * Thread-safe.
  *
