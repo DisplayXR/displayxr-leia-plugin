@@ -94,8 +94,11 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: 92 pfnWeaverSetComposeInputsDX11 (both used by the d3d11 DP when DXR_LEIA_HAS_SR_COMPOSE),
 :: 93 pfnDisplayGetEffectiveViews (unused here). Older SR runtimes answer
 :: SR_ERROR_FUNCTION_UNSUPPORTED for 91/92 and the runtime keeps its post-weave blit.
-set SR_V2_TAG=sr-sdk-v2-1.38.0.1860
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+1860.6cba7ce35c-win64-Release
+:: 1863 = RC @ 9774c6d43 (+ LeiaSR #376/#377): cached 2D-compose prefilter. 93 -> 94 slots,
+:: 1860's 93 an exact ordered prefix, APPENDS ONLY -- 94 pfnWeaverSetComposeLayerUnchanged
+:: (sr_weaver.h), used by the d3d11 DP under DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED (XR_DXR_weave v14).
+set SR_V2_TAG=sr-sdk-v2-1.38.0.1863
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+1863.9774c6d43c-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 

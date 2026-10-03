@@ -83,8 +83,11 @@ jobs:
       # 1860 = the weaver 2D compose (LeiaSR #368-#375): 90 -> 93 slots, APPENDS
       # ONLY (91 SetComposeOrder, 92 SetComposeInputsDX11 -- used by the d3d11 DP
       # under DXR_LEIA_HAS_SR_COMPOSE; 93 DisplayGetEffectiveViews, unused).
-      SR_V2_TAG: sr-sdk-v2-1.38.0.1860
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+1860.6cba7ce35c-win64-Release
+      # 1863 = cached 2D-compose prefilter (LeiaSR #376/#377): 93 -> 94 slots,
+      # APPENDS ONLY (94 SetComposeLayerUnchanged -- used under
+      # DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED, XR_DXR_weave v14).
+      SR_V2_TAG: sr-sdk-v2-1.38.0.1863
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+1863.9774c6d43c-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
