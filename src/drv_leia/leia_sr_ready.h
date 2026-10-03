@@ -141,6 +141,18 @@ bool
 leiasr_geometry_resolve(double max_time, const char *why);
 
 /*!
+ * Forget the cached geometry (P-c: the matched panel was unplugged or
+ * replaced). The probe cache and the next get_display_info then report
+ * nothing until the geometry is re-derived; the watcher is (re)started to do
+ * that once the panel is back and identified. The live head device keeps its
+ * last geometry until then. Cheap; logs once per actual invalidation.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_geometry_invalidate(const char *why);
+
+/*!
  * Register / unregister the live head device so a late geometry publish can
  * update it in place. Registering applies already-published geometry at once,
  * closing the window between "watcher published" and "device created".

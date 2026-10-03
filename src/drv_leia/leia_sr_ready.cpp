@@ -10,6 +10,7 @@
 
 #include "leia_sr_ready.h"
 #include "leia_interface.h"
+#include "leia_platform_state.h"
 
 #include "util/u_logging.h"
 
@@ -57,7 +58,12 @@ leiasr_geometry g_geom = {};
 xrt_device *g_hmd = nullptr;
 
 // --- watcher ----------------------------------------------------------------
-std::atomic<bool> g_watcher_started{false};
+// Restartable since P-c: it exits once geometry is published, and an
+// invalidation (panel unplugged / replaced) starts it again so the geometry is
+// re-derived when the panel returns. g_watcher_shutdown makes stop final.
+std::atomic<bool> g_watcher_running{false};
+std::atomic<bool> g_watcher_shutdown{false};
+std::mutex g_watcher_mu;         // serialises start vs shutdown
 HANDLE g_watcher_stop = nullptr; // manual-reset
 HANDLE g_watcher_done = nullptr; // manual-reset
 
@@ -97,20 +103,26 @@ watcher_body();
 void
 watcher_start()
 {
-	if (g_watcher_started.exchange(true)) {
+	std::lock_guard<std::mutex> lk(g_watcher_mu);
+	if (g_watcher_shutdown.load() || g_watcher_running.load()) {
 		return;
 	}
-	g_watcher_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-	g_watcher_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-	if (g_watcher_stop == nullptr || g_watcher_done == nullptr) {
-		U_LOG_E("Leia SR readiness watcher: CreateEvent failed (%lu) — late geometry re-derivation disabled",
-		        (unsigned long)GetLastError());
-		return;
+	if (g_watcher_stop == nullptr) {
+		g_watcher_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+		g_watcher_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+		if (g_watcher_stop == nullptr || g_watcher_done == nullptr) {
+			U_LOG_E("Leia SR readiness watcher: CreateEvent failed (%lu) — late geometry re-derivation "
+			        "disabled",
+			        (unsigned long)GetLastError());
+			return;
+		}
 	}
-	// Detached by design (there is exactly one, for the life of the process
-	// or until identification); shutdown signals g_watcher_stop and waits on
-	// g_watcher_done rather than joining, so a static std::thread can never
-	// std::terminate at DLL unload.
+	ResetEvent(g_watcher_done);
+	g_watcher_running.store(true);
+	// Detached by design (at most one at a time; it exits once geometry is
+	// published); shutdown signals g_watcher_stop and waits on g_watcher_done
+	// rather than joining, so a static std::thread can never std::terminate
+	// at DLL unload.
 	std::thread([]() { watcher_body(); }).detach();
 }
 
@@ -190,6 +202,12 @@ watcher_body()
 		if (!leiasr_display_identified()) {
 			continue;
 		}
+		// P-c: SR may keep a device identified after the panel is unplugged,
+		// so also require the platform state (cheap: a monitor-topology
+		// signature; the EDID enumeration re-runs only when it changed).
+		if (leia_platform_state_refresh(UINT32_MAX) != LEIA_PLATFORM_READY) {
+			continue;
+		}
 		// Identified. Query with a FRESH handle; a failure here (SR still
 		// switching its active display) is simply retried next tick.
 		bool ok = false;
@@ -203,6 +221,7 @@ watcher_body()
 		}
 	}
 	U_LOG_I("Leia SR readiness watcher exiting after %.0f s", (double)(GetTickCount64() - t0) / 1000.0);
+	g_watcher_running.store(false);
 	SetEvent(g_watcher_done);
 }
 
@@ -312,6 +331,14 @@ leiasr_geometry_resolve(double max_time, const char *why)
 			return true;
 		}
 	}
+	// Install-order gates (P-a / P-c), both cheap:
+	//  - the SR client DLLs are delay-loaded; no SR call before they bind,
+	//    or a missing platform faults at the call site;
+	//  - no SR query while the panel is known to be gone: SR would answer
+	//    with its "default display" placeholders, and they would be cached.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK || leia_platform_display_absent()) {
+		return false;
+	}
 	if (!leiasr_ready_wait()) {
 		return false; // fast once the budget is spent
 	}
@@ -321,6 +348,26 @@ leiasr_geometry_resolve(double max_time, const char *why)
 	}
 	publish(g, why != nullptr ? why : "query");
 	return true;
+}
+
+void
+leiasr_geometry_invalidate(const char *why)
+{
+	bool was_valid = false;
+	{
+		std::lock_guard<std::mutex> lk(g_mu);
+		was_valid = g_geom.valid;
+		g_geom = {};
+	}
+	if (!was_valid) {
+		return;
+	}
+	U_LOG_W("Leia display geometry invalidated (%s) — it will be re-derived once the panel is back and "
+	        "identified; until then get_display_info reports nothing new and the DP passes pixels through",
+	        why != nullptr ? why : "display change");
+	if (leia_sr_client_bound()) {
+		watcher_start();
+	}
 }
 
 void
@@ -365,7 +412,9 @@ leiasr_ready_note_weaver_ready(void)
 void
 leiasr_ready_shutdown(void)
 {
-	if (!g_watcher_started.load() || g_watcher_stop == nullptr) {
+	std::lock_guard<std::mutex> lk(g_watcher_mu);
+	g_watcher_shutdown.store(true);
+	if (!g_watcher_running.load() || g_watcher_stop == nullptr) {
 		return;
 	}
 	SetEvent(g_watcher_stop);
@@ -413,6 +462,12 @@ leiasr_geometry_resolve(double max_time, const char *why)
 	(void)max_time;
 	(void)why;
 	return false;
+}
+
+void
+leiasr_geometry_invalidate(const char *why)
+{
+	(void)why;
 }
 
 void

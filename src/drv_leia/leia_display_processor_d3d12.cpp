@@ -19,6 +19,7 @@
 
 #include "leia_display_processor_d3d12.h"
 #include "leia_sr_d3d12.h"
+#include "leia_platform_state.h"
 #include "leia_bg_capture_win.h"
 
 #include "xrt/xrt_display_metrics.h"
@@ -324,6 +325,11 @@ struct leia_display_processor_d3d12_impl
 	//! Without it the woven output keeps α=1 and the "transparent" window is
 	//! solid black. Mirrors the D3D11 DP's #551 client_present_mode.
 	bool client_present_mode;
+
+	//! P-c display hot-plug: last 1 Hz platform-state poll (GetTickCount64,
+	//! 0 = never) and the NO_DISPLAY pass-through state last logged.
+	uint64_t display_poll_ms;
+	bool display_absent_logged;
 	ID3D12Resource *bg_shared_tex;       //!< Opened from bg_capture's shared NT handle.
 	ID3D12Fence *bg_fence;               //!< Opened from bg_capture's shared fence handle.
 	ID3D12RootSignature *compose_root_sig;
@@ -1754,6 +1760,78 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	ID3D12GraphicsCommandList *cmd_3d =
 	    static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
 
+	// P-c display hot-plug (same contract as the D3D11 DP): ~1 Hz cheap
+	// platform-state poll — the EDID enumeration re-runs only on a monitor
+	// topology change — and, while the panel is gone (NO_DISPLAY; the runtime
+	// keeps the vendor DP, no live swap), pass view 0 through unwoven with
+	// the 2D blit pipeline instead of weaving for a lens that is not there.
+	{
+		const uint64_t now_ms = GetTickCount64();
+		if (ldp->display_poll_ms == 0 || (now_ms - ldp->display_poll_ms) > 1000) {
+			ldp->display_poll_ms = now_ms;
+			(void)leia_platform_state_refresh(UINT32_MAX);
+		}
+	}
+	const bool display_absent = leia_platform_display_absent();
+	if (display_absent != ldp->display_absent_logged) {
+		ldp->display_absent_logged = display_absent;
+		U_LOG_W("Leia D3D12 DP: %s", display_absent
+		                                 ? "Leia panel not attached (NO_DISPLAY) — passing pixels through unwoven"
+		                                 : "Leia panel attached again — weaving resumes");
+	}
+	if (display_absent) {
+		if (ldp->blit_pso == NULL || ldp->blit_root_sig == NULL || ldp->blit_srv_heap == NULL ||
+		    atlas_texture_resource == NULL) {
+			return;
+		}
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = static_cast<DXGI_FORMAT>(format);
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv_desc.Texture2D.MipLevels = 1;
+		ldp->device->CreateShaderResourceView(static_cast<ID3D12Resource *>(atlas_texture_resource), &srv_desc,
+		                                      ldp->blit_srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+		ID3D12DescriptorHeap *heaps[] = {ldp->blit_srv_heap};
+		cmd_3d->SetDescriptorHeaps(1, heaps);
+		cmd_3d->SetGraphicsRootSignature(ldp->blit_root_sig);
+		cmd_3d->SetPipelineState(ldp->blit_pso);
+
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+		rtv_handle.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+		cmd_3d->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+
+		D3D12_VIEWPORT viewport = {};
+		viewport.TopLeftX = static_cast<float>(vp_x);
+		viewport.TopLeftY = static_cast<float>(vp_y);
+		viewport.Width = static_cast<float>(vp_w);
+		viewport.Height = static_cast<float>(vp_h);
+		viewport.MaxDepth = 1.0f;
+		cmd_3d->RSSetViewports(1, &viewport);
+		D3D12_RECT scissor = {};
+		scissor.left = static_cast<LONG>(vp_x);
+		scissor.top = static_cast<LONG>(vp_y);
+		scissor.right = static_cast<LONG>(vp_x) + static_cast<LONG>(vp_w);
+		scissor.bottom = static_cast<LONG>(vp_y) + static_cast<LONG>(vp_h);
+		cmd_3d->RSSetScissorRects(1, &scissor);
+		cmd_3d->SetGraphicsRootDescriptorTable(0, ldp->blit_srv_heap->GetGPUDescriptorHandleForHeapStart());
+
+		// Sample only tile 0: it sits at the atlas origin, so the u/v scale
+		// IS the tile fraction (the D3D11 weaver-not-ready flat path).
+		float u_scale = (tile_columns > 0) ? 1.0f / (float)tile_columns : 1.0f;
+		float v_scale = (tile_rows > 0) ? 1.0f / (float)tile_rows : 1.0f;
+		uint32_t constants[4];
+		memcpy(&constants[0], &u_scale, sizeof(float));
+		memcpy(&constants[1], &v_scale, sizeof(float));
+		constants[2] = 0;
+		constants[3] = 0;
+		cmd_3d->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+		cmd_3d->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		cmd_3d->IASetVertexBuffers(0, 0, nullptr);
+		cmd_3d->DrawInstanced(4, 1, 0, 0);
+		return;
+	}
+
 	// Atlas is guaranteed content-sized SBS (2*view_width x view_height)
 	// by compositor crop-blit.
 	//
@@ -2832,6 +2910,13 @@ leia_dp_factory_d3d12(void *d3d12_device,
                       void *window_handle,
                       struct xrt_display_processor_d3d12 **out_xdp)
 {
+	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
+	// before the first SR call, or a missing/mismatched SR platform faults at
+	// the call site. The bind logs its own outcome once.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia D3D12 DP: SR platform client DLLs not usable — not creating the display processor");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
 	// so we pass 0,0 here.
 	struct leiasr_d3d12 *weaver = NULL;

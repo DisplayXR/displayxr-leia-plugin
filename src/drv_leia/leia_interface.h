@@ -120,6 +120,16 @@ bool
 leia_edid_get_cached_result(struct leia_display_probe_result *out);
 
 /*!
+ * The two cheap SR platform presence signals, without the EDID enumeration:
+ * the SR registry key (HKLM\SOFTWARE\Dimenco\Simulated Reality) and the SR
+ * Service's `Global\sharedDeviceSerialMemory` mapping. Either out may be NULL.
+ *
+ * @ingroup drv_leia
+ */
+void
+leia_sr_presence(bool *out_sdk_installed, bool *out_service_running);
+
+/*!
  * Perform a fresh EDID probe and return the current screen rectangle of the
  * first Leia/Dimenco 3D display connected to the system.
  *

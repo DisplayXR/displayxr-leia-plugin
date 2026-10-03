@@ -19,6 +19,7 @@
 
 #include "leia_display_processor_d3d11.h"
 #include "leia_sr_d3d11.h"
+#include "leia_platform_state.h"
 #include "leia_bg_capture_win.h"
 
 #include "xrt/xrt_display_metrics.h"
@@ -520,6 +521,8 @@ struct leia_display_processor_d3d11_impl
 	//! @{
 	uint64_t backend_poll_ms; //!< GetTickCount64 of the last poll (0 = never).
 	uint32_t backend_state;   //!< Last polled leia_sr_backend_state.
+	//! P-c: the NO_DISPLAY pass-through state last logged (edge-logged only).
+	bool display_absent_logged;
 	//! @}
 
 	//! #491 part 3 — the runtime's flattened 2D-under backdrop for the next
@@ -1439,7 +1442,25 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		if (ldp->backend_poll_ms == 0 || (now_ms - ldp->backend_poll_ms) > 1000) {
 			ldp->backend_poll_ms = now_ms;
 			ldp->backend_state = leiasr_d3d11_poll_backend_state(ldp->leiasr);
+			// P-c display hot-plug, same 1 Hz heartbeat. Cheap: a monitor
+			// topology signature; the EDID enumeration re-runs only when
+			// the monitor set changed. Publishes NO_DISPLAY on an unplug
+			// (and invalidates the cached geometry), READY on a re-plug.
+			(void)leia_platform_state_refresh(UINT32_MAX);
 		}
+	}
+
+	// P-c: the panel is gone while this DP is bound (the runtime keeps a
+	// vendor DP on NO_DISPLAY — no live swap). Weaving for a lens that is no
+	// longer there would put an interlaced pattern on whatever monitor the
+	// window now sits on, so pass pixels through instead (the flat path below
+	// that serves the weaver-not-ready window) until the panel returns.
+	const bool display_absent = leia_platform_display_absent();
+	if (display_absent != ldp->display_absent_logged) {
+		ldp->display_absent_logged = display_absent;
+		U_LOG_W("Leia D3D11 DP: %s", display_absent
+		                                 ? "Leia panel not attached (NO_DISPLAY) — passing pixels through unwoven"
+		                                 : "Leia panel attached again — weaving resumes");
 	}
 
 	// ADR-021: drive the weaver's sRGB conversion from the atlas encoding the
@@ -1576,11 +1597,11 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// flowing instead of drawing nothing (the weave call below would no-op and
 	// leave the target stale/garbage). Plain opaque blit: the transparency
 	// passes need weaver-adjacent state and the window lasts ~a second.
-	if (!leiasr_d3d11_is_ready(ldp->leiasr)) {
+	if (display_absent || !leiasr_d3d11_is_ready(ldp->leiasr)) {
 		if (ldp->blit_vs == NULL || ldp->blit_ps == NULL) {
 			return;
 		}
-		{
+		if (!display_absent) {
 			static uint64_t last_log_ms;
 			uint64_t now_ms = GetTickCount64();
 			if (now_ms - last_log_ms > 1000) {
@@ -2676,6 +2697,13 @@ leia_dp_factory_d3d11(void *d3d11_device,
                       void *window_handle,
                       struct xrt_display_processor_d3d11 **out_xdp)
 {
+	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
+	// before the first SR call, or a missing/mismatched SR platform faults at
+	// the call site. The bind logs its own outcome once.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia D3D11 DP: SR platform client DLLs not usable — not creating the display processor");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
 	// so we pass 0,0 here (avoids creating a redundant temp SR context just to
 	// query recommended dims that leiasr_d3d11_create queries again internally).

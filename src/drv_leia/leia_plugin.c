@@ -11,12 +11,14 @@
  * ADR-019; lower than sim_display's 200, so this wins on machines
  * with SR hardware).
  *
- * The probe is fast on the common path — EDID + SR-SDK/service presence
- * check only, no SR context creation. The slower
- * `leiasr_probe_display(timeout)` path is invoked only as a fallback when
- * the static EDID table misses but SR is installed and running (see
- * `leia_plugin_probe`), so a panel that SR accepts but our frozen table
- * has not yet learned still binds.
+ * The probe is presence checks only — SR registry key, SR client DLLs
+ * bindable (they are delay-loaded, so this DLL loads without the SR
+ * platform), the SR Service's shared-memory mapping, the EDID table — and
+ * never creates an SR context or waits for SR (install-order epic,
+ * displayxr-runtime#1803, P-a/P-b). Readiness waiting belongs to device
+ * creation. The outcome is one generic platform state + hint
+ * (leia_platform_state.h), reported through the runtime's
+ * `get_platform_state` slot when the runtime headers carry it.
  *
  * Issue #256 — vendor plug-in re-architecture.
  *
@@ -28,8 +30,10 @@
 #include "xrt/xrt_results.h"
 
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include "leia_interface.h"
+#include "leia_platform_state.h"
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*
@@ -52,6 +56,7 @@
 #endif
 
 #include <stddef.h>
+#include <string.h>
 
 
 /*
@@ -60,67 +65,40 @@
  *
  */
 
-/*
- * Fallback SR-context probe timeout, used only when the fast EDID table
- * misses. SR SDK + SRService are already confirmed present at that point, so
- * the context should come up quickly; keep the wait short to stay friendly on
- * the xrCreateInstance path.
- */
-#define LEIA_PLUGIN_SR_PROBE_TIMEOUT_S 2.0
+//! One WARN with the first probe's duration (acceptance: probe() <= ~100 ms).
+static bool g_leia_probe_timing_logged = false;
 
 static xrt_result_t
 leia_plugin_probe(struct xrt_plugin_instance **out_inst)
 {
 	/*
-	 * SR presence is required regardless of how the panel is identified:
-	 *   - SR SDK installed on this machine (sdk_installed),
-	 *   - SRService running (service_running).
-	 * If either is missing there is no SR display — decline cleanly so the
-	 * next plug-in (or the sim_display fallback) gets a turn.
+	 * Presence checks only (P-b). Never waits for the SR platform: a panel
+	 * the SR Service has not identified yet is device creation's problem
+	 * (bounded readiness budget there), not the probe's — the probe used to
+	 * spend up to the whole 20 s budget here on an EDID-table miss.
 	 */
+	const uint64_t t0 = os_monotonic_get_ns();
 	struct leia_display_probe_result edid = {0};
-	leia_edid_probe_display(&edid);
+	(void)leia_edid_probe_display(&edid);
+	const enum leia_platform_state st = leia_platform_state_evaluate(&edid);
+	const double ms = (double)(os_monotonic_get_ns() - t0) / 1e6;
 
-	if (!edid.sdk_installed || !edid.service_running) {
-		U_LOG_I("leia_plugin: probe declined — sdk=%d service=%d", edid.sdk_installed,
-		        edid.service_running);
-		*out_inst = NULL;
-		return XRT_ERROR_PROBER_NOT_SUPPORTED;
+	if (!g_leia_probe_timing_logged) {
+		g_leia_probe_timing_logged = true;
+		U_LOG_W("leia_plugin: probe took %.1f ms (platform state %s)", ms, leia_platform_state_name(st));
 	}
 
 	/*
-	 * Panel identification. The fast path is the EDID table match
-	 * (hw_found). That table is a frozen copy of SR's product-code map and
-	 * drifts: SR's ProductCodeInstaller registers new panels in SR's own
-	 * registry, which our table cannot see. So on a table miss we defer to
-	 * the authoritative source — the SR runtime itself. If SR reports an
-	 * active SR display, trust it. This costs one SR-context creation, but
-	 * only on the rare miss and only on a machine that already has the SDK +
-	 * a running service, so it stays off the common hot path.
-	 */
-	bool panel_ok = edid.hw_found;
-	if (!panel_ok) {
-		U_LOG_W("leia_plugin: EDID table miss with SR present — deferring to SR runtime probe "
-		        "(table is stale relative to SR's product-code registry)");
-		panel_ok = leiasr_probe_display(LEIA_PLUGIN_SR_PROBE_TIMEOUT_S);
-		if (panel_ok) {
-			U_LOG_W("leia_plugin: SR runtime confirms an active SR display — binding");
-		}
-	}
-
-	if (!panel_ok) {
-		U_LOG_I("leia_plugin: probe declined — no SR display (hw=%d sdk=%d service=%d)",
-		        edid.hw_found, edid.sdk_installed, edid.service_running);
-		*out_inst = NULL;
-		return XRT_ERROR_PROBER_NOT_SUPPORTED;
-	}
-
-	/*
-	 * No per-instance state: drv_leia stores hardware state in
-	 * file-scope statics inside the plug-in DLL (cached probe result,
-	 * SR context, etc.). Mirrors the sim_display plug-in shape.
+	 * No per-instance state: drv_leia stores hardware state in file-scope
+	 * statics inside the plug-in DLL (cached probe result, SR context, etc.).
+	 * Mirrors the sim_display plug-in shape.
 	 */
 	*out_inst = NULL;
+	if (st != LEIA_PLATFORM_READY) {
+		U_LOG_I("leia_plugin: probe declined — %s (hw=%d sdk=%d service=%d, %.1f ms)",
+		        leia_platform_state_name(st), edid.hw_found, edid.sdk_installed, edid.service_running, ms);
+		return XRT_ERROR_PROBER_NOT_SUPPORTED;
+	}
 	return XRT_SUCCESS;
 }
 
@@ -128,6 +106,11 @@ static xrt_result_t
 leia_plugin_create_device(struct xrt_plugin_instance *inst, struct xrt_device **out_dev)
 {
 	(void)inst;
+	/* Every path below may reach SR (geometry resolve); the delay-loaded SR
+	 * client DLLs must be bound first. probe() already required READY. */
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	struct xrt_device *xdev = leia_hmd_create();
 	if (xdev == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -248,18 +231,27 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 *     EDID + SDK + running service → VERIFIED.
 	 *   - The EDID table is a frozen copy of SR's product-code map and
 	 *     drifts (SR's ProductCodeInstaller registers panels our table can't
-	 *     see). So on a CLEAN table miss we defer to the authoritative
-	 *     source — the SR runtime — exactly like leia_plugin_probe() does,
-	 *     and claim the primary monitor VERIFIED. Without this, an
-	 *     SR-confirmed-but-table-unknown panel yields zero registry claims,
-	 *     so the registry-driven DP selection (the D3D11 service / shell
-	 *     path) loses the monitor to sim_display's FALLBACK claim and weaves
-	 *     with no head tracking — while the scalar in-process path, fed by
-	 *     probe()'s SR deferral, correctly picks Leia.
+	 *     see). So on a CLEAN table miss with the platform state READY (SR
+	 *     has identified a device and no table-known panel was ever seen in
+	 *     this process) we claim the primary monitor VERIFIED. Without this,
+	 *     an SR-confirmed-but-table-unknown panel yields zero registry
+	 *     claims, so the registry-driven DP selection (the D3D11 service /
+	 *     shell path) loses the monitor to sim_display's FALLBACK claim.
+	 *   - P-c: after a table-known panel was seen, a miss is an UNPLUG — the
+	 *     state is NO_DISPLAY and nothing is claimed (this path used to claim
+	 *     the primary monitor and weave on a normal screen).
+	 *   - PLATFORM_ABSENT / INCOMPATIBLE / NO_DISPLAY: claim nothing — this DLL now loads
+	 *     without SR, and an EDID claim would win the monitor over
+	 *     sim_display only for every DP factory to refuse it.
 	 */
 	struct leia_display_probe_result probe = {0};
 	(void)leia_edid_probe_display(&probe);
-	const bool verified = probe.sdk_installed && probe.service_running;
+	const enum leia_platform_state st = leia_platform_state_evaluate(&probe);
+	if (st == LEIA_PLATFORM_ABSENT || st == LEIA_PLATFORM_INCOMPATIBLE || st == LEIA_PLATFORM_NO_DISPLAY) {
+		g_leia_sr_claim_logged = false;
+		return 0;
+	}
+	const bool verified = st == LEIA_PLATFORM_READY;
 
 	/* Which create_dp_<api> factories this build actually ships — mirror
 	 * the #ifdef gating of the vtable factory fields. The runtime masks
@@ -302,18 +294,16 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	}
 
 	/*
-	 * Clean EDID-table miss on a machine that has the SDK + a running
-	 * service: defer to the SR runtime, mirroring leia_plugin_probe(). If SR
-	 * confirms an active display, claim the primary monitor VERIFIED so it
-	 * beats sim_display's FALLBACK(10) in the registry. This is the rare-miss
-	 * path only — same cost profile as probe()'s deferral (one SR-context
-	 * creation), gated behind sdk+service so it never runs on a non-SR box.
-	 * Single-display assumption: the SR runtime confirms *an* active SR
-	 * display but not *which* monitor id, so we pin it to the primary — the
-	 * same monitor the runtime's own back-compat synth-claim would pick.
+	 * Clean EDID-table miss while the platform state is READY: by
+	 * construction (leia_platform_state.c) that means SR has identified a
+	 * device and no table-known panel has been seen in this process — the
+	 * stale-table case. Claim the primary monitor VERIFIED so it beats
+	 * sim_display's FALLBACK(10). A named-mapping read, not the 2 s SR
+	 * context spin it used to be. Single-display assumption: SR confirms *an*
+	 * active SR display but not *which* monitor id, so we pin it to the
+	 * primary — the monitor the runtime's own back-compat synth-claim picks.
 	 */
-	if (n == 0 && verified && display_count > 0 && max_claims > 0 &&
-	    leiasr_probe_display(LEIA_PLUGIN_SR_PROBE_TIMEOUT_S)) {
+	if (n == 0 && verified && !probe.hw_found && display_count > 0 && max_claims > 0) {
 		uint32_t pick = 0;
 		for (uint32_t i = 0; i < display_count; i++) {
 			if (displays[i].flags & 1u) { /* bit 0 = primary monitor */
@@ -351,6 +341,36 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 
 	return n;
 }
+
+
+#ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
+/*
+ * ADR-045 platform state (runtime slot). Callable before probe(), from any
+ * thread, at any time: presence checks only. The EDID enumeration re-runs at
+ * most every 2 s (or on a monitor-topology change); the registry key and the
+ * SR Service mapping are re-read on every call.
+ */
+static bool
+leia_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
+{
+	if (out_status == NULL || out_status->struct_size < offsetof(struct xrt_plugin_platform_status, hint)) {
+		return false;
+	}
+	const enum leia_platform_state st = leia_platform_state_refresh(2000);
+	out_status->state = (uint32_t)st; /* leia_platform_state mirrors xrt_plugin_platform_state */
+	out_status->flags = 0;           /* a vendor plug-in: never FALLBACK */
+	if (out_status->struct_size >= offsetof(struct xrt_plugin_platform_status, hint) + sizeof(out_status->hint)) {
+		const char *hint = leia_platform_state_get_hint();
+		size_t len = strlen(hint);
+		if (len >= sizeof(out_status->hint)) {
+			len = sizeof(out_status->hint) - 1;
+		}
+		memcpy(out_status->hint, hint, len);
+		out_status->hint[len] = '\0';
+	}
+	return true;
+}
+#endif
 
 
 /*
@@ -451,6 +471,10 @@ static struct xrt_plugin_iface g_leia_iface = {
 #else
     .create_dp_d3d11_lift = NULL,
 #endif
+#endif
+
+#ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
+    .get_platform_state = leia_plugin_get_platform_state,
 #endif
 };
 

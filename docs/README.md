@@ -9,6 +9,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 | Group | Files |
 |---|---|
 | Plug-in entry (`xrtPluginNegotiate`) | `leia_plugin.c` |
+| Platform state + SR DLL delay-load | `leia_platform_state.{c,h}`, `leia_sr_delayload_win.c` |
 | Driver entry / device | `leia_device.c`, `leia_interface.h`, `leia_types.h`, `leia_edid_probe.c`, `leia_sr_probe.cpp` |
 | SR SDK bridge | `leia_cnsdk.{cpp,h}` |
 | Display processor (per API) | `leia_display_processor.{cpp,h}` (base), `leia_display_processor_d3d11.{cpp,h}`, `leia_display_processor_d3d12.{cpp,h}`, `leia_display_processor_gl.{cpp,h}` |
@@ -19,6 +20,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 
 ## Docs in this directory
 
+- **[Install order and platform state](install-order-and-platform-state.md)** — the plug-in loads without LeiaSR (delay-loaded SR DLLs resolved from `HKLM\SOFTWARE\Dimenco\Simulated Reality`), `probe()` never blocks, the generic platform states + hints reported to the runtime (ADR-045), display hot-plug (geometry invalidation, NO_DISPLAY pass-through), and the log lines to look for.
 - **[Weaver internals](weaver.md)** — DX11 / DX12 / OpenGL / Vulkan weaver creation, inputs, weave() flow, DPI handling, phase math.
 - **[Transparency model](transparency.md)** — current primary path: WGC compose-under-bg on D3D11 / D3D12 / Vulkan. Replaces the older chroma-key approach for those APIs.
 - **[Chroma-key overlay (legacy / OpenGL fallback)](chroma-key-overlay.md)** — fallback path; still the only transparency path on the Leia OpenGL DP.
