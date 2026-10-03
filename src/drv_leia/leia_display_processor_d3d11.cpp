@@ -284,7 +284,7 @@ cbuffer Constants : register(b0) {
 	float2 bg_uv_origin;      // #116 — window TL on monitor, normalized
 	float2 bg_uv_extent;      // #116 — window size on monitor, normalized
 	float2 canvas_px;         // gate viewport size in pixels (exact-texel read when a tile is 1:1)
-	uint  has_overlay;        // 1 ⟹ the weaver composited a 2D over-layer this frame
+	uint  has_overlay;        // weaver composited a 2D over-layer: 1 = estimate its alpha, 2 = alpha is its coverage
 	uint  _pad_ov;
 };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -354,9 +354,15 @@ float4 main(VSOut i) : SV_Target {
 	// larger of the layer's own alpha and the filtered colour's max channel:
 	// premultiplied rgb never exceeds its alpha, so the result stays a valid
 	// premultiplied colour.
+	//
+	// has_overlay == 2: the weaver wrote the filtered coverage into the output
+	// alpha (SR_COMPOSE_ORDER_2D_OVER_COVERAGE), so the alpha is exact.
 	if (has_overlay != 0) {
-		float3 w = backbuffer.Sample(samp, bb_uv).rgb;
-		float a = saturate(max(overlay.Sample(samp, bb_uv).a, max(w.r, max(w.g, w.b))));
+		float4 wv = backbuffer.Sample(samp, bb_uv);
+		float3 w = wv.rgb;
+		float a = (has_overlay == 2)
+		              ? saturate(wv.a)
+		              : saturate(max(overlay.Sample(samp, bb_uv).a, max(w.r, max(w.g, w.b))));
 		return float4(w + (1.0 - a) * under.rgb, a + (1.0 - a) * under.a);
 	}
 	return under;
@@ -1359,7 +1365,10 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		cb->bg_uv_extent[1] = ldp->bg_uv_last[3];
 		cb->canvas_px[0] = (float)vp_w;
 		cb->canvas_px[1] = (float)vp_h;
-		cb->has_overlay = (ldp->gate_overlay_srv != nullptr) ? 1u : 0u; // ADR-027 Amendment
+		// ADR-027 Amendment: 2 = the weaver's output alpha IS the filtered coverage.
+		cb->has_overlay = (ldp->gate_overlay_srv == nullptr)                          ? 0u
+		                  : leiasr_d3d11_compose_writes_coverage(ldp->leiasr) ? 2u
+		                                                                        : 1u;
 		cb->pad_ov = 0;
 		ctx->Unmap(ldp->alpha_gate_constants, 0);
 	}

@@ -76,6 +76,9 @@ struct leiasr_d3d11
 	// compose_weaver == weaver_v2.
 	SrWeaver compose_weaver = nullptr;
 	bool compose_ok = false;
+	//! The weaver also writes the FILTERED layer coverage into the output
+	//! alpha (SR_COMPOSE_ORDER_2D_OVER_COVERAGE); else alpha stays 1.0.
+	bool compose_coverage = false;
 #endif
 #endif
 
@@ -2564,15 +2567,38 @@ leiasr_d3d11_compose_available(struct leiasr_d3d11 *leiasr)
 		// Probe once per weaver: an SR runtime older than ST-5788 answers
 		// SR_ERROR_FUNCTION_UNSUPPORTED, and then the runtime keeps its own
 		// post-weave composite (the slot returns false).
-		const SrResult r = srWeaverSetComposeOrder(leiasr->weaver_v2, SR_COMPOSE_ORDER_2D_OVER);
+		//
+		// Prefer 2D_OVER_COVERAGE (= 3): the same compose, plus the weaver
+		// writes the filtered coverage into the output alpha, which the alpha
+		// gate then uses exactly. An SR runtime that predates it rejects the
+		// value with SR_ERROR_VALIDATION_FAILURE; fall back to 2D_OVER, whose
+		// output alpha stays 1.0. Numeric on purpose: the pinned headers may
+		// predate the enumerator, and the answer is the INSTALLED runtime's.
+		const SrWeaverComposeOrder k_order_coverage = static_cast<SrWeaverComposeOrder>(3);
+		SrResult r = srWeaverSetComposeOrder(leiasr->weaver_v2, k_order_coverage);
+		leiasr->compose_coverage = SR_SUCCEEDED(r);
+		if (!leiasr->compose_coverage) {
+			r = srWeaverSetComposeOrder(leiasr->weaver_v2, SR_COMPOSE_ORDER_2D_OVER);
+		}
 		leiasr->compose_weaver = leiasr->weaver_v2;
 		leiasr->compose_ok = SR_SUCCEEDED(r);
-		U_LOG_W("SR weaver 2D compose: %s (srWeaverSetComposeOrder(2D_OVER) = %s)",
+		U_LOG_W("SR weaver 2D compose: %s%s (srWeaverSetComposeOrder = %s)",
 		        leiasr->compose_ok ? "ENABLED - the 2D over-layer is composited and lens-filtered in the weave"
 		                           : "UNAVAILABLE - the runtime composites the 2D over-layer post-weave",
-		        leia_sr_v2_result_str(r));
+		        leiasr->compose_coverage ? ", coverage in output alpha" : "", leia_sr_v2_result_str(r));
 	}
 	return leiasr->compose_ok;
+#else
+	(void)leiasr;
+	return false;
+#endif
+}
+
+bool
+leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr)
+{
+#if defined(DXR_LEIA_HAS_SR_V2) && defined(DXR_LEIA_HAS_SR_COMPOSE)
+	return leiasr_d3d11_compose_available(leiasr) && leiasr->compose_coverage;
 #else
 	(void)leiasr;
 	return false;

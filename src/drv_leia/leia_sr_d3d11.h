@@ -215,6 +215,17 @@ bool
 leiasr_d3d11_compose_available(struct leiasr_d3d11 *leiasr);
 
 /*!
+ * Does the weaver write the FILTERED 2D-layer coverage into the output alpha
+ * when it composites (SR_COMPOSE_ORDER_2D_OVER_COVERAGE)? False when compose
+ * is unavailable or the installed SR runtime only knows 2D_OVER (output alpha
+ * stays 1.0 there).
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr);
+
+/*!
  * Hand the weaver this frame's 2D over-layer (runtime set_overlay_2d, ADR-027
  * Amendment) for the NEXT leiasr_d3d11_weave: the weaver composites it over the
  * woven views in encoded space and band-limits it for the lens (LeiaSR
