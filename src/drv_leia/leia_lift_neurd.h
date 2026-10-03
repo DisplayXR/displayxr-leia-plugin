@@ -16,7 +16,10 @@
  * streams; handles ref-count the instance.
  *
  * Absent NeurD.dll (or DXR_LEIA_LIFT=0): caps report modes=0 / state=0 and
- * every other entry point returns false. Nothing is loaded.
+ * every other entry point returns false. Nothing is loaded. Absence is not
+ * permanent: discovery re-runs every 30 s from caps and at once on each
+ * stream_create, so a NeurD installed later is adopted without a restart; a
+ * NeurD refused as too old is re-checked when NeurD.dll changes.
  *
  * Threading: every entry point is callable from any thread. convert() is
  * synchronous and blocking (tens of ms) — call it only from a worker thread,

@@ -9,7 +9,9 @@
  *  - Dynamic load only. NeurD.dll is located the way NeurD's own loader does it
  *    (PATH -> NEURD_PATH -> HKLM\SOFTWARE\LeiaInc\NeurD default value) but it
  *    is not a link dependency: a machine without NeurD loads this plug-in
- *    exactly as before and lift reports unavailable.
+ *    exactly as before and lift reports unavailable. Absence is re-probed
+ *    (slow timer driven by the caps poll + every stream request), so NeurD
+ *    installed after the service started is adopted without a restart.
  *
  *  - One NeurD instance per process (NeurD's rule). Loaded + initialised on a
  *    detached background thread, never on a caller's thread: NeurD_init runs a
@@ -119,6 +121,11 @@ constexpr uint32_t kMaxViews = 8;
 constexpr uint32_t kMaxTexDim = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 //! Retry period for a licence activation that failed on the network.
 constexpr uint64_t kActivationRetryMs = 15000;
+//! While NeurD is absent, or was refused for a file-rooted reason (too old, unloadable),
+//! re-run discovery at most this often from the caps poll (the runtime polls caps ~1 Hz
+//! while lift is not READY). A stream-create request re-probes immediately. The probe is
+//! cheap (SearchPath + one registry read + file attributes) and loads nothing.
+constexpr uint64_t kReprobeMs = 30000;
 //! Upper bound for any CPU drain of a GPU queue (device-lost guard).
 constexpr uint64_t kDrainTimeoutMs = 2000;
 //! Latency priors (reported until a measurement exists).
@@ -580,11 +587,14 @@ void main(uint3 id : SV_DispatchThreadID)
 enum gstate : uint32_t
 {
 	G_UNPROBED = 0, //!< Nothing looked at yet.
-	G_ABSENT,       //!< No NeurD.dll found — permanent for the process.
+	G_ABSENT,       //!< No NeurD.dll found. Re-probed (kReprobeMs / on stream create): NeurD
+	                //!< installed after the service started is picked up without a restart.
 	G_LOADING,      //!< Background worker is loading / initialising.
 	G_RETRY_WAIT,   //!< Licence activation hit the network; retry after next_retry_ms.
-	G_READY,        //!< Up; converts allowed.
-	G_FAILED,       //!< Permanent failure (bad licence, no DX device, ABI...).
+	G_READY,        //!< Up; converts allowed. Never left: NeurD is never unloaded.
+	G_FAILED,       //!< Failure. fail_recheckable: file-rooted (too old / unloadable) —
+	                //!< retried when NeurD.dll changes (path, size or mtime). Otherwise
+	                //!< (bad licence, no DX device, init error) permanent for the process.
 };
 
 struct global
@@ -594,6 +604,19 @@ struct global
 	std::atomic<uint32_t> state{G_UNPROBED};
 	std::atomic<bool> worker_running{false};
 	std::atomic<uint64_t> next_retry_ms{0};
+	std::atomic<uint64_t> next_reprobe_ms{0}; //!< ABSENT / recheckable FAILED: next discovery re-run.
+	std::atomic<bool> k0_set{false};          //!< k0 / requested_backend captured (first worker start).
+
+	//! Discovery + the file-rooted failure stamp. Guarded by probe_mtx (never held
+	//! across a load or any NeurD call).
+	std::mutex probe_mtx;
+	char cand_path[MAX_PATH] = {};   //!< NeurD.dll the next/last worker loads (full path).
+	const char *cand_where = "?";    //!< Which discovery step found it.
+	bool fail_recheckable = false;   //!< FAILED for a reason a new NeurD.dll can fix.
+	char fail_path[MAX_PATH] = {};   //!< ...and the file it was about, as it was then:
+	uint64_t fail_size = 0;
+	uint64_t fail_mtime = 0;
+	HMODULE failed_lib = nullptr;    //!< A refused NeurD that stayed mapped (no FreeLibrary).
 	std::atomic<uint64_t> latency_ns{0}; //!< EMA of full convert wall time; 0 = none yet.
 	std::atomic<uint32_t> streams_live{0};
 
@@ -673,45 +696,102 @@ file_exists(const char *path)
 	return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+/*!
+ * Resolve NeurD.dll to a full path in NeurD's loader order (PATH -> NEURD_PATH ->
+ * HKLM\SOFTWARE\LeiaInc\NeurD). Loads nothing. Re-run on every re-probe: the
+ * registry step is what finds a NeurD installed AFTER this (long-lived) process
+ * started — its PATH is a snapshot from process start.
+ */
 bool
-neurd_present()
+neurd_resolve(char *out, size_t cap, const char **out_where)
 {
 	char buf[MAX_PATH];
-	if (SearchPathA(nullptr, "NeurD.dll", nullptr, MAX_PATH, buf, nullptr) != 0) {
+	DWORD n = SearchPathA(nullptr, "NeurD.dll", nullptr, MAX_PATH, buf, nullptr);
+	if (n != 0 && n < MAX_PATH && file_exists(buf)) {
+		snprintf(out, cap, "%s", buf);
+		*out_where = "PATH";
 		return true;
 	}
 	const char *np = std::getenv("NEURD_PATH");
 	if (np != nullptr && np[0] != '\0' && file_exists(np)) {
+		snprintf(out, cap, "%s", np);
+		*out_where = "NEURD_PATH";
 		return true;
 	}
-	return registry_neurd_path(buf, sizeof(buf)) && file_exists(buf);
+	if (registry_neurd_path(buf, sizeof(buf)) && file_exists(buf)) {
+		snprintf(out, cap, "%s", buf);
+		*out_where = "HKLM\\SOFTWARE\\LeiaInc\\NeurD";
+		return true;
+	}
+	return false;
 }
 
-HMODULE
-neurd_load_library(const char **out_where)
+//! Size + last-write time of @p path (the "did NeurD.dll change" stamp).
+bool
+file_stamp(const char *path, uint64_t *out_size, uint64_t *out_mtime)
 {
-	HMODULE h = LoadLibraryA("NeurD.dll");
-	if (h != nullptr) {
-		*out_where = "PATH";
-		return h;
+	WIN32_FILE_ATTRIBUTE_DATA d = {};
+	if (!GetFileAttributesExA(path, GetFileExInfoStandard, &d)) {
+		return false;
 	}
-	const char *np = std::getenv("NEURD_PATH");
-	if (np != nullptr && np[0] != '\0') {
-		h = LoadLibraryExA(np, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-		if (h != nullptr) {
-			*out_where = "NEURD_PATH";
-			return h;
-		}
+	*out_size = ((uint64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
+	*out_mtime = ((uint64_t)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+	return true;
+}
+
+/*!
+ * NeurD version from the DLL's VERSIONINFO resource (NeurD.dll carries one, e.g.
+ * FileVersion 0.4.6), read WITHOUT loading the DLL — so a too-old NeurD is refused
+ * before it is ever mapped, and its installer can replace the file while this
+ * process keeps running. (version.lib is already linked for the SR version
+ * tripwires.) False = no usable resource (then the version is checked after the
+ * load, as before).
+ */
+bool
+file_neurd_version(const char *path, uint64_t *out)
+{
+	DWORD handle = 0;
+	DWORD sz = GetFileVersionInfoSizeA(path, &handle);
+	if (sz == 0) {
+		return false;
 	}
-	char path[MAX_PATH];
-	if (registry_neurd_path(path, sizeof(path))) {
-		h = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-		if (h != nullptr) {
-			*out_where = "HKLM\\SOFTWARE\\LeiaInc\\NeurD";
-			return h;
-		}
+	std::vector<uint8_t> blob(sz);
+	if (!GetFileVersionInfoA(path, 0, sz, blob.data())) {
+		return false;
 	}
-	return nullptr;
+	VS_FIXEDFILEINFO *ffi = nullptr;
+	UINT len = 0;
+	if (!VerQueryValueA(blob.data(), "\\", reinterpret_cast<void **>(&ffi), &len) || ffi == nullptr ||
+	    len < sizeof(*ffi) || ffi->dwSignature != 0xFEEF04BD) {
+		return false;
+	}
+	const uint32_t maj = HIWORD(ffi->dwFileVersionMS), min = LOWORD(ffi->dwFileVersionMS),
+	               pat = HIWORD(ffi->dwFileVersionLS);
+	if (maj == 0 && min == 0 && pat == 0) {
+		return false; // unset resource: no information
+	}
+	*out = NEURD_MAKE_VERSION(maj, min, pat);
+	return true;
+}
+
+/*!
+ * Record a FAILED whose cause lives in the NeurD.dll file (too old, unloadable),
+ * so kick() can retry once that file changes. @p mapped = the refused module was
+ * left mapped (no FreeLibrary).
+ */
+void
+mark_file_failure(const char *path, HMODULE mapped)
+{
+	std::lock_guard<std::mutex> lock(g.probe_mtx);
+	g.fail_recheckable = true;
+	snprintf(g.fail_path, sizeof(g.fail_path), "%s", path);
+	if (!file_stamp(path, &g.fail_size, &g.fail_mtime)) {
+		g.fail_size = g.fail_mtime = 0;
+	}
+	if (mapped != nullptr) {
+		g.failed_lib = mapped;
+	}
+	g.next_reprobe_ms.store(now_ms() + kReprobeMs);
 }
 
 void
@@ -906,14 +986,63 @@ activation_worker()
 {
 	uint32_t next = G_FAILED;
 	{
+		std::lock_guard<std::mutex> lock(g.probe_mtx);
+		g.fail_recheckable = false; // set again only by mark_file_failure
+	}
+	{
 		// Load happens once per process. NOT under g.mtx for the slow part —
 		// but nothing else touches g.lib / g.nd until state says READY.
 		if (g.nd == nullptr) {
+			char path[MAX_PATH];
 			const char *where = "?";
-			HMODULE lib = neurd_load_library(&where);
+			{
+				std::lock_guard<std::mutex> lock(g.probe_mtx);
+				snprintf(path, sizeof(path), "%s", g.cand_path);
+				where = g.cand_where;
+			}
+			// Refuse a too-old NeurD from its version resource, before it is
+			// mapped: nothing stays loaded, so its installer can replace the
+			// file under the running service and the re-check (kick) adopts it.
+			uint64_t file_ver = 0;
+			if (file_neurd_version(path, &file_ver) && file_ver < g.k0.min_version) {
+				U_LOG_W("Leia lift: NeurD.dll at %s (%s) is version %u.%u.%u, older than the minimum %u.%u.%u "
+				        "(%s) — not loaded, lift unavailable; callers fall back to their own conversion path. "
+				        "Re-checked when the file changes. Install NeurD >= %u.%u.%u, or set MinVersion "
+				        "(HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift) / DXR_LEIA_LIFT_MIN_VERSION to override",
+				        path, where, NEURD_GET_VERSION_MAJOR(file_ver), NEURD_GET_VERSION_MINOR(file_ver),
+				        NEURD_GET_VERSION_PATCH(file_ver), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version),
+				        knob_src_str(g.k0.src_min_version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
+				mark_file_failure(path, nullptr);
+				g.state.store(G_FAILED);
+				g.worker_running.store(false);
+				return;
+			}
+			HMODULE lib = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 			if (lib == nullptr) {
-				U_LOG_W("Leia lift: NeurD.dll present but LoadLibrary failed (err %lu) — lift unavailable",
-				        (unsigned long)GetLastError());
+				U_LOG_W("Leia lift: NeurD.dll found at %s (%s) but LoadLibrary failed (err %lu) — lift "
+				        "unavailable; re-checked when the file changes",
+				        path, where, (unsigned long)GetLastError());
+				mark_file_failure(path, nullptr);
+				g.state.store(G_FAILED);
+				g.worker_running.store(false);
+				return;
+			}
+			HMODULE prev_failed = nullptr;
+			{
+				std::lock_guard<std::mutex> lock(g.probe_mtx);
+				prev_failed = g.failed_lib;
+			}
+			if (lib == prev_failed) {
+				// The loader handed back the module refused earlier (same path; it
+				// stayed mapped, see below): the new file cannot be seen from this
+				// process. Drop the extra reference and wait for the next change.
+				FreeLibrary(lib);
+				U_LOG_W("Leia lift: NeurD.dll at %s changed, but the version refused earlier is still mapped in "
+				        "this process — restart the process to use the new NeurD",
+				        path);
+				mark_file_failure(path, nullptr);
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -924,6 +1053,7 @@ activation_worker()
 			if (nd == nullptr) {
 				U_LOG_W("Leia lift: NeurD.dll (%s) has no usable NeurD_load — lift unavailable", where);
 				// Deliberately no FreeLibrary: NeurD may have spun threads.
+				mark_file_failure(path, lib);
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -945,7 +1075,9 @@ activation_worker()
 				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version),
 				        knob_src_str(g.k0.src_min_version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
 				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
-				// Deliberately no FreeLibrary: NeurD may have spun threads.
+				// Deliberately no FreeLibrary: NeurD may have spun threads. (A NeurD
+				// with a version resource is refused before the load, above.)
+				mark_file_failure(path, lib);
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -955,6 +1087,7 @@ activation_worker()
 			    !LEIA_NEURD_HAS(nd, set_prop_1i) || !LEIA_NEURD_HAS(nd, set_prop_1f)) {
 				U_LOG_W("Leia lift: NeurD runtime too old/new for the D3D11 stream path (need 0.3.11+, "
 				        "major 0) — lift unavailable");
+				mark_file_failure(path, lib);
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1065,40 +1198,105 @@ activation_worker()
 }
 
 /*!
+ * Decide whether a recheckable FAILED should be retried: NeurD.dll now resolves to
+ * a different file, or the same file's size/mtime changed. Logs the transition.
+ * Returns false (and stays FAILED, silently) when nothing changed.
+ */
+bool
+failed_file_changed(const char *path, bool found)
+{
+	std::lock_guard<std::mutex> lock(g.probe_mtx);
+	if (!g.fail_recheckable) {
+		return false;
+	}
+	if (!found) {
+		return false; // gone entirely: stays FAILED until a NeurD.dll reappears (then differs)
+	}
+	uint64_t size = 0, mtime = 0;
+	const bool stamped = file_stamp(path, &size, &mtime);
+	const bool same_path = _stricmp(path, g.fail_path) == 0;
+	if (same_path && stamped && size == g.fail_size && mtime == g.fail_mtime) {
+		return false;
+	}
+	U_LOG_W("Leia lift: NeurD.dll changed since it was refused (%s%s) — retrying", same_path ? "" : "now ",
+	        same_path ? "size/mtime differ" : path);
+	return true;
+}
+
+/*!
  * Advance the process state machine without blocking: probe presence on first
- * touch, and (re)start the activation worker when due.
+ * touch, re-probe while ABSENT / file-rooted FAILED (rate-limited to kReprobeMs
+ * unless @p force_reprobe), and (re)start the activation worker when due.
+ * WARN once per state transition, never per call.
  */
 void
-kick(const struct knobs &k)
+kick(const struct knobs &k, bool force_reprobe)
 {
 	uint32_t s = g.state.load();
-	if (s == G_UNPROBED) {
-		// Racing first callers are fine: presence is idempotent and only one
-		// wins the worker_running exchange below.
-		if (!neurd_present()) {
+	char path[MAX_PATH] = {};
+	const char *where = "?";
+	if (s == G_UNPROBED || s == G_ABSENT || s == G_FAILED) {
+		if (s != G_UNPROBED) {
+			if (s == G_FAILED) {
+				std::lock_guard<std::mutex> lock(g.probe_mtx);
+				if (!g.fail_recheckable) {
+					return; // licence / device / init failure: permanent for the process
+				}
+			}
+			const uint64_t now = now_ms();
+			if (!force_reprobe && now < g.next_reprobe_ms.load()) {
+				return;
+			}
+			g.next_reprobe_ms.store(now + kReprobeMs);
+		}
+		// Racing callers are fine: the probe is idempotent and only one wins the
+		// worker_running exchange below.
+		const bool found = neurd_resolve(path, sizeof(path), &where);
+		if (s == G_FAILED) {
+			if (!failed_file_changed(path, found)) {
+				return;
+			}
+		} else if (!found) {
 			uint32_t expect = G_UNPROBED;
-			if (g.state.compare_exchange_strong(expect, G_ABSENT)) {
+			if (s == G_UNPROBED && g.state.compare_exchange_strong(expect, G_ABSENT)) {
+				g.next_reprobe_ms.store(now_ms() + kReprobeMs);
 				U_LOG_W("Leia lift: NeurD.dll not found (PATH / NEURD_PATH / HKLM\\SOFTWARE\\LeiaInc\\NeurD) — "
-				        "2D->3D lift unavailable; plug-in otherwise unaffected");
+				        "2D->3D lift unavailable; plug-in otherwise unaffected. Re-checked every %llus and on "
+				        "each lift stream request",
+				        (unsigned long long)(kReprobeMs / 1000));
 			}
 			return;
+		} else if (s == G_ABSENT) {
+			U_LOG_W("Leia lift: NeurD.dll appeared at %s (%s) — loading", path, where);
 		}
 	} else if (s == G_RETRY_WAIT) {
 		if (now_ms() < g.next_retry_ms.load()) {
 			return;
 		}
 	} else {
-		return; // ABSENT / LOADING / READY / FAILED: nothing to do.
+		return; // LOADING / READY: nothing to do.
 	}
 
 	bool expect_idle = false;
 	if (!g.worker_running.compare_exchange_strong(expect_idle, true)) {
 		return;
 	}
-	if (s == G_UNPROBED) {
+	if (g.state.load() != s) {
+		g.worker_running.store(false); // another caller moved the state first
+		return;
+	}
+	if (path[0] != '\0') {
+		std::lock_guard<std::mutex> lock(g.probe_mtx);
+		snprintf(g.cand_path, sizeof(g.cand_path), "%s", path);
+		g.cand_where = where;
+	}
+	if (!g.k0_set.load()) {
+		// First activation in the process: its knobs decide (NeurD's forced
+		// backend is sticky). Kept across re-probes after ABSENT / FAILED.
 		g.requested_backend = k.backend;
 		g.default_autoscaling = k.autoscaling;
 		g.k0 = k;
+		g.k0_set.store(true);
 	}
 	g.state.store(G_LOADING);
 	try {
@@ -1569,7 +1767,7 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	if (l == nullptr || !l->k.enabled) {
 		return true; // modes 0 / UNAVAILABLE — a valid answer, not a failure.
 	}
-	kick(l->k);
+	kick(l->k, false);
 
 	uint32_t s = g.state.load();
 	out->state = public_state(s);
@@ -1621,7 +1819,11 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 		LIFT_WARN_ONCE("Leia lift: stream_create with unsupported mode %u", desc->mode);
 		return false;
 	}
-	kick(l->k);
+	// A stream request re-probes NeurD at once (not rate-limited): a NeurD
+	// installed since the last probe moves the module to ACTIVATING right here,
+	// and the stream is accepted (its NeurD stream is created lazily on the
+	// first convert). Still unavailable => fail soft: false, no state latched.
+	kick(l->k, true);
 	if (public_state(g.state.load()) == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return false;
 	}
@@ -1693,7 +1895,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 	}
 	*out_resource = nullptr;
 
-	kick(l->k);
+	kick(l->k, false);
 	if (g.state.load() != G_READY) {
 		return false; // ACTIVATING or UNAVAILABLE — caps says which.
 	}
