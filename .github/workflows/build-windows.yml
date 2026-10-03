@@ -80,8 +80,11 @@ jobs:
       # 1758 = first 1.38.0, currency refresh over 1719, no new API: 90 slot
       # declarations, table IDENTICAL; only include/sr/version.h differs. SR
       # Service stop no longer crashes/hangs (LeiaSR #327).
-      SR_V2_TAG: sr-sdk-v2-1.38.0.1758
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+1758.f48e989e22-win64-Release
+      # 1860 = the weaver 2D compose (LeiaSR #368-#375): 90 -> 93 slots, APPENDS
+      # ONLY (91 SetComposeOrder, 92 SetComposeInputsDX11 -- used by the d3d11 DP
+      # under DXR_LEIA_HAS_SR_COMPOSE; 93 DisplayGetEffectiveViews, unused).
+      SR_V2_TAG: sr-sdk-v2-1.38.0.1860
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+1860.6cba7ce35c-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.

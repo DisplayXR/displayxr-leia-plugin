@@ -88,8 +88,14 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: 1758 = first 1.38.0, currency refresh over 1719, no new API: DECLARATION grep 90 slots,
 :: table IDENTICAL to 1719; only include/sr/version.h differs. SR Service stop no longer
 :: crashes/hangs (LeiaSR #327), which the service reconnect-after-restart path relies on.
-set SR_V2_TAG=sr-sdk-v2-1.38.0.1758
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+1758.f48e989e22-win64-Release
+:: 1860 = release-candidate/david-q3-2026 @ 6cba7ce35 (LeiaSR #368-#375): the weaver 2D
+:: compose (ADR-027 Amendment, "2D under the lens"). DECLARATION grep 90 -> 93 slots,
+:: 1758's 90 an exact ordered prefix, APPENDS ONLY -- 91 pfnWeaverSetComposeOrder,
+:: 92 pfnWeaverSetComposeInputsDX11 (both used by the d3d11 DP when DXR_LEIA_HAS_SR_COMPOSE),
+:: 93 pfnDisplayGetEffectiveViews (unused here). Older SR runtimes answer
+:: SR_ERROR_FUNCTION_UNSUPPORTED for 91/92 and the runtime keeps its post-weave blit.
+set SR_V2_TAG=sr-sdk-v2-1.38.0.1860
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+1860.6cba7ce35c-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
