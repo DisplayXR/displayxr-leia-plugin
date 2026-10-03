@@ -72,7 +72,8 @@ struct leiasr_geometry
  * Three-layer detection:
  * - hw_found: EDID manufacturer+product ID matched a known display panel
  * - sdk_installed: SR SDK registry key exists (HKLM\SOFTWARE\Dimenco\Simulated Reality)
- * - service_running: SRService shared memory is active (Global\sharedDeviceSerialMemory)
+ * - service_running: the SCM reports `SR Service` SERVICE_RUNNING AND its shared
+ *   memory exists (Global\sharedDeviceSerialMemory) — #294
  *
  * @ingroup drv_leia
  */
@@ -80,7 +81,7 @@ struct leia_display_probe_result
 {
 	bool hw_found;        //!< EDID matched a known Leia/Dimenco 3D display
 	bool sdk_installed;   //!< SR SDK is installed on this machine
-	bool service_running; //!< SRService is running with devices connected
+	bool service_running; //!< SR Service running (SCM) and its shared memory exists
 	uint16_t manufacturer_id; //!< EDID manufacturer ID of matched display
 	uint16_t product_id;      //!< EDID product ID of matched display
 	uint32_t pixel_w;     //!< Display width in pixels
@@ -121,13 +122,40 @@ leia_edid_get_cached_result(struct leia_display_probe_result *out);
 
 /*!
  * The two cheap SR platform presence signals, without the EDID enumeration:
- * the SR registry key (HKLM\SOFTWARE\Dimenco\Simulated Reality) and the SR
- * Service's `Global\sharedDeviceSerialMemory` mapping. Either out may be NULL.
+ * the SR registry key (HKLM\SOFTWARE\Dimenco\Simulated Reality) and "the SR
+ * Service is running" = the SCM reports `SR Service` SERVICE_RUNNING
+ * (leia_sr_service_scm_running, cached <= 1 s) AND the service's
+ * `Global\sharedDeviceSerialMemory` mapping exists. #294: the mapping alone is
+ * not enough — it survives a stopped service while another SR client still
+ * holds it. Either out may be NULL.
  *
  * @ingroup drv_leia
  */
 void
 leia_sr_presence(bool *out_sdk_installed, bool *out_service_running);
+
+//! SCM name of the SR platform's core service.
+#define LEIA_SR_SERVICE_NAME "SR Service"
+
+/*!
+ * true iff the Windows service @p service_name exists and the SCM reports it
+ * SERVICE_RUNNING. Uncached (OpenSCManager + OpenService +
+ * QueryServiceStatusEx, well under a millisecond); a missing service or an
+ * SCM error counts as not running. Always false off Windows.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_win_service_is_running(const char *service_name);
+
+/*!
+ * leia_win_service_is_running(LEIA_SR_SERVICE_NAME), cached for at most 1 s.
+ * Thread-safe.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_sr_service_scm_running(void);
 
 /*!
  * Perform a fresh EDID probe and return the current screen rectangle of the

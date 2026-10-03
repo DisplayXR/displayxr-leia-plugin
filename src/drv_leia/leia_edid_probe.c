@@ -21,6 +21,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winsvc.h> // SCM query (#294); excluded by WIN32_LEAN_AND_MEAN
 #endif
 
 #include "leia_edid_table.h"
@@ -60,6 +61,78 @@ static SRWLOCK g_leia_edid_lock = SRWLOCK_INIT;
 #define EDID_UNLOCK() ((void)0)
 #endif
 
+#ifdef _WIN32
+/*
+ * #294: SCM state of a Windows service. The `Global\sharedDeviceSerialMemory`
+ * section is NOT a liveness signal on its own — the section object outlives a
+ * stopped SR Service for as long as any other SR client (dashboard tray app,
+ * SRSession, ...) still holds a handle to it. SERVICE_QUERY_STATUS is granted
+ * to Authenticated Users by the service's SDDL, so this works unelevated
+ * (same query as leia_sr_liveness.cpp's generation token).
+ */
+bool
+leia_win_service_is_running(const char *service_name)
+{
+	if (service_name == NULL) {
+		return false;
+	}
+	SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT);
+	if (scm == NULL) {
+		return false;
+	}
+	bool running = false;
+	SC_HANDLE svc = OpenServiceA(scm, service_name, SERVICE_QUERY_STATUS);
+	if (svc != NULL) {
+		SERVICE_STATUS_PROCESS ssp;
+		DWORD needed = 0;
+		memset(&ssp, 0, sizeof(ssp));
+		if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &needed) &&
+		    ssp.dwCurrentState == SERVICE_RUNNING) {
+			running = true;
+		}
+		CloseServiceHandle(svc);
+	}
+	CloseServiceHandle(scm);
+	return running;
+}
+
+//! The SCM verdict for the SR Service is recomputed at most this often.
+#define LEIA_SR_SCM_CACHE_MS 1000
+
+static SRWLOCK g_leia_scm_lock = SRWLOCK_INIT;
+static bool g_leia_scm_valid = false;
+static bool g_leia_scm_running = false;
+static uint64_t g_leia_scm_stamp_ms = 0;
+
+bool
+leia_sr_service_scm_running(void)
+{
+	AcquireSRWLockExclusive(&g_leia_scm_lock);
+	const uint64_t now = GetTickCount64();
+	if (!g_leia_scm_valid || (now - g_leia_scm_stamp_ms) >= LEIA_SR_SCM_CACHE_MS) {
+		g_leia_scm_running = leia_win_service_is_running(LEIA_SR_SERVICE_NAME);
+		g_leia_scm_stamp_ms = now;
+		g_leia_scm_valid = true;
+	}
+	const bool running = g_leia_scm_running;
+	ReleaseSRWLockExclusive(&g_leia_scm_lock);
+	return running;
+}
+#else
+bool
+leia_win_service_is_running(const char *service_name)
+{
+	(void)service_name;
+	return false;
+}
+
+bool
+leia_sr_service_scm_running(void)
+{
+	return false;
+}
+#endif
+
 void
 leia_sr_presence(bool *out_sdk_installed, bool *out_service_running)
 {
@@ -72,7 +145,12 @@ leia_sr_presence(bool *out_sdk_installed, bool *out_service_running)
 		sdk = true;
 		RegCloseKey(hKey);
 	}
-	if (sdk) {
+	/*
+	 * #294: running = the SCM says SR Service is SERVICE_RUNNING (primary,
+	 * authoritative) AND its shared-memory section exists (secondary: the
+	 * service is far enough up to talk to). Either missing => not running.
+	 */
+	if (sdk && leia_sr_service_scm_running()) {
 		HANDLE hMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Global\\sharedDeviceSerialMemory");
 		if (hMapping != NULL) {
 			service = true;

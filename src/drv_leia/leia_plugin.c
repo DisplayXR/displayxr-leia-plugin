@@ -227,8 +227,8 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 *     the known-panel EDID table (the runtime already enumerated the
 	 *     monitors, so we don't re-enumerate).
 	 *   - SR SDK + service presence are system-global; check once and apply
-	 *     to every matched monitor. EDID match alone → EDID confidence;
-	 *     EDID + SDK + running service → VERIFIED.
+	 *     to every matched monitor. Claims are made only in READY (EDID +
+	 *     SDK + running service), always VERIFIED.
 	 *   - The EDID table is a frozen copy of SR's product-code map and
 	 *     drifts (SR's ProductCodeInstaller registers panels our table can't
 	 *     see). So on a CLEAN table miss with the platform state READY (SR
@@ -240,18 +240,20 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 *   - P-c: after a table-known panel was seen, a miss is an UNPLUG — the
 	 *     state is NO_DISPLAY and nothing is claimed (this path used to claim
 	 *     the primary monitor and weave on a normal screen).
-	 *   - PLATFORM_ABSENT / INCOMPATIBLE / NO_DISPLAY: claim nothing — this DLL now loads
-	 *     without SR, and an EDID claim would win the monitor over
-	 *     sim_display only for every DP factory to refuse it.
+	 *   - PLATFORM_ABSENT / INCOMPATIBLE / NO_DISPLAY / PLATFORM_NOT_RUNNING:
+	 *     claim nothing — this DLL now loads without SR, and an EDID claim
+	 *     would win the monitor over sim_display only for probe() to decline
+	 *     (#294: with SR Service stopped the runtime must start on the
+	 *     fallback; its slow re-probe timer adopts this plug-in once the
+	 *     service is back and the state reads READY).
 	 */
 	struct leia_display_probe_result probe = {0};
 	(void)leia_edid_probe_display(&probe);
 	const enum leia_platform_state st = leia_platform_state_evaluate(&probe);
-	if (st == LEIA_PLATFORM_ABSENT || st == LEIA_PLATFORM_INCOMPATIBLE || st == LEIA_PLATFORM_NO_DISPLAY) {
+	if (st != LEIA_PLATFORM_READY) {
 		g_leia_sr_claim_logged = false;
 		return 0;
 	}
-	const bool verified = st == LEIA_PLATFORM_READY;
 
 	/* Which create_dp_<api> factories this build actually ships — mirror
 	 * the #ifdef gating of the vtable factory fields. The runtime masks
@@ -278,7 +280,7 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		}
 		struct xrt_display_claim *c = &out_claims[n++];
 		c->monitor_id = displays[i].monitor_id;
-		c->confidence = verified ? (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED : (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+		c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
 		c->supported_apis = apis;
 		/*
 		 * TODO(#69 Phase 2 follow-up): read the FPC device serial from
@@ -290,7 +292,7 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 
 		U_LOG_I("leia_plugin: claim monitor 0x%016llx (mfr=0x%04X prod=0x%04X) confidence=%s",
 		        (unsigned long long)displays[i].monitor_id, displays[i].edid_manufacturer,
-		        displays[i].edid_product, verified ? "VERIFIED" : "EDID");
+		        displays[i].edid_product, "VERIFIED");
 	}
 
 	/*
@@ -303,7 +305,7 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 * active SR display but not *which* monitor id, so we pin it to the
 	 * primary — the monitor the runtime's own back-compat synth-claim picks.
 	 */
-	if (n == 0 && verified && !probe.hw_found && display_count > 0 && max_claims > 0) {
+	if (n == 0 && !probe.hw_found && display_count > 0 && max_claims > 0) {
 		uint32_t pick = 0;
 		for (uint32_t i = 0; i < display_count; i++) {
 			if (displays[i].flags & 1u) { /* bit 0 = primary monitor */

@@ -123,6 +123,8 @@ evaluate_locked(const struct leia_display_probe_result *edid, const char **out_h
 	case LEIA_SR_BIND_INCOMPATIBLE: *out_hint = k_hint_incompatible; return LEIA_PLATFORM_INCOMPATIBLE;
 	default: *out_hint = k_hint_reinstall; return LEIA_PLATFORM_ABSENT;
 	}
+	// #294: service_running = SCM SERVICE_RUNNING AND the shared-memory
+	// section exists (leia_sr_presence); either missing => NOT_RUNNING.
 	if (!edid->service_running) {
 		*out_hint = k_hint_not_running;
 		return LEIA_PLATFORM_NOT_RUNNING;
@@ -161,9 +163,11 @@ publish_locked(const struct leia_display_probe_result *edid)
 		const enum leia_platform_state prev = g_logged_state;
 		g_logged_state = st;
 		g_logged_hint = hint;
-		U_LOG_W("Leia SR platform state: %s%s%s (was %s; key=%d service=%d edid_match=%d dlls_bound=%d)",
+		U_LOG_W("Leia SR platform state: %s%s%s (was %s; key=%d service=%d scm_running=%d edid_match=%d "
+		        "dlls_bound=%d)",
 		        leia_platform_state_name(st), hint[0] != '\0' ? " - " : "", hint,
-		        leia_platform_state_name(prev), edid->sdk_installed, edid->service_running, edid->hw_found,
+		        leia_platform_state_name(prev), edid->sdk_installed, edid->service_running,
+		        leia_sr_service_scm_running(), edid->hw_found,
 		        leia_sr_client_bound());
 	}
 	return st;
@@ -200,7 +204,7 @@ leia_platform_state_refresh(uint32_t max_edid_age_ms)
 		g_topology_sig = sig;
 	} else {
 		// Same monitors: reuse the EDID match, re-read the two cheap
-		// platform signals (registry key, SR Service mapping).
+		// platform signals (registry key, SR Service SCM state + mapping).
 		(void)leia_edid_get_cached_result(&edid);
 		leia_sr_presence(&edid.sdk_installed, &edid.service_running);
 	}
