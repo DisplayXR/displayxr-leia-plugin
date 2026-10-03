@@ -19,6 +19,7 @@
 
 #include "leia_display_processor.h"
 #include "leia_sr.h"
+#include "leia_platform_state.h"
 
 #include "xrt/xrt_display_processor_vk.h" // #573 — the Vulkan transparency-enable variant
 #include "xrt/xrt_display_metrics.h"
@@ -2119,6 +2120,13 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
                    int32_t target_format,
                    struct xrt_display_processor **out_xdp)
 {
+	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
+	// before the first SR call, or a missing/mismatched SR platform faults at
+	// the call site. The bind logs its own outcome once.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia VK DP: SR platform client DLLs not usable — not creating the display processor");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// NOTE: no weaver preload here any more. The weaver DLL is no longer a
 	// delay-loaded import bound by base name — leia_vk_weaver_select_backend()
 	// picks the right one for the installed LeiaSR and LoadLibrary's it by

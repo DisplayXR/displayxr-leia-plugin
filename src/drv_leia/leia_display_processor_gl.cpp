@@ -19,6 +19,7 @@
 
 #include "leia_display_processor_gl.h"
 #include "leia_sr_gl.h"
+#include "leia_platform_state.h"
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
@@ -2112,6 +2113,13 @@ extern "C" xrt_result_t
 leia_dp_factory_gl(void *window_handle,
                     struct xrt_display_processor_gl **out_xdp)
 {
+	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
+	// before the first SR call, or a missing/mismatched SR platform faults at
+	// the call site. The bind logs its own outcome once.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia GL DP: SR platform client DLLs not usable — not creating the display processor");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Populate this module's GLAD table before any GL call (see above). The
 	// compositor has made the GL context current ahead of this call.
 	if (!leia_gl_ensure_glad_loaded()) {

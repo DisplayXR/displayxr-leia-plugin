@@ -39,14 +39,54 @@ static bool g_leia_edid_probed = false;
  * lifecycle events — a service started with the panel asleep must not emit
  * the same five lines every second until the panel wakes.
  *
- * Unguarded, like the two statics above: the probe is called from the
- * plug-in's probe() and probe_displays() entry points, which the runtime
- * serialises today. A concurrent pair of probes could at worst log the block
- * twice or skip one repeat — never corrupt the returned result, which is
- * written to the caller's own buffer.
+ * Guarded by g_leia_edid_lock, like the two statics above.
  */
 static struct os_display_edid_list g_leia_edid_last_list;
 static bool g_leia_edid_last_ok = false;
+
+#ifdef _WIN32
+/*
+ * Guards every static above. The probe used to rely on the runtime serialising
+ * its callers; since the install-order work it is also reached from the
+ * platform-state slot (any thread, any time), the DP's 1 Hz display poll and
+ * the geometry watcher. Held across the enumeration: a probe is tens of ms at
+ * worst and callers are rare.
+ */
+static SRWLOCK g_leia_edid_lock = SRWLOCK_INIT;
+#define EDID_LOCK() AcquireSRWLockExclusive(&g_leia_edid_lock)
+#define EDID_UNLOCK() ReleaseSRWLockExclusive(&g_leia_edid_lock)
+#else
+#define EDID_LOCK() ((void)0)
+#define EDID_UNLOCK() ((void)0)
+#endif
+
+void
+leia_sr_presence(bool *out_sdk_installed, bool *out_service_running)
+{
+	bool sdk = false;
+	bool service = false;
+#ifdef _WIN32
+	HKEY hKey;
+	if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Dimenco\\Simulated Reality", 0, KEY_READ, &hKey) ==
+	    ERROR_SUCCESS) {
+		sdk = true;
+		RegCloseKey(hKey);
+	}
+	if (sdk) {
+		HANDLE hMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Global\\sharedDeviceSerialMemory");
+		if (hMapping != NULL) {
+			service = true;
+			CloseHandle(hMapping);
+		}
+	}
+#endif
+	if (out_sdk_installed != NULL) {
+		*out_sdk_installed = sdk;
+	}
+	if (out_service_running != NULL) {
+		*out_service_running = service;
+	}
+}
 
 /*!
  * Compare the fields of a probe result that the diagnostics report or that a
@@ -116,6 +156,8 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 	}
 	memset(out, 0, sizeof(*out));
 
+	EDID_LOCK();
+
 	// Step 1: EDID-based hardware identification. Silent here — the
 	// diagnostics are emitted below, once the outcome is known, and only
 	// when it differs from the previous call.
@@ -148,24 +190,7 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 	 * runtime on a table miss (the authoritative check), so it needs
 	 * sdk_installed/service_running populated even when hw_found is false.
 	 */
-#ifdef _WIN32
-	{
-		HKEY hKey;
-		if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Dimenco\\Simulated Reality", 0, KEY_READ, &hKey) ==
-		    ERROR_SUCCESS) {
-			out->sdk_installed = true;
-			RegCloseKey(hKey);
-		}
-	}
-
-	if (out->sdk_installed) {
-		HANDLE hMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Global\\sharedDeviceSerialMemory");
-		if (hMapping != NULL) {
-			out->service_running = true;
-			CloseHandle(hMapping);
-		}
-	}
-#endif
+	leia_sr_presence(&out->sdk_installed, &out->service_running);
 
 	/*
 	 * Step 2: diagnostics. The first probe always logs; a later probe logs
@@ -229,17 +254,23 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 	g_leia_edid_last_list = edid_list;
 	g_leia_edid_last_ok = edid_ok;
 	g_leia_edid_probed = true;
+	EDID_UNLOCK();
 	return out->hw_found;
 }
 
 bool
 leia_edid_get_cached_result(struct leia_display_probe_result *out)
 {
-	if (out == NULL || !g_leia_edid_probed) {
+	if (out == NULL) {
 		return false;
 	}
-	*out = g_leia_edid_result;
-	return g_leia_edid_result.hw_found;
+	EDID_LOCK();
+	const bool probed = g_leia_edid_probed;
+	if (probed) {
+		*out = g_leia_edid_result;
+	}
+	EDID_UNLOCK();
+	return probed && out->hw_found;
 }
 
 bool

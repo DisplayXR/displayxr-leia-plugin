@@ -33,6 +33,13 @@ set(LEIA_SOURCES
     leia_sr_ready.h
     leia_sr_ready.cpp
     leia_vk_weaver_v2.cpp
+    # Install-order epic (displayxr-runtime#1803): the SR client DLLs are
+    # delay-loaded and resolved by full path from the SR install dir
+    # (leia_sr_delayload_win.c), and the plug-in reports a generic platform
+    # state (leia_platform_state.c).
+    leia_platform_state.h
+    leia_platform_state.c
+    leia_sr_delayload_win.c
     leia_plugin.c
 )
 
@@ -359,6 +366,29 @@ if(LEIA_SR_VULKAN_AVAILABLE)
     target_link_options(DisplayXR-LeiaSR PRIVATE "/DELAYLOAD:vulkan-1.dll")
     target_link_libraries(DisplayXR-LeiaSR PRIVATE delayimp)
 endif()
+
+# --- SR client DLLs: delay-loaded (install-order epic, P-a) -------------------
+# The plug-in must LOAD on a box without the SR platform (it then reports
+# PLATFORM_ABSENT and declines), and a long-lived service must find the SR DLLs
+# after an SR install without relying on its PATH snapshot. So every SR client
+# DLL is /DELAYLOAD'ed; leia_sr_delayload_win.c resolves them by full path from
+# HKLM\SOFTWARE\Dimenco\Simulated Reality (falling back to the normal search)
+# and binds every import eagerly behind leia_sr_client_bind(), which gates every
+# SR call. Keep this list equal to k_sr_dlls[] in that file (same gates).
+# opencv_world343 is NOT here: the linker drops it (no direct import), it is an
+# SR DLL's dependency, resolved from the SR bin dir via
+# LOAD_WITH_ALTERED_SEARCH_PATH.
+set(LEIA_SR_DELAYLOAD_DLLS SimulatedRealityCore.dll SimulatedRealityDisplays.dll)
+if(LEIA_SR_D3D11_AVAILABLE)
+    list(APPEND LEIA_SR_DELAYLOAD_DLLS SimulatedRealityDirectX.dll)
+endif()
+if(LEIA_SR_GL_AVAILABLE)
+    list(APPEND LEIA_SR_DELAYLOAD_DLLS SimulatedRealityOpenGL.dll)
+endif()
+foreach(_dll IN LISTS LEIA_SR_DELAYLOAD_DLLS)
+    target_link_options(DisplayXR-LeiaSR PRIVATE "/DELAYLOAD:${_dll}")
+endforeach()
+target_link_libraries(DisplayXR-LeiaSR PRIVATE delayimp)
 
 if(LEIA_SR_D3D11_AVAILABLE)
     target_link_libraries(DisplayXR-LeiaSR PRIVATE
