@@ -569,6 +569,9 @@ struct leia_display_processor_d3d11_impl
 	ID3D11ShaderResourceView *gate_overlay_srv;
 	//! One-shot log latch for an accepted layer that missed its weave.
 	bool overlay_lost_logged;
+	//! XR_DXR_weave v14: the caller declared overlay_srv's pixels unchanged
+	//! since the previous call, so the weaver may reuse its cached prefilter.
+	bool overlay_unchanged;
 
 #ifdef DXR_LEIA_DP_D3D11_LIFT
 	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
@@ -1478,7 +1481,9 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// ADR-027 Amendment: the 2D over-layer applies to THIS call only. Taken here,
 	// before any early return, so it can never leak into a later weave.
 	ID3D11ShaderResourceView *overlay_srv = ldp->overlay_srv;
+	const bool overlay_unchanged = ldp->overlay_unchanged;
 	ldp->overlay_srv = nullptr;
+	ldp->overlay_unchanged = false;
 	ldp->gate_overlay_srv = nullptr;
 
 	// #158: ~1 Hz SR-platform health poll. This is the thing that ARMS the
@@ -1762,7 +1767,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// band-limits it for the lens. set_overlay_2d already told the runtime we
 	// would, so a failure here loses the layer for one frame (logged once).
 	if (overlay_srv != nullptr) {
-		if (leiasr_d3d11_set_compose_layer(ldp->leiasr, overlay_srv)) {
+		if (leiasr_d3d11_set_compose_layer(ldp->leiasr, overlay_srv, overlay_unchanged)) {
 			ldp->gate_overlay_srv = overlay_srv;
 		} else if (!ldp->overlay_lost_logged) {
 			ldp->overlay_lost_logged = true;
@@ -2276,11 +2281,13 @@ leia_dp_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
                              void *overlay_srv,
                              uint32_t width,
                              uint32_t height,
-                             enum xrt_atlas_encoding encoding)
+                             enum xrt_atlas_encoding encoding,
+                             bool layer_unchanged)
 {
 	(void)d3d11_context;
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ldp->overlay_srv = nullptr;
+	ldp->overlay_unchanged = false;
 	if (overlay_srv == nullptr || width == 0 || height == 0 || encoding != XRT_ATLAS_ENCODING_ENCODED) {
 		return false;
 	}
@@ -2289,6 +2296,7 @@ leia_dp_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
 		return false;
 	}
 	ldp->overlay_srv = static_cast<ID3D11ShaderResourceView *>(overlay_srv);
+	ldp->overlay_unchanged = layer_unchanged;
 	return true;
 }
 #endif

@@ -142,6 +142,21 @@ if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_dx11.h")
     unset(_leia_sr_dx11_hdr)
     unset(_leia_sr_weaver_hdr)
 endif()
+# ST-5797 cached prefilter (slot 94): srWeaverSetComposeLayerUnchanged. Same
+# header-grep reasoning; independent of the compose pair, which an SDK can have
+# without it (1855/1860).
+set(LEIA_SR_COMPOSE_UNCHANGED_AVAILABLE FALSE)
+if(LEIA_SR_COMPOSE_AVAILABLE)
+    file(GLOB _leia_sr_hdrs "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" "${LEIASR_V2_SDKROOT}/include/sr/sr_dx11.h")
+    foreach(_h IN LISTS _leia_sr_hdrs)
+        file(READ "${_h}" _leia_sr_h)
+        if(_leia_sr_h MATCHES "srWeaverSetComposeLayerUnchanged")
+            set(LEIA_SR_COMPOSE_UNCHANGED_AVAILABLE TRUE)
+        endif()
+    endforeach()
+    unset(_leia_sr_h)
+    unset(_leia_sr_hdrs)
+endif()
 if(LEIA_SR_COMPOSE_AVAILABLE)
     message(STATUS "SR weaver 2D compose: ENABLED (SDK declares srWeaverSetComposeInputsDX11) - "
                    "the D3D11 DP takes the runtime's 2D over-layer into the weave")
@@ -373,6 +388,10 @@ if(LEIA_SR_V2_AVAILABLE)
     # its probe.
     if(LEIA_SR_COMPOSE_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE=1)
+    endif()
+    if(LEIA_SR_COMPOSE_UNCHANGED_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED=1)
+        message(STATUS "SR weaver 2D compose: cached prefilter reuse (srWeaverSetComposeLayerUnchanged) ENABLED")
     endif()
 endif()
 

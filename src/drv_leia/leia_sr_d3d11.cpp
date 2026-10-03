@@ -2606,12 +2606,30 @@ leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr)
 }
 
 bool
-leiasr_d3d11_set_compose_layer(struct leiasr_d3d11 *leiasr, void *layer_srv)
+leiasr_d3d11_set_compose_layer(struct leiasr_d3d11 *leiasr, void *layer_srv, bool layer_unchanged)
 {
 #if defined(DXR_LEIA_HAS_SR_V2) && defined(DXR_LEIA_HAS_SR_COMPOSE)
 	if (!leiasr_d3d11_compose_available(leiasr)) {
 		return false;
 	}
+#ifdef DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED
+	// XR_DXR_weave v14: reuse the cached prefilter on a static layer. Per weave
+	// (the SR default is false), so it is sent every frame, true or false. An
+	// SR runtime older than slot 94 answers FUNCTION_UNSUPPORTED: it re-filters
+	// every frame, which is correct, so the answer is only logged once.
+	if (layer_srv != nullptr) {
+		const SrResult ur = srWeaverSetComposeLayerUnchanged(leiasr->weaver_v2, layer_unchanged ? SR_TRUE : SR_FALSE);
+		static bool s_unsupported_logged = false;
+		if (!SR_SUCCEEDED(ur) && !s_unsupported_logged) {
+			s_unsupported_logged = true;
+			U_LOG_W("srWeaverSetComposeLayerUnchanged: %s - the weaver re-filters the 2D layer every frame "
+			        "(logged once)",
+			        leia_sr_v2_result_str(ur));
+		}
+	}
+#else
+	(void)layer_unchanged;
+#endif
 	// The weaver AddRefs the view and drops it after the NEXT weave, so a
 	// frame that passes NULL (or never calls) weaves with no layer.
 	const SrResult r = srWeaverSetComposeInputsDX11(leiasr->weaver_v2,
@@ -2629,6 +2647,7 @@ leiasr_d3d11_set_compose_layer(struct leiasr_d3d11 *leiasr, void *layer_srv)
 #else
 	(void)leiasr;
 	(void)layer_srv;
+	(void)layer_unchanged;
 	return false;
 #endif
 }
