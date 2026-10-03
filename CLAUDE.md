@@ -35,6 +35,12 @@ the service / in-process apps with Windows Restart Manager (`dxr-rm-close.exe`) 
 never starts the service elevated. Never run it (or its uninstaller) on a shared dev
 box. Details: [`docs/installer.md`](docs/installer.md).
 
+The plug-in itself loads WITHOUT the LeiaSR platform (SR client DLLs are `/DELAYLOAD`ed and
+resolved from the SR install dir) and reports a platform state —
+[`docs/install-order-and-platform-state.md`](docs/install-order-and-platform-state.md).
+**No SR SDK call may run before `leia_sr_client_bind()` returned OK** — a missing delay-loaded
+DLL faults at the call site.
+
 ## Where this fits in DisplayXR
 
 ```
@@ -102,13 +108,14 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_sr_*.{cpp,h}` | SR SDK weaver wrappers. The SDK throws `std::runtime_error` as routine internal control flow (~11/frame in some paths) — every call wrapped in try/catch. |
 | `src/drv_leia/leia_bg_capture_win.{cpp,h}` | WGC background capture for compose-under transparency (Leia transparency model). |
 | `src/drv_leia/leia_lift_neurd.{cpp,h}` | 2D→3D lift slots on the D3D11 DP, backed by a dynamically loaded NeurD.dll (absent ⇒ caps unavailable, nothing loaded). Compiles only with the private NeurD headers (fetched at build time, below) AND runtime headers with `XRT_DP_D3D11_HAS_LIFT`; otherwise the slots stay NULL. See [`docs/lift-neurd.md`](docs/lift-neurd.md). |
+| `src/drv_leia/leia_sr_delayload_win.c`, `leia_platform_state.{c,h}` | SR client DLL delay-load hook (registry-resolved full paths) + `leia_sr_client_bind()` gate; the platform state machine (READY / PLATFORM_ABSENT / PLATFORM_NOT_RUNNING / NO_DISPLAY / INCOMPATIBLE) behind `probe()`, `probe_displays()` and the runtime's `get_platform_state` slot. |
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
 | `src/drv_leia_linux/leia_sr_linux.h` | **Linux weaver-backend seam** — interface shaped 1:1 by `docs/leia-linux-sdk-contract.md` (every declaration cites its R-* requirement). Track B implements it against the real SDK. |
 | `src/drv_leia_linux/leia_sr_stub.c` | Track A stub backend: canned panel info + passthrough SBS blit, `TODO(Track B)` at every body. |
 | `src/drv_leia_linux/leia_sr_linux_sdk.c` | Track B backend: the real srSDK (C99, API 1.0.0) behind the same seam — instance/display/lens/weaver + event latching. Selected by `-DDXR_LEIA_LINUX_WEAVER=sdk`. |
 | `src/drv_leia_linux/leia_plugin_linux.c` | Linux `xrtPluginNegotiate` + iface (VK-only factories; env-gated probe). |
 | `src/drv_leia_linux/leia_display_processor_linux.c` | Linux VK DP — 1×1 grid blits, multi-view goes through the seam. Reuses `../drv_leia/leia_device.c`. |
-| `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Binary, ProbeOrder}`. No prerequisites; see `docs/installer.md`. |
+| `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `C:\Program Files\DisplayXR\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` with values `Binary`, `ProbeOrder`, `Version`, `DisplayName`, `Vendor`, `UninstallString`. No prerequisites; see `docs/installer.md`. |
 | `installer/rm-helper/` | `dxr-rm-close.exe` — generic Restart Manager driver the installer/uninstaller use to close and restart whatever maps the plug-in's files (one `session` process spans both phases). `rm_test_holder.cpp` is a test-only holder (EXCLUDE_FROM_ALL). |
 | `scripts/build-windows.bat` | Local Windows build entry point. |
 | `docs/` | Leia implementation internals (weaver, transparency, chroma-key, phase snapping, mode switching) — migrated from the runtime's `docs/vendors/leia/`. Start at `docs/README.md`. |
@@ -270,9 +277,10 @@ Full spec:
   team; if it shifts, realign `src/drv_leia_linux/leia_sr_linux.h` (and the
   stub) in the same change — the two must never drift.
 - **Registry registration is at install time.** During dev,
-  installer not run, the DLL won't load. Use the runtime's
-  `XRT_PLUGIN_SEARCH_PATH` env var to point at the dev build's
-  `Plugins/LeiaSR/` directory.
+  installer not run, the DLL won't load. On Windows discovery is
+  registry-only (`XRT_PLUGIN_SEARCH_PATH` is POSIX-only): register the
+  dev DLL with the runtime's `scripts\register_dev_plugin.bat leia <dll>`
+  (elevated).
 - **The pre-extraction history lives in the runtime repo.** Anything
   before commit `73e4705` was at `displayxr-runtime/src/xrt/drivers/leia/`.
   The runtime repo's `pre-leia-extraction-2026-05-04` tag preserves

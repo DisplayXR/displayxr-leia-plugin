@@ -62,8 +62,10 @@ while unidentified is ever cached.
 ## The startup budget — ONE, shared
 
 `leiasr_ready_wait()` block-polls signal 1 at 100 ms within a single
-process-wide deadline, started on first use (probe / `create_device` /
-`get_display_info`):
+process-wide deadline, started on first use (`create_device` /
+`get_display_info`). **Never from `probe()`**: since the install-order work
+(displayxr-runtime#1803) the probe is presence checks only and returns in
+milliseconds — see [install-order-and-platform-state.md](install-order-and-platform-state.md):
 
 | | |
 |---|---|
@@ -75,10 +77,10 @@ process-wide deadline, started on first use (probe / `create_device` /
 The SR-side verification spin that follows a successful wait is clamped to what
 is left of the budget, with a 1 s floor (`leiasr_ready_clamp`).
 
-The budget also applies to every in-process OpenXR app (the plug-in's `probe`
-runs at each `xrCreateInstance`): an app started while the panel sleeps waits
-up to the budget at instance create, then binds with fallback geometry and is
-updated in place like the service.
+The budget also applies to every in-process OpenXR app (`get_display_info` and
+`create_device` run at each `xrCreateInstance`): an app started while the panel
+sleeps waits up to the budget at instance create, then binds with fallback
+geometry and is updated in place like the service.
 
 ## Late re-derivation
 
@@ -98,7 +100,11 @@ handle and **publishes** it:
    how the geometry reaches apps.
 
 The watcher exits once the geometry is resolved (by itself or by anyone else),
-or on plug-in `destroy`. Two other paths publish through the same function,
+or on plug-in `destroy`. It is restarted when the cached geometry is
+**invalidated** — the EDID-matched panel was unplugged or replaced (P-c in
+[install-order-and-platform-state.md](install-order-and-platform-state.md)) —
+and then additionally waits for the platform state to be `READY` again, because
+SR can keep a device identified after its panel is gone. Two other paths publish through the same function,
 closing the gap when they get there first:
 
 - the **D3D11 weaver's create worker** (`async_create_worker_body`, which

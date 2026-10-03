@@ -8,20 +8,21 @@ This plug-in turns Leia SR glasses-free 3D displays (e.g. Samsung Odyssey 3D, Ac
 
 ## How it works
 
-Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_iface` from the runtime's public ABI (`xrt/xrt_plugin.h`). It loads at `xrCreateInstance` time via registry-driven discovery (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`).
+Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_iface` from the runtime's public ABI (`xrt/xrt_plugin.h`). It loads at `xrCreateInstance` time via registry-driven discovery (`HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`). It loads even when the LeiaSR platform is not installed (the SR client DLLs are delay-loaded and resolved from the SR install dir) and then reports why it is not weaving — see [Install order and platform state](docs/install-order-and-platform-state.md).
 
 ## Architecture
 
 - **`src/drv_leia/`** — Windows driver source: device, EDID probe, plug-in entry point (`xrtPluginNegotiate`), per-API display processors (D3D11, D3D12, OpenGL, Vulkan), SR SDK weavers, eye-tracking listener, WGC background capture.
 - **`src/drv_leia_android/`** — Android arm (CNSDK): `libdxrp050_leia_cnsdk.so` for the runtime APK.
 - **`src/drv_leia_linux/`** — Linux desktop arm: `DisplayXR-LeiaSR.so`, with two weaver backends behind one seam. **Track B (`-DDXR_LEIA_LINUX_WEAVER=sdk`) is the real srSDK Vulkan weaver** — it builds clean on Ubuntu 26.04 against the installed `leiasr-runtime` .deb and passes `displayxr-cli selftest` with `leia-sr` active (on-panel weave validation on 26.04 still pending; weave itself was validated on 22.04/NVIDIA, #81). Track A is the default **stub weaver** (passthrough, no SR SDK) for CI and SDK-less boxes. The SDK-facing interface is fixed by the [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED). Build/validate with `scripts/build-linux.sh` and the [Track B runbook](docs/linux-track-b-runbook.md); CI covers Ubuntu 22.04/24.04/26.04.
-- **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`; releases/restarts processes holding the DLL with Windows Restart Manager (`installer/rm-helper/dxr-rm-close.exe`). See [docs/installer.md](docs/installer.md).
+- **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `C:\Program Files\DisplayXR\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` (values `Binary`, `ProbeOrder`, `Version`, `DisplayName`, `Vendor`, `UninstallString`); releases/restarts processes holding the DLL with Windows Restart Manager (`installer/rm-helper/dxr-rm-close.exe`). See [docs/installer.md](docs/installer.md).
 
 ## Documentation
 
 Implementation internals live in [`docs/`](docs/) (migrated from the runtime's `docs/vendors/leia/`):
 
 - [Integration overview](docs/README.md) — source layout, build flags, eye-tracking mode
+- [Install order and platform state](docs/install-order-and-platform-state.md) — loads without LeiaSR, non-blocking probe, the platform states + hints, display hot-plug, log lines
 - [Weaver internals](docs/weaver.md) — DX11 / DX12 / GL / Vulkan weaver creation, weave() flow, DPI, phase math
 - [Transparency model](docs/transparency.md) — WGC compose-under-bg (primary) on D3D11 / D3D12 / Vulkan
 - [Chroma-key overlay](docs/chroma-key-overlay.md) — legacy fallback; still the only path on the GL DP
