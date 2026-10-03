@@ -80,21 +80,29 @@ not reported.
 | `PLATFORM_ABSENT` | SR registry key missing | `Install the LeiaSR Runtime` |
 | `PLATFORM_ABSENT` | key present, SR client DLLs cannot be loaded | `LeiaSR Runtime files not found - reinstall the LeiaSR Runtime` |
 | `INCOMPATIBLE` | SR DLLs load but lack an export this build imports | `The installed LeiaSR Runtime is not compatible with this plug-in - update the LeiaSR Runtime` |
-| `PLATFORM_NOT_RUNNING` | key present, `Global\sharedDeviceSerialMemory` absent | `The SR Service is not running` |
+| `PLATFORM_NOT_RUNNING` | key present, and the SCM does not report the `SR Service` service as `SERVICE_RUNNING`, or its `Global\sharedDeviceSerialMemory` section is absent | `The SR Service is not running` |
 | `NO_DISPLAY` | SR running, no Leia panel attached: no EDID match, and either a table-known panel was seen earlier in this process (an unplug) or SR has identified no device | `No Leia 3D display detected` |
 | `READY` | SR running and a panel is attached (EDID match, or SR has identified a panel the frozen EDID table does not know) | (empty) |
 
-`probe()` succeeds only in `READY`. `probe_displays()` returns no claims in
-`PLATFORM_ABSENT`, `INCOMPATIBLE` and `NO_DISPLAY`. In `PLATFORM_NOT_RUNNING`
-it claims EDID matches with `EDID` confidence, as before. In `READY` it claims
-them as `VERIFIED`. The plug-in never sets `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`.
+The SCM state is the authority for "running" (#294). The shared-memory section
+alone is not enough: it survives a stopped SR Service for as long as another SR
+client (the SR dashboard tray app, SRSession, ...) holds a handle to it. The
+section stays a secondary check, meaning the service is far enough up to talk
+to. The SCM query is cached for 1 s and works unelevated.
+
+`probe()` succeeds only in `READY`. `probe_displays()` returns no claims in any
+other state. In `READY` it claims EDID matches as `VERIFIED`. So with SR Service
+stopped, the runtime starts on the fallback DP, and its slow re-probe timer
+adopts this plug-in once the service is back. The plug-in never sets
+`XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`.
 
 ## Display hot-plug
 
 - **Unplug while bound:** the state becomes `NO_DISPLAY`. The cached SR
   geometry is invalidated, so the probe cache and `get_display_info` stop
-  reporting the old panel. The D3D11 and D3D12 DPs pass view 0 through unwoven,
-  using the same flat-blit pipeline as the weaver-not-ready window. Under
+  reporting the old panel. All four Windows DPs pass view 0 through unwoven
+  and skip the SR weaver: D3D11 and D3D12 with the flat-blit pipeline of the
+  weaver-not-ready window, GL and VK with their single-view blit. Under
   ADR-045's no-live-swap rule, the runtime keeps the DP bound.
 - **Re-plug:** the state returns to `READY`. The geometry watcher, which the
   invalidation restarted, re-derives the geometry once SR identifies the panel,
@@ -108,9 +116,6 @@ them as `VERIFIED`. The plug-in never sets `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`.
   that signature changes. The runtime's re-probes run a full EDID probe on
   every call.
 
-The GL and VK DPs do not have the pass-through yet. They keep weaving during
-`NO_DISPLAY`.
-
 ## Log lines
 
 All of these are one-shot `WARN`s, logged when the value changes:
@@ -119,12 +124,15 @@ All of these are one-shot `WARN`s, logged when the value changes:
 Leia SR: client DLL directory resolved to 'C:\Program Files\LeiaSR\Platform\bin\' (HKLM\SOFTWARE\Dimenco\Simulated Reality)
 Leia SR: client DLLs bound (4 DLLs, delay-loaded)
 Leia SR: client DLLs NOT usable — SimulatedRealityCore.dll could not be loaded (code 0xc06d007e); ...
-Leia SR platform state: READY (was UNKNOWN; key=1 service=1 edid_match=1 dlls_bound=1)
+Leia SR platform state: READY (was UNKNOWN; key=1 service=1 scm_running=1 edid_match=1 dlls_bound=1)
+Leia SR platform state: PLATFORM_NOT_RUNNING - The SR Service is not running (was READY; key=1 service=0 scm_running=0 ...)
 Leia SR platform state: PLATFORM_ABSENT - Install the LeiaSR Runtime (was UNKNOWN; key=0 ...)
 leia_plugin: probe took 0.5 ms (platform state READY)
 Leia display geometry invalidated (the Leia panel is no longer attached (EDID match lost)) — ...
 Leia D3D11 DP: Leia panel not attached (NO_DISPLAY) — passing pixels through unwoven
 Leia D3D11 DP: Leia panel attached again — weaving resumes
+Leia GL DP: Leia panel not attached (NO_DISPLAY) — passing view 0 through unwoven
+Leia VK DP: Leia panel attached again — weaving resumes
 Leia D3D11 DP: SR platform client DLLs not usable — not creating the display processor
 ```
 

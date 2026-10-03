@@ -197,6 +197,11 @@ struct leia_display_processor_gl_impl
 	GLuint read_fbo;     //!< Cached read FBO for 2D blit path.
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
 
+	//! P-c: GetTickCount64() of the last ~1 Hz platform-state poll (0 =
+	//! never) and the NO_DISPLAY pass-through state last logged.
+	uint64_t display_poll_ms;
+	bool display_absent_logged;
+
 	//
 	// Chroma-key transparency support (lazy-initialized on first frame).
 	//
@@ -1241,8 +1246,29 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	// centering below.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
 
-	// Single-view content: bypass weaver, blit atlas content directly via glBlitFramebuffer
-	if (ldp->view_count == 1) {
+	// P-c display hot-plug (same contract as the D3D11/D3D12 DPs): ~1 Hz cheap
+	// platform-state poll — the EDID enumeration re-runs only on a monitor
+	// topology change — and, while the panel is gone (NO_DISPLAY; the runtime
+	// keeps the vendor DP, no live swap), pass view 0 through unwoven with the
+	// single-view blit below instead of weaving for a lens that is not there.
+	{
+		const uint64_t now_ms = GetTickCount64();
+		if (ldp->display_poll_ms == 0 || (now_ms - ldp->display_poll_ms) > 1000) {
+			ldp->display_poll_ms = now_ms;
+			(void)leia_platform_state_refresh(UINT32_MAX);
+		}
+	}
+	const bool display_absent = leia_platform_display_absent();
+	if (display_absent != ldp->display_absent_logged) {
+		ldp->display_absent_logged = display_absent;
+		U_LOG_W("Leia GL DP: %s", display_absent
+		                              ? "Leia panel not attached (NO_DISPLAY) — passing view 0 through unwoven"
+		                              : "Leia panel attached again — weaving resumes");
+	}
+
+	// Single-view content (or NO_DISPLAY): bypass the weaver, blit the atlas
+	// origin tile (view 0) directly via glBlitFramebuffer.
+	if (ldp->view_count == 1 || display_absent) {
 		// Lazily create the read FBO
 		if (ldp->read_fbo == 0) {
 			glGenFramebuffers(1, &ldp->read_fbo);
