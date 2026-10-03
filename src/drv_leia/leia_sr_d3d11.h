@@ -204,6 +204,34 @@ bool
 leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr);
 
 /*!
+ * Can this weaver composite a 2D over-layer (LeiaSR ST-5788)? Probes the SR
+ * runtime once per weaver (srWeaverSetComposeOrder(2D_OVER), sticky) and
+ * caches the answer. False on the v1 weaver, a not-ready weaver, an SR runtime
+ * without the capability, or a build without DXR_LEIA_HAS_SR_COMPOSE.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_compose_available(struct leiasr_d3d11 *leiasr);
+
+/*!
+ * Hand the weaver this frame's 2D over-layer (runtime set_overlay_2d, ADR-027
+ * Amendment) for the NEXT leiasr_d3d11_weave: the weaver composites it over the
+ * woven views in encoded space and band-limits it for the lens (LeiaSR
+ * ST-5788). Layer: viewport-sized, premultiplied RGBA8/BGRA8 UNORM, encoded
+ * sRGB, alpha = 2D coverage. NULL clears.
+ *
+ * @return true when the layer will be composited by the next weave; false on
+ *         the v1 weaver, a not-ready weaver, an SR runtime without the
+ *         capability (probed once per weaver), a build without
+ *         DXR_LEIA_HAS_SR_COMPOSE, or NULL.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_set_compose_layer(struct leiasr_d3d11 *leiasr, void *layer_srv);
+
+/*!
  * Check if the weaver's HWND is still valid.
  * Use this for debugging "window handle is invalid" errors from SR SDK.
  *

@@ -123,6 +123,33 @@ else()
                    "SR liveness falls back to the SCM probe alone")
 endif()
 
+# --- SR weaver 2D compose (ANOTHER separate, narrower gate) ----------------
+# srWeaverSetComposeOrder + srWeaverSetComposeInputsDX11 (LeiaSR ST-5788,
+# dispatch slots #91/#92 on the release-candidate lineage) let the D3D11 weaver
+# composite the runtime's 2D over-layer inside the weave and band-limit it for
+# the lens (runtime set_overlay_2d slot, ADR-027 Amendment). Same two reasons
+# as the connection-state gate above: the pinned SDK predates them, and a
+# drop from another lineage would put them at different dispatch indices — so
+# a header grep, never folded into DXR_LEIA_HAS_SR_V2.
+set(LEIA_SR_COMPOSE_AVAILABLE FALSE)
+if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_dx11.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_dx11.h" _leia_sr_dx11_hdr)
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_weaver_hdr)
+    if(_leia_sr_dx11_hdr MATCHES "srWeaverSetComposeInputsDX11"
+       AND _leia_sr_weaver_hdr MATCHES "srWeaverSetComposeOrder")
+        set(LEIA_SR_COMPOSE_AVAILABLE TRUE)
+    endif()
+    unset(_leia_sr_dx11_hdr)
+    unset(_leia_sr_weaver_hdr)
+endif()
+if(LEIA_SR_COMPOSE_AVAILABLE)
+    message(STATUS "SR weaver 2D compose: ENABLED (SDK declares srWeaverSetComposeInputsDX11) - "
+                   "the D3D11 DP takes the runtime's 2D over-layer into the weave")
+else()
+    message(STATUS "SR weaver 2D compose: DISABLED (SDK predates ST-5788, or no v2 SDK) - "
+                   "the runtime keeps compositing the 2D over-layer post-weave")
+endif()
+
 # Vulkan weaver path. The weaver DLL is resolved and loaded at RUNTIME (see
 # leia_vk_weaver_select.cpp), so no SR Vulkan import library is linked and the
 # gate below only asks "were Vulkan weaver bits fetched at all". Either name
@@ -341,6 +368,11 @@ if(LEIA_SR_V2_AVAILABLE)
     # connection-state/platform-id pair. See the long note above the probe.
     if(LEIA_SR_CONNECTION_STATE_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_CONNECTION_STATE=1)
+    endif()
+    # Narrower gate for the ST-5788 weaver 2D compose pair. See the note above
+    # its probe.
+    if(LEIA_SR_COMPOSE_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE=1)
     endif()
 endif()
 

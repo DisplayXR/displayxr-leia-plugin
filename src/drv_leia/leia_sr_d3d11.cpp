@@ -69,6 +69,14 @@ struct leiasr_d3d11
 	SrInstance instance_v2 = nullptr;
 	SrWeaver weaver_v2 = nullptr;
 	SrLens lens_v2 = nullptr;
+#ifdef DXR_LEIA_HAS_SR_COMPOSE
+	// ST-5788 weaver 2D compose. The compose ORDER is sticky per weaver, so the
+	// probe is keyed to the weaver handle it ran on: a recreated weaver (#144
+	// async recreate) is probed again. compose_ok is meaningful only while
+	// compose_weaver == weaver_v2.
+	SrWeaver compose_weaver = nullptr;
+	bool compose_ok = false;
+#endif
 #endif
 
 	// D3D11 resources (references, not owned)
@@ -2543,6 +2551,60 @@ leiasr_d3d11_set_latency_in_frames(struct leiasr_d3d11 *leiasr,
 	}
 
 	w_set_latency_in_frames(leiasr, latency_frames);
+}
+
+bool
+leiasr_d3d11_compose_available(struct leiasr_d3d11 *leiasr)
+{
+#if defined(DXR_LEIA_HAS_SR_V2) && defined(DXR_LEIA_HAS_SR_COMPOSE)
+	if (leiasr == nullptr || leiasr->weaver_v2 == nullptr || !w_ready(leiasr)) {
+		return false;
+	}
+	if (leiasr->compose_weaver != leiasr->weaver_v2) {
+		// Probe once per weaver: an SR runtime older than ST-5788 answers
+		// SR_ERROR_FUNCTION_UNSUPPORTED, and then the runtime keeps its own
+		// post-weave composite (the slot returns false).
+		const SrResult r = srWeaverSetComposeOrder(leiasr->weaver_v2, SR_COMPOSE_ORDER_2D_OVER);
+		leiasr->compose_weaver = leiasr->weaver_v2;
+		leiasr->compose_ok = SR_SUCCEEDED(r);
+		U_LOG_W("SR weaver 2D compose: %s (srWeaverSetComposeOrder(2D_OVER) = %s)",
+		        leiasr->compose_ok ? "ENABLED - the 2D over-layer is composited and lens-filtered in the weave"
+		                           : "UNAVAILABLE - the runtime composites the 2D over-layer post-weave",
+		        leia_sr_v2_result_str(r));
+	}
+	return leiasr->compose_ok;
+#else
+	(void)leiasr;
+	return false;
+#endif
+}
+
+bool
+leiasr_d3d11_set_compose_layer(struct leiasr_d3d11 *leiasr, void *layer_srv)
+{
+#if defined(DXR_LEIA_HAS_SR_V2) && defined(DXR_LEIA_HAS_SR_COMPOSE)
+	if (!leiasr_d3d11_compose_available(leiasr)) {
+		return false;
+	}
+	// The weaver AddRefs the view and drops it after the NEXT weave, so a
+	// frame that passes NULL (or never calls) weaves with no layer.
+	const SrResult r = srWeaverSetComposeInputsDX11(leiasr->weaver_v2,
+	                                                static_cast<ID3D11ShaderResourceView *>(layer_srv), nullptr);
+	if (!SR_SUCCEEDED(r)) {
+		static uint32_t s_failed_logged = 0;
+		if (s_failed_logged < 4) {
+			s_failed_logged++;
+			U_LOG_E("srWeaverSetComposeInputsDX11 failed: %s - runtime falls back to its post-weave composite",
+			        leia_sr_v2_result_str(r));
+		}
+		return false;
+	}
+	return layer_srv != nullptr;
+#else
+	(void)leiasr;
+	(void)layer_srv;
+	return false;
+#endif
 }
 
 bool
