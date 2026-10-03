@@ -21,7 +21,7 @@ carries bit 8.
 | Slot | Plug-in behaviour |
 |---|---|
 | `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.6 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
-| `lift_stream_create` | Non-blocking. Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. |
+| `lift_stream_create` | Non-blocking. Re-probes NeurD first (see *Absent is not permanent*). Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. Fails soft (returns false, latches nothing in the plug-in) while unavailable. The runtime (`d3d11_lift.cpp`) calls it only once caps say READY, and a false there marks that runtime stream permanently failed — which is why caps report READY only when the module is READY. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
 | `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
 
@@ -52,8 +52,9 @@ the widest that fits D3D11's 16384-texel limit; a wider request fails with a WAR
 ## Process model
 
 **Supported NeurD versions.** By default the plug-in accepts **NeurD 0.4.6 or newer** —
-the only release tested on hardware. An older `NeurD.dll` is refused right after it is
-loaded, before backend selection, init, licensing or any model load: one WARN names the
+the only release tested on hardware. An older `NeurD.dll` is refused from its version
+resource before it is loaded (or, lacking one, right after it is loaded), before backend
+selection, init, licensing or any model load: one WARN names the
 found version and the minimum, and lift reports unavailable (`modes=0 / state=0`) exactly
 as if NeurD were absent, so callers fall back to their own conversion path. (Older NeurD
 would otherwise *look* available and then fail or degrade: 0.3.11–0.4.2 need the CUDA
@@ -72,6 +73,24 @@ metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERS
 - **Absent NeurD → nothing changes.** A presence probe (no `LoadLibrary`) runs on the
   first caps/stream call; if the DLL is not found the process state becomes
   *absent*, caps report `modes=0 / state=0`, and the plug-in behaves exactly as before.
+- **Absent is not permanent (runtime#1803 P-d).** While absent, discovery re-runs at most
+  every **30 s** from `lift_get_caps` (the runtime polls caps ~1 Hz while lift is not
+  READY, so that poll is the slow timer — no extra thread) and **immediately on every
+  `lift_stream_create`**. The registry step is what finds a NeurD installed after the
+  service started (the service's `PATH` is a snapshot from its start). When NeurD appears:
+  one WARN `Leia lift: NeurD.dll appeared at <path> (<where>) — loading`, then the normal
+  LOADING → READY path. Each re-probe is a `SearchPath`, one registry read and a file
+  attribute query; nothing is loaded and nothing is logged while nothing changed.
+- **A NeurD refused for a file reason is re-checked when the file changes.** "Older than
+  `MinVersion`", "LoadLibrary failed" and "no usable `NeurD_load`/stream API" store the
+  DLL's path, size and last-write time; the same 30 s / stream-request re-probe retries only
+  when NeurD.dll now resolves to another path or its size/mtime differ (one WARN `NeurD.dll
+  changed since it was refused (...) — retrying`). The version floor is checked from the
+  DLL's **VERSIONINFO resource before it is loaded** (NeurD.dll carries `FileVersion`,
+  e.g. 0.4.6), so a too-old NeurD is never mapped and its installer can replace it under a
+  running service; a DLL without the resource is checked after the load as before (and then
+  stays mapped — a replacement at the same path is reported as "still mapped, restart the
+  process"). Licence, device and init failures stay permanent for the process.
 - **One NeurD instance per process** (NeurD's rule). DP handles ref-count it. It is
   loaded and initialised on a **detached background thread**, never on a caller's
   thread and never at DP create (the DP factory runs on the service critical path).
@@ -378,8 +397,13 @@ lift-enabled runtime + this plug-in registered:
    `LICENSE_NETWORK_ERROR` WARN; reconnect → ready within ~15 s of the next call.
 5. Version floor: with NeurD 0.4.6 installed, set `DXR_LEIA_LIFT_MIN_VERSION=0.4.7` in the
    environment of the process that loads the plug-in (the service, under IPC) → the log
-   shows `Leia lift: NeurD 0.4.6 is older than the minimum 0.4.7 (env)` and no `READY`,
-   and `lift caps` reports `modes=0 state=unavailable`.
+   shows `Leia lift: NeurD.dll at <path> (...) is version 0.4.6, older than the minimum
+   0.4.7 (env) — not loaded` and no `READY`, and `lift caps` reports
+   `modes=0 state=unavailable`.
+6. NeurD installed after the service: with NeurD absent, start the service and an app
+   that asks for lift (`lift caps` → `state=unavailable`, log `NeurD.dll not found ...
+   Re-checked every 30s`), install NeurD, wait ≤ 30 s (or create a lift stream) → log
+   `NeurD.dll appeared at ... — loading`, then `NeurD READY`, with no service restart.
 
 ## Known limits
 
