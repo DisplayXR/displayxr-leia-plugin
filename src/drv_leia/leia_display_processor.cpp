@@ -25,6 +25,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,11 @@ struct leia_display_processor
 	struct xrt_display_processor_vk base;
 	struct leiasr *leiasr; //!< Owned — destroyed in leia_dp_destroy.
 	struct vk_bundle *vk;  //!< Cached vk_bundle (not owned).
+
+	//! P-c: os_monotonic_get_ns() of the last ~1 Hz platform-state poll (0 =
+	//! never) and the NO_DISPLAY pass-through state last logged.
+	uint64_t display_poll_ns;
+	bool display_absent_logged;
 
 	VkRenderPass render_pass;   //!< Render pass for framebuffer compatibility.
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
@@ -1604,8 +1610,29 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	// centering below.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
 
-	// Single-view content: bypass weaver, blit atlas content directly to target
-	if (ldp->view_count == 1 && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+	// P-c display hot-plug (same contract as the D3D11/D3D12 DPs): ~1 Hz cheap
+	// platform-state poll — the EDID enumeration re-runs only on a monitor
+	// topology change — and, while the panel is gone (NO_DISPLAY; the runtime
+	// keeps the vendor DP, no live swap), pass view 0 through unwoven with the
+	// single-view blit below instead of weaving for a lens that is not there.
+	{
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (ldp->display_poll_ns == 0 || (now_ns - ldp->display_poll_ns) > 1000000000ull) {
+			ldp->display_poll_ns = now_ns;
+			(void)leia_platform_state_refresh(UINT32_MAX);
+		}
+	}
+	const bool display_absent = leia_platform_display_absent();
+	if (display_absent != ldp->display_absent_logged) {
+		ldp->display_absent_logged = display_absent;
+		U_LOG_W("Leia VK DP: %s", display_absent
+		                              ? "Leia panel not attached (NO_DISPLAY) — passing view 0 through unwoven"
+		                              : "Leia panel attached again — weaving resumes");
+	}
+
+	// Single-view content (or NO_DISPLAY): bypass the weaver, blit the atlas
+	// origin tile (view 0) directly to the target.
+	if ((ldp->view_count == 1 || display_absent) && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
 		// Barrier: atlas SHADER_READ → TRANSFER_SRC, target COLOR_ATTACHMENT → TRANSFER_DST
 		VkImageMemoryBarrier pre[2] = {
 		    {
