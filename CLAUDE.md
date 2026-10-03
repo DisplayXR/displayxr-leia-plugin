@@ -27,10 +27,13 @@ Three platform arms, all implementing the `xrt_plugin_iface` ABI from
   `DXR_LEIA_FORCE_PROBE=1` force-binds it; on a real panel the SDK backend
   auto-binds via DRM/EDID and needs no env.
 
-End-user artifact: `DisplayXRLeiaSRSetup-<version>.exe`. Hard prereq:
-the DisplayXR runtime must be installed first; the installer reads
-`HKLM\Software\DisplayXR\Runtime\InstallPath` to drop the DLL at
-`$RuntimeInstall\Plugins\LeiaSR\`.
+End-user artifact: `DisplayXRLeiaSRSetup-<version>.exe`, installed to
+`%ProgramFiles%\DisplayXR\Plugins\LeiaSR\`. **No prerequisites** (runtime#1803):
+it installs before or after the DisplayXR runtime and the LeiaSR platform; the only
+gate is the ABI floor (exit 5) when a runtime IS installed. It releases the DLL from
+the service / in-process apps with Windows Restart Manager (`dxr-rm-close.exe`) and
+never starts the service elevated. Never run it (or its uninstaller) on a shared dev
+box. Details: [`docs/installer.md`](docs/installer.md).
 
 ## Where this fits in DisplayXR
 
@@ -105,7 +108,8 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia_linux/leia_sr_linux_sdk.c` | Track B backend: the real srSDK (C99, API 1.0.0) behind the same seam — instance/display/lens/weaver + event latching. Selected by `-DDXR_LEIA_LINUX_WEAVER=sdk`. |
 | `src/drv_leia_linux/leia_plugin_linux.c` | Linux `xrtPluginNegotiate` + iface (VK-only factories; env-gated probe). |
 | `src/drv_leia_linux/leia_display_processor_linux.c` | Linux VK DP — 1×1 grid blits, multi-view goes through the seam. Reuses `../drv_leia/leia_device.c`. |
-| `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `$RuntimeInstall\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Path, ProbeOrder}`. |
+| `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr\{Binary, ProbeOrder}`. No prerequisites; see `docs/installer.md`. |
+| `installer/rm-helper/` | `dxr-rm-close.exe` — generic Restart Manager driver the installer/uninstaller use to close and restart whatever maps the plug-in's files (one `session` process spans both phases). `rm_test_holder.cpp` is a test-only holder (EXCLUDE_FROM_ALL). |
 | `scripts/build-windows.bat` | Local Windows build entry point. |
 | `docs/` | Leia implementation internals (weaver, transparency, chroma-key, phase snapping, mode switching) — migrated from the runtime's `docs/vendors/leia/`. Start at `docs/README.md`. |
 

@@ -8,11 +8,18 @@
 ; registry-driven discovery (target_plugin_loader.c) picks it up at
 ; xrCreateInstance time.
 ;
-; Hard prereq: DisplayXR runtime, located via
-; HKLM\Software\DisplayXR\Runtime\InstallPath. Without the runtime,
-; the plug-in's DisplayXRClient.lib import can't resolve and
-; LoadLibraryEx fails — we fail fast at install time with a clear
-; error pointing at the runtime download.
+; Order-independent (DisplayXR/displayxr-runtime#1803, P-e): no prerequisite.
+;  - No DisplayXR runtime yet: the files and the DisplayProcessors
+;    registration are written anyway. The registration key is the runtime's
+;    public discovery contract and may exist before the runtime does; the
+;    runtime picks the plug-in up once it is installed. The only runtime gate
+;    is the ABI floor (exit 5), and it applies only when a runtime IS present.
+;  - No Leia SR platform check, deliberately: the plug-in loads without SR and
+;    reports the platform as absent at run time, so installing it before SR
+;    (or on a box that gets SR later) is a supported order.
+;  - Files held by running processes (the service, in-process OpenXR apps)
+;    are released through Windows Restart Manager (dxr-rm-close.exe), which
+;    also restarts what it closed. See docs/installer.md.
 
 ;--------------------------------
 ; Build-time definitions (passed from CMake):
@@ -121,16 +128,244 @@ AllowSkipFiles off
 ; silent mode set a distinct exit code instead: the bundle already checks
 ; `$0 != 0` and reports "installer exited with code $0. Aborting bundle."
 ;
-; Codes: 3 = not 64-bit, 4 = runtime absent, 5 = runtime below the ABI floor.
-; (2 is reserved — the INNER uninstaller-emitting pass exits 2 by design.)
+; Codes: 3 = not 64-bit, 5 = runtime below the ABI floor. (4 was "runtime
+; absent" — retired: the plug-in now installs before the runtime. 2 is
+; reserved — the INNER uninstaller-emitting pass exits 2 by design.)
 !macro AbortWithReason CODE MSG
 	${If} ${Silent}
 		SetErrorLevel ${CODE}
 	${Else}
-		MessageBox MB_ICONSTOP "${MSG}"
+		MessageBox MB_ICONSTOP "${MSG}" /SD IDOK
 	${EndIf}
 	Abort
 !macroend
+
+;--------------------------------
+; Releasing the plug-in's files: Restart Manager (dxr-rm-close.exe).
+;
+; The plug-in DLL (and its Vulkan weavers) are mapped by displayxr-service.exe
+; for its whole life, and by any in-process OpenXR app. Replacing or deleting
+; them needs those processes closed. Windows Restart Manager does that
+; generically: it finds the holders, closes them (the service exits cleanly on
+; the RM close query and registered "--rm-restart" for RM to relaunch it,
+; non-elevated), and after the files are swapped restarts exactly what it
+; closed. Only the process that started an RM session may shut down/restart in
+; it, so dxr-rm-close runs ONE "session" process across both phases and talks
+; to us through files in $RmDir (closed.txt / go.txt / done.txt / log.txt).
+;
+; Fallback, only when RM itself fails or the helper is missing: taskkill /f
+; the service and start it again through explorer.exe — never a plain Exec
+; from this elevated installer, which would leave an ELEVATED service that
+; normal-integrity apps cannot reach.
+
+!define SVC_EXE "displayxr-service.exe"
+
+Var RmHelper      ; path of the dxr-rm-close.exe copy we run (in $PLUGINSDIR)
+Var RmDir         ; RM session state dir
+Var RmClosedRc    ; closed.txt code: 0 closed, 10 nothing held, 1 RM failed, or none/timeout/noexec/nohelper
+Var RmLogLines    ; log.txt lines already DetailPrinted
+Var SvcWasRunning ; 1 = displayxr-service.exe was running before we touched anything
+Var NoStart       ; 1 = /NOSTART: never start or restart anything
+
+; Defines the RM helper functions for the installer (PFX="") and the
+; uninstaller (PFX="un.") — NSIS requires separate copies.
+!macro RM_FUNCTIONS PFX
+
+; First line of $0 (a marker file), CR/LF trimmed -> $1 ("" when unreadable).
+Function ${PFX}RmReadCode
+	StrCpy $1 ""
+	ClearErrors
+	FileOpen $2 "$0" r
+	${IfNot} ${Errors}
+		FileRead $2 $1
+		FileClose $2
+	${EndIf}
+	${Do}
+		StrCpy $2 $1 1 -1
+		${If} $2 == "$\r"
+		${OrIf} $2 == "$\n"
+			StrCpy $1 $1 -1
+		${Else}
+			${ExitDo}
+		${EndIf}
+	${Loop}
+FunctionEnd
+
+; DetailPrint the helper's log.txt lines not printed yet.
+Function ${PFX}RmPrintLog
+	ClearErrors
+	FileOpen $2 "$RmDir\log.txt" r
+	${If} ${Errors}
+		Return
+	${EndIf}
+	StrCpy $3 0
+	${Do}
+		ClearErrors
+		FileRead $2 $1
+		${If} ${Errors}
+			${ExitDo}
+		${EndIf}
+		IntOp $3 $3 + 1
+		${If} $3 > $RmLogLines
+			; trim CR/LF
+			${Do}
+				StrCpy $4 $1 1 -1
+				${If} $4 == "$\r"
+				${OrIf} $4 == "$\n"
+					StrCpy $1 $1 -1
+				${Else}
+					${ExitDo}
+				${EndIf}
+			${Loop}
+			DetailPrint "  [rm] $1"
+		${EndIf}
+	${Loop}
+	FileClose $2
+	StrCpy $RmLogLines $3
+FunctionEnd
+
+; Wait up to $0 ms for file $1. Sets error flag on timeout.
+Function ${PFX}RmWaitFile
+	StrCpy $2 0
+	ClearErrors
+	${Do}
+		${If} ${FileExists} "$1"
+			Return
+		${EndIf}
+		${If} $2 >= $0
+			SetErrors
+			Return
+		${EndIf}
+		Sleep 200
+		IntOp $2 $2 + 200
+	${Loop}
+FunctionEnd
+
+; Phase 1: close every process holding the plug-in's files in $INSTDIR.
+; Requires $RmHelper; sets $SvcWasRunning and $RmClosedRc.
+Function ${PFX}RmClose
+	StrCpy $SvcWasRunning 0
+	StrCpy $RmLogLines 0
+	StrCpy $RmDir "$PLUGINSDIR\rm"
+	${IfNot} ${FileExists} "$RmHelper"
+		StrCpy $RmClosedRc "nohelper"
+		DetailPrint "Restart Manager helper missing: falling back to taskkill."
+		nsExec::ExecToLog 'taskkill /f /im ${SVC_EXE}'
+		Pop $0
+		${If} $0 == 0
+			StrCpy $SvcWasRunning 1
+			Sleep 1500 ; let the killed process release its file handles
+		${EndIf}
+		Return
+	${EndIf}
+
+	nsExec::Exec '"$RmHelper" is-running ${SVC_EXE}'
+	Pop $0
+	${If} $0 == 0
+		StrCpy $SvcWasRunning 1
+	${EndIf}
+
+	RMDir /r "$RmDir"
+	CreateDirectory "$RmDir"
+	DetailPrint "Releasing the plug-in's files (Restart Manager)..."
+	; Not waited on (it lives until RmFinish); ExecShell + SW_HIDE so the
+	; console helper shows no window.
+	ClearErrors
+	ExecShell "open" '"$RmHelper"' 'session "$RmDir" "$INSTDIR\DisplayXR-LeiaSR.dll" "$INSTDIR\SimulatedRealityVulkan.dll" "$INSTDIR\SimulatedRealityVulkanBeta.dll"' SW_HIDE
+	${If} ${Errors}
+		StrCpy $RmClosedRc "noexec"
+	${Else}
+		; RmForceShutdown waits ~5 s per unresponsive window before its 30 s
+		; force; 120 s is far beyond any measured close (<= 11 s).
+		StrCpy $0 120000
+		StrCpy $1 "$RmDir\closed.txt"
+		Call ${PFX}RmWaitFile
+		${If} ${Errors}
+			StrCpy $RmClosedRc "timeout"
+		${Else}
+			StrCpy $0 "$RmDir\closed.txt"
+			Call ${PFX}RmReadCode
+			StrCpy $RmClosedRc $1
+		${EndIf}
+		Call ${PFX}RmPrintLog
+	${EndIf}
+
+	${If} $RmClosedRc == "0"
+		DetailPrint "Restart Manager closed the processes holding the plug-in."
+	${ElseIf} $RmClosedRc == "10"
+		DetailPrint "No process holds the plug-in's files."
+	${Else}
+		; RM could not do it (or the helper did not run): last resort.
+		DetailPrint "Restart Manager did not release the files ($RmClosedRc): falling back to taskkill."
+		${If} $SvcWasRunning == 1
+			nsExec::ExecToLog 'taskkill /f /im ${SVC_EXE}'
+			Pop $0
+			Sleep 1500 ; let the killed process release its file handles
+		${EndIf}
+	${EndIf}
+FunctionEnd
+
+; Phase 2: after the files were replaced/deleted. Unless /NOSTART, RM restarts
+; what it closed; then, if the service was running before and is not now,
+; start it through the shell (non-elevated).
+Function ${PFX}RmFinish
+	${If} $RmClosedRc == "0"
+	${OrIf} $RmClosedRc == "1"
+	${OrIf} $RmClosedRc == "timeout"
+		; A session process is waiting for go.txt.
+		${If} $NoStart == 1
+			StrCpy $1 "end"
+		${Else}
+			StrCpy $1 "restart"
+		${EndIf}
+		FileOpen $2 "$RmDir\go.txt" w
+		FileWrite $2 "$1$\r$\n"
+		FileClose $2
+		StrCpy $0 60000
+		StrCpy $1 "$RmDir\done.txt"
+		Call ${PFX}RmWaitFile
+		${If} ${Errors}
+			DetailPrint "Restart Manager helper did not finish in time."
+		${EndIf}
+		Call ${PFX}RmPrintLog
+	${EndIf}
+
+	${If} $NoStart == 1
+		DetailPrint "Not starting the DisplayXR service (/NOSTART)."
+		Return
+	${EndIf}
+	${If} $SvcWasRunning != 1
+		; It was not running before: start nothing new. The next OpenXR app
+		; (or the next logon) starts it.
+		Return
+	${EndIf}
+	; RmRestart may relaunch it via a short-lived hand-off (an elevated
+	; --rm-restart instance re-launches itself through explorer.exe), so give
+	; it a few seconds to appear before deciding it is gone.
+	${If} ${FileExists} "$RmHelper"
+		nsExec::Exec '"$RmHelper" is-running ${SVC_EXE} 8000'
+		Pop $0
+	${Else}
+		StrCpy $0 1
+	${EndIf}
+	${If} $0 == 0
+		DetailPrint "DisplayXR service is running."
+		Return
+	${EndIf}
+	SetRegView 64
+	ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+	${If} $0 != ""
+	${AndIf} ${FileExists} "$0\${SVC_EXE}"
+		; explorer.exe starts it in the desktop shell's non-elevated context.
+		DetailPrint "Starting the DisplayXR service (non-elevated, via explorer.exe)..."
+		Exec '"$WINDIR\explorer.exe" "$0\${SVC_EXE}"'
+	${EndIf}
+FunctionEnd
+
+!macroend
+
+!insertmacro RM_FUNCTIONS ""
+!insertmacro RM_FUNCTIONS "un."
 
 ;--------------------------------
 ; Interface Settings
@@ -167,37 +402,36 @@ Section "Leia SR Plug-in" SecPlugin
 	; runtime's 64-bit-view contract).
 	SetRegView 64
 
-	; -----------------------------------------------------------------
-	; Hard prereq: the DisplayXR runtime must be installed first.
-	; Without it, DisplayXR-LeiaSR.dll's DisplayXRClient.dll import
-	; can't resolve and LoadLibraryEx fails. Mirrors the workspace-
-	; controller installer's prereq check pattern.
-	; -----------------------------------------------------------------
+	; No runtime prerequisite (the runtime is not needed to install; it
+	; loads the plug-in once it is there) — just say which case this is.
 	ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
 	${If} $0 == ""
-		MessageBox MB_OK|MB_ICONSTOP \
-			"DisplayXR Runtime is required and was not found.$\r$\n$\r$\nInstall it first from https://github.com/DisplayXR/displayxr-runtime/releases then retry this plug-in installer."
-		Abort
+		DetailPrint "DisplayXR runtime not installed yet: the plug-in will be used once the DisplayXR runtime is installed."
+	${Else}
+		DetailPrint "DisplayXR runtime found at $0"
 	${EndIf}
-	${IfNot} ${FileExists} "$0\DisplayXRClient.dll"
-		MessageBox MB_OK|MB_ICONSTOP \
-			"DisplayXR Runtime install path registered ($0) but DisplayXRClient.dll is missing. Reinstall the runtime then retry this plug-in installer."
-		Abort
+
+	; '/NOSTART' (passed by the bundle, which restarts the service ONCE after
+	; the whole chain) — never start or restart anything. Unknown switches
+	; are ignored by older installers, so callers can always pass it.
+	StrCpy $NoStart 0
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOSTART" $R1
+	${IfNot} ${Errors}
+		StrCpy $NoStart 1
 	${EndIf}
-	DetailPrint "Verified DisplayXR Runtime at $0"
+
+	; #461: the files must be released BEFORE the File steps — a locked DLL
+	; aborts the install (AllowSkipFiles off above). Restart Manager closes
+	; whoever maps them (the service, in-process apps) and restarts them once
+	; the new files are in place (RmFinish below).
+	InitPluginsDir
+	File "/oname=$PLUGINSDIR\dxr-rm-close.exe" "${BIN_DIR}\tools\dxr-rm-close.exe"
+	StrCpy $RmHelper "$PLUGINSDIR\dxr-rm-close.exe"
+	Call RmClose
 
 	SetOutPath "$INSTDIR"
-
-	; #461: stop displayxr-service BEFORE the File steps — it maps this
-	; plug-in DLL once any client has connected, and a locked DLL would
-	; abort the install (AllowSkipFiles off above). The runtime installer
-	; (or its logon Run key) started it; we restart it at the end of this
-	; section. In the bundle chain the bundle stops it up-front and
-	; restarts it once at the end — our kill/restart is then redundant
-	; but harmless (the service has a single-instance pipe guard).
-	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	Pop $0
-	Sleep 1500   ; let the killed process release its file handles
 
 	; Install the plug-in DLL.
 	File "${BIN_DIR}\plugins\DisplayXR-LeiaSR.dll"
@@ -224,6 +458,10 @@ Section "Leia SR Plug-in" SecPlugin
 	File "${BIN_DIR}\plugins\SimulatedRealityVulkanBeta.dll"
 	File "${BIN_DIR}\plugins\SimulatedRealityVulkan.dll"
 
+	; The Restart Manager helper, next to Uninstall.exe: the uninstaller needs
+	; it to release the DLL before deleting it.
+	File "${BIN_DIR}\tools\dxr-rm-close.exe"
+
 	; -----------------------------------------------------------------
 	; Register at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr per
 	; the contract in docs/specs/runtime/plugin-discovery.md.
@@ -233,8 +471,9 @@ Section "Leia SR Plug-in" SecPlugin
 	; systems without Leia hardware, probe declines via
 	; XRT_ERROR_PROBER_NOT_SUPPORTED and sim-display takes over.
 	;
-	; UninstallString set so the runtime's cascade-uninstall cleans us
-	; up if the user uninstalls the runtime before this plug-in.
+	; UninstallString: informational for older runtime uninstallers that
+	; cascade into vendor uninstallers. The plug-in's own uninstall (ARP)
+	; works with or without the runtime present.
 	; -----------------------------------------------------------------
 	WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" \
 		"Binary"          "$INSTDIR\DisplayXR-LeiaSR.dll"
@@ -292,46 +531,72 @@ Section "Leia SR Plug-in" SecPlugin
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR" \
 		"EstimatedSize" "$0"
 
-	; #461: restart the service we killed above so the box doesn't sit
-	; service-less until the next logon / shell launch. '/NOSTART' (passed
-	; by the bundle, which restarts the service ONCE after the whole
-	; chain) suppresses this; unknown switches are ignored by older
-	; installers so callers can always pass it.
-	${GetParameters} $R0
-	ClearErrors
-	${GetOptions} $R0 "/NOSTART" $R1
-	${IfNot} ${Errors}
-		DetailPrint "Skipping service restart (/NOSTART)."
-	${Else}
-		ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
-		${If} $0 != ""
-		${AndIf} ${FileExists} "$0\displayxr-service.exe"
-			DetailPrint "Restarting DisplayXR Service..."
-			Exec '"$0\displayxr-service.exe"'
-		${EndIf}
-	${EndIf}
+	; #461: bring back what Restart Manager closed (the service relaunches
+	; itself non-elevated with --rm-restart), or — only if RM failed — start
+	; the service via explorer.exe. Nothing is started that was not running
+	; before, and nothing at all under /NOSTART.
+	Call RmFinish
 
 SectionEnd
+
+; An aborted install (e.g. a file still locked) must not leave the processes
+; RM closed down: release the waiting helper and restore the service.
+Function .onInstFailed
+	Call RmFinish
+FunctionEnd
 
 ;--------------------------------
 ; Uninstaller
 
+!macro UnDeleteHeld FILE
+	ClearErrors
+	Delete "${FILE}"
+	${If} ${Errors}
+		; Still mapped by a process RM could not close: remove it at reboot
+		; rather than silently leaving it behind.
+		Delete /REBOOTOK "${FILE}"
+		DetailPrint "${FILE} is still in use; it will be removed at the next reboot."
+	${EndIf}
+!macroend
+
 Section "Uninstall"
 	SetRegView 64
 
-	; Remove the registry subkey first so the runtime's discovery
-	; doesn't pick us up after the DLL is gone (race window is very
-	; narrow but cheap to close).
+	StrCpy $NoStart 0
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOSTART" $R1
+	${IfNot} ${Errors}
+		StrCpy $NoStart 1
+	${EndIf}
+
+	; Remove the registry subkey first so a service restarted below (or by
+	; anyone else) does not find us; it then runs on the fallback display
+	; processor.
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\leia-sr"
 
+	; Release the DLL before deleting it: the service and in-process apps map
+	; it, and a plain Delete of a mapped DLL fails (it used to fail silently and
+	; leave the file behind). Works with or without the runtime installed —
+	; with no service and no app holding the files RM simply finds nothing.
+	; Run a copy of the helper from $PLUGINSDIR so $INSTDIR can be removed.
+	InitPluginsDir
+	StrCpy $RmHelper "$PLUGINSDIR\dxr-rm-close.exe"
+	CopyFiles /SILENT "$INSTDIR\dxr-rm-close.exe" "$PLUGINSDIR"
+	Call un.RmClose
+
 	; Remove our files.
-	Delete "$INSTDIR\DisplayXR-LeiaSR.dll"
-	Delete "$INSTDIR\SimulatedRealityVulkanBeta.dll"
-	Delete "$INSTDIR\SimulatedRealityVulkan.dll"
+	!insertmacro UnDeleteHeld "$INSTDIR\DisplayXR-LeiaSR.dll"
+	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkanBeta.dll"
+	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkan.dll"
+	Delete "$INSTDIR\dxr-rm-close.exe"
 	Delete "$INSTDIR\Uninstall.exe"
 
-	; Remove install dir.
-	RMDir "$INSTDIR"
+	; Bring back what RM closed — the service comes back without the plug-in.
+	Call un.RmFinish
+
+	; Remove install dir (at reboot, if a held file was deferred above).
+	RMDir /REBOOTOK "$INSTDIR"
 	RMDir "$PROGRAMFILES64\DisplayXR\Plugins"
 	; Don't RMDir $PROGRAMFILES64\DisplayXR — the runtime's uninstaller
 	; owns that directory.
@@ -344,6 +609,10 @@ Section "Uninstall"
 	DeleteRegKey /ifempty HKLM "Software\DisplayXR\Plugins"
 
 SectionEnd
+
+Function un.onUninstFailed
+	Call un.RmFinish
+FunctionEnd
 
 ;--------------------------------
 ; Section Descriptions
@@ -369,7 +638,13 @@ Function .onInit
 	${EndIf}
 
 	; -----------------------------------------------------------------
-	; Runtime prereq + ABI-pairing floor.
+	; ABI-pairing floor — only when a runtime IS installed.
+	;
+	; No runtime at all is fine (#1803 P-e): the plug-in is installed and
+	; registered, and the runtime loads it once it is installed. There is
+	; deliberately no Leia SR platform check either: the plug-in loads
+	; without SR and reports the platform as absent at run time, so SR may
+	; be installed before or after this.
 	;
 	; The runtime's loader rejects a plug-in whose plug-in-API major differs
 	; from its own and then falls back to sim-display (ProbeOrder 200) — the
@@ -390,10 +665,6 @@ Function .onInit
 	ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
 	SetRegView 32
 
-	${If} $0 == ""
-		!insertmacro AbortWithReason 4 "The DisplayXR runtime is not installed.$\r$\n$\r$\nThis plug-in is a display processor FOR the runtime and cannot work without it.$\r$\n$\r$\nInstall the runtime first:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
-	${EndIf}
-
 	; MIN_RUNTIME_VERSION is empty when the plug-in was built against a
 	; non-release runtime pin (branch/SHA) — there is no ordered version to
 	; compare, so the floor is omitted rather than guessed. See
@@ -402,8 +673,11 @@ Function .onInit
 		; $R0: 0 = equal, 1 = installed newer, 2 = floor newer (too old).
 		; Installed-first, floor-second — inverting the operands silently
 		; inverts the gate.
+		; Gate only on a recorded Version: no runtime (or none recorded) means
+		; nothing to be incompatible with yet.
 		${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $R0
-		${If} $R0 == 2
+		${If} $1 != ""
+		${AndIf} $R0 == 2
 			!insertmacro AbortWithReason 5 "DisplayXR runtime $1 is too old for this plug-in.$\r$\n$\r$\nLeia SR ${VERSION} is built against runtime ${MIN_RUNTIME_VERSION} and needs ${MIN_RUNTIME_VERSION} or later. Installing it on $1 would leave the runtime unable to load it — 3D would silently fall back to the simulated display.$\r$\n$\r$\nUpdate the runtime (or install the DisplayXR bundle, which keeps the pair matched):$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
 		${EndIf}
 	!endif
