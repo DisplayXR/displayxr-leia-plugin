@@ -4,7 +4,7 @@
 
 This plug-in turns Leia SR glasses-free 3D displays (e.g. Samsung Odyssey 3D, Acer SpatialLabs) into OpenXR targets for the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime). Building a plug-in for your own display? Start from this worked example, alongside the [vendor onboarding guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/guides/vendor-plugin-onboarding.md).
 
-**Get it:** download `DisplayXRLeiaSRSetup-<version>.exe` from the [Releases page](https://github.com/DisplayXR/displayxr-leia-plugin/releases). The DisplayXR runtime must be installed first (the installer reads `HKLM\Software\DisplayXR\Runtime\InstallPath`).
+**Get it:** download `DisplayXRLeiaSRSetup-<version>.exe` from the [Releases page](https://github.com/DisplayXR/displayxr-leia-plugin/releases). It has no prerequisites: install it before or after the DisplayXR runtime and the LeiaSR platform, in any order — the runtime picks it up once both are present. See [docs/installer.md](docs/installer.md).
 
 ## How it works
 
@@ -15,7 +15,7 @@ Ships `DisplayXR-LeiaSR.dll`, a vendor plug-in DLL implementing `xrt_plugin_ifac
 - **`src/drv_leia/`** — Windows driver source: device, EDID probe, plug-in entry point (`xrtPluginNegotiate`), per-API display processors (D3D11, D3D12, OpenGL, Vulkan), SR SDK weavers, eye-tracking listener, WGC background capture.
 - **`src/drv_leia_android/`** — Android arm (CNSDK): `libdxrp050_leia_cnsdk.so` for the runtime APK.
 - **`src/drv_leia_linux/`** — Linux desktop arm: `DisplayXR-LeiaSR.so`, with two weaver backends behind one seam. **Track B (`-DDXR_LEIA_LINUX_WEAVER=sdk`) is the real srSDK Vulkan weaver** — it builds clean on Ubuntu 26.04 against the installed `leiasr-runtime` .deb and passes `displayxr-cli selftest` with `leia-sr` active (on-panel weave validation on 26.04 still pending; weave itself was validated on 22.04/NVIDIA, #81). Track A is the default **stub weaver** (passthrough, no SR SDK) for CI and SDK-less boxes. The SDK-facing interface is fixed by the [LeiaSR Linux SDK contract](docs/leia-linux-sdk-contract.md) (PROPOSED). Build/validate with `scripts/build-linux.sh` and the [Track B runbook](docs/linux-track-b-runbook.md); CI covers Ubuntu 22.04/24.04/26.04.
-- **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `$RuntimeInstall\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`.
+- **`installer/DisplayXRLeiaSRInstaller.nsi`** — NSIS installer that drops the DLL at `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\` and registers the plug-in under `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr`; releases/restarts processes holding the DLL with Windows Restart Manager (`installer/rm-helper/dxr-rm-close.exe`). See [docs/installer.md](docs/installer.md).
 
 ## Documentation
 

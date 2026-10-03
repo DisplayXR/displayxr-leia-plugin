@@ -7,6 +7,34 @@ if(NOT WIN32)
     return()
 endif()
 
+# dxr-rm-close.exe — the installer's Restart Manager driver (NSIS has no RM
+# plug-in). Closes whatever holds the plug-in's files before they are replaced
+# or deleted, and restarts what registered for it afterwards. Generic Windows
+# code, no DisplayXR knowledge. Built before the NSIS check so a box without
+# NSIS still compiles (and can test) it. Static CRT: it runs from the
+# installer's temp dir on boxes that may not have the VC++ redistributable.
+# Staged into _package/bin/tools so the signing pass (which walks _package/bin)
+# covers it and the installer packs the signed copy.
+add_executable(dxr-rm-close rm-helper/dxr_rm_close.cpp)
+target_compile_definitions(dxr-rm-close PRIVATE UNICODE _UNICODE)
+target_link_libraries(dxr-rm-close PRIVATE rstrtmgr)
+set_target_properties(dxr-rm-close PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded")
+install(TARGETS dxr-rm-close
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/tools COMPONENT Runtime)
+
+# Test-only holder process for dxr-rm-close (never shipped, never installed):
+#   cmake --build build --config Release --target rm-test-holder
+add_executable(rm-test-holder EXCLUDE_FROM_ALL rm-helper/rm_test_holder.cpp)
+target_compile_definitions(rm-test-holder PRIVATE UNICODE _UNICODE)
+set_target_properties(rm-test-holder PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded"
+    WIN32_EXECUTABLE ON)
+if(MSVC)
+    # WIN32 subsystem with a wmain entry point.
+    target_link_options(rm-test-holder PRIVATE "/ENTRY:wmainCRTStartup")
+endif()
+
 find_program(NSIS_EXECUTABLE makensis
     PATHS
         "$ENV{PROGRAMFILES}/NSIS"
@@ -51,7 +79,8 @@ if(_dxr_min_rt_match)
 else()
     # Non-release pin (branch or SHA) — there is no ordered version to compare
     # against, so ship without the version gate rather than with a wrong one.
-    # The "runtime absent entirely" check in the NSI stays active regardless.
+    # (The floor only ever applies when a runtime IS installed — the plug-in
+    # installs fine before the runtime; see DisplayXRLeiaSRInstaller.nsi.)
     set(MIN_RUNTIME_VERSION "")
     message(WARNING
         "DXR_RUNTIME_GIT_TAG='${DXR_RUNTIME_GIT_TAG}' is not a vX.Y.Z release tag — "
@@ -121,4 +150,4 @@ add_custom_target(installer
     COMMENT "Building DisplayXR Leia SR plug-in installer..."
     VERBATIM
 )
-add_dependencies(installer DisplayXR-LeiaSR)
+add_dependencies(installer DisplayXR-LeiaSR dxr-rm-close)
