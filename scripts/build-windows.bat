@@ -99,8 +99,11 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: (sr_weaver.h), used by the d3d11 DP under DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED (XR_DXR_weave v14).
 :: 1867 = RC @ 10e91d74d (+ LeiaSR #378 reuse log, #379 compose motion mode): no API change,
 :: DECLARATION grep 94 slots, table IDENTICAL to 1863.
-set SR_V2_TAG=sr-sdk-v2-1.38.0.1867
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+1867.10e91d74db-win64-Release
+:: 1874 = RC @ 8be75023b (+ LeiaSR ST-5799): 94 -> 95 slots, 1867's 94 an exact ordered prefix,
+:: APPENDS ONLY -- 95 pfnWeaverSetComposeFilterStrength (sr_weaver.h; compiled default 0.6),
+:: used by the d3d11 DP under DXR_LEIA_HAS_SR_COMPOSE_STRENGTH (XR_DXR_weave v15).
+set SR_V2_TAG=sr-sdk-v2-1.38.0.1874
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+1874.8be75023bc-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
