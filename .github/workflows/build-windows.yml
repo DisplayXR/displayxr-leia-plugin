@@ -90,8 +90,11 @@ jobs:
       # change, 94 slot declarations, table IDENTICAL to 1863.
       # 1874 = + LeiaSR ST-5799: 94 -> 95 slots, APPENDS ONLY (95
       # SetComposeFilterStrength, used under DXR_LEIA_HAS_SR_COMPOSE_STRENGTH).
-      SR_V2_TAG: sr-sdk-v2-1.38.0.1874
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+1874.8be75023bc-win64-Release
+      # 1895 = final RC @ c0384431e: no new functions -- 104 slot declarations,
+      # 95 live (an exact ordered copy of 1874's) + 9 reserved NULL (Metal, GL/VK
+      # compose inputs). Repinned so releases name the SR build David distributes.
+      SR_V2_TAG: sr-sdk-v2-1.38.0.1895
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+1895.c0384431eb-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
