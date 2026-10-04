@@ -79,6 +79,13 @@ struct leiasr_d3d11
 	//! The weaver also writes the FILTERED layer coverage into the output
 	//! alpha (SR_COMPOSE_ORDER_2D_OVER_COVERAGE); else alpha stays 1.0.
 	bool compose_coverage = false;
+	//! ST-5799 / XR_DXR_weave v15: the filter strength last APPLIED to
+	//! compose_weaver (sticky in SR), so the call is made only on change.
+	//! compose_strength_valid false = nothing applied yet on this weaver.
+	float compose_strength_applied = -1.0f;
+	bool compose_strength_valid = false;
+	SrWeaver compose_strength_weaver = nullptr; //!< the weaver compose_strength_* describes
+	bool compose_strength_unsupported_logged = false;
 #endif
 #endif
 
@@ -2591,6 +2598,48 @@ leiasr_d3d11_compose_available(struct leiasr_d3d11 *leiasr)
 #else
 	(void)leiasr;
 	return false;
+#endif
+}
+
+void
+leiasr_d3d11_set_compose_filter_strength(struct leiasr_d3d11 *leiasr, float strength)
+{
+#if defined(DXR_LEIA_HAS_SR_V2) && defined(DXR_LEIA_HAS_SR_COMPOSE_STRENGTH)
+	if (!leiasr_d3d11_compose_available(leiasr)) {
+		return; // also re-keys compose_weaver on a recreated weaver (probe above)
+	}
+	// Normalise: any negative = "the SR runtime's default" (config / compiled 0.6).
+	const float want = (strength >= 0.0f && strength <= 1.0f) ? strength : SR_COMPOSE_FILTER_STRENGTH_DEFAULT;
+	if (leiasr->compose_strength_weaver != leiasr->weaver_v2) {
+		// A new weaver starts at the runtime default; forget what the old one had.
+		leiasr->compose_strength_weaver = leiasr->weaver_v2;
+		leiasr->compose_strength_valid = false;
+	}
+	const bool is_default = want < 0.0f;
+	if (!leiasr->compose_strength_valid && is_default) {
+		return; // a fresh weaver already runs the default — nothing to send
+	}
+	if (leiasr->compose_strength_valid && leiasr->compose_strength_applied == want) {
+		return; // sticky in SR, unchanged
+	}
+	const SrResult r = srWeaverSetComposeFilterStrength(leiasr->weaver_v2, want);
+	if (SR_SUCCEEDED(r)) {
+		leiasr->compose_strength_applied = want;
+		leiasr->compose_strength_valid = true;
+		U_LOG_W("SR weaver 2D compose: filter strength %s%.2f (XR_DXR_weave v15)",
+		        is_default ? "runtime default (" : "", is_default ? -1.0 : (double)want);
+	} else if (!leiasr->compose_strength_unsupported_logged) {
+		// FUNCTION_UNSUPPORTED on an SR runtime that predates ST-5799: its own
+		// default applies, which is correct. Logged once.
+		leiasr->compose_strength_unsupported_logged = true;
+		leiasr->compose_strength_applied = want;
+		leiasr->compose_strength_valid = true;
+		U_LOG_W("srWeaverSetComposeFilterStrength(%.2f): %s - the SR runtime's default strength applies (logged once)",
+		        (double)want, leia_sr_v2_result_str(r));
+	}
+#else
+	(void)leiasr;
+	(void)strength;
 #endif
 }
 

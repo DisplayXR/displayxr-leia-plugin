@@ -226,6 +226,19 @@ bool
 leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr);
 
 /*!
+ * XR_DXR_weave v15: the app's lens-filter strength for the 2D layer, [0,1], or
+ * negative for the SR runtime's default (sr_config / compiled 0.6). Forwarded
+ * to srWeaverSetComposeFilterStrength (LeiaSR ST-5799) ONLY when it changes,
+ * since the SR setting is sticky per weaver; a recreated weaver starts at the
+ * default again. No-op without DXR_LEIA_HAS_SR_COMPOSE_STRENGTH or on the v1
+ * weaver; FUNCTION_UNSUPPORTED (older SR runtime) is logged once.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d11_set_compose_filter_strength(struct leiasr_d3d11 *leiasr, float strength);
+
+/*!
  * Hand the weaver this frame's 2D over-layer (runtime set_overlay_2d, ADR-027
  * Amendment) for the NEXT leiasr_d3d11_weave: the weaver composites it over the
  * woven views in encoded space and band-limits it for the lens (LeiaSR
