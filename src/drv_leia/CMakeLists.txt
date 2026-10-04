@@ -157,6 +157,17 @@ if(LEIA_SR_COMPOSE_AVAILABLE)
     unset(_leia_sr_h)
     unset(_leia_sr_hdrs)
 endif()
+# ST-5799 filter strength: srWeaverSetComposeFilterStrength (sticky per weaver;
+# XR_DXR_weave v15). Same header-grep reasoning: independent of the compose
+# pair and of slot 94, which an SDK can have without it (1863/1867).
+set(LEIA_SR_COMPOSE_STRENGTH_AVAILABLE FALSE)
+if(LEIA_SR_COMPOSE_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_h)
+    if(_leia_sr_h MATCHES "srWeaverSetComposeFilterStrength")
+        set(LEIA_SR_COMPOSE_STRENGTH_AVAILABLE TRUE)
+    endif()
+    unset(_leia_sr_h)
+endif()
 if(LEIA_SR_COMPOSE_AVAILABLE)
     message(STATUS "SR weaver 2D compose: ENABLED (SDK declares srWeaverSetComposeInputsDX11) - "
                    "the D3D11 DP takes the runtime's 2D over-layer into the weave")
@@ -392,6 +403,10 @@ if(LEIA_SR_V2_AVAILABLE)
     if(LEIA_SR_COMPOSE_UNCHANGED_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED=1)
         message(STATUS "SR weaver 2D compose: cached prefilter reuse (srWeaverSetComposeLayerUnchanged) ENABLED")
+    endif()
+    if(LEIA_SR_COMPOSE_STRENGTH_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE_STRENGTH=1)
+        message(STATUS "SR weaver 2D compose: app filter strength (srWeaverSetComposeFilterStrength) ENABLED")
     endif()
 endif()
 

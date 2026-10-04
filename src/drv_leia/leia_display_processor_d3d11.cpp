@@ -572,6 +572,9 @@ struct leia_display_processor_d3d11_impl
 	//! XR_DXR_weave v14: the caller declared overlay_srv's pixels unchanged
 	//! since the previous call, so the weaver may reuse its cached prefilter.
 	bool overlay_unchanged;
+	//! XR_DXR_weave v15: the app's filter strength for overlay_srv's weave
+	//! (negative = SR runtime default). Consumed with the layer.
+	float overlay_filter_strength;
 
 #ifdef DXR_LEIA_DP_D3D11_LIFT
 	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
@@ -1482,8 +1485,10 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// before any early return, so it can never leak into a later weave.
 	ID3D11ShaderResourceView *overlay_srv = ldp->overlay_srv;
 	const bool overlay_unchanged = ldp->overlay_unchanged;
+	const float overlay_filter_strength = ldp->overlay_filter_strength;
 	ldp->overlay_srv = nullptr;
 	ldp->overlay_unchanged = false;
+	ldp->overlay_filter_strength = -1.0f;
 	ldp->gate_overlay_srv = nullptr;
 
 	// #158: ~1 Hz SR-platform health poll. This is the thing that ARMS the
@@ -1767,6 +1772,8 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// band-limits it for the lens. set_overlay_2d already told the runtime we
 	// would, so a failure here loses the layer for one frame (logged once).
 	if (overlay_srv != nullptr) {
+		// v15: sticky in SR, so this only calls through when the value changes.
+		leiasr_d3d11_set_compose_filter_strength(ldp->leiasr, overlay_filter_strength);
 		if (leiasr_d3d11_set_compose_layer(ldp->leiasr, overlay_srv, overlay_unchanged)) {
 			ldp->gate_overlay_srv = overlay_srv;
 		} else if (!ldp->overlay_lost_logged) {
@@ -2301,6 +2308,19 @@ leia_dp_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
 }
 #endif
 
+#ifdef XRT_DP_D3D11_HAS_OVERLAY_2D_FILTER_STRENGTH
+/*
+ * XR_DXR_weave v15 — the app's lens-filter strength for the next weave's 2D
+ * layer. The runtime calls this right before set_overlay_2d every frame the
+ * layer goes to the DP; negative = the SR runtime's own default.
+ */
+static void
+leia_dp_d3d11_set_overlay_2d_filter_strength(struct xrt_display_processor_d3d11 *xdp, float strength)
+{
+	leia_dp_d3d11(xdp)->overlay_filter_strength = strength;
+}
+#endif
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. Same D3D11 device as the compositor → the SRV is used directly
 // (no open/import, unlike the WGC desktop). NULL ⟹ clear (desktop-only).
@@ -2659,6 +2679,12 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #ifdef XRT_DP_D3D11_HAS_OVERLAY_2D
 	ldp->base.set_overlay_2d = leia_dp_d3d11_set_overlay_2d; // ADR-027 Amendment — 2D under the lens
 #endif
+#ifdef XRT_DP_D3D11_HAS_OVERLAY_2D_FILTER_STRENGTH
+	ldp->base.set_overlay_2d_filter_strength = leia_dp_d3d11_set_overlay_2d_filter_strength; // v15
+#endif
+	// The struct is calloc'd: 0.0 would mean "no lens filtering". Start (and,
+	// against a runtime without the v15 slot, stay) at "SR default".
+	ldp->overlay_filter_strength = -1.0f;
 	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #573 (sole transparency enable)
 	ldp->base.set_shared_texture_present = leia_dp_d3d11_set_shared_texture_present; // #68
 	ldp->base.destroy = leia_dp_d3d11_destroy;
