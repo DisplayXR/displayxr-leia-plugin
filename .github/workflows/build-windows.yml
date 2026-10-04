@@ -80,8 +80,16 @@ jobs:
       # 1758 = first 1.38.0, currency refresh over 1719, no new API: 90 slot
       # declarations, table IDENTICAL; only include/sr/version.h differs. SR
       # Service stop no longer crashes/hangs (LeiaSR #327).
-      SR_V2_TAG: sr-sdk-v2-1.38.0.1758
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+1758.f48e989e22-win64-Release
+      # 1860 = the weaver 2D compose (LeiaSR #368-#375): 90 -> 93 slots, APPENDS
+      # ONLY (91 SetComposeOrder, 92 SetComposeInputsDX11 -- used by the d3d11 DP
+      # under DXR_LEIA_HAS_SR_COMPOSE; 93 DisplayGetEffectiveViews, unused).
+      # 1863 = cached 2D-compose prefilter (LeiaSR #376/#377): 93 -> 94 slots,
+      # APPENDS ONLY (94 SetComposeLayerUnchanged -- used under
+      # DXR_LEIA_HAS_SR_COMPOSE_UNCHANGED, XR_DXR_weave v14).
+      # 1867 = + LeiaSR #378/#379 (reuse log, compose motion mode): no API
+      # change, 94 slot declarations, table IDENTICAL to 1863.
+      SR_V2_TAG: sr-sdk-v2-1.38.0.1867
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+1867.10e91d74db-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
@@ -109,7 +117,7 @@ jobs:
       # regression originally).
       # #734: runtime v2.0.0 (a8f6e74f) ships the XR_EXT_* → XR_DXR_*
       # extension rename this plug-in's headers now use (ABI unchanged, v4).
-      RUNTIME_REF: v2.24.0
+      RUNTIME_REF: v2.25.2
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -271,6 +271,9 @@ Texture2D<float4> backdrop   : register(t2);
 // when the runtime presents opaque DWM completes no blends, so every partial-
 // alpha output must be flattened against the baked bg here instead.
 Texture2D<float4> bg         : register(t3);
+// ADR-027 Amendment — the runtime's 2D over-layer, ALREADY composited (and
+// lens-filtered) into the back buffer by the weaver. Only its alpha is read.
+Texture2D<float4> overlay    : register(t4);
 SamplerState samp            : register(s0);
 cbuffer Constants : register(b0) {
 	uint2 tile_count;
@@ -281,7 +284,8 @@ cbuffer Constants : register(b0) {
 	float2 bg_uv_origin;      // #116 — window TL on monitor, normalized
 	float2 bg_uv_extent;      // #116 — window size on monitor, normalized
 	float2 canvas_px;         // gate viewport size in pixels (exact-texel read when a tile is 1:1)
-	float2 _pad_px;
+	uint  has_overlay;        // weaver composited a 2D over-layer: 1 = estimate its alpha, 2 = alpha is its coverage
+	uint  _pad_ov;
 };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 float4 main(VSOut i) : SV_Target {
@@ -329,19 +333,39 @@ float4 main(VSOut i) : SV_Target {
 	// own alpha (DWM adds the live desktop) instead of punching fully through.
 	// #116 — flatten (opaque present): DWM adds nothing, so complete the blend
 	// against the captured desktop and output alpha 1.
+	float4 under = float4(0.0, 0.0, 0.0, 0.0); // live desktop
 	if (has_backdrop != 0) {
 		float4 bd = backdrop.Sample(samp, bb_uv);
 		if (flatten != 0) {
 			float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
-			return float4(bd.rgb + (1.0 - bd.a) * b, 1.0);
+			under = float4(bd.rgb + (1.0 - bd.a) * b, 1.0);
+		} else {
+			under = float4(bd.rgb, bd.a);
 		}
-		return float4(bd.rgb, bd.a);
-	}
-	if (flatten != 0) {
+	} else if (flatten != 0) {
 		float3 b = bg.SampleLevel(samp, bg_uv_origin + bb_uv * bg_uv_extent, 0).rgb;
-		return float4(b, 1.0); // baked desktop instead of live punch-through
+		under = float4(b, 1.0); // baked desktop instead of live punch-through
 	}
-	return float4(0.0, 0.0, 0.0, 0.0); // live desktop
+	// ADR-027 Amendment — a 2D over-layer the weaver composited here, where no
+	// view has content: the weave of the transparent atlas is black, so the
+	// back buffer holds exactly the weaver's lens-FILTERED premultiplied layer.
+	// Keep it instead of punching it out, and lay it over whatever the gate
+	// would otherwise emit. The filtered alpha is not available, so take the
+	// larger of the layer's own alpha and the filtered colour's max channel:
+	// premultiplied rgb never exceeds its alpha, so the result stays a valid
+	// premultiplied colour.
+	//
+	// has_overlay == 2: the weaver wrote the filtered coverage into the output
+	// alpha (SR_COMPOSE_ORDER_2D_OVER_COVERAGE), so the alpha is exact.
+	if (has_overlay != 0) {
+		float4 wv = backbuffer.Sample(samp, bb_uv);
+		float3 w = wv.rgb;
+		float a = (has_overlay == 2)
+		              ? saturate(wv.a)
+		              : saturate(max(overlay.Sample(samp, bb_uv).a, max(w.r, max(w.g, w.b))));
+		return float4(w + (1.0 - a) * under.rgb, a + (1.0 - a) * under.a);
+	}
+	return under;
 }
 )";
 
@@ -370,7 +394,8 @@ struct AlphaGateConstants {
 	float    bg_uv_origin[2];  // #116
 	float    bg_uv_extent[2];  // #116
 	float    canvas_px[2];     // gate viewport size in px (exact-texel read when a tile is 1:1)
-	float    pad_px[2];
+	uint32_t has_overlay;      // ADR-027 Amendment — the weaver composited a 2D over-layer
+	uint32_t pad_ov;
 };
 
 
@@ -532,6 +557,21 @@ struct leia_display_processor_d3d11_impl
 	//! it over the live desktop. NULL ⟹ no backdrop (desktop-only).
 	ID3D11ShaderResourceView *backdrop_srv; //!< NOT owned (compositor-owned).
 	uint32_t backdrop_w, backdrop_h;
+
+	//! ADR-027 Amendment — the runtime's 2D over-layer for the NEXT
+	//! process_atlas only (set_overlay_2d; stateless, consumed and cleared at
+	//! the top of process_atlas). NOT owned. Forwarded to the SR weaver right
+	//! before its weave, so a frame that skips the weave never leaves a layer
+	//! pending inside the SDK.
+	ID3D11ShaderResourceView *overlay_srv;
+	//! The layer the weaver composited THIS weave (the alpha gate keeps it in
+	//! the transparent regions); NULL otherwise.
+	ID3D11ShaderResourceView *gate_overlay_srv;
+	//! One-shot log latch for an accepted layer that missed its weave.
+	bool overlay_lost_logged;
+	//! XR_DXR_weave v14: the caller declared overlay_srv's pixels unchanged
+	//! since the previous call, so the weaver may reuse its cached prefilter.
+	bool overlay_unchanged;
 
 #ifdef DXR_LEIA_DP_D3D11_LIFT
 	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
@@ -1328,8 +1368,11 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		cb->bg_uv_extent[1] = ldp->bg_uv_last[3];
 		cb->canvas_px[0] = (float)vp_w;
 		cb->canvas_px[1] = (float)vp_h;
-		cb->pad_px[0] = 0.0f;
-		cb->pad_px[1] = 0.0f;
+		// ADR-027 Amendment: 2 = the weaver's output alpha IS the filtered coverage.
+		cb->has_overlay = (ldp->gate_overlay_srv == nullptr)                          ? 0u
+		                  : leiasr_d3d11_compose_writes_coverage(ldp->leiasr) ? 2u
+		                                                                        : 1u;
+		cb->pad_ov = 0;
 		ctx->Unmap(ldp->alpha_gate_constants, 0);
 	}
 
@@ -1371,14 +1414,18 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	// when compose-under-bg is off; gated by the flatten constant).
 	ID3D11ShaderResourceView *ag_bg =
 	    (ldp->bg_shared_srv != nullptr) ? ldp->bg_shared_srv : ldp->ck_strip_srv;
-	ID3D11ShaderResourceView *srvs[4] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop, ag_bg};
-	ctx->PSSetShaderResources(0, 4, srvs);
+	// ADR-027 Amendment — t4 = the 2D over-layer the weaver composited (dummy =
+	// strip copy when absent; gated by has_overlay).
+	ID3D11ShaderResourceView *ag_overlay =
+	    (ldp->gate_overlay_srv != nullptr) ? ldp->gate_overlay_srv : ldp->ck_strip_srv;
+	ID3D11ShaderResourceView *srvs[5] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop, ag_bg, ag_overlay};
+	ctx->PSSetShaderResources(0, 5, srvs);
 	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
 	ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
 	ctx->Draw(4, 0);
 
-	ID3D11ShaderResourceView *null_srvs[4] = {nullptr, nullptr, nullptr, nullptr};
-	ctx->PSSetShaderResources(0, 4, null_srvs);
+	ID3D11ShaderResourceView *null_srvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+	ctx->PSSetShaderResources(0, 5, null_srvs);
 
 	// prev_sc_count == 0 when nothing was bound → clears the scissor array,
 	// i.e. exactly the state we found.
@@ -1430,6 +1477,14 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
+
+	// ADR-027 Amendment: the 2D over-layer applies to THIS call only. Taken here,
+	// before any early return, so it can never leak into a later weave.
+	ID3D11ShaderResourceView *overlay_srv = ldp->overlay_srv;
+	const bool overlay_unchanged = ldp->overlay_unchanged;
+	ldp->overlay_srv = nullptr;
+	ldp->overlay_unchanged = false;
+	ldp->gate_overlay_srv = nullptr;
 
 	// #158: ~1 Hz SR-platform health poll. This is the thing that ARMS the
 	// in-place weaver reconnect — the SR SDK never reports a platform restart,
@@ -1707,6 +1762,20 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		frame_ctr++;
 	}
 
+	// ADR-027 Amendment — hand the weaver the runtime's 2D over-layer for THIS
+	// weave: it composites the layer over the woven views in encoded space and
+	// band-limits it for the lens. set_overlay_2d already told the runtime we
+	// would, so a failure here loses the layer for one frame (logged once).
+	if (overlay_srv != nullptr) {
+		if (leiasr_d3d11_set_compose_layer(ldp->leiasr, overlay_srv, overlay_unchanged)) {
+			ldp->gate_overlay_srv = overlay_srv;
+		} else if (!ldp->overlay_lost_logged) {
+			ldp->overlay_lost_logged = true;
+			U_LOG_E("Leia D3D11 DP: 2D over-layer accepted but the weaver refused it at weave time - "
+			        "layer dropped this frame (logged once)");
+		}
+	}
+
 	leiasr_d3d11_weave(ldp->leiasr);
 
 	// Post-weave transparency pass:
@@ -1728,6 +1797,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	} else if (ck_should_run(ldp)) {
 		ck_run_post_weave_strip(ldp, ctx);
 	}
+	ldp->gate_overlay_srv = nullptr;
 }
 
 static bool
@@ -2195,6 +2265,42 @@ leia_dp_d3d11_set_shared_texture_present(struct xrt_display_processor_d3d11 *xdp
 	        enabled, enabled ? "SKIPPED" : "applied");
 }
 
+#ifdef XRT_DP_D3D11_HAS_OVERLAY_2D
+/*
+ * ADR-027 Amendment — the runtime's 2D over-layer for the next process_atlas.
+ * Accept it only when that weave can actually take it: a 3D frame (2D mode
+ * passthrough-blits and never weaves), a present display, and a weaver whose
+ * SR runtime has the ST-5788 compose (probed once per weaver). Otherwise
+ * return false and the runtime composites the layer post-weave itself, as
+ * before. Only ENCODED layers (the v1 contract; the weaver blends in encoded
+ * space).
+ */
+static bool
+leia_dp_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
+                             void *d3d11_context,
+                             void *overlay_srv,
+                             uint32_t width,
+                             uint32_t height,
+                             enum xrt_atlas_encoding encoding,
+                             bool layer_unchanged)
+{
+	(void)d3d11_context;
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	ldp->overlay_srv = nullptr;
+	ldp->overlay_unchanged = false;
+	if (overlay_srv == nullptr || width == 0 || height == 0 || encoding != XRT_ATLAS_ENCODING_ENCODED) {
+		return false;
+	}
+	if (ldp->view_count <= 1 || leia_platform_display_absent() ||
+	    !leiasr_d3d11_compose_available(ldp->leiasr)) {
+		return false;
+	}
+	ldp->overlay_srv = static_cast<ID3D11ShaderResourceView *>(overlay_srv);
+	ldp->overlay_unchanged = layer_unchanged;
+	return true;
+}
+#endif
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. Same D3D11 device as the compositor → the SRV is used directly
 // (no open/import, unlike the WGC desktop). NULL ⟹ clear (desktop-only).
@@ -2550,6 +2656,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.get_display_pixel_info = leia_dp_d3d11_get_display_pixel_info;
 	ldp->base.is_alpha_native = leia_dp_d3d11_is_alpha_native;
 	ldp->base.set_background_2d = leia_dp_d3d11_set_background_2d; // #491 part 3
+#ifdef XRT_DP_D3D11_HAS_OVERLAY_2D
+	ldp->base.set_overlay_2d = leia_dp_d3d11_set_overlay_2d; // ADR-027 Amendment — 2D under the lens
+#endif
 	ldp->base.set_transparent_background = leia_dp_d3d11_set_transparent_background; // #573 (sole transparency enable)
 	ldp->base.set_shared_texture_present = leia_dp_d3d11_set_shared_texture_present; // #68
 	ldp->base.destroy = leia_dp_d3d11_destroy;
