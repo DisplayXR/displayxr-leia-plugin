@@ -2064,6 +2064,8 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 			}
 			ctx->Unmap(ldp->zone_staging, 0);
 
+			const bool first_eval = !ldp->zone_eval_valid;
+			const bool verdict_changed = first_eval || ldp->zone_want_3d != any;
 			ldp->zone_want_3d = any;
 			ldp->zone_eval_seq = seq;
 			ldp->zone_eval_valid = true;
@@ -2076,12 +2078,23 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 			                      ? (double)(t1.QuadPart - ldp->zone_readback_t0_qpc) * 1000.0 /
 			                            (double)freq.QuadPart
 			                      : 0.0;
-			// Once per generation — not per frame.
-			U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
-			        "readback %.1f ms over %u poll%s%s)",
-			        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height, ms,
-			        ldp->zone_readback_polls, ldp->zone_readback_polls == 1 ? "" : "s",
-			        ldp->async_zone_publish ? "" : " [blocking]");
+			// Once per generation, but a generation is per MASK CHANGE: a page
+			// scrolling 3D tiles publishes a new one several times a second
+			// (measured ~2/s on the gallery, 2026-10-04), so a WARN here flooded
+			// the service log. WARN only when the verdict flips (or on the first
+			// evaluation); every other generation is INFO. "readback" is the
+			// latency across DO_NOT_WAIT polls, not time spent blocked.
+			if (verdict_changed) {
+				U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
+				        "readback %.1f ms over %u poll%s%s)",
+				        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height, ms,
+				        ldp->zone_readback_polls, ldp->zone_readback_polls == 1 ? "" : "s",
+				        ldp->async_zone_publish ? "" : " [blocking]");
+			} else {
+				U_LOG_I("SR D3D11 zone: generation %llu evaluated → %s (unchanged; readback %.1f ms over %u poll%s%s)",
+				        (unsigned long long)seq, any ? "3D" : "2D", ms, ldp->zone_readback_polls,
+				        ldp->zone_readback_polls == 1 ? "" : "s", ldp->async_zone_publish ? "" : " [blocking]");
+			}
 		}
 	}
 
