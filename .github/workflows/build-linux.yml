@@ -400,7 +400,20 @@ jobs:
       # (CMake FATAL_ERROR + the symbol check below). Build numbers are not
       # ordered across SR branches — 41935 is older than 10693 in API terms —
       # so check the header, not the number, when moving this pin.
-      SR_TAG: 1.37.0.10693
+      #
+      # 1.38.0.10108 (sr-sdk-v1.38.0.10108): first Linux SDK with the SR compose
+      # API — srWeaverSetComposeInputsVulkan (loader slot 94),
+      # srWeaverSetComposeOrder (81), srWeaverSetComposeLayerUnchanged (84),
+      # srWeaverSetComposeFilterStrength (85) — which the 2D-under-the-lens
+      # build probe (src/drv_leia_linux/CMakeLists.txt) keys on. Snap +
+      # present-origin are still present. Same tarball layout as 1.37.0.10693.
+      SR_TAG: 1.38.0.10108
+      # The exact asset and its sha256. The download is pinned to this name
+      # and refused on a hash mismatch: a re-uploaded asset under the same tag
+      # must be a deliberate pin change, never a silent swap. Move all three
+      # together.
+      SR_SDK_ASSET: LeiaSR-SDK-1.38.0.10108-linux64.tar.gz
+      SR_SDK_SHA256: c6c13a6e813112afb43376bd7c8c1a6c47e001964d9b522fa308d3cae4621dd8
       # Private Leia artifact repo hosting every sr-sdk-v* release (see
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
@@ -473,26 +486,36 @@ jobs:
             echo "::warning::LEIALOFT_GITHUB_TOKEN absent (fork PR?) — the Linux SR SDK lives on the private $SR_SDK_REPO release; skipping the Track B .deb."
             echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # Try common tarball extensions; the LeiaSR Linux build decides the
-          # exact name. Absent asset => soft-skip (the .deb path isn't live yet).
+          case "$SR_SDK_ASSET" in
+            "LeiaSR-SDK-$SR_TAG-linux64."*) ;;
+            *) echo "::error::SR_SDK_ASSET '$SR_SDK_ASSET' does not belong to SR_TAG '$SR_TAG' — move the pins together."
+               exit 1 ;;
+          esac
+          # Absent asset => soft-skip on a PR/branch (hard error on a v* tag).
           got=""
-          for ext in tar.gz tgz tar.xz zip; do
-            if gh release download "sr-sdk-v$SR_TAG" -R "$SR_SDK_REPO" \
-                 -p "LeiaSR-SDK-$SR_TAG-linux64.$ext" -D . 2>/dev/null; then
-              got="LeiaSR-SDK-$SR_TAG-linux64.$ext"; break
-            fi
-          done
+          if gh release download "sr-sdk-v$SR_TAG" -R "$SR_SDK_REPO" \
+               -p "$SR_SDK_ASSET" -D . 2>/dev/null; then
+            got="$SR_SDK_ASSET"
+          fi
           if [ -z "$got" ]; then
             # A v* release tag with no SDK would publish a release with no
             # Linux .deb at all (DebRelease just skips) — refuse that loudly.
             case "$GITHUB_REF" in
               refs/tags/v*)
-                echo "::error::No LeiaSR-SDK-$SR_TAG-linux64.* on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — a release tag cannot ship without the Track B .deb."
+                echo "::error::No $SR_SDK_ASSET on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — a release tag cannot ship without the Track B .deb."
                 exit 1 ;;
             esac
-            echo "::warning::No LeiaSR-SDK-$SR_TAG-linux64.* on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
+            echo "::warning::No $SR_SDK_ASSET on the $SR_SDK_REPO sr-sdk-v$SR_TAG release — skipping the Track B .deb. Upload the Linux SDK to that release to enable it (runtime #781)."
             echo "have_sdk=no" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          # Integrity: hard error on mismatch (PR or tag) — a wrong SDK must
+          # never be built into a .deb.
+          have_sha=$(sha256sum "$got" | cut -d' ' -f1)
+          if [ "$have_sha" != "$SR_SDK_SHA256" ]; then
+            echo "::error::$got sha256 mismatch: got $have_sha, pinned $SR_SDK_SHA256."
+            exit 1
+          fi
+          echo "$got sha256 OK ($have_sha)"
           mkdir -p _srsdk
           case "$got" in
             *.zip) unzip -q "$got" -d _srsdk ;;

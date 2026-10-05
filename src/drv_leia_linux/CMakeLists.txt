@@ -120,7 +120,7 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
                             "(declared in sr/sr_weaver.h AND linkable from srSDK::loader's libsrSDK_loader.a). "
                             "Window drags cannot phase-snap without it (runtime#1588, #271). "
                             "Minimum SR SDK: one that ships srWeaverSnapToPhase + srWeaverSetPresentOrigin "
-                            "(LeiaSR#85), e.g. the 1.37.0.10693 Linux SDK. The 1.37.0.41935 linux64 SDK "
+                            "(LeiaSR#85), e.g. the 1.37.0.10693 or 1.38.0.10108 Linux SDK. The 1.37.0.41935 linux64 SDK "
                             "predates it despite its higher build number (different branch). "
                             "Point SRSDK_ROOT at a newer SDK (in a FRESH build dir: the probe result is cached "
                             "in CMakeCache.txt), or pass -DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON for a non-release "

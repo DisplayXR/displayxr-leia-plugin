@@ -39,7 +39,10 @@ chase. It ships everything the plug-in configures against under `/opt/leiasr`:
 | CMake config package | `/opt/leiasr/lib/cmake/srSDK/srSDKConfig.cmake` |
 | active-runtime registration | `/etc/leia/sr/1/active_runtime.json` (written by this .deb) |
 
-So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`, `Deb` job `SR_TAG`) pins `1.37.0.10693`.
+So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`, `Deb` job `SR_TAG`) pins `1.38.0.10108`
+(asset `LeiaSR-SDK-1.38.0.10108-linux64.tar.gz`, sha256 checked against `SR_SDK_SHA256`;
+the first Linux SDK with the SR compose API — `srWeaverSetComposeInputsVulkan` etc. —
+that the 2D-under-the-lens build probe keys on; the previous pin was `1.37.0.10693`).
 **The SDK must ship `srWeaverSnapToPhase` + `srWeaverSetPresentOrigin` (LeiaSR#85)** —
 configure now fails without the snap call (#271) unless you pass
 `-DDXR_LEIA_LNX_ALLOW_NO_SNAP=ON` (bring-up only; the plug-in then logs
