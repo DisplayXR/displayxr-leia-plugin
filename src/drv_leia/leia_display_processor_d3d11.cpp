@@ -679,11 +679,19 @@ leia_dp_timing_enabled(void)
 {
 	static int s_on = -1;
 	if (s_on < 0) {
-		const char *a = std::getenv("DXR_WEAVE_GPU_TIMING");
-		const char *b = std::getenv("DXR_LEIA_DP_WEAVE_TIMING");
-		s_on = ((a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1')) ? 1 : 0;
+		// The process environment block, NOT the CRT's copy: with std::getenv
+		// this knob never armed in the service on the panel box although the
+		// runtime's own read of it did. Same read as env_present_opaque().
+		char buf[8];
+		DWORD na = GetEnvironmentVariableA("DXR_WEAVE_GPU_TIMING", buf, sizeof(buf));
+		const bool a = (na > 0 && na < sizeof(buf) && buf[0] == '1');
+		DWORD nb = GetEnvironmentVariableA("DXR_LEIA_DP_WEAVE_TIMING", buf, sizeof(buf));
+		const bool b = (nb > 0 && nb < sizeof(buf) && buf[0] == '1');
+		s_on = (a || b) ? 1 : 0;
 		if (s_on == 1) {
 			U_LOG_W("Leia D3D11 DP: weave timing on (DXR_WEAVE_GPU_TIMING) — logging every 5 s");
+		} else {
+			U_LOG_I("Leia D3D11 DP: weave timing off (DXR_WEAVE_GPU_TIMING unset)");
 		}
 	}
 	return s_on == 1;
