@@ -93,6 +93,13 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(sr_fb_sdk, "DXR_LEIA_SR_FB_SDK", false)
+/* 2D under the lens: DXR_LEIA_SR_COMPOSE=0 declines every layer (the runtime
+ * then blends it post-weave, as before) — an on-panel A/B, not a setting.
+ * DXR_LEIA_SR_COMPOSE_INLINE=1 keeps a composing weave inside OUR render pass,
+ * which makes SR fall back to its inline lens kernel (no prefilter passes, no
+ * v14 reuse) — the escape hatch should the SDK-owned pass misbehave. */
+DEBUG_GET_ONCE_BOOL_OPTION(sr_compose, "DXR_LEIA_SR_COMPOSE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(sr_compose_inline, "DXR_LEIA_SR_COMPOSE_INLINE", false)
 
 #define SDK_HALF_IPD_MM 31.5f /* nominal 63 mm IPD — R-T2 fallback pair */
 
@@ -726,6 +733,18 @@ struct leiasr_lnx
 
 	struct leiasr_lnx_eye_pair_mm last_good_pair;
 	bool have_last_good;
+
+	/* 2D under the lens (ADR-027 Amendment). The compose ORDER is sticky per
+	 * weaver and one weaver lives exactly as long as this struct, so the probe
+	 * runs once per instance (compose_probed) and its answer is compose_ok.
+	 * compose_strength_* latch the filter strength last APPLIED (sticky in SR
+	 * too), so the SDK call is made on change only. */
+	bool compose_probed;
+	bool compose_ok;
+	bool compose_strength_valid;
+	float compose_strength_applied;
+	bool compose_announced;   //!< first composited weave logged
+	bool compose_lost_logged; //!< a layer that reached the weave but could not be composited
 };
 
 static void
@@ -1242,6 +1261,147 @@ sdk_passthrough_blit(VkCommandBuffer cmd_buffer,
 
 /*
  *
+ * 2D under the lens (ADR-027 Amendment) — srWeaverSetComposeOrder +
+ * srWeaverSetComposeInputsVulkan (LeiaSR ST-5801 / ST-5792), plus the v14
+ * cache hint (srWeaverSetComposeLayerUnchanged) and the v15 strength
+ * (srWeaverSetComposeFilterStrength).
+ *
+ * Every one of these goes through the loader trampoline, like
+ * srWeaverSnapToPhase: an installed SR runtime that predates a call answers
+ * SR_ERROR_FUNCTION_UNSUPPORTED, which is the run-time guard. The build-time
+ * guard is CMake's check_symbol_exists against the SAME loader archive (see
+ * CMakeLists.txt) — the trampolines dispatch by slot index, so only a loader
+ * from the runtime's own tree is safe, exactly as for the snap call.
+ *
+ */
+
+static void
+sdk_compose_log_lost(struct leiasr_lnx *lnx, const char *why)
+{
+	if (!lnx->compose_lost_logged) {
+		lnx->compose_lost_logged = true;
+		U_LOG_W("leia_sr_sdk: 2D over-layer reached the weave but was NOT composited (%s) — dropped this frame "
+		        "(logged once)",
+		        why);
+	}
+}
+
+bool
+leiasr_lnx_compose_available(struct leiasr_lnx *lnx)
+{
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE
+	if (lnx == NULL || lnx->weaver == NULL) {
+		return false;
+	}
+	if (lnx->compose_probed) {
+		return lnx->compose_ok;
+	}
+	lnx->compose_probed = true;
+	if (!debug_get_bool_option_sr_compose()) {
+		U_LOG_W("leia_sr_sdk: SR weaver 2D compose DISABLED by DXR_LEIA_SR_COMPOSE=0 — the runtime composites "
+		        "the 2D over-layer post-weave");
+		return false;
+	}
+	/* SR_COMPOSE_ORDER_2D_OVER (1), deliberately NOT 2D_OVER_COVERAGE (3) as on
+	 * Windows. Order 3 writes the filtered 2D coverage into the output alpha,
+	 * i.e. alpha 0 over every woven 3D pixel. The D3D11 DP consumes that alpha
+	 * in its alpha gate; nothing here does — the woven output goes back to the
+	 * runtime (weave engine) or to a present that treats alpha as alpha — so
+	 * order 3 would only make the 3D transparent. Order 1 writes alpha 1.0, as
+	 * a weave without compose does. Sticky per weaver: set once here. */
+	const SrResult res = srWeaverSetComposeOrder(lnx->weaver, SR_COMPOSE_ORDER_2D_OVER);
+	lnx->compose_ok = !SR_FAILED(res);
+	U_LOG_W("leia_sr_sdk: SR weaver 2D compose %s (srWeaverSetComposeOrder(2D_OVER) = %s)",
+	        lnx->compose_ok ? "ENABLED — the runtime's 2D over-layer is composited and lens-filtered in the weave"
+	                        : "UNAVAILABLE — the runtime composites the 2D over-layer post-weave",
+	        srResultToString(res));
+	return lnx->compose_ok;
+#else
+	(void)lnx;
+	return false;
+#endif
+}
+
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE_STRENGTH
+/*!
+ * XR_DXR_weave v15 — the app's filter strength, sent only when it changes
+ * (sticky per weaver in SR; a fresh weaver starts at the runtime default, so a
+ * "default" request before anything was applied sends nothing).
+ */
+static void
+sdk_apply_compose_strength(struct leiasr_lnx *lnx, float strength)
+{
+	const float want = (strength >= 0.0f && strength <= 1.0f) ? strength : SR_COMPOSE_FILTER_STRENGTH_DEFAULT;
+	const bool is_default = want < 0.0f;
+	if (!lnx->compose_strength_valid && is_default) {
+		return;
+	}
+	if (lnx->compose_strength_valid && lnx->compose_strength_applied == want) {
+		return;
+	}
+	const SrResult res = srWeaverSetComposeFilterStrength(lnx->weaver, want);
+	/* Latched either way: a FUNCTION_UNSUPPORTED (SR runtime older than
+	 * ST-5799) means its own default applies, which is correct — logged once
+	 * per value change, never per frame. */
+	lnx->compose_strength_applied = want;
+	lnx->compose_strength_valid = true;
+	if (SR_FAILED(res)) {
+		U_LOG_W("leia_sr_sdk: srWeaverSetComposeFilterStrength(%.2f): %s — the SR runtime's default strength "
+		        "applies",
+		        (double)want, srResultToString(res));
+	} else if (is_default) {
+		U_LOG_W("leia_sr_sdk: SR weaver 2D compose: filter strength back to the SR runtime default (XR_DXR_weave "
+		        "v15)");
+	} else {
+		U_LOG_W("leia_sr_sdk: SR weaver 2D compose: filter strength %.2f (XR_DXR_weave v15)", (double)want);
+	}
+}
+#endif
+
+/*!
+ * Hand the weaver this weave's 2D layer. Called immediately before
+ * srWeaverWeave, after every early return of leiasr_lnx_weave, so a layer the
+ * SDK accepted is always consumed by the very next weave (it applies to that
+ * weave only, and must not survive into a later one holding a dead view).
+ */
+static bool
+sdk_set_compose_inputs(struct leiasr_lnx *lnx, const struct leiasr_lnx_weave_input *input)
+{
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE_STRENGTH
+	sdk_apply_compose_strength(lnx, input->compose_strength);
+#endif
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE_UNCHANGED
+	/* v14: per weave (SR clears it after each weave), so sent every frame. An
+	 * SR runtime without it re-filters every frame, which is correct. */
+	const SrResult ures =
+	    srWeaverSetComposeLayerUnchanged(lnx->weaver, input->compose_unchanged ? SR_TRUE : SR_FALSE);
+	if (SR_FAILED(ures)) {
+		LOG_SR_ONCE("srWeaverSetComposeLayerUnchanged (the weaver re-filters the layer every frame)", ures);
+	}
+#endif
+	const SrResult res = srWeaverSetComposeInputsVulkan(lnx->weaver, (SrVkImageView)input->compose_view,
+	                                                    (SrVkFormat)input->compose_format, 0);
+	if (SR_FAILED(res)) {
+		LOG_SR_ONCE("srWeaverSetComposeInputsVulkan", res);
+		sdk_compose_log_lost(lnx, srResultToString(res));
+		return false;
+	}
+	if (!lnx->compose_announced) {
+		lnx->compose_announced = true;
+		U_LOG_W("leia_sr_sdk: first 2D over-layer composited in the weave (view format %d, %s)",
+		        (int)input->compose_format,
+		        debug_get_bool_option_sr_compose_inline()
+		            ? "inside our render pass: SR's inline lens kernel (DXR_LEIA_SR_COMPOSE_INLINE=1)"
+		            : "SR-owned output pass: prefilter passes + v14 reuse available");
+	}
+	return true;
+}
+#endif
+
+
+/*
+ *
  * Surface (a) — Vulkan weaver.
  *
  */
@@ -1391,6 +1551,9 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 			        input->tile_columns, input->tile_rows);
 			logged = true;
 		}
+		if (input->compose_view != VK_NULL_HANDLE) {
+			sdk_compose_log_lost(lnx, "non-2x1 grid: passthrough blit, no weave");
+		}
 		sdk_passthrough_blit(cmd_buffer, input, output, viewport);
 		return;
 	}
@@ -1445,17 +1608,43 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 		return;
 	}
 
-	const bool fb_to_sdk = debug_get_bool_option_sr_fb_sdk();
+	/* 2D under the lens: a layer for this weave (the DP hands one only after
+	 * leiasr_lnx_compose_available said yes). SR filters it for the lens in
+	 * prefilter render passes of its own, which it can record only BEFORE the
+	 * output pass — i.e. only when it begins that pass itself. So a composing
+	 * weave hands the SDK a framebuffer, always OUR cached one: it is built
+	 * against our render pass, the same shape as SR's RenderPassCache pass
+	 * (one colour attachment, LOAD, COLOR_ATTACHMENT in/out, 0 dependencies),
+	 * hence compatible by construction — the caller's framebuffer may come
+	 * from a pass with dependencies (#280). Without a framebuffer, or with
+	 * DXR_LEIA_SR_COMPOSE_INLINE=1, the weave stays inside our pass and SR uses
+	 * its inline kernel (same lens box, no prefilter cache). */
+	bool composing = false;
+	VkFramebuffer compose_fb = VK_NULL_HANDLE;
+	if (input->compose_view != VK_NULL_HANDLE) {
+		if (lnx->compose_ok) {
+			composing = true;
+			if (!debug_get_bool_option_sr_compose_inline()) {
+				compose_fb = sdk_fb_cache_get(lnx, output);
+			}
+		} else {
+			sdk_compose_log_lost(lnx, "SR compose unavailable on this weaver");
+		}
+	}
+
+	const bool fb_to_sdk = debug_get_bool_option_sr_fb_sdk() || compose_fb != VK_NULL_HANDLE;
 
 	/* Outside any render pass, before either path begins one (#280). */
 	sdk_weave_target_barrier(cmd_buffer, output->image);
 
 	if (fb_to_sdk) {
-		/* Escape hatch: hand the caller framebuffer to the SDK and let it
-		 * begin its own render pass (framebuffer must be compatible with
-		 * the SDK's internal pass — the assumption under test). */
-		VkFramebuffer fb = output->framebuffer != VK_NULL_HANDLE ? output->framebuffer
-		                                                         : sdk_fb_cache_get(lnx, output);
+		/* Hand the framebuffer to the SDK and let it begin its own render
+		 * pass: a composing weave (above), or the DXR_LEIA_SR_FB_SDK escape
+		 * hatch (framebuffer must be compatible with the SDK's internal pass
+		 * — the assumption under test). */
+		VkFramebuffer fb = compose_fb != VK_NULL_HANDLE              ? compose_fb
+		                   : output->framebuffer != VK_NULL_HANDLE ? output->framebuffer
+		                                                           : sdk_fb_cache_get(lnx, output);
 		res = srWeaverSetOutputFrameBufferVulkan(lnx->weaver, (SrVkFramebuffer)fb, (int32_t)output->width,
 		                                         (int32_t)output->height, (SrVkFormat)output->format);
 		if (SR_FAILED(res)) {
@@ -1507,6 +1696,16 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	if (SR_FAILED(res)) {
 		LOG_SR_ONCE("srWeaverSetPresentOrigin", res);
 	}
+
+#ifdef DXR_LEIA_LNX_HAVE_SR_COMPOSE
+	/* Last thing before the weave, after every early return above: the layer
+	 * applies to the NEXT srWeaverWeave only and must never be left pending. */
+	if (composing) {
+		(void)sdk_set_compose_inputs(lnx, input);
+	}
+#else
+	(void)composing;
+#endif
 
 	res = srWeaverWeave(lnx->weaver);
 	if (SR_FAILED(res)) {

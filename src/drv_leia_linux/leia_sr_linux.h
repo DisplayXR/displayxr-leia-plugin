@@ -134,6 +134,24 @@ struct leiasr_lnx_weave_input
 	uint32_t tile_columns;
 	uint32_t tile_rows;
 	bool y_flip; //!< UV-flip toggle (R-W4; Vulkan apps render Y-down)
+
+	/*!
+	 * @name 2D under the lens (ADR-027 Amendment; runtime set_overlay_2d)
+	 * Optional 2D layer the weaver composites OVER the woven views inside the
+	 * weave and band-limits for the lens (srWeaverSetComposeInputsVulkan).
+	 * VK_NULL_HANDLE = none, the weave is exactly as before. Only meaningful
+	 * after @ref leiasr_lnx_compose_available returned true for this backend.
+	 * Contract (the SR one): output-viewport-sized, premultiplied, encoded
+	 * sRGB, RGBA8/BGRA8 (`_UNORM` or `_SRGB` view), in
+	 * SHADER_READ_ONLY_OPTIMAL when the weave's command buffer executes.
+	 * Applies to THIS weave only.
+	 * @{
+	 */
+	VkImageView compose_view;
+	VkFormat compose_format;
+	bool compose_unchanged;  //!< XR_DXR_weave v14: same pixels as the previous weave's layer
+	float compose_strength;  //!< XR_DXR_weave v15: [0,1], negative = the SR runtime's default
+	//! @}
 };
 
 /*!
@@ -384,6 +402,23 @@ leiasr_lnx_snap_to_phase(struct leiasr_lnx *lnx,
  */
 bool
 leiasr_lnx_has_sr_snap(const char **out_reason);
+
+/*!
+ * Can this backend's weaver composite a 2D layer inside the weave (ADR-027
+ * Amendment, "2D under the lens"; LeiaSR ST-5801/ST-5792)?
+ *
+ * Probed ONCE per backend instance (one weaver each) by setting the weaver's
+ * sticky compose order to SR_COMPOSE_ORDER_2D_OVER; the answer is cached. False
+ * on the stub, on a build without DXR_LEIA_LNX_HAVE_SR_COMPOSE (the SDK
+ * headers predate srWeaverSetComposeInputsVulkan), on an installed SR runtime
+ * that predates it (SR_ERROR_FUNCTION_UNSUPPORTED) or whose Vulkan weaver
+ * cannot compose (SR_ERROR_FEATURE_NOT_SUPPORTED), and when the
+ * DXR_LEIA_SR_COMPOSE=0 diagnostic switch is set. Every false of the last three
+ * kinds is logged once. A false means the runtime keeps compositing its 2D
+ * over-layer post-weave, exactly as before.
+ */
+bool
+leiasr_lnx_compose_available(struct leiasr_lnx *lnx);
 
 
 /*
