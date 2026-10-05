@@ -576,6 +576,10 @@ struct leia_display_processor_d3d11_impl
 	//! (negative = SR runtime default). Consumed with the layer.
 	float overlay_filter_strength;
 
+	//! DXR_WEAVE_GPU_TIMING=1 diagnostic state (P0 "2D under the lens");
+	//! allocated on first use only when the knob is on, else NULL.
+	struct leia_dp_timing *timing;
+
 #ifdef DXR_LEIA_DP_D3D11_LIFT
 	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
 	//! DLL load — destroyed in leia_dp_d3d11_destroy). NULL only on OOM.
@@ -587,6 +591,301 @@ static inline struct leia_display_processor_d3d11_impl *
 leia_dp_d3d11(struct xrt_display_processor_d3d11 *xdp)
 {
 	return (struct leia_display_processor_d3d11_impl *)xdp;
+}
+
+
+/*
+ *
+ * DXR_WEAVE_GPU_TIMING=1 (alias DXR_LEIA_DP_WEAVE_TIMING=1) — per-stage cost
+ * of the 3D weave, "2D under the lens" P0 instrumentation. The runtime's D3D11
+ * service reads the same knob for its own stages, so one env var on the service
+ * process arms both sides. Diagnostic only, off by default, env read once.
+ *
+ * GPU: four timestamps on the caller's immediate context bracket the stages of
+ * a 3D process_atlas — PRE (bg compose / chroma-key fill) | WEAVE (2D-layer
+ * hand-off + the SR weave call, incl. its in-weave compose) | POST_WEAVE (the
+ * alpha gate or the chroma-key strip) | END. Read back non-blocking, a few
+ * frames late (a set still in flight when its ring slot comes round again is
+ * dropped, never waited on). The SR SDK's own refilter count is in the SR log
+ * and is not duplicated here.
+ *
+ * One WARN line per DP every 5 s, never per frame.
+ *
+ */
+
+#define LEIA_DP_TIMING_RING 8
+
+enum leia_dp_timing_ts
+{
+	LDT_TS_PRE = 0,
+	LDT_TS_WEAVE,
+	LDT_TS_POST_WEAVE,
+	LDT_TS_END,
+	LDT_TS_COUNT,
+};
+
+enum leia_dp_timing_flag
+{
+	LDT_F_PRE_PASS = 1u << 0,     //!< bg compose or chroma-key fill ran before the weave
+	LDT_F_ALPHA_GATE = 1u << 1,   //!< the post-weave alpha gate ran
+	LDT_F_GATE_OVERLAY = 1u << 2, //!< ... with the composited 2D layer bound (has_overlay=2)
+	LDT_F_CK_STRIP = 1u << 3,     //!< the chroma-key strip ran instead
+};
+
+struct leia_dp_timing_stat
+{
+	double sum;
+	double max;
+	uint32_t n;
+};
+
+struct leia_dp_timing
+{
+	ID3D11Query *disjoint[LEIA_DP_TIMING_RING];
+	ID3D11Query *ts[LEIA_DP_TIMING_RING][LDT_TS_COUNT];
+	bool pending[LEIA_DP_TIMING_RING];
+	uint8_t flags[LEIA_DP_TIMING_RING];
+	uint32_t head;
+	int open_slot; //!< slot stamped by the current process_atlas, -1 = none
+
+	// GPU (ms), from read-back sets.
+	struct leia_dp_timing_stat gpu_pre;
+	struct leia_dp_timing_stat gpu_weave;
+	struct leia_dp_timing_stat gpu_gate;
+	struct leia_dp_timing_stat gpu_ck;
+	uint32_t gpu_n;
+	uint32_t gpu_disjoint;
+	uint32_t gpu_gate_overlay;
+
+	// CPU, per process_atlas.
+	struct leia_dp_timing_stat cpu_weave; //!< wall time of leiasr_d3d11_weave
+	uint32_t calls;
+	uint32_t weaves_3d;
+	uint32_t blits_2d;
+	uint32_t not_ready;
+	uint32_t bg_compose;
+	uint32_t layer_offered;
+	uint32_t layer_composed;
+	uint32_t layer_unchanged; //!< offered AND declared unchanged by the client (v14)
+	float strength_last;
+	float strength_min;
+	float strength_max;
+
+	uint64_t window_start_ms;
+};
+
+static bool
+leia_dp_timing_enabled(void)
+{
+	static int s_on = -1;
+	if (s_on < 0) {
+		const char *a = std::getenv("DXR_WEAVE_GPU_TIMING");
+		const char *b = std::getenv("DXR_LEIA_DP_WEAVE_TIMING");
+		s_on = ((a != nullptr && a[0] == '1') || (b != nullptr && b[0] == '1')) ? 1 : 0;
+		if (s_on == 1) {
+			U_LOG_W("Leia D3D11 DP: weave timing on (DXR_WEAVE_GPU_TIMING) — logging every 5 s");
+		}
+	}
+	return s_on == 1;
+}
+
+static void
+leia_dp_timing_stat_add(struct leia_dp_timing_stat *s, double v)
+{
+	s->sum += v;
+	if (v > s->max) {
+		s->max = v;
+	}
+	s->n++;
+}
+
+static double
+leia_dp_timing_stat_avg(const struct leia_dp_timing_stat *s)
+{
+	return s->n > 0 ? s->sum / (double)s->n : 0.0;
+}
+
+//! The DP's timing state, created on first use; NULL when the knob is off.
+static struct leia_dp_timing *
+leia_dp_timing_get(struct leia_display_processor_d3d11_impl *ldp)
+{
+	if (!leia_dp_timing_enabled()) {
+		return nullptr;
+	}
+	if (ldp->timing == nullptr) {
+		ldp->timing = (struct leia_dp_timing *)calloc(1, sizeof(*ldp->timing));
+		if (ldp->timing != nullptr) {
+			ldp->timing->open_slot = -1;
+			ldp->timing->strength_last = -1.0f;
+			ldp->timing->window_start_ms = GetTickCount64();
+		}
+	}
+	return ldp->timing;
+}
+
+static void
+leia_dp_timing_collect(struct leia_dp_timing *t, ID3D11DeviceContext *ctx, uint32_t slot)
+{
+	if (!t->pending[slot]) {
+		return;
+	}
+	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+	UINT64 v[LDT_TS_COUNT] = {};
+	if (ctx->GetData(t->disjoint[slot], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+		return; // still in flight
+	}
+	for (int i = 0; i < LDT_TS_COUNT; i++) {
+		if (ctx->GetData(t->ts[slot][i], &v[i], sizeof(v[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+			return;
+		}
+	}
+	t->pending[slot] = false;
+	if (dj.Disjoint || dj.Frequency == 0) {
+		t->gpu_disjoint++;
+		return;
+	}
+	const double to_ms = 1000.0 / (double)dj.Frequency;
+	auto span = [&](int a, int b) { return v[b] >= v[a] ? (double)(v[b] - v[a]) * to_ms : 0.0; };
+	const uint8_t f = t->flags[slot];
+	if ((f & LDT_F_PRE_PASS) != 0) {
+		leia_dp_timing_stat_add(&t->gpu_pre, span(LDT_TS_PRE, LDT_TS_WEAVE));
+	}
+	leia_dp_timing_stat_add(&t->gpu_weave, span(LDT_TS_WEAVE, LDT_TS_POST_WEAVE));
+	if ((f & LDT_F_ALPHA_GATE) != 0) {
+		leia_dp_timing_stat_add(&t->gpu_gate, span(LDT_TS_POST_WEAVE, LDT_TS_END));
+		if ((f & LDT_F_GATE_OVERLAY) != 0) {
+			t->gpu_gate_overlay++;
+		}
+	} else if ((f & LDT_F_CK_STRIP) != 0) {
+		leia_dp_timing_stat_add(&t->gpu_ck, span(LDT_TS_POST_WEAVE, LDT_TS_END));
+	}
+	t->gpu_n++;
+}
+
+//! Open this weave's query set and stamp LDT_TS_PRE.
+static void
+leia_dp_timing_begin(struct leia_dp_timing *t, ID3D11Device *device, ID3D11DeviceContext *ctx)
+{
+	t->open_slot = -1;
+	if (device == nullptr || ctx == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < LEIA_DP_TIMING_RING; i++) {
+		leia_dp_timing_collect(t, ctx, i);
+	}
+	const uint32_t slot = t->head;
+	t->head = (slot + 1) % LEIA_DP_TIMING_RING;
+	if (t->disjoint[slot] == nullptr) {
+		D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+		if (FAILED(device->CreateQuery(&qd, &t->disjoint[slot]))) {
+			t->disjoint[slot] = nullptr;
+			return;
+		}
+		qd.Query = D3D11_QUERY_TIMESTAMP;
+		for (int i = 0; i < LDT_TS_COUNT; i++) {
+			if (FAILED(device->CreateQuery(&qd, &t->ts[slot][i]))) {
+				t->ts[slot][i] = nullptr;
+				for (int k = 0; k < i; k++) {
+					t->ts[slot][k]->Release();
+					t->ts[slot][k] = nullptr;
+				}
+				t->disjoint[slot]->Release();
+				t->disjoint[slot] = nullptr;
+				return;
+			}
+		}
+	}
+	t->pending[slot] = false; // a set still in flight is dropped, not waited on
+	ctx->Begin(t->disjoint[slot]);
+	ctx->End(t->ts[slot][LDT_TS_PRE]);
+	t->open_slot = (int)slot;
+}
+
+static void
+leia_dp_timing_stamp(struct leia_dp_timing *t, ID3D11DeviceContext *ctx, int i)
+{
+	if (t != nullptr && t->open_slot >= 0) {
+		ctx->End(t->ts[t->open_slot][i]);
+	}
+}
+
+static void
+leia_dp_timing_end(struct leia_dp_timing *t, ID3D11DeviceContext *ctx, uint8_t flags)
+{
+	if (t == nullptr || t->open_slot < 0) {
+		return;
+	}
+	const int slot = t->open_slot;
+	ctx->End(t->ts[slot][LDT_TS_END]);
+	ctx->End(t->disjoint[slot]);
+	t->pending[slot] = true;
+	t->flags[slot] = flags;
+	t->open_slot = -1;
+}
+
+//! Once per process_atlas, on every path: log the 5 s window and reset it.
+static void
+leia_dp_timing_maybe_log(struct leia_dp_timing *t)
+{
+	if (t == nullptr) {
+		return;
+	}
+	const uint64_t now_ms = GetTickCount64();
+	const uint64_t window_ms = now_ms - t->window_start_ms;
+	if (window_ms < 5000) {
+		return;
+	}
+	U_LOG_W("Leia D3D11 DP timing %.1fs: process_atlas=%u (3D weave=%u, 2D blit=%u, not-ready/absent=%u) | "
+	        "2D layer: offered=%u composed=%u unchanged=%u strength last=%.2f min=%.2f max=%.2f "
+	        "(<0 = SR default) | bg-compose=%u | CPU sr_weave ms avg/max %.3f/%.3f | "
+	        "GPU ms avg/max n=%u disjoint=%u: pre_weave %.3f/%.3f (n=%u) sr_weave %.3f/%.3f "
+	        "alpha_gate %.3f/%.3f (n=%u, with 2D layer=%u) ck_strip %.3f/%.3f (n=%u)",
+	        (double)window_ms / 1000.0, t->calls, t->weaves_3d, t->blits_2d, t->not_ready, t->layer_offered,
+	        t->layer_composed, t->layer_unchanged, t->strength_last,
+	        t->layer_composed > 0 ? t->strength_min : -1.0f, t->layer_composed > 0 ? t->strength_max : -1.0f,
+	        t->bg_compose, leia_dp_timing_stat_avg(&t->cpu_weave), t->cpu_weave.max, t->gpu_n, t->gpu_disjoint,
+	        leia_dp_timing_stat_avg(&t->gpu_pre), t->gpu_pre.max, t->gpu_pre.n,
+	        leia_dp_timing_stat_avg(&t->gpu_weave), t->gpu_weave.max, leia_dp_timing_stat_avg(&t->gpu_gate),
+	        t->gpu_gate.max, t->gpu_gate.n, t->gpu_gate_overlay, leia_dp_timing_stat_avg(&t->gpu_ck),
+	        t->gpu_ck.max, t->gpu_ck.n);
+	t->gpu_pre = {};
+	t->gpu_weave = {};
+	t->gpu_gate = {};
+	t->gpu_ck = {};
+	t->gpu_n = 0;
+	t->gpu_disjoint = 0;
+	t->gpu_gate_overlay = 0;
+	t->cpu_weave = {};
+	t->calls = 0;
+	t->weaves_3d = 0;
+	t->blits_2d = 0;
+	t->not_ready = 0;
+	t->bg_compose = 0;
+	t->layer_offered = 0;
+	t->layer_composed = 0;
+	t->layer_unchanged = 0;
+	t->window_start_ms = now_ms;
+}
+
+static void
+leia_dp_timing_destroy(struct leia_dp_timing **tp)
+{
+	struct leia_dp_timing *t = *tp;
+	if (t == nullptr) {
+		return;
+	}
+	for (uint32_t s = 0; s < LEIA_DP_TIMING_RING; s++) {
+		if (t->disjoint[s] != nullptr) {
+			t->disjoint[s]->Release();
+		}
+		for (int i = 0; i < LDT_TS_COUNT; i++) {
+			if (t->ts[s][i] != nullptr) {
+				t->ts[s][i]->Release();
+			}
+		}
+	}
+	free(t);
+	*tp = nullptr;
 }
 
 
@@ -1491,6 +1790,27 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	ldp->overlay_filter_strength = -1.0f;
 	ldp->gate_overlay_srv = nullptr;
 
+	// DXR_WEAVE_GPU_TIMING (NULL when off): per-call counters, and the 5 s
+	// log on every exit path.
+	struct leia_dp_timing *timing = leia_dp_timing_get(ldp);
+	struct leia_dp_timing_log_guard
+	{
+		struct leia_dp_timing *t;
+		~leia_dp_timing_log_guard()
+		{
+			leia_dp_timing_maybe_log(t);
+		}
+	} timing_log_guard{timing};
+	if (timing != nullptr) {
+		timing->calls++;
+		if (overlay_srv != nullptr) {
+			timing->layer_offered++;
+			if (overlay_unchanged) {
+				timing->layer_unchanged++;
+			}
+		}
+	}
+
 	// #158: ~1 Hz SR-platform health poll. This is the thing that ARMS the
 	// in-place weaver reconnect — the SR SDK never reports a platform restart,
 	// so somebody has to look, and process_atlas is the only guaranteed
@@ -1560,6 +1880,9 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 
 	// 2D mode: passthrough stretch-blit (first tile fills target)
 	if (ldp->view_count == 1) {
+		if (timing != nullptr) {
+			timing->blits_2d++;
+		}
 		if (ldp->blit_vs == NULL || ldp->blit_ps == NULL) {
 			return;
 		}
@@ -1658,6 +1981,9 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// leave the target stale/garbage). Plain opaque blit: the transparency
 	// passes need weaver-adjacent state and the window lasts ~a second.
 	if (display_absent || !leiasr_d3d11_is_ready(ldp->leiasr)) {
+		if (timing != nullptr) {
+			timing->not_ready++;
+		}
 		if (ldp->blit_vs == NULL || ldp->blit_ps == NULL) {
 			return;
 		}
@@ -1712,6 +2038,17 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// alpha=1 surface stay backward-compatible under either path: chroma-key
 	// is a no-op (lerp(key, src.rgb, 1.0) == src.rgb); compose-under-bg
 	// overwrites their fill with the actual captured desktop (better!).
+	uint8_t ldt_flags = 0;
+	if (timing != nullptr) {
+		timing->weaves_3d++;
+		leia_dp_timing_begin(timing, ldp->device, ctx);
+		if (compose_should_run(ldp)) {
+			ldt_flags |= LDT_F_PRE_PASS;
+			timing->bg_compose++;
+		} else if (ck_should_run(ldp)) {
+			ldt_flags |= LDT_F_PRE_PASS;
+		}
+	}
 	void *weaver_srv = atlas_srv;
 	uint32_t atlas_w = tile_columns * view_width;
 	uint32_t atlas_h = tile_rows * view_height;
@@ -1767,6 +2104,8 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		frame_ctr++;
 	}
 
+	leia_dp_timing_stamp(timing, ctx, LDT_TS_WEAVE);
+
 	// ADR-027 Amendment — hand the weaver the runtime's 2D over-layer for THIS
 	// weave: it composites the layer over the woven views in encoded space and
 	// band-limits it for the lens. set_overlay_2d already told the runtime we
@@ -1783,7 +2122,41 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		}
 	}
 
+	if (timing != nullptr && ldp->gate_overlay_srv != nullptr) {
+		timing->layer_composed++;
+		if (timing->layer_composed == 1 || overlay_filter_strength < timing->strength_min) {
+			timing->strength_min = overlay_filter_strength;
+		}
+		if (timing->layer_composed == 1 || overlay_filter_strength > timing->strength_max) {
+			timing->strength_max = overlay_filter_strength;
+		}
+		timing->strength_last = overlay_filter_strength;
+	}
+	LARGE_INTEGER ldt_q0 = {};
+	if (timing != nullptr) {
+		QueryPerformanceCounter(&ldt_q0);
+	}
 	leiasr_d3d11_weave(ldp->leiasr);
+	if (timing != nullptr) {
+		LARGE_INTEGER q1 = {};
+		LARGE_INTEGER qf = {};
+		QueryPerformanceCounter(&q1);
+		QueryPerformanceFrequency(&qf);
+		if (qf.QuadPart > 0) {
+			leia_dp_timing_stat_add(&timing->cpu_weave,
+			                        (double)(q1.QuadPart - ldt_q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
+		}
+	}
+	leia_dp_timing_stamp(timing, ctx, LDT_TS_POST_WEAVE);
+
+	if (alpha_gate_should_run(ldp)) {
+		ldt_flags |= LDT_F_ALPHA_GATE;
+		if (ldp->gate_overlay_srv != nullptr) {
+			ldt_flags |= LDT_F_GATE_OVERLAY;
+		}
+	} else if (ck_should_run(ldp)) {
+		ldt_flags |= LDT_F_CK_STRIP;
+	}
 
 	// Post-weave transparency pass:
 	//   - compose path: alpha-gate samples the atlas directly to derive an
@@ -1804,6 +2177,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	} else if (ck_should_run(ldp)) {
 		ck_run_post_weave_strip(ldp, ctx);
 	}
+	leia_dp_timing_end(timing, ctx, ldt_flags);
 	ldp->gate_overlay_srv = nullptr;
 }
 
@@ -2611,6 +2985,7 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 
 	compose_release_resources(ldp);
 	ck_release_resources(ldp);
+	leia_dp_timing_destroy(&ldp->timing);
 
 	if (ldp->zone_staging != NULL) {
 		ldp->zone_staging->Release();
