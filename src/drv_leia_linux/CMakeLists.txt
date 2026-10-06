@@ -127,6 +127,46 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
                             "bring-up build.")
     endif()
 
+    # --- 2D under the lens (ADR-027 Amendment; LeiaSR ST-5801 / ST-5792) -----
+    # srWeaverSetComposeOrder + srWeaverSetComposeInputsVulkan let the Vulkan
+    # weaver composite the runtime's 2D over-layer inside the weave and filter it
+    # for the lens (runtime set_overlay_2d VK slot). Same probe shape as the snap
+    # above, for the same reason: the trampolines dispatch by slot index, so the
+    # answer has to come from THIS loader archive, not from a header alone.
+    # Unlike the snap this is OPTIONAL: an SDK without it (1.37.0.10693 and
+    # every SDK before the Linux compose line; CI pins 1.38.0.10108, which has
+    # it) compiles the feature out and the runtime keeps blending the layer
+    # post-weave. The two
+    # follow-ups (v14 cache hint, v15 strength) are probed separately: an SDK
+    # can carry the compose pair without them.
+    set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
+    set(CMAKE_REQUIRED_LIBRARIES srSDK::loader)
+    check_symbol_exists(srWeaverSetComposeInputsVulkan "sr/sr.h;sr/sr_vk.h" DXR_LEIA_LNX_HAVE_SR_COMPOSE_VK)
+    check_symbol_exists(srWeaverSetComposeOrder "sr/sr.h;sr/sr_weaver.h" DXR_LEIA_LNX_HAVE_SR_COMPOSE_ORDER)
+    check_symbol_exists(srWeaverSetComposeLayerUnchanged "sr/sr.h;sr/sr_weaver.h"
+                        DXR_LEIA_LNX_HAVE_SR_COMPOSE_UNCHANGED)
+    check_symbol_exists(srWeaverSetComposeFilterStrength "sr/sr.h;sr/sr_weaver.h"
+                        DXR_LEIA_LNX_HAVE_SR_COMPOSE_STRENGTH)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(DXR_LEIA_LNX_HAVE_SR_COMPOSE_VK AND DXR_LEIA_LNX_HAVE_SR_COMPOSE_ORDER)
+        target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_COMPOSE=1)
+        set(_compose_extras "")
+        if(DXR_LEIA_LNX_HAVE_SR_COMPOSE_UNCHANGED)
+            target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_COMPOSE_UNCHANGED=1)
+            string(APPEND _compose_extras " +v14 cache hint")
+        endif()
+        if(DXR_LEIA_LNX_HAVE_SR_COMPOSE_STRENGTH)
+            target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_COMPOSE_STRENGTH=1)
+            string(APPEND _compose_extras " +v15 filter strength")
+        endif()
+        message(STATUS "DisplayXR-LeiaSR: SR weaver 2D compose (2D under the lens) ENABLED${_compose_extras}")
+        unset(_compose_extras)
+    else()
+        message(STATUS "DisplayXR-LeiaSR: SR weaver 2D compose DISABLED (the SDK at ${_srsdk_snap_inc} predates "
+                       "srWeaverSetComposeInputsVulkan) - the runtime keeps blending its 2D over-layer post-weave")
+    endif()
+
     # DEV-ONLY convenience: bake the SDK lib dir as DT_RUNPATH so the static
     # loader's dlopen("libLeiaSR_runtime.so") resolves with zero environment
     # setup on a spike/bring-up box (glibc honors the CALLING object's

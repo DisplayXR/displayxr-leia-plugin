@@ -436,3 +436,12 @@ leiasr_lnx_has_sr_snap(const char **out_reason)
 	}
 	return false;
 }
+
+bool
+leiasr_lnx_compose_available(struct leiasr_lnx *lnx)
+{
+	/* The stub's passthrough blit has no weave to compose a 2D layer into, so
+	 * the runtime keeps its post-weave composite. */
+	(void)lnx;
+	return false;
+}

@@ -168,6 +168,22 @@ struct leia_dp_linux
 	//! Combined with the per-atlas canvas offset at weave time (present + viewport).
 	int32_t present_origin_x;
 	int32_t present_origin_y;
+
+	//! The grid of the last process_atlas: set_overlay_2d accepts a layer only
+	//! while the content is the 2x1 stereo the SR weaver weaves (a 1x1 frame
+	//! blits, an N-view grid falls back to a passthrough blit).
+	uint32_t last_tile_columns, last_tile_rows;
+
+	//! 2D under the lens (ADR-027 Amendment, runtime set_overlay_2d): the
+	//! runtime's 2D over-layer for the NEXT process_atlas only. NOT owned.
+	//! Stateless per frame: consumed and cleared at the top of process_atlas,
+	//! before any early return, so it can never leak into a later weave.
+	VkImageView overlay_view;
+	VkFormat overlay_format;
+	uint32_t overlay_w, overlay_h;
+	bool overlay_unchanged;        //!< XR_DXR_weave v14
+	float overlay_filter_strength; //!< XR_DXR_weave v15; negative = SR default. Consumed with the layer.
+	bool overlay_lost_logged;      //!< one WARN for an accepted layer that missed its weave
 };
 
 static inline struct leia_dp_linux *
@@ -1602,6 +1618,18 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
 	struct vk_bundle *vk = ldp->vk;
 
+	// 2D under the lens (ADR-027 Amendment): the over-layer applies to THIS
+	// call only. Taken here, before any early return, so it never leaks.
+	const VkImageView overlay_view = ldp->overlay_view;
+	const VkFormat overlay_format = ldp->overlay_format;
+	const uint32_t overlay_w = ldp->overlay_w;
+	const uint32_t overlay_h = ldp->overlay_h;
+	const bool overlay_unchanged = ldp->overlay_unchanged;
+	const float overlay_filter_strength = ldp->overlay_filter_strength;
+	ldp->overlay_view = VK_NULL_HANDLE;
+	ldp->overlay_unchanged = false;
+	ldp->overlay_filter_strength = -1.0f;
+
 	// Lazy transparency: adopt a capture the worker finished starting, stop
 	// one that is no longer wanted, age the ones waiting on the GPU.
 	dp_capture_reconcile(ldp, /*age_graveyard=*/true);
@@ -1609,6 +1637,33 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	// runtime#542: atlas processing follows the CONTENT, not the lens —
 	// the grid the runtime packed decides weave vs flat blit.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
+	ldp->last_tile_columns = tile_columns;
+	ldp->last_tile_rows = tile_rows;
+
+	// set_overlay_2d already told the runtime we would composite this layer,
+	// so a frame that cannot weave it loses it once (logged once). The checks
+	// mirror set_overlay_2d's, re-made against THIS frame.
+	VkImageView compose_view = VK_NULL_HANDLE;
+	if (overlay_view != VK_NULL_HANDLE) {
+		const uint32_t vp_w = canvas_width != 0 ? canvas_width : target_width;
+		const uint32_t vp_h = canvas_height != 0 ? canvas_height : target_height;
+		const char *why = NULL;
+		if (tile_columns != 2 || tile_rows != 1 || target_image == (VkImage_XDP)0) {
+			why = "this frame is not a 2x1 weave";
+		} else if (overlay_w != vp_w || overlay_h != vp_h) {
+			why = "layer size != weave viewport";
+		} else if (dp_transparency_live(ldp)) {
+			why = "transparency went live (the alpha-gate would punch the layer out)";
+		} else {
+			compose_view = overlay_view;
+		}
+		if (why != NULL && !ldp->overlay_lost_logged) {
+			ldp->overlay_lost_logged = true;
+			U_LOG_W("leia_lnx_dp: 2D over-layer accepted but not composited: %s — dropped this frame "
+			        "(logged once)",
+			        why);
+		}
+	}
 
 	// Single-view content: bypass the weaver, blit atlas content to target
 	// (same convention as the Windows DP's 2D path).
@@ -1739,6 +1794,12 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	     * above the cube. If a future producer supplies a bottom-up atlas, gate
 	     * this per-input rather than hardcoding.) */
 	    .y_flip = false,
+	    // ADR-027 Amendment: the runtime's 2D over-layer, composited and
+	    // lens-filtered by the weaver (VK_NULL_HANDLE = none).
+	    .compose_view = compose_view,
+	    .compose_format = overlay_format,
+	    .compose_unchanged = overlay_unchanged,
+	    .compose_strength = overlay_filter_strength,
 	};
 	struct leiasr_lnx_weave_output output = {
 	    .framebuffer = (VkFramebuffer)target_fb,
@@ -2073,6 +2134,68 @@ leia_lnx_dp_snap_window_rect(struct xrt_display_processor_vk *xdp_vk,
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D
+/*
+ * 2D under the lens (ADR-027 Amendment) — the Vulkan twin of the D3D11 arm's
+ * leia_dp_d3d11_set_overlay_2d: the runtime's 2D over-layer for the next
+ * process_atlas. Accept it only when that weave can actually take it: the
+ * content is the 2x1 stereo the SR weaver weaves (a 1x1 frame blits, an N-view
+ * grid falls back to a passthrough blit — both judged on the last frame's grid,
+ * as Windows judges on view_count), transparency is not live (the post-weave
+ * alpha-gate would punch the layer out wherever the atlas is transparent), the
+ * layer is in a format the SR contract names, ENCODED, and the weaver's SR
+ * runtime has the Vulkan compose (probed once per weaver). Otherwise return
+ * false and the runtime composites the layer post-weave itself, as before.
+ */
+static bool
+leia_lnx_dp_set_overlay_2d(struct xrt_display_processor_vk *xdp_vk,
+                           VkImageView overlay_view,
+                           VkFormat_XDP format,
+                           uint32_t width,
+                           uint32_t height,
+                           enum xrt_atlas_encoding encoding,
+                           bool layer_unchanged)
+{
+	struct leia_dp_linux *ldp = (struct leia_dp_linux *)xdp_vk;
+	ldp->overlay_view = VK_NULL_HANDLE;
+	ldp->overlay_unchanged = false;
+	if (overlay_view == VK_NULL_HANDLE || width == 0 || height == 0 || encoding != XRT_ATLAS_ENCODING_ENCODED) {
+		return false;
+	}
+	switch ((VkFormat)format) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB:
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: break;
+	default: return false; // srWeaverSetComposeInputsVulkan names exactly these four
+	}
+	if (ldp->last_tile_columns != 2 || ldp->last_tile_rows != 1 || dp_transparency_live(ldp) ||
+	    !leiasr_lnx_compose_available(ldp->sr)) {
+		return false;
+	}
+	ldp->overlay_view = (VkImageView)overlay_view;
+	ldp->overlay_format = (VkFormat)format;
+	ldp->overlay_w = width;
+	ldp->overlay_h = height;
+	ldp->overlay_unchanged = layer_unchanged;
+	return true;
+}
+#endif
+
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH
+/*
+ * XR_DXR_weave v15 — the app's lens-filter strength for the next weave's 2D
+ * layer. The runtime calls this right before set_overlay_2d every frame the
+ * layer goes to the DP; negative = the SR runtime's own default. Consumed with
+ * the layer at process_atlas; the backend forwards it only on change.
+ */
+static void
+leia_lnx_dp_set_overlay_2d_filter_strength(struct xrt_display_processor_vk *xdp_vk, float strength)
+{
+	((struct leia_dp_linux *)xdp_vk)->overlay_filter_strength = strength;
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
 /*
  * Rear depth budget background source (runtime ADR-040 / XR_DXR_depth_budget,
@@ -2284,6 +2407,17 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	// (sizeof the variant) covers it only when the headers carry it.
 	ldp->base.get_background_preview = leia_lnx_dp_get_background_preview;
 #endif
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D
+	// 2D under the lens (ADR-027 Amendment): the runtime's 2D over-layer is
+	// composited and lens-filtered inside the SR weave.
+	ldp->base.set_overlay_2d = leia_lnx_dp_set_overlay_2d;
+#endif
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH
+	ldp->base.set_overlay_2d_filter_strength = leia_lnx_dp_set_overlay_2d_filter_strength; // XR_DXR_weave v15
+#endif
+	// The struct is calloc'd: 0.0 would mean "no lens filtering". Start (and,
+	// against a runtime without the v15 slot, stay) at "SR default".
+	ldp->overlay_filter_strength = -1.0f;
 	// TODO(Track B): get_window_metrics (window-scoped Kooima, needs the
 	// X11 window position).
 	ldp->vk = vk;
@@ -2337,7 +2471,7 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 		const bool sr_snap = leiasr_lnx_has_sr_snap(&sr_snap_reason);
 		U_LOG_W(
 		    "leia_lnx_dp: built with rear-depth-budget background preview: %s; drag phase-snap slot: %s "
-		    "(SR-side snap call: %s); lazy transparency slot: %s",
+		    "(SR-side snap call: %s); lazy transparency slot: %s; 2D-under-the-lens slot: %s",
 #ifdef XRT_DP_VK_HAS_BACKGROUND_PREVIEW
 		    "YES",
 #else
@@ -2351,10 +2485,16 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 #endif
 		    sr_snap ? "YES" : "NO",
 #ifdef XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE
-		    "YES"
+		    "YES",
 #else
 		    "NO (runtime headers predate XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE — a transparency-capable session "
-		    "runs its desktop capture for its whole lifetime)"
+		    "runs its desktop capture for its whole lifetime)",
+#endif
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D
+		    "YES (the SR side is probed on the first layer)"
+#else
+		    "NO (runtime headers predate XRT_DP_VK_HAS_OVERLAY_2D — the runtime blends its 2D over-layer "
+		    "post-weave)"
 #endif
 		);
 		if (!sr_snap) {
