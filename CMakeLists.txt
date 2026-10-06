@@ -246,7 +246,7 @@ set(DXR_RUNTIME_GIT_TAG_LINUX "v2.27.0" CACHE STRING
 # reads the slot only when struct_size covers it). That is also why the runtime's
 # ABI-gated runtime-pin-bump.yml SKIPS this track -- an appended slot is
 # invisible to an ABI comparison, so the repin is human-driven.
-set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.16.19" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.26.0" CACHE STRING
     "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
 
 if(DXR_RUNTIME_SOURCE_DIR)

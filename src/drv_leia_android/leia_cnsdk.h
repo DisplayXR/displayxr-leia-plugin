@@ -455,6 +455,29 @@ leia_cnsdk_set_predicted_scanout(struct leia_cnsdk *cnsdk, uint64_t weave_to_sca
 bool
 leia_cnsdk_last_weave_dropped(struct leia_cnsdk *cnsdk);
 
+/*!
+ * 2D under the lens: whether the loaded core can composite a 2D over-layer inside
+ * the weave (experimental leia_interlacer_vulkan_set_overlay_2d, CNSDK#746).
+ */
+bool
+leia_cnsdk_overlay_2d_available(struct leia_cnsdk *cnsdk);
+
+/*!
+ * Hand the interlacer the 2D over-layer for the NEXT leia_cnsdk_weave only (the
+ * interlacer drops it after that weave). @p strength < 0 = the interlacer's default.
+ * Call on the weave thread, right before leia_cnsdk_weave.
+ *
+ * @return true when the next weave composites the layer.
+ */
+bool
+leia_cnsdk_set_overlay_2d(struct leia_cnsdk *cnsdk,
+                          VkImageView view,
+                          VkFormat format,
+                          uint32_t width,
+                          uint32_t height,
+                          float strength,
+                          bool layer_unchanged);
+
 #ifdef __cplusplus
 }
 #endif

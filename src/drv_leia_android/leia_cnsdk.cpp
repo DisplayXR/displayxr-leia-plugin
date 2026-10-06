@@ -71,6 +71,23 @@ typedef leia_bool (*leia_interlacer_get_last_weave_result)(struct leia_interlace
 #define leia_interlacer_get_last_weave_result_VERSION (1)
 #endif
 
+/*
+ * 2D under the lens (LeiaInc/CNSDK#746): the interlacer composites the runtime's
+ * 2D over-layer inside the weave. Same fallback shape as above: resolved by name,
+ * so a core without it yields NULL and the DP declines the layer (the runtime then
+ * keeps its post-weave composite, i.e. today's look).
+ */
+#if !defined(leia_interlacer_vulkan_set_overlay_2d_VERSION)
+typedef leia_bool (*leia_interlacer_vulkan_set_overlay_2d)(struct leia_interlacer *,
+                                                           VkImageView layerView,
+                                                           VkFormatInt format,
+                                                           int32_t width,
+                                                           int32_t height,
+                                                           float strength,
+                                                           leia_bool layerUnchanged);
+#define leia_interlacer_vulkan_set_overlay_2d_VERSION (1)
+#endif
+
 /*!
  * #1394: how many dropped-frame RUNS log verbatim before the 5 s throttle takes
  * over. Sized so a realistic episode (measured on the pad: 17 drops across 8
@@ -269,6 +286,8 @@ struct leia_cnsdk
 	// LeiaInc/CNSDK#734 — we then never report a drop, which is today's
 	// behaviour. See the typedef block at the top of this file.
 	leia_interlacer_get_last_weave_result fn_get_last_weave_result{nullptr};
+	// 2D under the lens: nullptr on a core without CNSDK#746.
+	leia_interlacer_vulkan_set_overlay_2d fn_set_overlay_2d{nullptr};
 	//! #1394: set by leia_cnsdk_weave from the call above; read by the DP
 	//! immediately after, on the same (render) thread. Never latched across
 	//! frames — the runtime asks about the frame it just submitted.
@@ -1036,6 +1055,10 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	// no core required.
 	leia_interlacer_get_last_weave_result fn_weave_result =
 	    LEIA_GET_EXPERIMENTAL_API(lib, leia_interlacer_get_last_weave_result);
+	leia_interlacer_vulkan_set_overlay_2d fn_overlay_2d =
+	    LEIA_GET_EXPERIMENTAL_API(lib, leia_interlacer_vulkan_set_overlay_2d);
+	U_LOG_W("HW_EYES: experimental API — vulkan_set_overlay_2d=%s (2D under the lens)",
+	        fn_overlay_2d != nullptr ? "OK" : "MISSING");
 	// #206: the per-frame prediction horizon sink. Absent on older CNSDK.
 #if defined(leia_interlacer_set_predicted_scanout_ns_VERSION)
 	leia_interlacer_set_predicted_scanout_ns fn_scanout =
@@ -1148,6 +1171,7 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 #endif
 	cnsdk->fn_nonpred_eyes = fn_nonpred_eyes;
 	cnsdk->fn_get_last_weave_result = fn_weave_result;
+	cnsdk->fn_set_overlay_2d = fn_overlay_2d;
 #ifdef XRT_OS_ANDROID
 	// Same gate as limit_orientations above: Activity-typed CNSDK calls
 	// (leia_core_on_pause/on_resume) are only safe with a real Activity.
@@ -2942,6 +2966,28 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 }
 
 extern "C" bool
+leia_cnsdk_overlay_2d_available(struct leia_cnsdk *cnsdk)
+{
+	return cnsdk != nullptr && cnsdk->fn_set_overlay_2d != nullptr;
+}
+
+bool
+leia_cnsdk_set_overlay_2d(struct leia_cnsdk *cnsdk,
+                          VkImageView view,
+                          VkFormat format,
+                          uint32_t width,
+                          uint32_t height,
+                          float strength,
+                          bool layer_unchanged)
+{
+	if (cnsdk == nullptr || cnsdk->fn_set_overlay_2d == nullptr || cnsdk->interlacer == nullptr) {
+		return false;
+	}
+	return cnsdk->fn_set_overlay_2d(cnsdk->interlacer, view, (VkFormatInt)format, (int32_t)width, (int32_t)height,
+	                                strength, layer_unchanged ? 1 : 0) != 0;
+}
+
+bool
 leia_cnsdk_last_weave_dropped(struct leia_cnsdk *cnsdk)
 {
 	// Plain read: written by leia_cnsdk_weave on the weave thread and read by
