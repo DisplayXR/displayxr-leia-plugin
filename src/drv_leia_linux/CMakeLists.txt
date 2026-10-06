@@ -133,9 +133,10 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     # for the lens (runtime set_overlay_2d VK slot). Same probe shape as the snap
     # above, for the same reason: the trampolines dispatch by slot index, so the
     # answer has to come from THIS loader archive, not from a header alone.
-    # Unlike the snap this is OPTIONAL: an SDK without it (CI's pinned
-    # 1.37.0.10693, every SDK before the Linux compose line) compiles the
-    # feature out and the runtime keeps blending the layer post-weave. The two
+    # Unlike the snap this is OPTIONAL: an SDK without it (1.37.0.10693 and
+    # every SDK before the Linux compose line; CI pins 1.38.0.10108, which has
+    # it) compiles the feature out and the runtime keeps blending the layer
+    # post-weave. The two
     # follow-ups (v14 cache hint, v15 strength) are probed separately: an SDK
     # can carry the compose pair without them.
     set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
