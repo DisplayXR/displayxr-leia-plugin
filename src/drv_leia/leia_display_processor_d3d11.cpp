@@ -369,6 +369,82 @@ float4 main(VSOut i) : SV_Target {
 }
 )";
 
+/*
+ * Mask-only post-weave alpha gate (P1 perf). The full gate above COPIES the
+ * whole woven target (CopyResource into ck_strip_tex) so it can read it back,
+ * then rewrites every pixel of the canvas. In the common configuration —
+ * no 2D-under backdrop, no opaque-present flatten, and either no 2D layer or a
+ * layer whose filtered coverage the weaver already wrote into the output alpha
+ * (SR_COMPOSE_ORDER_2D_OVER_COVERAGE, has_overlay == 2) — the full gate's
+ * result is a pure function of (woven pixel, "all views transparent here"):
+ *
+ *   all views transparent, has_overlay == 2 : out = woven            (identity)
+ *   all views transparent, has_overlay == 0 : out = (0,0,0,0)
+ *   any view opaque                          : out = (woven.rgb, 1)
+ *
+ * None of those needs the woven pixel in the SHADER — the output-merger can
+ * apply them to the render target in place. So this shader reads only the
+ * atlas, emits a selector, and the caller binds a blend state that does the
+ * rest; no CopyResource, no back-buffer read, and with has_overlay == 2 no
+ * write at all outside the woven content (discard):
+ *
+ *   has_overlay == 2 : blend off, write mask = ALPHA; opaque -> a = 1,
+ *                      transparent -> discard (pixel untouched).
+ *   has_overlay == 0 : RGB = dst * src.a, A = src.a (blend ZERO / SRC_ALPHA,
+ *                      ONE / ZERO); opaque -> src = (0,0,0,1) keeps dst.rgb with
+ *                      a = 1, transparent -> src = (0,0,0,0) punches (0,0,0,0).
+ *
+ * The "all views transparent" test is a copy of the full gate's loop and MUST
+ * stay identical to it (same exact-texel rule, same > 0.0 threshold). The
+ * cbuffer is the full gate's AlphaGateConstants, unchanged.
+ */
+static const char *alpha_gate_mask_ps_source = R"(
+Texture2D<float4> atlas      : register(t1);
+SamplerState samp            : register(s0);
+cbuffer Constants : register(b0) {
+	uint2 tile_count;
+	uint  has_backdrop;
+	uint  flatten;
+	float2 canvas_uv_origin;
+	float2 canvas_uv_extent;
+	float2 bg_uv_origin;
+	float2 bg_uv_extent;
+	float2 canvas_px;
+	uint  has_overlay;
+	uint  _pad_ov;
+};
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+float4 main(VSOut i) : SV_Target {
+	uint atlas_w, atlas_h;
+	atlas.GetDimensions(atlas_w, atlas_h);
+	float2 tile_px = float2(atlas_w, atlas_h) / float2(tile_count);
+	bool exact = all(abs(tile_px - canvas_px) < 0.5);
+	bool all_transparent = true;
+	for (uint ty = 0; ty < tile_count.y; ty++) {
+		for (uint tx = 0; tx < tile_count.x; tx++) {
+			float a;
+			if (exact) {
+				int2 px = int2(float2(tx, ty) * tile_px + i.uv * canvas_px);
+				a = atlas.Load(int3(px, 0)).a;
+			} else {
+				float2 uv_at_tile = (float2(tx, ty) + i.uv) / float2(tile_count);
+				a = atlas.SampleLevel(samp, uv_at_tile, 0).a;
+			}
+			if (a > 0.0) {
+				all_transparent = false;
+			}
+		}
+	}
+	if (!all_transparent) {
+		return float4(0.0, 0.0, 0.0, 1.0);
+	}
+	if (has_overlay == 2) {
+		discard; // the weaver's pixel (filtered 2D layer + its coverage) is the answer
+	}
+	return float4(0.0, 0.0, 0.0, 0.0);
+}
+)";
+
 
 // #116 — the runtime presents opaque (DXR_PRESENT_OPAQUE, runtime #833): DWM
 // completes no blends, so the alpha-gate must flatten everything itself. Same
@@ -534,6 +610,12 @@ struct leia_display_processor_d3d11_impl
 	// Post-weave alpha-gate (replaces ck_strip when compose is active).
 	ID3D11PixelShader *alpha_gate_ps;
 	ID3D11Buffer *alpha_gate_constants;  //!< sizeof(AlphaGateConstants).
+	//! Mask-only gate (alpha_gate_mask_ps_source): no strip copy, no
+	//! back-buffer read; the output-merger applies the result in place.
+	ID3D11PixelShader *alpha_gate_mask_ps;
+	ID3D11BlendState *alpha_gate_bs_alpha_only; //!< has_overlay == 2: blend off, write mask = A.
+	ID3D11BlendState *alpha_gate_bs_punch;      //!< has_overlay == 0: RGB = dst*src.a, A = src.a.
+	bool alpha_gate_mask_failed;                //!< mask pipeline unavailable: always the full gate.
 	//! @}
 
 	//! @name #158 SR platform hot reconnect
@@ -630,6 +712,7 @@ enum leia_dp_timing_flag
 	LDT_F_ALPHA_GATE = 1u << 1,   //!< the post-weave alpha gate ran
 	LDT_F_GATE_OVERLAY = 1u << 2, //!< ... with the composited 2D layer bound (has_overlay=2)
 	LDT_F_CK_STRIP = 1u << 3,     //!< the chroma-key strip ran instead
+	LDT_F_GATE_MASK_ONLY = 1u << 4, //!< the gate ran as the mask-only pass (no strip copy)
 };
 
 struct leia_dp_timing_stat
@@ -656,6 +739,7 @@ struct leia_dp_timing
 	uint32_t gpu_n;
 	uint32_t gpu_disjoint;
 	uint32_t gpu_gate_overlay;
+	uint32_t gpu_gate_mask_only; //!< read-back gates that took the mask-only pass
 
 	// CPU, per process_atlas.
 	struct leia_dp_timing_stat cpu_weave; //!< wall time of leiasr_d3d11_weave
@@ -764,6 +848,9 @@ leia_dp_timing_collect(struct leia_dp_timing *t, ID3D11DeviceContext *ctx, uint3
 		if ((f & LDT_F_GATE_OVERLAY) != 0) {
 			t->gpu_gate_overlay++;
 		}
+		if ((f & LDT_F_GATE_MASK_ONLY) != 0) {
+			t->gpu_gate_mask_only++;
+		}
 	} else if ((f & LDT_F_CK_STRIP) != 0) {
 		leia_dp_timing_stat_add(&t->gpu_ck, span(LDT_TS_POST_WEAVE, LDT_TS_END));
 	}
@@ -847,7 +934,7 @@ leia_dp_timing_maybe_log(struct leia_dp_timing *t)
 	        "2D layer: offered=%u composed=%u unchanged=%u strength last=%.2f min=%.2f max=%.2f "
 	        "(<0 = SR default) | bg-compose=%u | CPU sr_weave ms avg/max %.3f/%.3f | "
 	        "GPU ms avg/max n=%u disjoint=%u: pre_weave %.3f/%.3f (n=%u) sr_weave %.3f/%.3f "
-	        "alpha_gate %.3f/%.3f (n=%u, with 2D layer=%u) ck_strip %.3f/%.3f (n=%u)",
+	        "alpha_gate %.3f/%.3f (n=%u, with 2D layer=%u) ck_strip %.3f/%.3f (n=%u) gate_mask_only=%u",
 	        (double)window_ms / 1000.0, t->calls, t->weaves_3d, t->blits_2d, t->not_ready, t->layer_offered,
 	        t->layer_composed, t->layer_unchanged, t->strength_last,
 	        t->layer_composed > 0 ? t->strength_min : -1.0f, t->layer_composed > 0 ? t->strength_max : -1.0f,
@@ -855,7 +942,7 @@ leia_dp_timing_maybe_log(struct leia_dp_timing *t)
 	        leia_dp_timing_stat_avg(&t->gpu_pre), t->gpu_pre.max, t->gpu_pre.n,
 	        leia_dp_timing_stat_avg(&t->gpu_weave), t->gpu_weave.max, leia_dp_timing_stat_avg(&t->gpu_gate),
 	        t->gpu_gate.max, t->gpu_gate.n, t->gpu_gate_overlay, leia_dp_timing_stat_avg(&t->gpu_ck),
-	        t->gpu_ck.max, t->gpu_ck.n);
+	        t->gpu_ck.max, t->gpu_ck.n, t->gpu_gate_mask_only);
 	t->gpu_pre = {};
 	t->gpu_weave = {};
 	t->gpu_gate = {};
@@ -863,6 +950,7 @@ leia_dp_timing_maybe_log(struct leia_dp_timing *t)
 	t->gpu_n = 0;
 	t->gpu_disjoint = 0;
 	t->gpu_gate_overlay = 0;
+	t->gpu_gate_mask_only = 0;
 	t->cpu_weave = {};
 	t->calls = 0;
 	t->weaves_3d = 0;
@@ -1560,7 +1648,113 @@ compose_run_pre_weave(struct leia_display_processor_d3d11_impl *ldp,
  * the woven composed-bg content. Replaces ck_run_post_weave_strip when
  * compose-under-bg is the active path — no chroma keying involved.
  */
-static void
+enum alpha_gate_ran
+{
+	ALPHA_GATE_SKIPPED = 0,
+	ALPHA_GATE_FULL,      //!< strip copy + alpha_gate_ps (any configuration)
+	ALPHA_GATE_MASK_ONLY, //!< alpha_gate_mask_ps + output-merger blend (no copy)
+};
+
+// DXR_LEIA_ALPHA_GATE_FULL=1 forces the full gate everywhere (A/B against the
+// mask-only gate, and the rollback if a configuration turns out to differ).
+// Process environment block, like env_present_opaque(); read once.
+static bool
+env_alpha_gate_force_full(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char buf[8];
+		DWORD n = GetEnvironmentVariableA("DXR_LEIA_ALPHA_GATE_FULL", buf, sizeof(buf));
+		cached = (n > 0 && n < sizeof(buf) && buf[0] == '1') ? 1 : 0;
+		if (cached == 1) {
+			U_LOG_W("Leia D3D11 DP: DXR_LEIA_ALPHA_GATE_FULL=1 - mask-only alpha gate disabled");
+		}
+	}
+	return cached == 1;
+}
+
+//! The 8- and 10-bit UNORM families (incl. their TYPELESS / _SRGB members).
+static bool
+alpha_gate_mask_format_ok(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return true;
+	default: return false;
+	}
+}
+
+//! Lazily build the mask-only gate (shader + its two blend states). A failure
+//! is sticky and logged once; the full gate then serves every frame.
+static bool
+alpha_gate_mask_init(struct leia_display_processor_d3d11_impl *ldp)
+{
+	if (ldp->alpha_gate_mask_ps != nullptr && ldp->alpha_gate_bs_alpha_only != nullptr &&
+	    ldp->alpha_gate_bs_punch != nullptr) {
+		return true;
+	}
+	if (ldp->alpha_gate_mask_failed || ldp->device == nullptr) {
+		return false;
+	}
+	HRESULT hr = S_OK;
+	if (ldp->alpha_gate_mask_ps == nullptr) {
+		ID3DBlob *blob = nullptr;
+		ID3DBlob *err = nullptr;
+		hr = D3DCompile(alpha_gate_mask_ps_source, strlen(alpha_gate_mask_ps_source), nullptr, nullptr, nullptr,
+		                "main", "ps_5_0", 0, 0, &blob, &err);
+		if (SUCCEEDED(hr)) {
+			hr = ldp->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                     &ldp->alpha_gate_mask_ps);
+		} else {
+			U_LOG_E("Leia D3D11 DP: mask-only alpha-gate PS compile failed: 0x%08x %s", (unsigned)hr,
+			        err ? (const char *)err->GetBufferPointer() : "");
+		}
+		if (blob) blob->Release();
+		if (err) err->Release();
+	}
+	if (SUCCEEDED(hr) && ldp->alpha_gate_bs_alpha_only == nullptr) {
+		D3D11_BLEND_DESC bd = {};
+		bd.RenderTarget[0].BlendEnable = FALSE;
+		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+		hr = ldp->device->CreateBlendState(&bd, &ldp->alpha_gate_bs_alpha_only);
+	}
+	if (SUCCEEDED(hr) && ldp->alpha_gate_bs_punch == nullptr) {
+		D3D11_BLEND_DESC bd = {};
+		bd.RenderTarget[0].BlendEnable = TRUE;
+		bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+		bd.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_ALPHA;
+		bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+		bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+		bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		hr = ldp->device->CreateBlendState(&bd, &ldp->alpha_gate_bs_punch);
+	}
+	if (FAILED(hr) || ldp->alpha_gate_mask_ps == nullptr) {
+		ldp->alpha_gate_mask_failed = true;
+		U_LOG_E("Leia D3D11 DP: mask-only alpha gate unavailable (0x%08x) - using the full gate", (unsigned)hr);
+		return false;
+	}
+	U_LOG_W("Leia D3D11 DP: mask-only alpha gate ready (no strip copy when there is no backdrop/flatten and "
+	        "the 2D layer is absent or coverage-alpha)");
+	return true;
+}
+
+/*
+ * Returns which gate ran (ALPHA_GATE_*), for the DXR_WEAVE_GPU_TIMING line.
+ *
+ * P1 perf: the full gate costs a whole-target CopyResource plus a whole-canvas
+ * read + write. Where its result does not depend on reading the woven pixel in
+ * the shader (see alpha_gate_mask_ps_source) the mask-only gate produces the
+ * same output with neither.
+ */
+static enum alpha_gate_ran
 alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
                           ID3D11DeviceContext *ctx,
                           ID3D11ShaderResourceView *atlas_srv,
@@ -1580,7 +1774,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		compose_init_pipeline(ldp);
 	}
 	if (atlas_srv == nullptr || ldp->alpha_gate_ps == nullptr) {
-		return;
+		return ALPHA_GATE_SKIPPED;
 	}
 
 	ID3D11RenderTargetView *rtv = nullptr;
@@ -1588,7 +1782,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	ctx->OMGetRenderTargets(1, &rtv, &dsv);
 	if (rtv == nullptr) {
 		if (dsv) dsv->Release();
-		return;
+		return ALPHA_GATE_SKIPPED;
 	}
 
 	ID3D11Resource *rtv_res = nullptr;
@@ -1602,7 +1796,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		if (rtv_res) rtv_res->Release();
 		rtv->Release();
 		if (dsv) dsv->Release();
-		return;
+		return ALPHA_GATE_SKIPPED;
 	}
 
 	D3D11_TEXTURE2D_DESC bb_desc = {};
@@ -1627,17 +1821,37 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		rtv_res->Release();
 		rtv->Release();
 		if (dsv) dsv->Release();
-		return;
+		return ALPHA_GATE_SKIPPED;
 	}
-	if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height, bb_desc.Format)) {
-		back_buffer->Release();
-		rtv_res->Release();
-		rtv->Release();
-		if (dsv) dsv->Release();
-		return;
-	}
+	// The configuration decides which gate can serve this frame.
+	const uint32_t gate_has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u;                    // #491 part 3
+	const uint32_t gate_flatten = (env_present_opaque() && ldp->bg_shared_srv != nullptr) ? 1u : 0u; // #116
+	// ADR-027 Amendment: 2 = the weaver's output alpha IS the filtered coverage.
+	const uint32_t gate_has_overlay = (ldp->gate_overlay_srv == nullptr)                      ? 0u
+	                                  : leiasr_d3d11_compose_writes_coverage(ldp->leiasr) ? 2u
+	                                                                                    : 1u;
+	// Mask-only whenever the full gate would read nothing but the atlas and the
+	// woven pixel itself: no backdrop (t2), no flatten (t3), and a 2D layer that
+	// is either absent or already carries its exact alpha (has_overlay 1 needs
+	// the layer's own alpha AND the woven rgb in one max() — not expressible as
+	// a blend).
+	// Fixed-point targets only: the full gate saturate()s the woven alpha, which
+	// is the identity on UNORM and not necessarily on a float target.
+	const bool unorm_target = alpha_gate_mask_format_ok(bb_desc.Format);
+	const bool use_mask = gate_has_backdrop == 0 && gate_flatten == 0 && gate_has_overlay != 1 && unorm_target &&
+	                      !env_alpha_gate_force_full() && alpha_gate_mask_init(ldp);
 
-	ctx->CopyResource(ldp->ck_strip_tex, back_buffer);
+	if (!use_mask) {
+		if (!ck_ensure_strip_source(ldp, bb_desc.Width, bb_desc.Height, bb_desc.Format)) {
+			back_buffer->Release();
+			rtv_res->Release();
+			rtv->Release();
+			if (dsv) dsv->Release();
+			return ALPHA_GATE_SKIPPED;
+		}
+
+		ctx->CopyResource(ldp->ck_strip_tex, back_buffer);
+	}
 
 	// (#131) Restrict the gate to the canvas sub-rect: the woven 3D lives there,
 	// so i.uv (0..1 across this viewport) maps directly to the atlas tile-local
@@ -1666,8 +1880,8 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		AlphaGateConstants *cb = reinterpret_cast<AlphaGateConstants *>(m.pData);
 		cb->tile_count[0] = tile_columns;
 		cb->tile_count[1] = tile_rows;
-		cb->has_backdrop = (ldp->backdrop_srv != nullptr) ? 1u : 0u; // #491 part 3
-		cb->flatten = (env_present_opaque() && ldp->bg_shared_srv != nullptr) ? 1u : 0u; // #116
+		cb->has_backdrop = gate_has_backdrop; // #491 part 3
+		cb->flatten = gate_flatten;           // #116
 		cb->canvas_uv_origin[0] = cu_ox;
 		cb->canvas_uv_origin[1] = cu_oy;
 		cb->canvas_uv_extent[0] = cu_ex;
@@ -1678,10 +1892,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 		cb->bg_uv_extent[1] = ldp->bg_uv_last[3];
 		cb->canvas_px[0] = (float)vp_w;
 		cb->canvas_px[1] = (float)vp_h;
-		// ADR-027 Amendment: 2 = the weaver's output alpha IS the filtered coverage.
-		cb->has_overlay = (ldp->gate_overlay_srv == nullptr)                          ? 0u
-		                  : leiasr_d3d11_compose_writes_coverage(ldp->leiasr) ? 2u
-		                                                                        : 1u;
+		cb->has_overlay = gate_has_overlay;
 		cb->pad_ov = 0;
 		ctx->Unmap(ldp->alpha_gate_constants, 0);
 	}
@@ -1703,36 +1914,54 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	ctx->RSSetScissorRects(1, &sc);
 	ctx->OMSetRenderTargets(1, &rtv, nullptr);
 
-	// The gate REPLACES the back buffer (including its alpha) — it must not be
-	// alpha-blended. The service zones composite / weave can leave a src-over
-	// blend state bound; under that state the gate's float4(0,0,0,0) output for a
-	// transparent pixel computes dst*(1-0)=dst (a no-op), so the opaque black
-	// weave survives and the live desktop never shows. Force the default
-	// (blend-disabled, write-all-channels) state so α=0 actually lands. (#551 —
-	// in-process this happened to inherit a default state, masking the bug.)
-	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+	if (use_mask) {
+		// Mask-only: the output-merger applies the gate to the target in place
+		// (see alpha_gate_mask_ps_source for the two blend states' algebra).
+		ctx->OMSetBlendState(gate_has_overlay == 2 ? ldp->alpha_gate_bs_alpha_only : ldp->alpha_gate_bs_punch,
+		                     nullptr, 0xffffffffu);
+		ctx->IASetInputLayout(nullptr);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
+		ctx->PSSetShader(ldp->alpha_gate_mask_ps, nullptr, 0);
+		ID3D11ShaderResourceView *mask_srvs[2] = {nullptr, atlas_srv};
+		ctx->PSSetShaderResources(0, 2, mask_srvs);
+		ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
+		ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
+		ctx->Draw(4, 0);
+		// Leave the same (default) blend state the full gate leaves behind.
+		ctx->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+	} else {
+		// The gate REPLACES the back buffer (including its alpha) — it must not be
+		// alpha-blended. The service zones composite / weave can leave a src-over
+		// blend state bound; under that state the gate's float4(0,0,0,0) output for a
+		// transparent pixel computes dst*(1-0)=dst (a no-op), so the opaque black
+		// weave survives and the live desktop never shows. Force the default
+		// (blend-disabled, write-all-channels) state so α=0 actually lands. (#551 —
+		// in-process this happened to inherit a default state, masking the bug.)
+		ctx->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
 
-	ctx->IASetInputLayout(nullptr);
-	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
-	ctx->PSSetShader(ldp->alpha_gate_ps, nullptr, 0);
-	// #491 part 3 — t2 = the 2D-under backdrop (dummy = strip copy when absent;
-	// gated by has_backdrop).
-	ID3D11ShaderResourceView *ag_backdrop =
-	    (ldp->backdrop_srv != nullptr) ? ldp->backdrop_srv : ldp->ck_strip_srv;
-	// #116 — t3 = captured desktop for the flatten path (dummy = strip copy
-	// when compose-under-bg is off; gated by the flatten constant).
-	ID3D11ShaderResourceView *ag_bg =
-	    (ldp->bg_shared_srv != nullptr) ? ldp->bg_shared_srv : ldp->ck_strip_srv;
-	// ADR-027 Amendment — t4 = the 2D over-layer the weaver composited (dummy =
-	// strip copy when absent; gated by has_overlay).
-	ID3D11ShaderResourceView *ag_overlay =
-	    (ldp->gate_overlay_srv != nullptr) ? ldp->gate_overlay_srv : ldp->ck_strip_srv;
-	ID3D11ShaderResourceView *srvs[5] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop, ag_bg, ag_overlay};
-	ctx->PSSetShaderResources(0, 5, srvs);
-	ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
-	ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
-	ctx->Draw(4, 0);
+		ctx->IASetInputLayout(nullptr);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->VSSetShader(ldp->blit_vs, nullptr, 0);
+		ctx->PSSetShader(ldp->alpha_gate_ps, nullptr, 0);
+		// #491 part 3 — t2 = the 2D-under backdrop (dummy = strip copy when absent;
+		// gated by has_backdrop).
+		ID3D11ShaderResourceView *ag_backdrop =
+		    (ldp->backdrop_srv != nullptr) ? ldp->backdrop_srv : ldp->ck_strip_srv;
+		// #116 — t3 = captured desktop for the flatten path (dummy = strip copy
+		// when compose-under-bg is off; gated by the flatten constant).
+		ID3D11ShaderResourceView *ag_bg =
+		    (ldp->bg_shared_srv != nullptr) ? ldp->bg_shared_srv : ldp->ck_strip_srv;
+		// ADR-027 Amendment — t4 = the 2D over-layer the weaver composited (dummy =
+		// strip copy when absent; gated by has_overlay).
+		ID3D11ShaderResourceView *ag_overlay =
+		    (ldp->gate_overlay_srv != nullptr) ? ldp->gate_overlay_srv : ldp->ck_strip_srv;
+		ID3D11ShaderResourceView *srvs[5] = {ldp->ck_strip_srv, atlas_srv, ag_backdrop, ag_bg, ag_overlay};
+		ctx->PSSetShaderResources(0, 5, srvs);
+		ctx->PSSetSamplers(0, 1, &ldp->compose_sampler);
+		ctx->PSSetConstantBuffers(0, 1, &ldp->alpha_gate_constants);
+		ctx->Draw(4, 0);
+	}
 
 	ID3D11ShaderResourceView *null_srvs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 	ctx->PSSetShaderResources(0, 5, null_srvs);
@@ -1745,6 +1974,7 @@ alpha_gate_run_post_weave(struct leia_display_processor_d3d11_impl *ldp,
 	rtv_res->Release();
 	rtv->Release();
 	if (dsv) dsv->Release();
+	return use_mask ? ALPHA_GATE_MASK_ONLY : ALPHA_GATE_FULL;
 }
 
 static void
@@ -1752,6 +1982,10 @@ compose_release_resources(struct leia_display_processor_d3d11_impl *ldp)
 {
 	if (ldp->alpha_gate_constants) { ldp->alpha_gate_constants->Release(); ldp->alpha_gate_constants = nullptr; }
 	if (ldp->alpha_gate_ps)        { ldp->alpha_gate_ps->Release();        ldp->alpha_gate_ps = nullptr; }
+	if (ldp->alpha_gate_mask_ps)   { ldp->alpha_gate_mask_ps->Release();   ldp->alpha_gate_mask_ps = nullptr; }
+	if (ldp->alpha_gate_bs_alpha_only) { ldp->alpha_gate_bs_alpha_only->Release(); ldp->alpha_gate_bs_alpha_only = nullptr; }
+	if (ldp->alpha_gate_bs_punch)  { ldp->alpha_gate_bs_punch->Release();  ldp->alpha_gate_bs_punch = nullptr; }
+	ldp->alpha_gate_mask_failed = false;
 	if (ldp->bg_fence)             { ldp->bg_fence->Release();             ldp->bg_fence = nullptr; }
 	if (ldp->bg_shared_srv)        { ldp->bg_shared_srv->Release();        ldp->bg_shared_srv = nullptr; }
 	if (ldp->bg_shared_tex)        { ldp->bg_shared_tex->Release();        ldp->bg_shared_tex = nullptr; }
@@ -2176,12 +2410,15 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	//     fringe artifact at silhouettes.
 	//   - chroma-key fallback: legacy strip pass.
 	if (alpha_gate_should_run(ldp)) {
-		alpha_gate_run_post_weave(
+		const enum alpha_gate_ran gate = alpha_gate_run_post_weave(
 		    ldp, ctx,
 		    static_cast<ID3D11ShaderResourceView *>(atlas_srv),
 		    tile_columns, tile_rows,
 		    target_width, target_height,
 		    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height);
+		if (gate == ALPHA_GATE_MASK_ONLY) {
+			ldt_flags |= LDT_F_GATE_MASK_ONLY;
+		}
 	} else if (ck_should_run(ldp)) {
 		ck_run_post_weave_strip(ldp, ctx);
 	}
