@@ -177,6 +177,18 @@ struct leia_dp_cnsdk
 	// (`set_background_2d`) today and by a real capture producer later.
 	VkImageView bg2d_view;   //!< Runtime-owned backdrop, BORROWED (or NULL).
 	uint32_t bg2d_w, bg2d_h; //!< Backdrop dims (informational / logging).
+
+	// --- 2D under the lens (runtime set_overlay_2d, CNSDK#746) -------------
+	// The runtime's 2D over-layer for the NEXT process_atlas only: CNSDK
+	// band-limits it to the lens and composites it inside the weave. Cleared by
+	// process_atlas on every path (contract: stateless, per frame).
+	VkImageView ov2d_view;
+	VkFormat ov2d_format;
+	uint32_t ov2d_w, ov2d_h;
+	bool ov2d_unchanged;
+	float ov2d_strength;    //!< < 0 = CNSDK's default. Set by set_overlay_2d_filter_strength.
+	bool ov2d_last_3d;      //!< The previous process_atlas reached the stereo weave.
+	int ov2d_last_verdict;  //!< -1 unknown, 0 runtime composites, 1 CNSDK composites (log on flip).
 	bool cmp_inited;
 	VkFormat cmp_fmt;        //!< Atlas format the pass was built for.
 	VkRenderPass cmp_rp;
@@ -1964,6 +1976,68 @@ set_background_2d_cnsdk(struct xrt_display_processor *xdp, VkImageView backgroun
 }
 
 
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D
+/*
+ * 2D under the lens (runtime ADR-027 amendment, VK twin of the D3D11 slot).
+ *
+ * Returning true is a promise that the next process_atlas composites the layer,
+ * because the runtime then skips its own post-weave composite. So decline whenever
+ * that promise might not hold:
+ *   - not ENCODED, or not an 8-bit RGBA/BGRA layer (the CNSDK contract);
+ *   - the loaded core lacks CNSDK#746;
+ *   - session transparency is on: CNSDK writes opaque alpha, and the alpha gate
+ *     would rebuild alpha from the atlas alone and punch the 2D out where every
+ *     view is transparent (the D3D11 DP's "overlay mode 1" problem, not ported);
+ *   - the previous frame did not reach the stereo weave (mono / 2D mode, not ready):
+ *     its early returns would drop the layer. One frame of lag at a mode switch.
+ */
+static bool
+set_overlay_2d_cnsdk(struct xrt_display_processor_vk *xdp,
+                     VkImageView overlay_view,
+                     VkFormat_XDP format,
+                     uint32_t width,
+                     uint32_t height,
+                     enum xrt_atlas_encoding encoding,
+                     bool layer_unchanged)
+{
+	leia_dp_cnsdk *impl = as_impl(&xdp->base);
+	impl->ov2d_view = VK_NULL_HANDLE;
+
+	const VkFormat f = (VkFormat)format;
+	const bool fmt_ok = f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_B8G8R8A8_UNORM ||
+	                    f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
+	const bool accept = overlay_view != VK_NULL_HANDLE && width > 0u && height > 0u &&
+	                    encoding == XRT_ATLAS_ENCODING_ENCODED && fmt_ok && !impl->transparent_bg_enabled &&
+	                    impl->ov2d_last_3d && leia_cnsdk_overlay_2d_available(impl->cnsdk);
+
+	const int verdict = accept ? 1 : 0;
+	if (verdict != impl->ov2d_last_verdict) {
+		impl->ov2d_last_verdict = verdict;
+		U_LOG_W("Leia CNSDK DP: 2D layer %ux%u fmt=%d -> %s (core=%s transparent=%d last3d=%d)", width, height,
+		        (int)f, accept ? "composited by CNSDK inside the weave" : "declined, runtime composites post-weave",
+		        leia_cnsdk_overlay_2d_available(impl->cnsdk) ? "yes" : "no", (int)impl->transparent_bg_enabled,
+		        (int)impl->ov2d_last_3d);
+	}
+	if (!accept) {
+		return false;
+	}
+	impl->ov2d_view = overlay_view;
+	impl->ov2d_format = f;
+	impl->ov2d_w = width;
+	impl->ov2d_h = height;
+	impl->ov2d_unchanged = layer_unchanged;
+	return true;
+}
+#endif
+
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH
+static void
+set_overlay_2d_filter_strength_cnsdk(struct xrt_display_processor_vk *xdp, float strength)
+{
+	as_impl(&xdp->base)->ov2d_strength = strength;
+}
+#endif
+
 // Alpha-gate mode (#568), read once from `debug.dxr.alphagate`:
 //   1 (default) = woven per-pixel view-select — makes the parallax
 //                 de-occlusion band see-through (the fix).
@@ -2383,6 +2457,13 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// us the weave did not reach the GPU.
 	impl->last_frame_dropped = false;
 
+	// 2D under the lens: take this frame's layer (if the runtime offered one) and
+	// clear it at once, so no early return below can leak it into a later frame.
+	// ov2d_last_3d is re-armed only where the stereo weave actually runs.
+	const VkImageView ov2d_view = impl->ov2d_view;
+	impl->ov2d_view = VK_NULL_HANDLE;
+	impl->ov2d_last_3d = false;
+
 	// #201: the tracking watchdog is cycling core pause/resume to recover a
 	// lost frame subscription. CNSDK state is mid-teardown; running the
 	// interlacer now throws (observed: terminate()/__emutls SIGSEGV on this
@@ -2512,6 +2593,23 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// would poison the next frame.
 	VkSemaphore weave_done_sem =
 	    (compose_done_sem != VK_NULL_HANDLE) ? impl->cmp_weave_sem : VK_NULL_HANDLE;
+
+	// 2D under the lens: hand CNSDK this frame's layer right before the weave. A
+	// size mismatch cannot normally happen (the runtime only offers a target-sized
+	// layer), but it would mean CNSDK refuses, so check here and say so once.
+	impl->ov2d_last_3d = true;
+	if (ov2d_view != VK_NULL_HANDLE) {
+		bool ok = impl->ov2d_w == target_width && impl->ov2d_h == target_height &&
+		          leia_cnsdk_set_overlay_2d(impl->cnsdk, ov2d_view, impl->ov2d_format, impl->ov2d_w,
+		                                    impl->ov2d_h, impl->ov2d_strength, impl->ov2d_unchanged);
+		static bool warned = false;
+		if (!ok && !warned) {
+			warned = true;
+			U_LOG_W("Leia CNSDK DP: accepted a %ux%u 2D layer but CNSDK refused it for the %ux%u target; "
+			        "the 2D is missing from this frame",
+			        impl->ov2d_w, impl->ov2d_h, target_width, target_height);
+		}
+	}
 
 	const bool wove = leia_cnsdk_weave(impl->cnsdk,
 	                                   impl->vk->device,
@@ -2866,6 +2964,14 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	// inside struct_size (it is a BASE slot and we report
 	// sizeof(xrt_display_processor_vk)), so no ABI bump — ADR-020 clean.
 	impl->dp_vk.base.set_background_2d = set_background_2d_cnsdk;
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D
+	impl->dp_vk.set_overlay_2d = set_overlay_2d_cnsdk;
+	impl->ov2d_strength = -1.0f;
+	impl->ov2d_last_verdict = -1;
+#endif
+#ifdef XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH
+	impl->dp_vk.set_overlay_2d_filter_strength = set_overlay_2d_filter_strength_cnsdk;
+#endif
 #ifdef XRT_DP_VK_HAS_WINDOW_SCREEN_RECT
 	// runtime#1033 / #150: per-window weave phase. struct_size above already
 	// covers this slot (it is sizeof(xrt_display_processor_vk)), so filling the
