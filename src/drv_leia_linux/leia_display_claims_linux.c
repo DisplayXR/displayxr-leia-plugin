@@ -42,7 +42,10 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 uint16_t
 leia_lnx_pnp_to_manufacturer_id(const char *pnp)
@@ -431,4 +434,102 @@ leia_lnx_claims_lookup(uint64_t monitor_id, struct leia_lnx_claim_binding *out)
 	}
 	pthread_mutex_unlock(&g_bind_lock);
 	return found;
+}
+
+
+/*
+ *
+ * SR service device store (legacy FPC serial source).
+ *
+ */
+
+static bool
+serial_chars_ok(const char *s)
+{
+	if (s[0] == '\0') {
+		return false;
+	}
+	for (const char *c = s; *c != '\0'; c++) {
+		const bool ok = (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') ||
+		                *c == '.' || *c == '_' || *c == '-';
+		if (!ok) {
+			return false;
+		}
+	}
+	return strcmp(s, ".") != 0 && strcmp(s, "..") != 0;
+}
+
+bool
+leia_lnx_sr_device_store_serial_at(const char *active_link, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (active_link == NULL || active_link[0] == '\0') {
+		return false;
+	}
+
+	char target[512];
+	const ssize_t n = readlink(active_link, target, sizeof(target) - 1);
+	if (n <= 0 || (size_t)n >= sizeof(target) - 1) {
+		return false; // not a symlink, absent, or implausibly long
+	}
+	target[n] = '\0';
+	// Trailing slashes do not change what it points at.
+	size_t len = (size_t)n;
+	while (len > 1 && target[len - 1] == '/') {
+		target[--len] = '\0';
+	}
+
+	// Must be ".../Devices/<serial>" (relative "Devices/<serial>" in practice).
+	const char *base = strrchr(target, '/');
+	if (base == NULL) {
+		return false;
+	}
+	const char *serial = base + 1;
+	const size_t dir_len = (size_t)(base - target);
+	static const char kDevices[] = "Devices";
+	const size_t kd = sizeof(kDevices) - 1;
+	if (dir_len < kd || strncmp(base - kd, kDevices, kd) != 0 || (dir_len > kd && base[-(long)kd - 1] != '/')) {
+		return false;
+	}
+	if (!serial_chars_ok(serial) || strlen(serial) >= cap) {
+		return false;
+	}
+
+	// The target must exist (stat follows the link): a dangling link means
+	// the service has no active device.
+	struct stat st;
+	if (stat(active_link, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		return false;
+	}
+	snprintf(out, cap, "%s", serial);
+	return true;
+}
+
+bool
+leia_lnx_sr_device_store_serial(char *out, size_t cap, char *out_source, size_t source_cap)
+{
+	if (out_source != NULL && source_cap > 0) {
+		out_source[0] = '\0';
+	}
+	const char *xdg = getenv("XDG_CACHE_HOME");
+	if (xdg != NULL && xdg[0] == '/') {
+		char link[512];
+		const int w = snprintf(link, sizeof(link), "%s/leiasr/active", xdg);
+		if (w > 0 && (size_t)w < sizeof(link) && leia_lnx_sr_device_store_serial_at(link, out, cap)) {
+			if (out_source != NULL && source_cap > 0) {
+				snprintf(out_source, source_cap, "%s", link);
+			}
+			return true;
+		}
+	}
+	if (leia_lnx_sr_device_store_serial_at(LEIA_LNX_SR_DEVICE_STORE_ACTIVE, out, cap)) {
+		if (out_source != NULL && source_cap > 0) {
+			snprintf(out_source, source_cap, "%s", LEIA_LNX_SR_DEVICE_STORE_ACTIVE);
+		}
+		return true;
+	}
+	return false;
 }
