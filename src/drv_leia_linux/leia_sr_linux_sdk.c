@@ -2329,16 +2329,49 @@ leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap)
 		return false;
 	}
 	out_serial[0] = '\0';
+
+	/* 1. The SR service's device store (<root>/active -> Devices/<serial>),
+	 *    what the SR runtime's own resolveLinuxPrimaryDeviceSerial reads. The
+	 *    supported legacy source: no SR call, no context needed. */
+	char source[512];
+	if (leia_lnx_sr_device_store_serial(out_serial, cap, source, sizeof(source))) {
+		static char logged_serial[64];
+		if (strncmp(logged_serial, out_serial, sizeof(logged_serial)) != 0) {
+			snprintf(logged_serial, sizeof(logged_serial), "%s", out_serial);
+			U_LOG_I("leia_sr_sdk: FPC serial '%s' from the SR device store (%s)", out_serial, source);
+		}
+		return true;
+	}
+
+	/* 2. srLensGetSerialNumber (slot 48). A stub on the Linux line so far
+	 *    (SR_ERROR_FEATURE_NOT_SUPPORTED on 1.38) — kept as a last resort for
+	 *    a runtime that implements it; its failure is an INFO, once. */
 	bool ok = false;
 	pthread_mutex_lock(&g_ctx_lock);
 	if (g_ctx.state == SR_CTX_READY && !atomic_load(&g_ctx.context_invalid) && g_ctx.lens != NULL) {
 		uint32_t written = 0;
 		const SrResult res = srLensGetSerialNumber(g_ctx.lens, out_serial, (uint32_t)cap, &written);
-		if (SR_SUCCEEDED(res)) {
-			ok = out_serial[0] != '\0';
+		if (SR_SUCCEEDED(res) && out_serial[0] != '\0') {
+			ok = true;
+			static bool lens_logged;
+			if (!lens_logged) {
+				lens_logged = true;
+				U_LOG_I("leia_sr_sdk: FPC serial '%s' from srLensGetSerialNumber", out_serial);
+			}
 		} else {
-			LOG_SR_ONCE("srLensGetSerialNumber", res);
 			out_serial[0] = '\0';
+		}
+		if (!ok) {
+			static bool fail_logged;
+			if (!fail_logged) {
+				fail_logged = true;
+				U_LOG_I(
+				    "leia_sr_sdk: no FPC serial: SR device store has no active device (%s or "
+				    "$XDG_CACHE_HOME/leiasr/active) and srLensGetSerialNumber %s — claims stay at EDID "
+				    "confidence",
+				    LEIA_LNX_SR_DEVICE_STORE_ACTIVE,
+				    SR_FAILED(res) ? srResultToString(res) : "returned an empty serial");
+			}
 		}
 	}
 	pthread_mutex_unlock(&g_ctx_lock);

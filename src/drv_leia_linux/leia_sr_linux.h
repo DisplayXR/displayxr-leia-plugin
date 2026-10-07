@@ -540,10 +540,17 @@ leiasr_lnx_get_hardware_3d_state(struct leiasr_lnx *lnx, bool *out_is_3d);
 struct leia_lnx_sr_display; // leia_display_claims_linux.h
 
 /*!
- * FPC serial of the device the LIVE SR context drives (srLensGetSerialNumber,
- * slot 48, present on SR 1.38). Never creates a context; never touches the
- * lens preference (a serial read is not an enable/disable, LeiaSR #266).
- * @return false when there is no live context, no lens, or no serial.
+ * FPC serial of the device the SR service drives, for runtimes WITHOUT
+ * srEnumerateDisplays (which stays the preferred source). In order:
+ *   1. the SR service's device store, `<root>/active -> Devices/<serial>`
+ *      ($XDG_CACHE_HOME/leiasr, else /var/lib/leiasr/leiasr) — what the SR
+ *      runtime's own resolveLinuxPrimaryDeviceSerial reads; no context needed;
+ *   2. srLensGetSerialNumber (slot 48) on the live context — a stub on the
+ *      Linux line so far (SR_ERROR_FEATURE_NOT_SUPPORTED on 1.38).
+ * The source is logged once at INFO, a miss once at INFO. Never creates a
+ * context; never touches the lens preference (LeiaSR #266). The serial is
+ * system-wide: the claim logic uses it only with exactly one Leia panel.
+ * The stub backend returns false (no SR service behind it).
  */
 bool
 leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap);

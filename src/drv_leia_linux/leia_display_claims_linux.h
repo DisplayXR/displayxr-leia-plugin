@@ -146,6 +146,44 @@ leia_lnx_claims_store(const struct leia_lnx_claim_binding *bindings, uint32_t co
 bool
 leia_lnx_claims_lookup(uint64_t monitor_id, struct leia_lnx_claim_binding *out);
 
+/*
+ * SR service device store (the legacy FPC-serial source).
+ *
+ * On LeiaSR runtimes without srEnumerateDisplays (the 1.38 line), the FPC
+ * serial of the device the SR service drives is NOT available through the API
+ * (srLensGetSerialNumber is a stub on Linux: SR_ERROR_FEATURE_NOT_SUPPORTED).
+ * The service records it in its device store instead: `<root>/active` is a
+ * symlink to `Devices/<serial>`, exactly what the SR runtime's own
+ * resolveLinuxPrimaryDeviceSerial reads. <root> = $XDG_CACHE_HOME/leiasr — the
+ * service runs with XDG_CACHE_HOME=/var/lib/leiasr under systemd, so on a box
+ * with the .deb it is /var/lib/leiasr/leiasr. The serial is system-wide, not
+ * tied to a panel: the claim logic VERIFIES a monitor with it only when
+ * exactly one Leia panel is connected (leia_lnx_compute_claims).
+ */
+
+//! Default store link when $XDG_CACHE_HOME does not lead to one.
+#define LEIA_LNX_SR_DEVICE_STORE_ACTIVE "/var/lib/leiasr/leiasr/active"
+
+/*!
+ * Read one device-store `active` link: readlink, require the target to be
+ * `Devices/<serial>` (relative, or absolute ending so) and to exist as a
+ * directory (a dangling link = no active device), and return the basename.
+ * The serial must be 1..cap-1 chars of [A-Za-z0-9._-].
+ * @return true and the serial in @p out, else false and "" in @p out.
+ */
+bool
+leia_lnx_sr_device_store_serial_at(const char *active_link, char *out, size_t cap);
+
+/*!
+ * The active device's FPC serial from the SR service's device store:
+ * `$XDG_CACHE_HOME/leiasr/active` when XDG_CACHE_HOME is set and that link
+ * resolves, else LEIA_LNX_SR_DEVICE_STORE_ACTIVE. @p out_source (may be NULL)
+ * receives the link path that answered. Cheap (one or two readlink + stat),
+ * no SR call, no SR context.
+ */
+bool
+leia_lnx_sr_device_store_serial(char *out, size_t cap, char *out_source, size_t source_cap);
+
 #ifdef __cplusplus
 }
 #endif

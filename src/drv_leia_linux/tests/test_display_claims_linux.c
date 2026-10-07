@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int g_failures;
 
@@ -165,7 +167,7 @@ test_claims_edid_ids(void)
 	CHECK(c[0].serial[0] == '\0');
 	CHECK(strcmp(b[0].connector, "HDMI-A-1") == 0 && b[0].sr_display_id == 0);
 
-	// 1.38 with a live context's lens serial: one panel -> VERIFIED + serial.
+	// 1.38 with the legacy serial (SR device store): one panel -> VERIFIED + serial.
 	in.legacy_fpc_serial = "QI012321D10117";
 	n = leia_lnx_compute_claims(d, 2, &in, c, b, 4);
 	CHECK(n == 1 && c[0].confidence == XRT_DISPLAY_CLAIM_VERIFIED);
@@ -424,6 +426,119 @@ test_binding_table(void)
 	CHECK(!leia_lnx_claims_lookup(1, &out));
 }
 
+/* SR service device store: <root>/active -> Devices/<serial>, read with a
+ * fake tree under a temp dir (the shape /var/lib/leiasr/leiasr has on the
+ * DS1 box: active -> Devices/QI012321D10117). */
+static void
+mkdir_p2(const char *a, const char *b)
+{
+	char p[512];
+	snprintf(p, sizeof(p), "%s/%s", a, b);
+	(void)mkdir(p, 0755);
+}
+
+static void
+link_at(const char *dir, const char *name, const char *target)
+{
+	char p[512];
+	snprintf(p, sizeof(p), "%s/%s", dir, name);
+	(void)unlink(p);
+	CHECK(symlink(target, p) == 0);
+}
+
+static void
+test_device_store(void)
+{
+	char root[] = "/tmp/leia_devstore_XXXXXX";
+	CHECK(mkdtemp(root) != NULL);
+	char store[256], link[320], serial[64];
+	snprintf(store, sizeof(store), "%s/leiasr", root);
+	(void)mkdir(store, 0755);
+	mkdir_p2(store, "Devices");
+	mkdir_p2(store, "Devices/QI012321D10117");
+	mkdir_p2(store, "Other");
+	mkdir_p2(store, "Other/QI000");
+	snprintf(link, sizeof(link), "%s/active", store);
+
+	// The real shape: relative Devices/<serial>.
+	link_at(store, "active", "Devices/QI012321D10117");
+	CHECK(leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	CHECK(strcmp(serial, "QI012321D10117") == 0);
+
+	// Absolute target and a trailing slash are fine.
+	char abs_target[320];
+	snprintf(abs_target, sizeof(abs_target), "%s/Devices/QI012321D10117/", store);
+	link_at(store, "active", abs_target);
+	CHECK(leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	CHECK(strcmp(serial, "QI012321D10117") == 0);
+
+	// Dangling link: the service has no active device.
+	link_at(store, "active", "Devices/QI999");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	CHECK(serial[0] == '\0');
+
+	// Not under Devices/, a bare name, "Devices" itself, suffix-only match.
+	link_at(store, "active", "Other/QI000");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	link_at(store, "active", "Devices");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	mkdir_p2(store, "NotDevices");
+	mkdir_p2(store, "NotDevices/QI1");
+	link_at(store, "active", "NotDevices/QI1");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+
+	// Implausible serial characters.
+	mkdir_p2(store, "Devices/bad serial");
+	link_at(store, "active", "Devices/bad serial");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+
+	// Too small an output buffer.
+	link_at(store, "active", "Devices/QI012321D10117");
+	char tiny[8];
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, tiny, sizeof(tiny)));
+
+	// A plain directory named "active" is not the service's link.
+	(void)unlink(link);
+	mkdir_p2(store, "active");
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	(void)rmdir(link);
+
+	// Absent link / NULL.
+	CHECK(!leia_lnx_sr_device_store_serial_at(link, serial, sizeof(serial)));
+	CHECK(!leia_lnx_sr_device_store_serial_at(NULL, serial, sizeof(serial)));
+
+	// Resolver: $XDG_CACHE_HOME/leiasr/active wins when it resolves.
+	link_at(store, "active", "Devices/QI012321D10117");
+	const char *old_xdg = getenv("XDG_CACHE_HOME");
+	char saved[512] = {0};
+	if (old_xdg != NULL) {
+		snprintf(saved, sizeof(saved), "%s", old_xdg);
+	}
+	setenv("XDG_CACHE_HOME", root, 1);
+	char source[512];
+	CHECK(leia_lnx_sr_device_store_serial(serial, sizeof(serial), source, sizeof(source)));
+	CHECK(strcmp(serial, "QI012321D10117") == 0);
+	CHECK(strcmp(source, link) == 0);
+	if (old_xdg != NULL) {
+		setenv("XDG_CACHE_HOME", saved, 1);
+	} else {
+		unsetenv("XDG_CACHE_HOME");
+	}
+
+	// Cleanup (best effort).
+	char p[600];
+	(void)unlink(link);
+	const char *dirs[] = {
+	    "Devices/bad serial", "Devices/QI012321D10117", "Devices", "Other/QI000", "Other", "NotDevices/QI1",
+	    "NotDevices"};
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		snprintf(p, sizeof(p), "%s/%s", store, dirs[i]);
+		(void)rmdir(p);
+	}
+	(void)rmdir(store);
+	(void)rmdir(root);
+}
+
 int
 main(void)
 {
@@ -436,6 +551,7 @@ main(void)
 	test_fallback_claim();
 	test_claims_stride();
 	test_binding_table();
+	test_device_store();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_display_claims_linux: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

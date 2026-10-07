@@ -242,9 +242,17 @@ identity, never by name). The runtime's monitors are matched against that list
 - **By origin + size**, else by an unambiguous size match, when it does not (the runtime's
   XWayland path, #251). An eDP that shares the panel's resolution is never claimed.
 - **Confidence, SR 1.38** (the installed `.deb`): `EDID` (50), or `VERIFIED` (100) with
-  `serial` = the lens's FPC serial (`srLensGetSerialNumber`) when a live SR context exists
-  **and exactly one** Leia panel is connected. That serial is system-global, so with two
-  panels it cannot be attributed and both stay at `EDID`.
+  `serial` = the SR service's active device. That serial is read from the service's device
+  store: `<root>/active` is a symlink to `Devices/<serial>`, with `<root>` =
+  `$XDG_CACHE_HOME/leiasr`, else `/var/lib/leiasr/leiasr` (the service runs with
+  `XDG_CACHE_HOME=/var/lib/leiasr`). This is the file the SR runtime's own
+  `resolveLinuxPrimaryDeviceSerial` reads. A dangling link means no active device. The
+  monitor is `VERIFIED` only when the service has an active device **and exactly one**
+  Leia panel is connected. The serial is system-wide, so with two panels it cannot be
+  attributed and both stay at `EDID`. **`srLensGetSerialNumber` is a stub on the Linux
+  line** (`SR_ERROR_FEATURE_NOT_SUPPORTED` on 1.38). It is kept only as a last resort,
+  and on 1.38 `VERIFIED` comes from the device store, never from that call. The source is
+  logged once at INFO (`FPC serial '…' from the SR device store (…)`), and so is a miss.
 - **Confidence, new SR API** (`srEnumerateDisplays`, LeiaSR Linux line 876620d62+):
   `VERIFIED` + FPC serial when SR reports the display `FPC_VERIFIED`, joined by DRM
   connector, then EDID ids + serial. SR's list is authoritative, so a monitor SR lists but
@@ -358,6 +366,16 @@ That release is recorded as "nothing to re-apply", not as a 2D wish. Without it 
 long-lived service process would hold an ENABLE preference forever, and SRService keeps
 the lens on while any client does (§4, "Co-existing"). The rules and their test live in
 `leia_lens_owner_linux.h` / `test_lens_owner_linux`.
+
+**Build the plug-in with the runtime's build type.** The loader compares `sizeof(struct
+vk_bundle)` and its function-table offset exactly (#1243). `struct os_mutex` carries two
+debug-only fields under `#ifndef NDEBUG`, and `vk_bundle` holds two of them, so a
+RelWithDebInfo/Release plug-in (NDEBUG) is 16 bytes short of a Debug runtime (2176/784 vs
+2192/800). The runtime then logs `vk_bundle ABI mismatch … Refusing the VK DP factory` and
+no Leia code runs. `scripts/build_linux.sh` builds the runtime as Debug, so configure the
+plug-in with `-DCMAKE_BUILD_TYPE=Debug` against it. To check without loading anything, dlopen
+both `.so`s and read `vk_bundle_abi_size` / `vk_bundle_fn_table_offset` from the iface
+`xrtPluginNegotiate` returns (negotiate does not probe or create an SR context).
 
 **Refresh** (#184): `srDisplayGetRefreshRate` when the SDK has it (CMake
 `DXR_LEIA_LNX_HAVE_SR_REFRESH`, compile + link probe) and the runtime answers a plausible
