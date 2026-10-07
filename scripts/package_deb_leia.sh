@@ -295,7 +295,11 @@ printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$PKG" "$PKG" >"$SHLIBS_
 LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O "$STAGED_SO" | sed -n 's/^shlibs:Depends=//p')"
 rm -rf "$SHLIBS_TMP"
 [ -n "$LIB_DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
-DEPENDS="displayxr-runtime, $LIB_DEPENDS"
+# Versioned (multi-screen M4 review): the plug-in's Vulkan weaver is windowless,
+# so the LeiaSR SDK no longer refuses a resampled X11 window itself; the runtime
+# does that from v2.27.1 (#1831). On an older runtime a scaled-desktop X11 app
+# would weave a double image.
+DEPENDS="displayxr-runtime (>= 2.27.1), $LIB_DEPENDS"
 # cube-hw finding (B): the SR runtime bundles copies of common .so's under
 # /opt/leiasr/lib. On a box whose linker path reaches them, the owning package
 # comes out as the vendor SR package — which must stay a Recommends, never a
@@ -343,7 +347,7 @@ Description: DisplayXR Leia SR display processor (Linux plug-in)
  vendor probe_order (50), so it claims the display ahead of the built-in
  sim-display fallback whenever the Leia SR runtime is present and reachable.
  .
- Requires the DisplayXR runtime (Depends: displayxr-runtime). The Leia SR
+ Requires the DisplayXR runtime 2.27.1 or newer. The Leia SR
  runtime is a Recommends: without it the plug-in still installs and its probe
  declines, so sim-display drives apps. The plug-in resolves the SR runtime via
  /etc/leia/sr/1/active_runtime.json (registered by the SR runtime installer) —

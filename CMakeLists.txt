@@ -212,7 +212,15 @@ set(DXR_RUNTIME_GIT_TAG "v2.27.0" CACHE STRING
 # Not in v2.17.1: the VK snap_window_rect slot (runtime#1592,
 # XRT_DP_VK_HAS_SNAP_WINDOW_RECT), so drag phase-snap compiles out at this pin
 # (expected; it compiles in automatically at the first pin that carries it).
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.27.0" CACHE STRING
+# v2.29.0 (from v2.27.0), multi-screen M4 review: the Vulkan weaver is now
+# windowless on every path (window = 0), which drops the LeiaSR SDK's own
+# refusal to weave into a resampled X11 window. The runtime took that refusal
+# over in v2.27.1 (#1831: X11 on a fractionally scaled panel presents 2D), so
+# the Linux pin moves past it (to the current tag), and the .deb now Depends
+# on displayxr-runtime (>= 2.27.1) (scripts/package_deb_leia.sh) — an older
+# runtime would weave a scaled X11 window into a double image. vk_bundle /
+# os_mutex / xrt_plugin.h are unchanged v2.27.0..v2.29.0.
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.29.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
