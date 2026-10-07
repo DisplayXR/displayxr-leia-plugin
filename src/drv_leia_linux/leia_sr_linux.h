@@ -544,11 +544,14 @@ struct leia_lnx_sr_display; // leia_display_claims_linux.h
  * srEnumerateDisplays (which stays the preferred source). In order:
  *   1. the SR service's device store, `<root>/active -> Devices/<serial>`
  *      ($XDG_CACHE_HOME/leiasr, else /var/lib/leiasr/leiasr) — what the SR
- *      runtime's own resolveLinuxPrimaryDeviceSerial reads; no context needed;
+ *      runtime's own resolveLinuxPrimaryDeviceSerial reads — consulted ONLY
+ *      while a live SR context exists (service reachable): Devices/ keeps
+ *      every device ever seen and `active` can be stale when SRService is
+ *      stopped;
  *   2. srLensGetSerialNumber (slot 48) on the live context — a stub on the
  *      Linux line so far (SR_ERROR_FEATURE_NOT_SUPPORTED on 1.38).
- * The source is logged once at INFO, a miss once at INFO. Never creates a
- * context; never touches the lens preference (LeiaSR #266). The serial is
+ * No live context = false. The source is logged once at INFO, a miss once
+ * at INFO. Never creates a context; never touches the lens preference (LeiaSR #266). The serial is
  * system-wide: the claim logic uses it only with exactly one Leia panel.
  * The stub backend returns false (no SR service behind it).
  */
