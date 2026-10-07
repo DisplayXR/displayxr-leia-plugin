@@ -445,3 +445,25 @@ leiasr_lnx_compose_available(struct leiasr_lnx *lnx)
 	(void)lnx;
 	return false;
 }
+
+/*
+ *
+ * Multi-screen M0 — no SR runtime behind the stub.
+ *
+ */
+
+bool
+leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap)
+{
+	(void)out_serial;
+	(void)cap;
+	return false;
+}
+
+int32_t
+leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
+{
+	(void)out;
+	(void)cap;
+	return -1; // claims stay at EDID confidence
+}

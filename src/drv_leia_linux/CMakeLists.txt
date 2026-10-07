@@ -105,8 +105,21 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
     set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
     set(CMAKE_REQUIRED_LIBRARIES srSDK::loader)
     check_symbol_exists(srWeaverSnapToPhase "sr/sr_weaver.h" DXR_LEIA_LNX_HAVE_SR_SNAP)
+    # Multi-screen M0 (SR-P1): srEnumerateDisplays (slot 97) + SrDisplayDescriptor
+    # + the two capability structs. Same compile-AND-link probe as the snap: a
+    # LeiaSR 1.38 root (no declaration, no trampoline) compiles the per-monitor
+    # SR identity out and probe_displays falls back to EDID + lens serial.
+    check_symbol_exists(srEnumerateDisplays "sr/sr.h" DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM)
     unset(CMAKE_REQUIRED_INCLUDES)
     unset(CMAKE_REQUIRED_LIBRARIES)
+    if(DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM)
+        target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM=1)
+        message(STATUS "DisplayXR-LeiaSR: SR display enumeration ENABLED (srEnumerateDisplays declared + "
+                       "linkable) — probe_displays joins SR's FPC-verified displays")
+    else()
+        message(STATUS "DisplayXR-LeiaSR: SR display enumeration COMPILED OUT — no srEnumerateDisplays in "
+                       "${_srsdk_snap_inc} (or this loader archive); probe_displays uses EDID + lens serial")
+    endif()
     if(DXR_LEIA_LNX_HAVE_SR_SNAP)
         target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_SNAP=1)
         message(STATUS "DisplayXR-LeiaSR: drag phase-snap ENABLED "
@@ -202,6 +215,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_display_processor_linux.h
     leia_edid_probe_linux.c
     leia_edid_probe_linux.h
+    leia_display_claims_linux.c
+    leia_display_claims_linux.h
     leia_bg_capture_linux.c
     leia_bg_capture_linux.h
     leia_bg_capture_worker_linux.c
@@ -301,3 +316,19 @@ add_executable(test_stereo_camera_parse
 target_include_directories(test_stereo_camera_parse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 target_link_libraries(test_stereo_camera_parse PRIVATE m)
 add_test(NAME test_stereo_camera_parse COMMAND test_stereo_camera_parse)
+
+# --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
+# Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
+# (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
+# for the matching. No SDK, no Vulkan device, no panel — both weaver arms.
+add_executable(test_display_claims_linux
+    tests/test_display_claims_linux.c
+    leia_edid_probe_linux.c
+    leia_display_claims_linux.c
+)
+target_include_directories(test_display_claims_linux PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia
+)
+target_link_libraries(test_display_claims_linux PRIVATE xrt-interfaces aux_util PkgConfig::PLUGIN_XCB)
+add_test(NAME test_display_claims_linux COMMAND test_display_claims_linux)

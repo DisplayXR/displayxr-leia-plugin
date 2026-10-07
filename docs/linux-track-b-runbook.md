@@ -228,6 +228,41 @@ Failure signatures:
   — a window handle was cleared to 0 *after* construction. NOT the native-Wayland case:
   a weaver *constructed* with `window = 0` weaves unconditionally. See §3.
 
+### Per-monitor claims (`probe_displays`, multi-screen M0)
+
+The Linux arm implements `xrt_plugin_iface::probe_displays` (it was `NULL`). One
+`/sys/class/drm` pass now returns **every** connector whose EDID is in the frozen panel
+table, with its DRM connector name (`HDMI-A-1`), EDID ids + serial (bytes 12-15), native
+px, image mm, and, when an X server is reachable, the RandR CRTC origin (joined by EDID
+identity, never by name). The runtime's monitors are matched against that list
+(`leia_display_claims_linux.c`):
+
+- **By EDID ids** when the descriptor carries them; identical twins are told apart by the
+  RandR origin.
+- **By origin + size**, else by an unambiguous size match, when it does not (the runtime's
+  XWayland path, #251). An eDP that shares the panel's resolution is never claimed.
+- **Confidence, SR 1.38** (the installed `.deb`): `EDID` (50), or `VERIFIED` (100) with
+  `serial` = the lens's FPC serial (`srLensGetSerialNumber`) when a live SR context exists
+  **and exactly one** Leia panel is connected. That serial is system-global, so with two
+  panels it cannot be attributed and both stay at `EDID`.
+- **Confidence, new SR API** (`srEnumerateDisplays`, LeiaSR Linux line 876620d62+):
+  `VERIFIED` + FPC serial when SR reports the display `FPC_VERIFIED`, joined by DRM
+  connector, then EDID ids + serial. SR's list is authoritative, so a monitor SR lists but
+  the frozen table lacks is still claimed. Each claim's `displayId` goes into a
+  plug-in-private table for the later per-DP binding (M4/M5). Nothing reads that table yet.
+- `supported_apis` = Vulkan only (this arm has no GL DP).
+
+`probe_displays` **never creates an SR context**: it reuses the one `probe()` already
+brought up and otherwise answers at EDID confidence. The new-API path is compiled only
+when CMake's `check_symbol_exists(srEnumerateDisplays)` compiles **and links** against
+`SRSDK_ROOT`. Configure then prints `SR display enumeration ENABLED`. Against 1.38 it
+prints `COMPILED OUT`. A new-header build running on a 1.38 runtime gets
+`SR_ERROR_FUNCTION_UNSUPPORTED` and falls back to the 1.38 path.
+
+Today's runtime builds no monitor list on Linux (`os_display_edid` is a stub there), so
+nothing calls `probe_displays` on this platform until the runtime half of M0 lands.
+`test_display_claims_linux` covers the parser and the matching without hardware.
+
 ## 3. Real weave on the panel
 
 ```bash

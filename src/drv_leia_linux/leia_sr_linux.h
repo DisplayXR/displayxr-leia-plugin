@@ -37,6 +37,7 @@
 #endif
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Platform defines (VK_USE_PLATFORM_XCB_KHR) MUST precede vulkan.h so that
@@ -497,6 +498,45 @@ leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d);
  */
 bool
 leiasr_lnx_get_hardware_3d_state(struct leiasr_lnx *lnx, bool *out_is_3d);
+
+/*
+ *
+ * Multi-screen M0 — per-monitor identity for probe_displays.
+ *
+ * NOT part of the PROPOSED contract's R-* set: these back the plug-in's
+ * per-monitor claims (multi-screen plan M0, SR-P1) and never create an SR
+ * context. Creating one just to answer a probe would connect to SRService and
+ * spin up the eye tracker for a monitor list query; the plug-in's probe()
+ * already brings the context up on a Leia box, so these reuse it when it
+ * exists and report "unknown" otherwise (claims then fall back to EDID
+ * confidence).
+ *
+ */
+
+struct leia_lnx_sr_display; // leia_display_claims_linux.h
+
+/*!
+ * FPC serial of the device the LIVE SR context drives (srLensGetSerialNumber,
+ * slot 48, present on SR 1.38). Never creates a context; never touches the
+ * lens preference (a serial read is not an enable/disable, LeiaSR #266).
+ * @return false when there is no live context, no lens, or no serial.
+ */
+bool
+leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap);
+
+/*!
+ * New SR API (srEnumerateDisplays, slot 97): every SR display with its
+ * identity, FPC confidence and opaque displayId. Queries
+ * SrRuntimeCapabilities with SrWeaverRoutingCapabilities +
+ * SrDisplayBindingCapabilities chained (logged once per context), then the
+ * two-call enumerate; the result is cached until the context changes or SR
+ * raises SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED. Never creates a context.
+ * Compiled to "unavailable" when the SDK headers/loader predate the call.
+ * @return number of entries written (<= @p cap), or -1 when the API is
+ *         unavailable (compiled out, no live context, runtime predates it).
+ */
+int32_t
+leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap);
 
 #ifdef __cplusplus
 }
