@@ -467,3 +467,9 @@ leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
 	(void)cap;
 	return -1; // claims stay at EDID confidence
 }
+
+uint64_t
+leia_lnx_sr_active_display_id(void)
+{
+	return 0; // the stub has no SR display list
+}

@@ -175,6 +175,97 @@ test_uncommitted_call_is_not_recorded(void)
 	CHECK(leia_lens_owner_on_new_context(&o) == LEIA_LENS_ACTION_NONE);
 }
 
+/* Multi-screen M4: an EXTERNAL-routed weaver never votes, so the plug-in turns
+ * the lens on at its creation and off after the last one is gone. */
+static void
+external_created(struct fake_ctx *c, struct leia_lens_owner *o)
+{
+	fake_send(c, o, leia_lens_owner_on_external_weaver_created(o));
+}
+
+static void
+external_destroyed(struct fake_ctx *c, struct leia_lens_owner *o)
+{
+	const enum leia_lens_action a = leia_lens_owner_on_external_weaver_destroyed(o);
+	if (a == LEIA_LENS_ACTION_NONE) {
+		return;
+	}
+	CHECK(a == LEIA_LENS_ACTION_DISABLE);
+	c->app_owns = true;
+	c->disables++;
+	c->pref_on = false;
+	c->pref_set = true;
+	leia_lens_owner_commit_release(o);
+}
+
+static void
+test_external_weaver_turns_the_lens_on_and_releases_it(void)
+{
+	struct leia_lens_owner o = {0};
+	struct fake_ctx c;
+	new_context(&c, &o);
+
+	external_created(&c, &o);
+	CHECK(c.enables == 1 && c.pref_on && c.app_owns);
+	CHECK(o.external_weavers == 1);
+
+	// The session-begin 3D request: the context is ours now, so it is sent
+	// (every request is, once owned — redundant, harmless).
+	request(&c, &o, true);
+	CHECK(c.enables == 2 && c.pref_on);
+
+	// A second EXTERNAL weaver (a segment DP next to the window's own DP).
+	external_created(&c, &o);
+	CHECK(c.enables == 2 && o.external_weavers == 2); // already on from us: no call
+	external_destroyed(&c, &o);
+	CHECK(c.disables == 0 && c.pref_on); // one still weaving
+
+	external_destroyed(&c, &o);
+	CHECK(c.disables == 1 && !c.pref_on);
+	CHECK(o.external_weavers == 0);
+	// A release is not a 2D wish: nothing to re-apply to a later context ...
+	CHECK(o.last_sent == LEIA_LENS_REQ_NONE);
+	// ... and the next session's EXTERNAL weaver turns the lens back on.
+	external_created(&c, &o);
+	CHECK(c.enables == 3 && c.pref_on);
+	external_destroyed(&c, &o);
+	CHECK(c.disables == 2);
+}
+
+/* With an EXTERNAL weaver alive a 3D wish is sent even before any 2D. */
+static void
+test_external_weaver_3d_request_is_sent(void)
+{
+	struct leia_lens_owner o = {0};
+	o.external_weavers = 1; // created while the enable failed (not committed)
+	CHECK(leia_lens_owner_on_request(&o, true) == LEIA_LENS_ACTION_ENABLE);
+}
+
+/* An app 2D wish survives a new EXTERNAL weaver; the 3D request restores it. */
+static void
+test_external_weaver_respects_2d(void)
+{
+	struct leia_lens_owner o = {0};
+	struct fake_ctx c;
+	new_context(&c, &o);
+	external_created(&c, &o);
+	request(&c, &o, false); // V toggle
+	CHECK(c.disables == 1 && !c.pref_on);
+
+	external_created(&c, &o); // a segment DP comes up mid-2D
+	CHECK(c.enables == 1 && !c.pref_on);
+
+	request(&c, &o, true);
+	CHECK(c.enables == 2 && c.pref_on);
+
+	// While the app is in 2D at teardown, the release has nothing to do.
+	request(&c, &o, false);
+	external_destroyed(&c, &o);
+	external_destroyed(&c, &o);
+	CHECK(c.disables == 2);
+	CHECK(o.last_sent == LEIA_LENS_REQ_2D);
+}
+
 int
 main(void)
 {
@@ -183,6 +274,9 @@ main(void)
 	test_new_context_reapplies_last_request();
 	test_new_context_without_history_stays_weaver_owned();
 	test_uncommitted_call_is_not_recorded();
+	test_external_weaver_turns_the_lens_on_and_releases_it();
+	test_external_weaver_3d_request_is_sent();
+	test_external_weaver_respects_2d();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_lens_owner_linux: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
