@@ -1703,15 +1703,20 @@ leiasr_lnx_destroy(struct leiasr_lnx *lnx)
 		 * SRService keeps the lens ON while ANY client holds an ENABLE, and
 		 * this SR context outlives the session (runbook §4, "Co-existing"). */
 		pthread_mutex_lock(&g_ctx_lock);
-		if (leia_lens_owner_on_external_weaver_destroyed(&g_lens_owner) == LEIA_LENS_ACTION_DISABLE &&
-		    g_ctx.lens != NULL) {
-			const SrResult lr = srLensDisable(g_ctx.lens);
+		if (leia_lens_owner_on_external_weaver_destroyed(&g_lens_owner) == LEIA_LENS_ACTION_DISABLE) {
+			const SrResult lr = g_ctx.lens != NULL ? srLensDisable(g_ctx.lens) : SR_ERROR_HANDLE_INVALID;
 			if (SR_SUCCEEDED(lr)) {
-				leia_lens_owner_commit_release(&g_lens_owner);
 				U_LOG_W("leia_sr_sdk: lens OFF — the last EXTERNAL-routed weaver is gone");
 			} else {
 				LOG_SR_ONCE("srLensDisable (EXTERNAL weaver release)", lr);
 			}
+			/* Recorded EVEN WHEN THE CALL FAILED (review 4): the usual failure
+			 * is a context SRService invalidated (restart), whose lens handle
+			 * is dead. Leaving last_sent = 3D would make the next context
+			 * re-apply ENABLE (leia_lens_owner_on_new_context) with no weaver
+			 * alive, and the lens would stay on over the 2D desktop. A dead
+			 * context's preference died with its connection anyway. */
+			leia_lens_owner_commit_release(&g_lens_owner);
 		}
 		pthread_mutex_unlock(&g_ctx_lock);
 	}

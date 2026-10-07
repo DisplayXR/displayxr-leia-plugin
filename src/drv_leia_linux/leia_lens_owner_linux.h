@@ -191,9 +191,10 @@ leia_lens_owner_on_external_weaver_destroyed(struct leia_lens_owner *o)
 	return LEIA_LENS_ACTION_NONE;
 }
 
-//! Record a successful release from leia_lens_owner_on_external_weaver_destroyed():
-//! the context stays ours (the SDK does not hand it back), but there is no wish
-//! left to re-apply to a later context.
+//! Record a release from leia_lens_owner_on_external_weaver_destroyed() —
+//! successful OR failed (a dead context's lens handle; its preference died with
+//! the connection): the context stays ours (the SDK does not hand it back), but
+//! there is no wish left to re-apply to a later context.
 static inline void
 leia_lens_owner_commit_release(struct leia_lens_owner *o)
 {
