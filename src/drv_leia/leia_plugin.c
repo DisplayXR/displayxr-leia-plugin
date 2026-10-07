@@ -34,6 +34,7 @@
 
 #include "leia_interface.h"
 #include "leia_platform_state.h"
+#include "leia_display_claims_win.h"
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*
@@ -127,10 +128,13 @@ leia_plugin_destroy(struct xrt_plugin_instance *inst)
 {
 	(void)inst;
 	/* No instance state — nothing to free. Stop the late-identification
-	 * watcher if one is running (leia_sr_ready.h). */
+	 * watcher if one is running (leia_sr_ready.h), and the SR
+	 * display-enumeration probe instance (multi-screen M0). */
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	leiasr_ready_shutdown();
 #endif
+	leia_win_sr_enumerate_shutdown();
+	leia_win_claims_store(NULL, 0);
 }
 
 static void
@@ -276,26 +280,61 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 #endif
 	/* No Metal weaver in drv_leia — that's the macOS sim_display path. */
 
-	uint32_t n = 0;
-	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
-		if (!leia_edid_table_contains(displays[i].edid_manufacturer, displays[i].edid_product)) {
-			continue;
-		}
-		struct xrt_display_claim *c = &out_claims[n++];
-		c->monitor_id = displays[i].monitor_id;
-		c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
-		c->supported_apis = apis;
-		/*
-		 * TODO(#69 Phase 2 follow-up): read the FPC device serial from
-		 * `Global\sharedDeviceSerialMemory` so multi-Leia setups can pair
-		 * each monitor with its own camera/calibration unit. Empty for now
-		 * — single-display setups don't need it.
-		 */
-		c->serial[0] = '\0';
+	/*
+	 * Multi-screen M0: join the runtime's monitor list with the SR runtime's
+	 * own display enumeration (srEnumerateDisplays, Windows slot 106) when the
+	 * installed SR runtime has it. Matching + confidence rules live in
+	 * leia_display_claims_win.c:
+	 *   - SR lists the monitor FPC_VERIFIED -> VERIFIED + FPC serial;
+	 *   - SR lists it EDID_ONLY (or the frozen table knows it but SR does not)
+	 *     -> EDID confidence, no serial;
+	 *   - SR does not enumerate (older runtime, service down, compiled out)
+	 *     -> today's rule: table hit + READY = VERIFIED, no serial.
+	 * The per-monitor binding (displayId, HMONITOR, device name) is kept in a
+	 * plug-in-private table for the M5/M6 per-DP binding.
+	 */
+	struct leia_win_sr_display sr_displays[LEIA_WIN_SR_MAX_DISPLAYS];
+	const int32_t sr_count = leia_win_sr_enumerate_displays(sr_displays, LEIA_WIN_SR_MAX_DISPLAYS);
 
-		U_LOG_I("leia_plugin: claim monitor 0x%016llx (mfr=0x%04X prod=0x%04X) confidence=%s",
-		        (unsigned long long)displays[i].monitor_id, displays[i].edid_manufacturer,
-		        displays[i].edid_product, "VERIFIED");
+	const struct leia_win_claim_inputs in = {
+	    .sr_displays = sr_displays,
+	    .sr_display_count = sr_count,
+	    .table_contains = leia_edid_table_contains,
+	    .legacy_table_verified = true, /* platform state is READY here */
+	    .supported_apis = apis,
+	};
+	struct leia_win_claim_binding bindings[LEIA_WIN_SR_MAX_DISPLAYS * 2];
+	const uint32_t bind_cap = max_claims < (uint32_t)(LEIA_WIN_SR_MAX_DISPLAYS * 2) ? max_claims
+	                                                                                : (uint32_t)(LEIA_WIN_SR_MAX_DISPLAYS * 2);
+	uint32_t n = leia_win_compute_claims(displays, display_count, &in, out_claims, bindings, bind_cap);
+	leia_win_claims_store(bindings, n);
+
+	/* One WARN per change of the claim set, INFO otherwise (the runtime
+	 * re-runs this per registry refresh). */
+	uint64_t fp = 1469598103934665603ull ^ (uint64_t)n ^ ((uint64_t)(sr_count + 1) << 32);
+	for (uint32_t i = 0; i < n; i++) {
+		fp = (fp ^ out_claims[i].monitor_id) * 1099511628211ull;
+		fp = (fp ^ out_claims[i].confidence) * 1099511628211ull;
+		for (const char *c = out_claims[i].serial; *c != '\0'; c++) {
+			fp = (fp ^ (uint64_t)(uint8_t)*c) * 1099511628211ull;
+		}
+	}
+	static uint64_t s_logged_claims_fp = 0;
+	const bool changed = fp != s_logged_claims_fp;
+	s_logged_claims_fp = fp;
+	for (uint32_t i = 0; i < n; i++) {
+		const struct xrt_display_claim *c = &out_claims[i];
+		const char *conf = c->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID";
+		if (changed) {
+			U_LOG_W("leia_plugin: claim monitor 0x%016llx confidence=%s serial='%s' sr_display=0x%016llx "
+			        "device='%s' (%s)",
+			        (unsigned long long)c->monitor_id, conf, c->serial,
+			        (unsigned long long)bindings[i].sr_display_id, bindings[i].device_name,
+			        sr_count >= 0 ? "SR enumeration" : "frozen EDID table");
+		} else {
+			U_LOG_I("leia_plugin: claim monitor 0x%016llx confidence=%s serial='%s' -- unchanged",
+			        (unsigned long long)c->monitor_id, conf, c->serial);
+		}
 	}
 
 	/*
@@ -307,8 +346,10 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 * context spin it used to be. Single-display assumption: SR confirms *an*
 	 * active SR display but not *which* monitor id, so we pin it to the
 	 * primary — the monitor the runtime's own back-compat synth-claim picks.
+	 * Only when SR could NOT enumerate: with srEnumerateDisplays the table
+	 * miss is answered per monitor above.
 	 */
-	if (n == 0 && !probe.hw_found && display_count > 0 && max_claims > 0) {
+	if (sr_count < 0 && n == 0 && !probe.hw_found && display_count > 0 && max_claims > 0) {
 		uint32_t pick = 0;
 		for (uint32_t i = 0; i < display_count; i++) {
 			if (displays[i].flags & 1u) { /* bit 0 = primary monitor */

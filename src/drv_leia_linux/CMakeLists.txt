@@ -363,6 +363,15 @@ target_include_directories(test_stereo_camera_parse PRIVATE ${CMAKE_CURRENT_SOUR
 target_link_libraries(test_stereo_camera_parse PRIVATE m)
 add_test(NAME test_stereo_camera_parse COMMAND test_stereo_camera_parse)
 
+# Windows-arm claim matcher (leia_display_claims_win.c): platform-neutral C,
+# host-tested here because the Windows build has no ctest lane.
+add_executable(test_display_claims_win
+    ../drv_leia/tests/test_display_claims_win.c
+    ../drv_leia/leia_display_claims_win.c)
+target_include_directories(test_display_claims_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+target_link_libraries(test_display_claims_win PRIVATE xrt-interfaces pthread)
+add_test(NAME test_display_claims_win COMMAND test_display_claims_win)
+
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
