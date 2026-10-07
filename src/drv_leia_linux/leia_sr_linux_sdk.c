@@ -258,9 +258,13 @@ sr_ctx_on_system_event(const SrSystemEvent *event, void *user_data)
 	case SR_EVENT_TYPE_DISPLAY_NOT_CONNECTED:
 		atomic_store(&g_ctx.display_info_dirty, true);
 		atomic_store(&g_ctx.display_topology_dirty, true);
+		leia_lnx_edid_cache_invalidate(); // a hot-plugged panel re-resolves (review C)
 		break;
 #ifdef DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM
-	case SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED: atomic_store(&g_ctx.display_topology_dirty, true); break;
+	case SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED:
+		atomic_store(&g_ctx.display_topology_dirty, true);
+		leia_lnx_edid_cache_invalidate();
+		break;
 #endif
 	default: break;
 	}
@@ -2224,15 +2228,22 @@ leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
 
 	const bool dirty = atomic_exchange(&g_ctx.display_topology_dirty, false);
 	if (dirty || g_sr_displays_generation != gen) {
+		// The cache is marked fresh for this context only once an answer
+		// was read (review C): a transient failure must be retried on the
+		// next probe, not stick until a topology event.
 		g_sr_display_count = -1;
-		g_sr_displays_generation = gen;
+		g_sr_displays_generation = 0;
 
 		uint32_t count = 0;
 		SrResult res = srEnumerateDisplays(g_ctx.instance, &count, NULL);
 		if (SR_FAILED(res)) {
 			// SR_ERROR_FUNCTION_UNSUPPORTED = the installed runtime is older
-			// than these headers (e.g. 1.38): the 1.38 path takes over.
+			// than these headers (e.g. 1.38): the 1.38 path takes over. That
+			// answer is final for this context; anything else is retried.
 			LOG_SR_ONCE("srEnumerateDisplays (count)", res);
+			if (res == SR_ERROR_FUNCTION_UNSUPPORTED) {
+				g_sr_displays_generation = gen;
+			}
 			goto out;
 		}
 		SrDisplayDescriptor descs[LEIA_LNX_SR_MAX_DISPLAYS];
@@ -2261,6 +2272,7 @@ leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
 			    g_sr_displays[i].refresh_hz, g_sr_displays[i].product_code);
 		}
 		g_sr_display_count = (int32_t)count;
+		g_sr_displays_generation = gen;
 	}
 
 	if (g_sr_display_count >= 0) {
