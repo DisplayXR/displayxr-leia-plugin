@@ -231,8 +231,9 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 *   - every Leia panel on this box (one /sys/class/drm pass + RandR join);
 	 *   - the new SR API's display list when it is compiled in AND a live SR
 	 *     context exists (FPC confidence, serial, displayId);
-	 *   - otherwise SR 1.38's only per-device fact: the live context's lens
-	 *     serial (verifies a single panel).
+	 *   - otherwise the SR service's active device serial (its device store,
+	 *     <root>/active -> Devices/<serial>; srLensGetSerialNumber as a last
+	 *     resort) — system-wide, so it verifies a single panel only.
 	 * Never creates an SR context (seam header explains why) — on a box where
 	 * probe() did not bring one up, claims stay at EDID confidence.
 	 */
