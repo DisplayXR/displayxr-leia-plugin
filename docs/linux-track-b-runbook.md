@@ -299,7 +299,17 @@ runtime supplies the phase origin per frame (`set_present_origin` →
 `getScreenRect` is (0,0), contract R-W3). With an X11 id the SDK refuses a resampled panel,
 which forced 2D under the fractionally scaled XWayland desktop this box runs. A weaver
 *constructed* windowless always weaves (§3, "Native Wayland weaves windowless"). The weave
-log line now always reads `window=0x0 = windowless`. If an X11 window was handed in, one
+log line now always reads `window=0x0 = windowless`.
+
+**The runtime owns the resampled refusal, from 2.27.1.** That SDK refusal, not
+the window, was what kept a scaled X11 window from weaving into a double image.
+Since runtime v2.27.1 (#1831) the runtime itself presents 2D when an X11 window's
+pixels are resampled (and gates each segment the same way, using the DP's
+`get_scanout_caps`, flags 0 here). That is why the weaver can be windowless.
+The Linux runtime pin is therefore v2.29.0, and the `.deb` Depends on
+`displayxr-runtime (>= 2.27.1)`. Do not reintroduce the X11 window: on a scaled
+XWayland desktop it forces 2D even with an explicit present origin, which is
+exactly the M4 straddling case. If an X11 window was handed in, one
 INFO line says it was not forwarded.
 
 **What a DP does with a screen binding.** `create_dp_vk_for_screen` hands the DP an
