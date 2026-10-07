@@ -69,8 +69,10 @@ env:
   # vk_bundle ABI fingerprint fields; no feature macro, an older ref fails to
   # compile). v2.17.1: first line with the rear-depth-budget preview
   # (XRT_DP_VK_HAS_BACKGROUND_PREVIEW), and a vk_bundle layout that matches
-  # runtimes v2.16.0..main — see the CMakeLists comment.
-  RUNTIME_REF: v2.27.0
+  # runtimes v2.16.0..main — see the CMakeLists comment. v2.29.0: past
+  # v2.27.1, which owns the resampled-X11 refusal the windowless weaver
+  # (multi-screen M4) no longer gets from the SR SDK.
+  RUNTIME_REF: v2.29.0
 
 jobs:
   # Classify the change. Same rule as displayxr-runtime's build-linux.yml:

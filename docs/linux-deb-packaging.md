@@ -13,7 +13,7 @@ fallback; see `displayxr-runtime/scripts/package_deb_linux.sh`).
 | Discovery | Drops `DisplayXR-LeiaSR.so` + `050-leia-sr.json` (probe_order **50**) into `/usr/lib/displayxr/plugins/` — the dir the runtime searches by default (runtime #781 Phase 1). No registry, no env. |
 | Claim vs fallback | `probe_order=50` beats sim-display's `200`. The **presence probe** (leia-plugin #99, on `main`) claims when the SR runtime is reachable and declines otherwise, so sim-display drives apps on a box without the SR stack. No `DXR_LEIA_FORCE_PROBE`. |
 | SR runtime discovery | **No baked rpath.** The srSDK loader resolves `libLeiaSR_runtime.so` via `/etc/leia/sr/1/active_runtime.json` (registered by the SR runtime installer) → `$SR_RUNTIME_PATH` → plain dlopen. See `docs/leia-linux-sdk-contract.md` §7. The packager strips any `DT_RUNPATH` with `patchelf` so no build-machine path ships. |
-| Dependencies | `Depends: displayxr-runtime` (hard prereq) + **versioned** system-library dependencies derived with `dpkg-shlibdeps`. `Recommends:` the SR runtime package — without it the plug-in still installs and its probe declines. |
+| Dependencies | `Depends: displayxr-runtime (>= 2.27.1)` (hard prereq; 2.27.1 is the first runtime that refuses to weave a resampled X11 window itself, which the windowless weaver relies on) + **versioned** system-library dependencies derived with `dpkg-shlibdeps`. `Recommends:` the SR runtime package — without it the plug-in still installs and its probe declines. |
 | Portability | **One package for Ubuntu 22.04, 24.04 and 26.04.** See below. |
 
 ## One package for 22.04, 24.04 and 26.04
