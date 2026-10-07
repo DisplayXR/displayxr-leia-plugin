@@ -32,6 +32,24 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
                        int32_t target_format,
                        struct xrt_display_processor **out_xdp);
 
+struct leia_lnx_screen_binding; // leia_screen_linux.h
+
+/*!
+ * Per-screen variant (multi-screen M4; the runtime's
+ * `xrt_plugin_iface::create_dp_vk_for_screen`, M2): same as
+ * leia_lnx_dp_factory_vk, but the DP describes the screen @p binding names —
+ * its own size, pixels and desktop origin, resolved once at creation into
+ * per-instance state — and, being a segment DP, confines every write to the
+ * canvas it is handed. @p binding is never NULL.
+ */
+xrt_result_t
+leia_lnx_dp_factory_vk_for_screen(void *vk_bundle,
+                                  void *vk_cmd_pool,
+                                  void *window_handle,
+                                  int32_t target_format,
+                                  const struct leia_lnx_screen_binding *binding,
+                                  struct xrt_display_processor **out_xdp);
+
 #ifdef __cplusplus
 }
 #endif
