@@ -42,9 +42,14 @@
 #include "leia_edid_probe_linux.h"
 #include "leia_display_claims_linux.h"
 
+#include <pthread.h>
 #include <stddef.h>
+#include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
+
+//! probe_displays' panel-scan TTL (review C): one sysfs + RandR pass per burst of registry rebuilds.
+#define LEIA_LNX_PROBE_PANEL_TTL_NS (1000ull * 1000ull * 1000ull)
 
 //! probe() bound this plug-in (forced or a panel found). probe_displays then
 //! guarantees the plug-in at least one monitor (leia_lnx_fallback_claim).
@@ -229,8 +234,13 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 * Never creates an SR context (seam header explains why) — on a box where
 	 * probe() did not bring one up, claims stay at EDID confidence.
 	 */
+	// Short-TTL snapshot of the shared panel cache: the runtime rebuilds its
+	// registry per client connect, and a burst of rebuilds must not cost a
+	// sysfs scan + an X connection each; a hot-plugged panel is still picked
+	// up by the first rebuild after the TTL (review C).
 	struct leia_lnx_edid_panel panels[LEIA_LNX_EDID_MAX_PANELS];
-	const uint32_t panel_count = leia_lnx_edid_enumerate_panels(panels, LEIA_LNX_EDID_MAX_PANELS, true);
+	const uint32_t panel_count =
+	    leia_lnx_edid_panels_snapshot(panels, LEIA_LNX_EDID_MAX_PANELS, LEIA_LNX_PROBE_PANEL_TTL_NS);
 
 	struct leia_lnx_sr_display sr_displays[LEIA_LNX_SR_MAX_DISPLAYS];
 	const int32_t sr_count = leia_lnx_sr_enumerate_displays(sr_displays, LEIA_LNX_SR_MAX_DISPLAYS);
@@ -279,8 +289,27 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	// per-DP SR binding (M4/M5). Nothing consumes it yet.
 	leia_lnx_claims_store(bindings, n);
 
+	// Logged at INFO and only when the answer changed: probe_displays runs on
+	// every registry rebuild (per client connect), so a per-call WARN per
+	// claim flooded the service log (review C).
+	static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+	static struct xrt_display_claim last_claims[LEIA_LNX_EDID_MAX_PANELS + LEIA_LNX_SR_MAX_DISPLAYS];
+	static struct leia_lnx_claim_binding last_bindings[LEIA_LNX_EDID_MAX_PANELS + LEIA_LNX_SR_MAX_DISPLAYS];
+	static uint32_t last_n = UINT32_MAX;
+	pthread_mutex_lock(&log_lock);
+	const bool changed = n != last_n || memcmp(last_claims, out_claims, n * sizeof(out_claims[0])) != 0 ||
+	                     memcmp(last_bindings, bindings, n * sizeof(bindings[0])) != 0;
+	if (changed) {
+		last_n = n;
+		memcpy(last_claims, out_claims, n * sizeof(out_claims[0]));
+		memcpy(last_bindings, bindings, n * sizeof(bindings[0]));
+	}
+	pthread_mutex_unlock(&log_lock);
+	if (!changed) {
+		return n;
+	}
 	for (uint32_t i = 0; i < n; i++) {
-		U_LOG_W("leia_lnx_plugin: claim monitor 0x%016llx on %s confidence=%s serial='%s' sr_display=0x%016llx",
+		U_LOG_I("leia_lnx_plugin: claim monitor 0x%016llx on %s confidence=%s serial='%s' sr_display=0x%016llx",
 		        (unsigned long long)out_claims[i].monitor_id,
 		        bindings[i].connector[0] ? bindings[i].connector : "(unknown connector)",
 		        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID",

@@ -263,6 +263,8 @@ identity, never by name). The runtime's monitors are matched against that list
   `probe() bound but no monitor matched a Leia panel — fallback claim on monitor …`.
 - `supported_apis` = Vulkan only (this arm has no GL DP).
 
+**Cost and logging.** `probe_displays` runs on every runtime registry rebuild, which happens per client connect. It therefore reads the panel list from a shared cache with a 1 s TTL (one sysfs scan and one X connection per burst). It logs the `claim monitor … confidence=…` lines at INFO, and only when the answer changes. The same cache feeds the per-frame position getters. It is refreshed by that TTL and invalidated by SR display connect/topology events, so a hot-plugged or moved panel resolves on the next rebuild instead of never. A failed `srEnumerateDisplays` is retried on the next probe (only `SR_ERROR_FUNCTION_UNSUPPORTED` is final for a context).
+
 `probe_displays` **never creates an SR context**: it reuses the one `probe()` already
 brought up and otherwise answers at EDID confidence. The new-API path is compiled only
 when CMake's `check_symbol_exists(srEnumerateDisplays)` compiles **and links** against

@@ -86,11 +86,26 @@ uint32_t
 leia_lnx_edid_enumerate_panels(struct leia_lnx_edid_panel *out, uint32_t cap, bool with_positions);
 
 /*!
- * Desktop position of one panel, cached per connector for the process
- * lifetime (the first miss runs one enumerate-with-positions pass and caches
- * every panel it saw). @p connector NULL = the first panel in connector order —
- * the one a single-panel session binds today; M4/M5 pass the DP's own
- * connector. Thread-safe.
+ * The panel list (with RandR positions) from the shared cache, rescanned when
+ * it is older than @p max_age_ns or was invalidated (UINT64_MAX = only on
+ * invalidation or first use). probe_displays reads it with a short TTL, so a
+ * burst of registry rebuilds (the runtime rebuilds per client connect) costs
+ * one sysfs scan + one X connection, while a hot-plugged panel is picked up by
+ * the next rebuild after the TTL. Thread-safe.
+ * @return entries copied to @p out (<= @p cap).
+ */
+uint32_t
+leia_lnx_edid_panels_snapshot(struct leia_lnx_edid_panel *out, uint32_t cap, uint64_t max_age_ns);
+
+//! Mark the shared panel cache stale (SR display topology/connect events).
+void
+leia_lnx_edid_cache_invalidate(void);
+
+/*!
+ * Desktop position of one panel, from the shared panel cache (resolved on
+ * first use; refreshed by leia_lnx_edid_panels_snapshot() / invalidation —
+ * never by this hot-path accessor itself, which is called per frame). @p connector NULL = the first panel in connector
+ * order — the one a single-panel session binds today; M4/M5 pass the DP's own connector. Thread-safe.
  * @return true when that panel sits on an active RandR output.
  */
 bool

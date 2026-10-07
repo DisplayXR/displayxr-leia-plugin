@@ -21,6 +21,7 @@
 
 #include "../drv_leia/leia_edid_table.h"
 
+#include "os/os_time.h"
 #include "util/u_logging.h"
 
 #include <dirent.h>
@@ -433,26 +434,62 @@ leia_lnx_edid_panel_desktop_position(int32_t *out_left, int32_t *out_top)
 }
 
 /*
- * Per-connector position cache. Replaces the two per-function "the panel"
- * statics (plug-in get_display_info + DP get_display_pixel_info) so that, once
- * a DP is bound to a specific connector (M4/M5), each panel resolves its own
- * position. Resolved once per process like the statics it replaces: a panel
- * moved in the desktop mid-session keeps its first position (unchanged
- * behaviour; topology tracking is M0 runtime-side work).
+ * Shared panel cache (connector, ids, px, mm, RandR position). Replaces the
+ * two per-function "the panel" statics (plug-in get_display_info + DP
+ * get_display_pixel_info) so each panel resolves its own position. Resolved on
+ * first use; refreshed by probe_displays' short-TTL snapshot (every runtime
+ * registry rebuild) and invalidated by SR display connect/topology events, so
+ * a hot-plugged or moved panel is picked up — never re-scanned from the
+ * per-frame position accessor itself.
  */
 static pthread_mutex_t g_pos_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_pos_resolved = false;
+static bool g_pos_stale = false;
+static int64_t g_pos_resolved_ns = 0;
 static uint32_t g_pos_count = 0;
 static struct leia_lnx_edid_panel g_pos_panels[LEIA_LNX_EDID_MAX_PANELS];
+
+//! Caller holds g_pos_lock. Rescan when never resolved, invalidated, or older than @p max_age_ns.
+static void
+pos_resolve_locked(uint64_t max_age_ns)
+{
+	const int64_t now = os_monotonic_get_ns();
+	const bool expired = max_age_ns != UINT64_MAX && g_pos_resolved && now - g_pos_resolved_ns >= 0 &&
+	                     (uint64_t)(now - g_pos_resolved_ns) > max_age_ns;
+	if (!g_pos_resolved || g_pos_stale || expired) {
+		g_pos_count = leia_lnx_edid_enumerate_panels(g_pos_panels, LEIA_LNX_EDID_MAX_PANELS, true);
+		g_pos_resolved = true;
+		g_pos_stale = false;
+		g_pos_resolved_ns = now;
+	}
+}
+
+uint32_t
+leia_lnx_edid_panels_snapshot(struct leia_lnx_edid_panel *out, uint32_t cap, uint64_t max_age_ns)
+{
+	pthread_mutex_lock(&g_pos_lock);
+	pos_resolve_locked(max_age_ns);
+	const uint32_t n = g_pos_count < cap ? g_pos_count : cap;
+	if (out != NULL && n > 0) {
+		memcpy(out, g_pos_panels, n * sizeof(out[0]));
+	}
+	pthread_mutex_unlock(&g_pos_lock);
+	return out != NULL ? n : 0;
+}
+
+void
+leia_lnx_edid_cache_invalidate(void)
+{
+	pthread_mutex_lock(&g_pos_lock);
+	g_pos_stale = true;
+	pthread_mutex_unlock(&g_pos_lock);
+}
 
 bool
 leia_lnx_edid_panel_desktop_position_cached(const char *connector, int32_t *out_left, int32_t *out_top)
 {
 	pthread_mutex_lock(&g_pos_lock);
-	if (!g_pos_resolved) {
-		g_pos_count = leia_lnx_edid_enumerate_panels(g_pos_panels, LEIA_LNX_EDID_MAX_PANELS, true);
-		g_pos_resolved = true;
-	}
+	pos_resolve_locked(UINT64_MAX);
 	bool found = false;
 	for (uint32_t i = 0; i < g_pos_count && !found; i++) {
 		const struct leia_lnx_edid_panel *p = &g_pos_panels[i];
