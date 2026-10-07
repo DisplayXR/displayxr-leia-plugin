@@ -2330,9 +2330,21 @@ leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap)
 	}
 	out_serial[0] = '\0';
 
+	/* Only with a live context (review 2): the store is the service's
+	 * on-disk state, and Devices/ keeps every device ever seen. With
+	 * SRService stopped, the `active` link can name a device that is no longer
+	 * connected, and that stale serial must not VERIFY a monitor. A READY,
+	 * valid context means the service is reachable and driving a device. */
+	pthread_mutex_lock(&g_ctx_lock);
+	const bool live = g_ctx.state == SR_CTX_READY && !atomic_load(&g_ctx.context_invalid);
+	pthread_mutex_unlock(&g_ctx_lock);
+	if (!live) {
+		return false;
+	}
+
 	/* 1. The SR service's device store (<root>/active -> Devices/<serial>),
 	 *    what the SR runtime's own resolveLinuxPrimaryDeviceSerial reads. The
-	 *    supported legacy source: no SR call, no context needed. */
+	 *    supported legacy source: no SR call. */
 	char source[512];
 	if (leia_lnx_sr_device_store_serial(out_serial, cap, source, sizeof(source))) {
 		static char logged_serial[64];

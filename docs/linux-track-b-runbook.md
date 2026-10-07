@@ -247,8 +247,10 @@ identity, never by name). The runtime's monitors are matched against that list
   `$XDG_CACHE_HOME/leiasr`, else `/var/lib/leiasr/leiasr` (the service runs with
   `XDG_CACHE_HOME=/var/lib/leiasr`). This is the file the SR runtime's own
   `resolveLinuxPrimaryDeviceSerial` reads. A dangling link means no active device. The
-  monitor is `VERIFIED` only when the service has an active device **and exactly one**
-  Leia panel is connected. The serial is system-wide, so with two panels it cannot be
+  store is consulted **only while a live SR context exists** (SRService reachable).
+  `Devices/` keeps every device ever seen, and with the service stopped `active` can name
+  one that is gone. The monitor is `VERIFIED` only when the service is reachable, has an
+  active device, **and exactly one** Leia panel is connected. The serial is system-wide, so with two panels it cannot be
   attributed and both stay at `EDID`. **`srLensGetSerialNumber` is a stub on the Linux
   line** (`SR_ERROR_FEATURE_NOT_SUPPORTED` on 1.38). It is kept only as a last resort,
   and on 1.38 `VERIFIED` comes from the device store, never from that call. The source is
