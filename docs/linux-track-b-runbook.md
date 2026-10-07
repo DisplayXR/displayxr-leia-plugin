@@ -361,6 +361,12 @@ create then chains:
   else the `probe_displays` table's), the runtime reports `displayBinding`, and
   `maxBoundDisplays >= 1`.
 
+A segment DP **never weaves with another panel's calibration**. When its screen is not
+the SR-driven panel, or SR refused the display binding and the weaver fell back to the
+active display, the DP presents **flat**: the left view is blitted to its canvas, with one
+WARN `segment DP for monitor … presents FLAT (no weave): …`. Weaving would otherwise give
+wrong-phase output.
+
 If the create is refused, the binding is dropped first (`SR_ERROR_DEVICE_NOT_AVAILABLE`
 for an EDID-only display, `SR_ERROR_DISPLAY_NOT_FOUND` for an unknown id). If it is still
 refused, the routing is dropped too. Each step logs one INFO line and ends in exactly the

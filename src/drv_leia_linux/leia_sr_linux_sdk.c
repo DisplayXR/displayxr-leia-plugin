@@ -800,6 +800,7 @@ struct leiasr_lnx
 	 * creation and destruction drive the lens owner (leia_lens_owner_linux.h). */
 	bool external_routed;
 	bool display_bound;
+	bool display_binding_refused; //!< a binding was chained and SR refused it (see the seam)
 
 	VkRenderPass render_pass; //!< backend-owned, single color attachment (loadOp LOAD)
 	VkFormat render_pass_format;
@@ -1575,6 +1576,7 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	pthread_mutex_unlock(&g_ctx_lock);
 	struct leia_lnx_sr_weaver_plan plan =
 	    leia_lnx_sr_plan_weaver(&mcaps, debug_get_bool_option_sr_external_routing(), info->sr_display_id);
+	const bool binding_attempted = plan.bind_display;
 
 	SrResult sres = SR_SUCCESS;
 	for (;;) {
@@ -1623,6 +1625,7 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	}
 	lnx->external_routed = plan.routing_external;
 	lnx->display_bound = plan.bind_display;
+	lnx->display_binding_refused = binding_attempted && !plan.bind_display;
 	if (info->x11_window != NULL) {
 		static bool window_logged;
 		if (!window_logged) {
@@ -1915,6 +1918,12 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	if (!fb_to_sdk) {
 		vkCmdEndRenderPass(cmd_buffer);
 	}
+}
+
+bool
+leiasr_lnx_display_binding_refused(struct leiasr_lnx *lnx)
+{
+	return lnx != NULL && lnx->display_binding_refused;
 }
 
 VkRenderPass
