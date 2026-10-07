@@ -457,4 +457,298 @@ leia_sr_v2_create_lens(SrInstance instance, SrLens *out_lens)
 	U_LOG_W("SR v2 lens not available (%s) - 2D/3D switching disabled", leia_sr_v2_result_str(r));
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Multi-screen M0 -- SR display enumeration for probe_displays
+ * (leia_display_claims_win.h). Windows twin of the Linux arm's
+ * leia_lnx_sr_enumerate_displays().
+ *
+ * Differences from Linux, and why:
+ *  - Linux reads the LIVE weaver context and never creates one just to
+ *    probe. On Windows every DP owns its own SrInstance and a headless
+ *    caller (displayxr-cli, the service before any session) has none, so
+ *    the probe keeps ONE process-wide instance of its own. It is created
+ *    lazily, NEVER srInitialize'd (rt_EnumerateDisplays needs only a valid
+ *    instance; initialise would start trackers -- confirmed with the SR
+ *    session 2026-10-07), in NON_BLOCKING_CLIENT mode so a stopped SR
+ *    Service cannot block the registry refresh, and torn down on plug-in
+ *    destroy.
+ *  - A 2 s cache: the runtime re-runs probe_displays per registry refresh
+ *    and at ~1 Hz while a panel is unidentified (runtime#1722).
+ *  - HMONITORs and EDID_ONLY displayIds are NOT stable across display-config
+ *    events (the EDID_ONLY id is a hash until the FPC pairs it), so nothing
+ *    here persists beyond the cache TTL; M5/M6 must re-resolve from the
+ *    claim table, not remember a displayId.
+ * ------------------------------------------------------------------ */
+
+#ifdef DXR_LEIA_HAS_SR_DISPLAY_ENUM
+
+#include "leia_display_claims_win.h"
+#include "leia_platform_state.h"
+#include "os/os_time.h"
+
+#include <sr/sr_display.h>
+
+#include <stdio.h>
+
+namespace {
+
+SRWLOCK g_enum_lock = SRWLOCK_INIT;
+SrInstance g_probe_instance = nullptr;
+bool g_enum_unsupported = false; // installed SR runtime predates slot 106: final for this process
+bool g_caps_logged = false;
+uint64_t g_last_create_fail_ns = 0;
+
+struct leia_win_sr_display g_cache[LEIA_WIN_SR_MAX_DISPLAYS];
+int32_t g_cache_count = -1;
+uint64_t g_cache_ns = 0;
+uint64_t g_logged_fingerprint = 0;
+
+constexpr uint64_t CACHE_TTL_NS = 2000000000ull;        // 2 s
+constexpr uint64_t CREATE_RETRY_NS = 2000000000ull;     // after a failed srCreateInstance
+constexpr double CREATE_MAX_WAIT_S = 0.25;              // non-blocking mode: one or two spins at most
+
+void
+probe_instance_drop_locked()
+{
+	if (g_probe_instance != nullptr) {
+		srDestroyInstance(g_probe_instance);
+		g_probe_instance = nullptr;
+	}
+	g_caps_logged = false;
+}
+
+bool
+probe_instance_ensure_locked(uint64_t now_ns)
+{
+	if (g_probe_instance != nullptr) {
+		return true;
+	}
+	if (g_last_create_fail_ns != 0 && now_ns - g_last_create_fail_ns < CREATE_RETRY_NS) {
+		return false;
+	}
+	// Delay-loaded SR client DLLs must be bound before ANY SR call.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		g_last_create_fail_ns = now_ns;
+		return false;
+	}
+
+	const double start_s = (double)GetTickCount64() / 1000.0;
+	for (;;) {
+		SrInstanceCreateInfo ci{};
+		ci.sType = SR_TYPE_INSTANCE_CREATE_INFO;
+		ci.pNext = nullptr;
+		ci.apiVersion = SR_CURRENT_API_VERSION;
+		ci.networkMode = SR_NETWORK_MODE_NON_BLOCKING_CLIENT;
+
+		SrInstance inst = nullptr;
+		const SrResult r = srCreateInstance(&ci, &inst);
+		if (SR_SUCCEEDED(r) && inst != nullptr) {
+			g_probe_instance = inst;
+			g_last_create_fail_ns = 0;
+			U_LOG_W("leia_plugin: SR display-enumeration probe instance created (non-blocking client, "
+			        "never initialised)");
+			return true;
+		}
+		if (r != SR_ERROR_RUNTIME_UNAVAILABLE ||
+		    ((double)GetTickCount64() / 1000.0 - start_s) > CREATE_MAX_WAIT_S) {
+			static SrResult logged = SR_SUCCESS;
+			if (logged != r) {
+				logged = r;
+				U_LOG_W("leia_plugin: SR display-enumeration probe instance unavailable: %s (%d) -- "
+				        "claims fall back to the frozen EDID table",
+				        leia_sr_v2_result_str(r), (int)r);
+			}
+			g_last_create_fail_ns = now_ns;
+			return false;
+		}
+		Sleep(50);
+	}
+}
+
+/*! Capability query, once per instance: the phase A/C structs M6 will chain
+ *  (routing EXTERNAL, binding by displayId). Logged for bring-up. */
+void
+log_caps_once_locked()
+{
+	if (g_caps_logged) {
+		return;
+	}
+	g_caps_logged = true;
+
+	SrDisplayBindingCapabilities bind_caps{};
+	bind_caps.sType = SR_TYPE_DISPLAY_BINDING_CAPABILITIES;
+	SrWeaverRoutingCapabilities route_caps{};
+	route_caps.sType = SR_TYPE_WEAVER_ROUTING_CAPABILITIES;
+	route_caps.pNext = &bind_caps;
+	SrRuntimeCapabilities caps{};
+	caps.sType = SR_TYPE_RUNTIME_CAPABILITIES;
+	caps.pNext = &route_caps;
+	const SrResult r = srGetRuntimeCapabilities(g_probe_instance, &caps);
+	if (SR_FAILED(r)) {
+		U_LOG_W("leia_plugin: srGetRuntimeCapabilities failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
+		return;
+	}
+	U_LOG_W("leia_plugin: SR multi-display caps: externalRouting=%u routingFlags=0x%llx displayBinding=%u "
+	        "maxBoundDisplays=%u",
+	        (unsigned)route_caps.externalRouting, (unsigned long long)route_caps.supportedFlags,
+	        (unsigned)bind_caps.displayBinding, (unsigned)bind_caps.maxBoundDisplays);
+}
+
+void
+from_descriptor(const SrDisplayDescriptor &d, struct leia_win_sr_display &out)
+{
+	memset(&out, 0, sizeof(out));
+	out.display_id = d.displayId;
+	out.fpc_verified = d.confidence == SR_DISPLAY_CONFIDENCE_FPC_VERIFIED;
+	if (out.fpc_verified) {
+		snprintf(out.serial, sizeof(out.serial), "%.*s", (int)sizeof(d.serial), d.serial);
+	}
+	snprintf(out.product_code, sizeof(out.product_code), "%.*s", (int)sizeof(d.productCode) - 1, d.productCode);
+	out.manufacturer_id = leia_win_pnp_to_manufacturer_id(d.edidVendor);
+	out.product_id = d.edidProduct;
+	out.edid_serial = d.edidSerial;
+	out.left = (int32_t)d.location.left;
+	out.top = (int32_t)d.location.top;
+	out.location_is_desktop_global = d.locationIsDesktopGlobal == SR_TRUE;
+	out.native_w = d.nativeWidth > 0 ? (uint32_t)d.nativeWidth : 0;
+	out.native_h = d.nativeHeight > 0 ? (uint32_t)d.nativeHeight : 0;
+	out.refresh_hz = d.refreshHz;
+	snprintf(out.device_name, sizeof(out.device_name), "%.*s", (int)sizeof(d.connector), d.connector);
+	out.hmonitor = d.platformHandle;
+}
+
+uint64_t
+fingerprint(const struct leia_win_sr_display *v, int32_t n)
+{
+	// FNV-1a over the fields a claim depends on, so the WARN fires once per
+	// change of the answer rather than once per 2 s refresh.
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&h](const void *p, size_t len) {
+		const uint8_t *b = (const uint8_t *)p;
+		for (size_t i = 0; i < len; i++) {
+			h ^= b[i];
+			h *= 1099511628211ull;
+		}
+	};
+	mix(&n, sizeof(n));
+	for (int32_t i = 0; i < n; i++) {
+		mix(&v[i].display_id, sizeof(v[i].display_id));
+		mix(&v[i].fpc_verified, sizeof(v[i].fpc_verified));
+		mix(v[i].serial, strlen(v[i].serial));
+		mix(&v[i].manufacturer_id, sizeof(v[i].manufacturer_id));
+		mix(&v[i].product_id, sizeof(v[i].product_id));
+		mix(&v[i].left, sizeof(v[i].left));
+		mix(&v[i].top, sizeof(v[i].top));
+		mix(&v[i].location_is_desktop_global, sizeof(v[i].location_is_desktop_global));
+	}
+	return h;
+}
+
+/*! @return true when the cache now holds a fresh answer. */
+bool
+refresh_locked(uint64_t now_ns)
+{
+	uint32_t count = 0;
+	SrResult r = srEnumerateDisplays(g_probe_instance, &count, nullptr);
+	if (SR_FAILED(r)) {
+		if (r == SR_ERROR_FUNCTION_UNSUPPORTED || r == SR_ERROR_FEATURE_NOT_SUPPORTED) {
+			// The installed SR runtime predates slot 106 (or cannot enumerate
+			// here). Final for this process: the frozen-table path takes over.
+			U_LOG_W("leia_plugin: srEnumerateDisplays not available on the installed SR runtime (%s) -- "
+			        "claims use the frozen EDID table",
+			        leia_sr_v2_result_str(r));
+			g_enum_unsupported = true;
+			probe_instance_drop_locked();
+			return false;
+		}
+		// Anything else (service restarted under us, handle gone): drop the
+		// instance so the next refresh recreates it; keep no stale answer.
+		U_LOG_W("leia_plugin: srEnumerateDisplays (count) failed: %s (%d) -- probe instance dropped",
+		        leia_sr_v2_result_str(r), (int)r);
+		probe_instance_drop_locked();
+		g_cache_count = -1;
+		return false;
+	}
+
+	SrDisplayDescriptor descs[LEIA_WIN_SR_MAX_DISPLAYS];
+	if (count > LEIA_WIN_SR_MAX_DISPLAYS) {
+		count = LEIA_WIN_SR_MAX_DISPLAYS;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		descs[i] = SrDisplayDescriptor{};
+		descs[i].sType = SR_TYPE_DISPLAY_DESCRIPTOR;
+	}
+	if (count > 0) {
+		r = srEnumerateDisplays(g_probe_instance, &count, descs);
+		if (SR_FAILED(r)) { // SR_INCOMPLETE is a success code: keep the first `count`
+			U_LOG_W("leia_plugin: srEnumerateDisplays failed: %s (%d) -- probe instance dropped",
+			        leia_sr_v2_result_str(r), (int)r);
+			probe_instance_drop_locked();
+			g_cache_count = -1;
+			return false;
+		}
+	}
+
+	struct leia_win_sr_display fresh[LEIA_WIN_SR_MAX_DISPLAYS];
+	for (uint32_t i = 0; i < count; i++) {
+		from_descriptor(descs[i], fresh[i]);
+	}
+	const uint64_t fp = fingerprint(fresh, (int32_t)count);
+	if (fp != g_logged_fingerprint) {
+		g_logged_fingerprint = fp;
+		U_LOG_W("leia_plugin: SR enumerates %u display(s):", count);
+		for (uint32_t i = 0; i < count; i++) {
+			const struct leia_win_sr_display &s = fresh[i];
+			U_LOG_W("leia_plugin:   SR display #%u id=0x%016llx %s serial='%s' product=%s edid=0x%04X/0x%04X/%u "
+			        "at (%d,%d)%s %ux%u %.2f Hz device='%s' hmonitor=0x%llx",
+			        i, (unsigned long long)s.display_id, s.fpc_verified ? "FPC_VERIFIED" : "EDID_ONLY",
+			        s.serial, s.product_code, s.manufacturer_id, s.product_id, s.edid_serial, s.left, s.top,
+			        s.location_is_desktop_global ? "" : " (not desktop-global)", s.native_w, s.native_h,
+			        (double)s.refresh_hz, s.device_name, (unsigned long long)s.hmonitor);
+		}
+	}
+	memcpy(g_cache, fresh, count * sizeof(fresh[0]));
+	g_cache_count = (int32_t)count;
+	g_cache_ns = now_ns;
+	return true;
+}
+
+} // namespace
+
+extern "C" int32_t
+leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
+{
+	int32_t ret = -1;
+	AcquireSRWLockExclusive(&g_enum_lock);
+	if (!g_enum_unsupported) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const bool fresh = g_cache_count >= 0 && now_ns - g_cache_ns < CACHE_TTL_NS;
+		if (!fresh && probe_instance_ensure_locked(now_ns)) {
+			log_caps_once_locked();
+			(void)refresh_locked(now_ns);
+		}
+		if (g_cache_count >= 0 && (fresh || now_ns - g_cache_ns < CACHE_TTL_NS)) {
+			const uint32_t n = (uint32_t)g_cache_count < cap ? (uint32_t)g_cache_count : cap;
+			if (out != nullptr && n > 0) {
+				memcpy(out, g_cache, n * sizeof(out[0]));
+			}
+			ret = g_cache_count;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_enum_lock);
+	return ret;
+}
+
+extern "C" void
+leia_win_sr_enumerate_shutdown(void)
+{
+	AcquireSRWLockExclusive(&g_enum_lock);
+	probe_instance_drop_locked();
+	g_cache_count = -1;
+	ReleaseSRWLockExclusive(&g_enum_lock);
+}
+
+#endif // DXR_LEIA_HAS_SR_DISPLAY_ENUM
+
 #endif // DXR_LEIA_HAS_SR_V2

@@ -50,6 +50,12 @@ set(LEIA_SOURCES
     leia_stereo_camera.cpp
     leia_stereo_camera_parse.h
     leia_stereo_camera_parse.c
+
+    # Multi-screen M0: per-monitor claims joined with the SR runtime's
+    # display enumeration (host-tested: tests/test_display_claims_win.c, run
+    # by the Linux CI job).
+    leia_display_claims_win.h
+    leia_display_claims_win.c
     leia_plugin.c
 )
 
@@ -177,6 +183,29 @@ if(LEIA_SR_COMPOSE_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_weav
         set(LEIA_SR_COMPOSE_STRENGTH_AVAILABLE TRUE)
     endif()
     unset(_leia_sr_h)
+endif()
+# Multi-screen M0 (SR-P1, ST-5481 phase B): srEnumerateDisplays (Windows slot
+# 106) + SrDisplayDescriptor, and the phase A/C capability structs the plug-in
+# logs alongside it. Same header-grep reasoning. Absent => probe_displays
+# keeps today's frozen-table behaviour.
+set(LEIA_SR_DISPLAY_ENUM_AVAILABLE FALSE)
+if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h" _leia_sr_disp_h)
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_weav_h)
+    if(_leia_sr_disp_h MATCHES "srEnumerateDisplays"
+       AND _leia_sr_disp_h MATCHES "SrDisplayBindingCapabilities"
+       AND _leia_sr_weav_h MATCHES "SrWeaverRoutingCapabilities")
+        set(LEIA_SR_DISPLAY_ENUM_AVAILABLE TRUE)
+    endif()
+    unset(_leia_sr_disp_h)
+    unset(_leia_sr_weav_h)
+endif()
+if(LEIA_SR_DISPLAY_ENUM_AVAILABLE)
+    message(STATUS "SR display enumeration: ENABLED (SDK declares srEnumerateDisplays) - "
+                   "probe_displays joins SR's FPC-verified displays (multi-screen M0)")
+else()
+    message(STATUS "SR display enumeration: DISABLED (SDK predates ST-5481 phase B, or no v2 SDK) - "
+                   "probe_displays uses the frozen EDID table alone")
 endif()
 if(LEIA_SR_COMPOSE_AVAILABLE)
     message(STATUS "SR weaver 2D compose: ENABLED (SDK declares srWeaverSetComposeInputsDX11) - "
@@ -420,6 +449,9 @@ if(LEIA_SR_V2_AVAILABLE)
     if(LEIA_SR_COMPOSE_STRENGTH_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_COMPOSE_STRENGTH=1)
         message(STATUS "SR weaver 2D compose: app filter strength (srWeaverSetComposeFilterStrength) ENABLED")
+    endif()
+    if(LEIA_SR_DISPLAY_ENUM_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_DISPLAY_ENUM=1)
     endif()
 endif()
 
