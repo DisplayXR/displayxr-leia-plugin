@@ -112,6 +112,16 @@ bool
 leia_lnx_edid_panel_desktop_position_cached(const char *connector, int32_t *out_left, int32_t *out_top);
 
 /*!
+ * The panel list the position cache resolved (one enumerate-with-positions
+ * pass per process, shared with leia_lnx_edid_panel_desktop_position_cached).
+ * Multi-screen M4: what a per-screen DP resolves its screen against, without
+ * re-scanning sysfs or reconnecting to X per DP. Thread-safe.
+ * @return entries copied to @p out (<= @p cap).
+ */
+uint32_t
+leia_lnx_edid_panels_cached(struct leia_lnx_edid_panel *out, uint32_t cap);
+
+/*!
  * Scan /sys/class/drm/<connector>/edid for a connected monitor whose EDID
  * manufacturer+product IDs match the known Leia panel table. Single-panel
  * accessor: the first entry of leia_lnx_edid_enumerate_panels().

@@ -41,9 +41,11 @@
 #include "leia_display_processor_linux.h"
 #include "leia_edid_probe_linux.h"
 #include "leia_display_claims_linux.h"
+#include "leia_screen_linux.h"
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
@@ -327,6 +329,166 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 
 /*
  *
+ * Multi-screen M1/M4: per-monitor display info and per-screen DPs. Both slots
+ * are appended to xrt_plugin_iface (ADR-020, struct_size-gated) and compiled
+ * only when the runtime headers announce them, so this file still builds —
+ * slots compiled out — against a runtime pinned before multi-screen.
+ *
+ */
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR
+/*!
+ * Fill an xrt_plugin_display_info from a resolved screen (the shared tail of
+ * get_display_info_for_monitor). The SR-driven panel only: its eye tracking,
+ * and the same recommended view scale get_display_info reports (seeded at
+ * probe from the same SR numbers — never a second figure).
+ */
+static void
+leia_lnx_fill_info_from_screen(const struct leia_lnx_screen *scr, struct xrt_plugin_display_info *out_info)
+{
+	out_info->display_width_m = scr->width_m;
+	out_info->display_height_m = scr->height_m;
+	out_info->nominal_viewer_x_m = scr->nominal_viewer_x_m;
+	out_info->nominal_viewer_y_m = scr->nominal_viewer_y_m;
+	out_info->nominal_viewer_z_m = scr->nominal_viewer_z_m;
+	out_info->display_pixel_width = scr->pixel_width;
+	out_info->display_pixel_height = scr->pixel_height;
+	leia_view_scale_get(&out_info->recommended_view_scale_x, &out_info->recommended_view_scale_y);
+	out_info->display_screen_left = scr->screen_left;
+	out_info->display_screen_top = scr->screen_top;
+	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
+	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
+		out_info->refresh_mhz = scr->refresh_mhz;
+	}
+}
+
+/*! Resolve @p b against the claim table, the cached EDID list and the SR query. */
+static void
+leia_lnx_resolve_screen(const struct leia_lnx_screen_binding *b, struct leia_lnx_screen *out)
+{
+	struct leia_lnx_claim_binding claim = {0};
+	const bool have_claim = leia_lnx_claims_lookup(b->monitor_id, &claim);
+	struct leia_lnx_edid_panel panels[LEIA_LNX_EDID_MAX_PANELS];
+	const uint32_t panel_count = leia_lnx_edid_panels_cached(panels, LEIA_LNX_EDID_MAX_PANELS);
+	struct leiasr_lnx_display_info sr = {0};
+	if (!leiasr_lnx_query_display_info(&sr)) {
+		sr.valid = false;
+	}
+	leia_lnx_screen_resolve(b, have_claim ? &claim : NULL, panels, panel_count, &sr,
+	                        leia_lnx_sr_active_display_id(), out);
+}
+
+static bool
+leia_lnx_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
+                                             const struct xrt_display_descriptor *display,
+                                             const struct xrt_display_physical *physical,
+                                             struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+	if (display == NULL || out_info == NULL ||
+	    display->struct_size < offsetof(struct xrt_display_descriptor, screen_top) + sizeof(display->screen_top)) {
+		return false;
+	}
+	// Only monitors this plug-in claimed in probe_displays.
+	if (!leia_lnx_claims_lookup(display->monitor_id, NULL)) {
+		return false;
+	}
+
+	struct leia_lnx_screen_binding b = {0};
+	b.monitor_id = display->monitor_id;
+	b.desktop_left = display->screen_left;
+	b.desktop_top = display->screen_top;
+	b.desktop_width = display->pixel_width;
+	b.desktop_height = display->pixel_height;
+	if (physical != NULL) {
+		const uint32_t psz = physical->struct_size;
+		if (psz >= offsetof(struct xrt_display_physical, physical_height_mm) + sizeof(uint32_t)) {
+			b.width_mm = physical->physical_width_mm;
+			b.height_mm = physical->physical_height_mm;
+		}
+		if (psz >= offsetof(struct xrt_display_physical, native_pixel_height) + sizeof(uint32_t)) {
+			b.native_width = physical->native_pixel_width;
+			b.native_height = physical->native_pixel_height;
+		}
+	}
+
+	struct leia_lnx_screen scr;
+	leia_lnx_resolve_screen(&b, &scr);
+	// A Leia panel the SR context does not drive (a second panel, until
+	// LeiaSR phase D) has no tracking or calibration here: let the runtime
+	// derive its EDID defaults (no eye tracking, view scale 1).
+	if (!scr.valid || !scr.is_sr_panel) {
+		return false;
+	}
+	leia_lnx_fill_info_from_screen(&scr, out_info);
+	return true;
+}
+#endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN
+/*! Mirror the runtime's binding into the plain struct, never reading past its struct_size. */
+static void
+leia_lnx_binding_from_xrt(const struct xrt_screen_binding *xb, struct leia_lnx_screen_binding *out)
+{
+	memset(out, 0, sizeof(*out));
+	const uint32_t sz = xb->struct_size;
+#define LEIA_HAS(field) (sz >= offsetof(struct xrt_screen_binding, field) + sizeof(xb->field))
+	if (LEIA_HAS(monitor_id)) {
+		out->monitor_id = xb->monitor_id;
+	}
+	if (LEIA_HAS(desktop_height)) {
+		out->desktop_left = xb->desktop_left;
+		out->desktop_top = xb->desktop_top;
+		out->desktop_width = xb->desktop_width;
+		out->desktop_height = xb->desktop_height;
+	}
+	if (LEIA_HAS(native_pixel_height)) {
+		out->native_width = xb->native_pixel_width;
+		out->native_height = xb->native_pixel_height;
+	}
+	if (LEIA_HAS(physical_height_mm)) {
+		out->width_mm = xb->physical_width_mm;
+		out->height_mm = xb->physical_height_mm;
+	}
+	if (LEIA_HAS(desktop_scale)) {
+		out->desktop_scale = xb->desktop_scale;
+	}
+	if (LEIA_HAS(display_id)) {
+		out->display_id = xb->display_id;
+	}
+	if (LEIA_HAS(serial)) {
+		snprintf(out->serial, sizeof(out->serial), "%.*s", (int)sizeof(xb->serial), xb->serial);
+	}
+	if (LEIA_HAS(device_name)) {
+		snprintf(out->device_name, sizeof(out->device_name), "%.*s", (int)sizeof(xb->device_name),
+		         xb->device_name);
+	}
+#undef LEIA_HAS
+}
+
+static xrt_result_t
+leia_lnx_plugin_create_dp_vk_for_screen(struct xrt_plugin_instance *inst,
+                                        void *vk_bundle,
+                                        void *vk_cmd_pool,
+                                        void *window_handle,
+                                        int32_t target_format,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor **out_xdp)
+{
+	(void)inst;
+	if (binding == NULL || out_xdp == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	struct leia_lnx_screen_binding b;
+	leia_lnx_binding_from_xrt(binding, &b);
+	return leia_lnx_dp_factory_vk_for_screen(vk_bundle, vk_cmd_pool, window_handle, target_format, &b, out_xdp);
+}
+#endif
+
+
+/*
+ *
  * Vtable.
  *
  */
@@ -381,6 +543,15 @@ static struct xrt_plugin_iface g_leia_lnx_iface = {
 
     /* Per-monitor claims (multi-screen M0; #69 / ADR-015 shape). */
     .probe_displays = leia_lnx_plugin_probe_displays,
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR
+    /* Per-monitor display info (multi-screen M1). */
+    .get_display_info_for_monitor = leia_lnx_plugin_get_display_info_for_monitor,
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN
+    /* One DP per screen (multi-screen M2 slot; this plug-in's side is M4). */
+    .create_dp_vk_for_screen = leia_lnx_plugin_create_dp_vk_for_screen,
+#endif
 };
 
 

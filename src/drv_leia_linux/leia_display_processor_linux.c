@@ -23,6 +23,8 @@
 #include "leia_bg_capture_linux.h"
 #include "leia_bg_capture_worker_linux.h"
 #include "leia_compose_push_linux.h"
+#include "leia_screen_linux.h"
+#include "leia_display_claims_linux.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -47,6 +49,16 @@ struct leia_dp_linux
 	struct vk_bundle *vk;                 //!< compositor's bundle — not owned
 	struct leiasr_lnx *sr;                //!< weaver backend — owned
 	uint32_t view_count;                  //!< from the last process_atlas grid
+
+	//! Multi-screen M4: created for ONE screen (create_dp_vk_for_screen).
+	//! Then the display getters answer from @ref screen — resolved once at
+	//! creation, owned by this instance — and never from the process-wide SR
+	//! display or the "first panel" caches; and the DP is a SEGMENT DP that
+	//! confines every write to its canvas (a sibling DP may own the rest of
+	//! the target). False = the plain factory: today's behaviour exactly.
+	bool screen_bound;
+	struct leia_lnx_screen screen;
+	bool segment_alpha_gate_logged; //!< one line when a segment skips the alpha-gate
 
 	//! XR_DXR_display_zones (ADR-027). Zones need NO special weaver support on
 	//! Linux: the runtime composites every zone into the ONE content atlas and
@@ -1501,8 +1513,7 @@ flat_enc_blit_copy(struct leia_dp_linux *ldp,
                    const VkImageBlit *blit,
                    VkImage enc_image,
                    VkImage target_image,
-                   uint32_t w,
-                   uint32_t h)
+                   VkRect2D rect)
 {
 	struct vk_bundle *vk = ldp->vk;
 
@@ -1537,10 +1548,10 @@ flat_enc_blit_copy(struct leia_dp_linux *ldp,
 	// bytes as they are.
 	VkImageCopy region = {
 	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffset = {0, 0, 0},
+	    .srcOffset = {rect.offset.x, rect.offset.y, 0},
 	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffset = {0, 0, 0},
-	    .extent = {w, h, 1},
+	    .dstOffset = {rect.offset.x, rect.offset.y, 0},
+	    .extent = {rect.extent.width, rect.extent.height, 1},
 	};
 	vk->vkCmdCopyImage(cmd, enc_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -1634,6 +1645,36 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	// one that is no longer wanted, age the ones waiting on the GPU.
 	dp_capture_reconcile(ldp, /*age_graveyard=*/true);
 
+	// Multi-screen M4: a SEGMENT DP (created for one screen) writes only its
+	// canvas — a sibling DP may already have woven the rest of the target
+	// this frame. The canvas is clamped to the target (a rect outside it is
+	// nothing any weaver can honour). A plain-factory DP keeps today's
+	// behaviour exactly: segment_confined stays false.
+	VkRect2D out_rect = {.offset = {0, 0}, .extent = {target_width, target_height}};
+	bool segment_confined = false;
+	if (ldp->screen_bound && canvas_width != 0 && canvas_height != 0) {
+		int64_t x0 = canvas_offset_x, y0 = canvas_offset_y;
+		int64_t x1 = x0 + canvas_width, y1 = y0 + canvas_height;
+		x0 = x0 < 0 ? 0 : x0;
+		y0 = y0 < 0 ? 0 : y0;
+		x1 = x1 > (int64_t)target_width ? (int64_t)target_width : x1;
+		y1 = y1 > (int64_t)target_height ? (int64_t)target_height : y1;
+		if (x1 <= x0 || y1 <= y0) {
+			// Nothing of the canvas is on the target: write nothing, but
+			// leave the target in the layout every DP hands back (#280).
+			if (target_image != (VkImage_XDP)0) {
+				dp_target_to_present(ldp, cmd_buffer, (VkImage)target_image);
+			}
+			return;
+		}
+		out_rect.offset.x = (int32_t)x0;
+		out_rect.offset.y = (int32_t)y0;
+		out_rect.extent.width = (uint32_t)(x1 - x0);
+		out_rect.extent.height = (uint32_t)(y1 - y0);
+		segment_confined =
+		    !(x0 == 0 && y0 == 0 && (uint32_t)x1 == target_width && (uint32_t)y1 == target_height);
+	}
+
 	// runtime#542: atlas processing follows the CONTENT, not the lens —
 	// the grid the runtime packed decides weave vs flat blit.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
@@ -1700,7 +1741,10 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .srcOffsets = {{0, 0, 0}, {(int32_t)view_width, (int32_t)view_height, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{0, 0, 0}, {(int32_t)target_width, (int32_t)target_height, 1}},
+		    // The whole target, or (segment DP) just its canvas.
+		    .dstOffsets = {{out_rect.offset.x, out_rect.offset.y, 0},
+		                   {out_rect.offset.x + (int32_t)out_rect.extent.width,
+		                    out_rect.offset.y + (int32_t)out_rect.extent.height, 1}},
 		};
 		// Issue #278: the declared encoding is read per frame (set_atlas_encoding
 		// runs before every process_atlas). A LINEAR atlas into a target that
@@ -1717,8 +1761,8 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 			}
 		}
 		if (enc_image != VK_NULL_HANDLE) {
-			flat_enc_blit_copy(ldp, cmd_buffer, (VkImage)atlas_image, &blit, enc_image, (VkImage)target_image,
-			                   target_width, target_height);
+			flat_enc_blit_copy(ldp, cmd_buffer, (VkImage)atlas_image, &blit, enc_image,
+			                   (VkImage)target_image, out_rect);
 		} else {
 			vk->vkCmdBlitImage(cmd_buffer, (VkImage)atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			                   (VkImage)target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
@@ -1807,6 +1851,7 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .width = target_width,
 	    .height = target_height,
 	    .format = (VkFormat)target_format,
+	    .confine_to_viewport = segment_confined,
 	};
 
 	// Viewport and phase origin decoupled (contract R-W7): the woven pixels
@@ -1817,6 +1862,10 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .extent = {canvas_width != 0 ? canvas_width : target_width,
 	               canvas_height != 0 ? canvas_height : target_height},
 	};
+	if (segment_confined) {
+		// The clamped canvas: a render area must lie inside the framebuffer.
+		viewport = out_rect;
+	}
 	// Windowed weaving (runtime#757 / LeiaSR#85): the phase origin is the app
 	// WINDOW's panel-relative top-left (pushed by the compositor via
 	// set_present_origin; 0,0 = display-scoped default). The weave adds the
@@ -1835,7 +1884,17 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	// view when compose_pre_weave baked a trusted captured desktop into the
 	// de-occlusion band this frame, else in ANY view (silhouette intersection). Pass the ORIGINAL atlas_view (pre-compose) — that carries the app's
 	// per-view alpha the gate keys on.
-	if (dp_transparency_live(ldp) && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
+	if (segment_confined && dp_transparency_live(ldp)) {
+		// The alpha-gate re-punches the WHOLE target from the atlas; on a
+		// segment it would punch the sibling segments too. A transparent
+		// window spanning screens stays opaque on this one (multi-screen M4).
+		if (!ldp->segment_alpha_gate_logged) {
+			ldp->segment_alpha_gate_logged = true;
+			U_LOG_W(
+			    "leia_lnx_dp: segment DP with transparency — post-weave alpha-gate skipped (it is "
+			    "whole-target); this segment presents opaque (logged once)");
+		}
+	} else if (dp_transparency_live(ldp) && target_image != (VkImage_XDP)0 && !dxr_leia_bg_debug()) {
 		alpha_gate_run(ldp, cmd_buffer, (VkImage)target_image, (VkImageView)atlas_view,
 		               (VkFormat)target_format, target_width, target_height, tile_columns, tile_rows);
 	}
@@ -1878,7 +1937,16 @@ leia_lnx_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struc
 static bool
 leia_lnx_dp_get_display_dimensions(struct xrt_display_processor *xdp, float *out_width_m, float *out_height_m)
 {
-	(void)xdp;
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (ldp->screen_bound) {
+		// Multi-screen M4: THIS DP's screen, resolved at creation.
+		if (!ldp->screen.valid) {
+			return false;
+		}
+		*out_width_m = ldp->screen.width_m;
+		*out_height_m = ldp->screen.height_m;
+		return true;
+	}
 	struct leiasr_lnx_display_info info;
 	if (!leiasr_lnx_query_display_info(&info) || !info.valid) {
 		return false;
@@ -1895,7 +1963,20 @@ leia_lnx_dp_get_display_pixel_info(struct xrt_display_processor *xdp,
                                    int32_t *out_screen_left,
                                    int32_t *out_screen_top)
 {
-	(void)xdp;
+	struct leia_dp_linux *ldp = leia_dp_linux(xdp);
+	if (ldp->screen_bound) {
+		// Multi-screen M4: the bound screen's device pixels and the
+		// desktop origin the runtime gave it (out_screen_left/top = the
+		// binding's origin, per the create_dp_vk_for_screen contract).
+		if (!ldp->screen.valid) {
+			return false;
+		}
+		*out_pixel_width = ldp->screen.pixel_width;
+		*out_pixel_height = ldp->screen.pixel_height;
+		*out_screen_left = ldp->screen.screen_left;
+		*out_screen_top = ldp->screen.screen_top;
+		return true;
+	}
 	struct leiasr_lnx_display_info info;
 	if (!leiasr_lnx_query_display_info(&info) || !info.valid) {
 		return false;
@@ -2212,6 +2293,34 @@ leia_lnx_dp_get_background_preview(struct xrt_display_processor_vk *xdp_vk, stru
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
+/*
+ * Scanout caps, stated explicitly rather than left to the absent-slot default
+ * (which is the same answer): a GPU weaver that writes final pixels into the
+ * canvas it is handed (weave scope CANVAS), whose output does NOT survive a
+ * display-server resample — a lenticular weave is a 1-pixel-period pattern
+ * that a fractional scale turns into a uniform double image. So flags = 0,
+ * i.e. no XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE (multi-screen M2/M4): the
+ * runtime's refuse-rather-than-resample gates (#1595, #1831, the per-segment
+ * gate) keep degrading a resampled Leia surface to flat 2D. Writes only within
+ * the caller's struct_size and zeroes everything else in it.
+ */
+static bool
+leia_lnx_dp_get_scanout_caps(struct xrt_display_processor_vk *xdp_vk, struct xrt_dp_scanout_caps *out_caps)
+{
+	(void)xdp_vk;
+	if (out_caps == NULL || out_caps->struct_size < XRT_DP_SCANOUT_CAPS_SIZE_V1) {
+		return false;
+	}
+	const uint32_t caller_size = out_caps->struct_size;
+	const size_t n = caller_size < sizeof(*out_caps) ? caller_size : sizeof(*out_caps);
+	memset((uint8_t *)out_caps + sizeof(out_caps->struct_size), 0, n - sizeof(out_caps->struct_size));
+	out_caps->weave_scope = XRT_DP_WEAVE_SCOPE_CANVAS;
+	// flags (multi-screen M2, carved out of reserved[0]) stay 0: needs 1:1 pixels.
+	return true;
+}
+#endif
+
 static void
 leia_lnx_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -2332,12 +2441,13 @@ leia_lnx_dp_clear_local_zone_mask(struct xrt_display_processor *xdp)
  *
  */
 
-xrt_result_t
-leia_lnx_dp_factory_vk(void *vk_bundle,
-                       void *vk_cmd_pool,
-                       void *window_handle,
-                       int32_t target_format,
-                       struct xrt_display_processor **out_xdp)
+static xrt_result_t
+leia_lnx_dp_create(void *vk_bundle,
+                   void *vk_cmd_pool,
+                   void *window_handle,
+                   int32_t target_format,
+                   const struct leia_lnx_screen_binding *binding,
+                   struct xrt_display_processor **out_xdp)
 {
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle;
 	if (vk == NULL || out_xdp == NULL) {
@@ -2411,6 +2521,10 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 #ifdef XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH
 	ldp->base.set_overlay_2d_filter_strength = leia_lnx_dp_set_overlay_2d_filter_strength; // XR_DXR_weave v15
 #endif
+#ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
+	// Weave scope CANVAS, flags 0 = needs 1:1 pixels (multi-screen M2/M4).
+	ldp->base.get_scanout_caps = leia_lnx_dp_get_scanout_caps;
+#endif
 	// The struct is calloc'd: 0.0 would mean "no lens filtering". Start (and,
 	// against a runtime without the v15 slot, stay) at "SR default".
 	ldp->overlay_filter_strength = -1.0f;
@@ -2419,9 +2533,20 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	ldp->vk = vk;
 	ldp->view_count = 2;
 
-	// Backend creation on the compositor's Vulkan objects (R-W2). The
-	// window handle is NULL on Linux today (display-scoped, contract §3.5);
-	// runtime Phase 3b supplies an X11 Window for per-window phase.
+	// Multi-screen M4: the SR display this DP's screen is, for the weaver's
+	// display binding — the runtime's binding (opaque to it), else this
+	// plug-in's own probe_displays table. 0 for the plain factory.
+	struct leia_lnx_claim_binding claim = {0};
+	const bool have_claim = binding != NULL && leia_lnx_claims_lookup(binding->monitor_id, &claim);
+	uint64_t sr_display_id = 0;
+	if (binding != NULL) {
+		sr_display_id = binding->display_id != 0 ? binding->display_id : claim.sr_display_id;
+	}
+
+	// Backend creation on the compositor's Vulkan objects (R-W2). The window
+	// handle is carried on the seam, but the SDK weaver is ALWAYS created
+	// windowless (multi-screen M4 / ADR-033 — leia_sr_linux.h): the phase
+	// origin comes from set_present_origin every frame.
 	struct leiasr_lnx_create_info info = {
 	    .physical_device = vk->physical_device,
 	    .device = vk->device,
@@ -2432,6 +2557,7 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 	    .x11_connection = NULL,
 	    .retry_budget_s = 5.0, // Windows-parity connect budget (R-W1)
 	    .target_format = (VkFormat)target_format,
+	    .sr_display_id = sr_display_id,
 	};
 	struct leiasr_lnx *sr = NULL;
 	enum leiasr_lnx_result res = leiasr_lnx_create(&info, &sr);
@@ -2442,6 +2568,31 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	ldp->sr = sr;
+
+	if (binding != NULL) {
+		// Resolve this DP's screen ONCE, into state it owns: the binding, the
+		// EDID panel list (cached per process, sysfs + RandR once), and — only
+		// if this screen is the panel the SR context drives — SR's numbers.
+		struct leia_lnx_edid_panel panels[LEIA_LNX_EDID_MAX_PANELS];
+		const uint32_t panel_count = leia_lnx_edid_panels_cached(panels, LEIA_LNX_EDID_MAX_PANELS);
+		struct leiasr_lnx_display_info sr_info = {0};
+		if (!leiasr_lnx_query_display_info(&sr_info)) {
+			sr_info.valid = false;
+		}
+		leia_lnx_screen_resolve(binding, have_claim ? &claim : NULL, panels, panel_count, &sr_info,
+		                        leia_lnx_sr_active_display_id(), &ldp->screen);
+		ldp->screen_bound = true;
+		U_LOG_W(
+		    "leia_lnx_dp: segment DP for monitor 0x%016llx ('%s', connector '%s'): %ux%u px at (%d,%d), "
+		    "%.3fx%.3f m, %s, SR display 0x%016llx%s",
+		    (unsigned long long)binding->monitor_id, binding->device_name, ldp->screen.connector,
+		    ldp->screen.pixel_width, ldp->screen.pixel_height, ldp->screen.screen_left, ldp->screen.screen_top,
+		    ldp->screen.width_m, ldp->screen.height_m,
+		    ldp->screen.is_sr_panel ? "the SR-driven panel"
+		                            : "NOT the SR-driven panel (no tracking/calibration)",
+		    (unsigned long long)ldp->screen.sr_display_id,
+		    ldp->screen.valid ? "" : " — INCOMPLETE (getters will report false)");
+	}
 
 	// WARN not INFO: one-off lifecycle line (docs/reference/debug-logging.md)
 	// — aux INFO is dropped from the hot path, which is exactly how this line
@@ -2502,4 +2653,29 @@ leia_lnx_dp_factory_vk(void *vk_bundle,
 
 	*out_xdp = &ldp->base.base;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+leia_lnx_dp_factory_vk(void *vk_bundle,
+                       void *vk_cmd_pool,
+                       void *window_handle,
+                       int32_t target_format,
+                       struct xrt_display_processor **out_xdp)
+{
+	// The plain factory: the primary (first) panel, today's behaviour.
+	return leia_lnx_dp_create(vk_bundle, vk_cmd_pool, window_handle, target_format, NULL, out_xdp);
+}
+
+xrt_result_t
+leia_lnx_dp_factory_vk_for_screen(void *vk_bundle,
+                                  void *vk_cmd_pool,
+                                  void *window_handle,
+                                  int32_t target_format,
+                                  const struct leia_lnx_screen_binding *binding,
+                                  struct xrt_display_processor **out_xdp)
+{
+	if (binding == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return leia_lnx_dp_create(vk_bundle, vk_cmd_pool, window_handle, target_format, binding, out_xdp);
 }
