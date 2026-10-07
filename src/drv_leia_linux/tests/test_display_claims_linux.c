@@ -350,6 +350,41 @@ test_claims_ambiguous_twins(void)
 	CHECK(c[1].monitor_id == 0xC && strcmp(b[1].connector, "DP-1") == 0);
 }
 
+/* probe() bound, compute_claims found nothing: one EDID claim on the bound
+ * panel's monitor (by size), else the primary, else the first. */
+static void
+test_fallback_claim(void)
+{
+	struct xrt_display_descriptor d[2] = {
+	    desc(0xA, LGD_ID, 0x0601, 2560, 1600, 0, 0),
+	    desc(0xB, 0, 0, 3840, 2160, 2560, 0), // no ids (XWayland path)
+	};
+	struct leia_lnx_edid_panel p = panel("HDMI-A-1", 7, false, 0, 0);
+	struct xrt_display_claim c;
+	struct leia_lnx_claim_binding b;
+
+	CHECK(leia_lnx_fallback_claim(d, 2, &p, 1, XRT_DP_API_BIT_VK, &c, &b));
+	CHECK(c.monitor_id == 0xB && c.confidence == XRT_DISPLAY_CLAIM_EDID && c.serial[0] == '\0');
+	CHECK(c.supported_apis == XRT_DP_API_BIT_VK);
+	CHECK(b.monitor_id == 0xB && strcmp(b.connector, "HDMI-A-1") == 0 && b.sr_display_id == 0);
+
+	// Forced probe, no panel at all: the primary monitor.
+	d[0].flags = 0;
+	d[1].flags = 1;
+	CHECK(leia_lnx_fallback_claim(d, 2, NULL, 0, XRT_DP_API_BIT_VK, &c, &b));
+	CHECK(c.monitor_id == 0xB && b.connector[0] == '\0');
+	d[1].flags = 0;
+	d[0].flags = 1;
+	CHECK(leia_lnx_fallback_claim(d, 2, NULL, 0, XRT_DP_API_BIT_VK, &c, &b));
+	CHECK(c.monitor_id == 0xA);
+
+	// No primary flag: the first monitor. Nothing to claim: false.
+	d[0].flags = 0;
+	CHECK(leia_lnx_fallback_claim(d, 2, NULL, 0, XRT_DP_API_BIT_VK, &c, NULL));
+	CHECK(c.monitor_id == 0xA);
+	CHECK(!leia_lnx_fallback_claim(d, 0, &p, 1, XRT_DP_API_BIT_VK, &c, &b));
+}
+
 /*! A future runtime appended fields: walk with ITS stride, not ours. */
 struct bigger_descriptor
 {
@@ -398,6 +433,7 @@ main(void)
 	test_claims_no_ids();
 	test_claims_new_api();
 	test_claims_ambiguous_twins();
+	test_fallback_claim();
 	test_claims_stride();
 	test_binding_table();
 	if (g_failures != 0) {
