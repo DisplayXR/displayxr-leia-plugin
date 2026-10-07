@@ -113,6 +113,28 @@ leia_lnx_compute_claims(const struct xrt_display_descriptor *displays,
                         uint32_t max_claims);
 
 /*!
+ * The claim to make when probe() BOUND the plug-in but
+ * leia_lnx_compute_claims() matched no monitor (DXR_LEIA_FORCE_PROBE=1, or a
+ * descriptor the matcher cannot pair with the panel). A plug-in that
+ * implements probe_displays no longer gets the runtime's fallback claim, so
+ * without this the bound plug-in owns no monitor and another plug-in wins
+ * the panel. One EDID-confidence claim (no serial, no SR display), on:
+ *   1. the first descriptor whose pixel size is a panel's (native mode or
+ *      RandR CRTC; panels in connector order) — the bound panel;
+ *   2. else the descriptor flagged primary (flags bit 0);
+ *   3. else the first descriptor.
+ * @return false only when @p display_count is 0.
+ */
+bool
+leia_lnx_fallback_claim(const struct xrt_display_descriptor *displays,
+                        uint32_t display_count,
+                        const struct leia_lnx_edid_panel *panels,
+                        uint32_t panel_count,
+                        uint32_t supported_apis,
+                        struct xrt_display_claim *out_claim,
+                        struct leia_lnx_claim_binding *out_binding);
+
+/*!
  * Replace the plug-in-private monitor table with the latest probe's bindings
  * (thread-safe). Called by probe_displays; read by the per-DP binding work
  * (M4/M5 — nothing reads it yet).

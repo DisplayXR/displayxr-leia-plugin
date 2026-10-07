@@ -46,6 +46,10 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
 
+//! probe() bound this plug-in (forced or a panel found). probe_displays then
+//! guarantees the plug-in at least one monitor (leia_lnx_fallback_claim).
+static bool g_probe_bound;
+
 
 /*
  *
@@ -103,6 +107,7 @@ leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 
 	/* No per-instance state — hardware state lives in file-scope statics
 	 * inside the plug-in .so, mirroring the Windows/Android arms. */
+	g_probe_bound = true;
 	*out_inst = NULL;
 	return XRT_SUCCESS;
 }
@@ -247,7 +252,28 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	const uint32_t cap = max_claims < (uint32_t)(sizeof(bindings) / sizeof(bindings[0]))
 	                         ? max_claims
 	                         : (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
-	const uint32_t n = leia_lnx_compute_claims(displays, display_count, &in, out_claims, bindings, cap);
+	uint32_t n = leia_lnx_compute_claims(displays, display_count, &in, out_claims, bindings, cap);
+
+	// probe() bound us but no monitor matched (DXR_LEIA_FORCE_PROBE=1, or a
+	// descriptor the matcher cannot pair). The runtime gives a plug-in that
+	// implements probe_displays no fallback claim of its own, so without
+	// this the bound plug-in would own no monitor and another plug-in would
+	// win the panel. One EDID-confidence claim on the bound panel's monitor
+	// (by size), else the primary monitor.
+	if (n == 0 && g_probe_bound &&
+	    leia_lnx_fallback_claim(displays, display_count, panels, panel_count, XRT_DP_API_BIT_VK, &out_claims[0],
+	                            &bindings[0])) {
+		n = 1;
+		static bool fallback_logged;
+		if (!fallback_logged) {
+			fallback_logged = true;
+			U_LOG_W(
+			    "leia_lnx_plugin: probe() bound but no monitor matched a Leia panel — fallback claim on "
+			    "monitor 0x%016llx%s%s (EDID confidence)",
+			    (unsigned long long)out_claims[0].monitor_id, bindings[0].connector[0] ? " on " : "",
+			    bindings[0].connector);
+		}
+	}
 
 	// Plug-in-private monitor table: displayId per claimed monitor, for the
 	// per-DP SR binding (M4/M5). Nothing consumes it yet.

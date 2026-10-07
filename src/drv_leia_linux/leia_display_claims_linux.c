@@ -334,6 +334,60 @@ leia_lnx_compute_claims(const struct xrt_display_descriptor *displays,
 	return n;
 }
 
+bool
+leia_lnx_fallback_claim(const struct xrt_display_descriptor *displays,
+                        uint32_t display_count,
+                        const struct leia_lnx_edid_panel *panels,
+                        uint32_t panel_count,
+                        uint32_t supported_apis,
+                        struct xrt_display_claim *out_claim,
+                        struct leia_lnx_claim_binding *out_binding)
+{
+	if (displays == NULL || display_count == 0 || out_claim == NULL) {
+		return false;
+	}
+	if (panel_count > LEIA_LNX_EDID_MAX_PANELS) {
+		panel_count = LEIA_LNX_EDID_MAX_PANELS;
+	}
+
+	int32_t pick = -1;
+	const char *connector = "";
+	// 1. The bound panel, by pixel size.
+	for (uint32_t k = 0; k < panel_count && pick < 0 && panels != NULL; k++) {
+		for (uint32_t i = 0; i < display_count; i++) {
+			const struct desc_view v = desc_read(desc_at(displays, i));
+			if (panel_size_is(&panels[k], v.px_w, v.px_h)) {
+				pick = (int32_t)i;
+				connector = panels[k].connector;
+				break;
+			}
+		}
+	}
+	// 2. The primary monitor.
+	for (uint32_t i = 0; i < display_count && pick < 0; i++) {
+		const struct xrt_display_descriptor *d = desc_at(displays, i);
+		if (DESC_HAS(d, flags) && (d->flags & 1u) != 0) {
+			pick = (int32_t)i;
+		}
+	}
+	// 3. The first monitor.
+	if (pick < 0) {
+		pick = 0;
+	}
+
+	const struct desc_view v = desc_read(desc_at(displays, (uint32_t)pick));
+	memset(out_claim, 0, sizeof(*out_claim));
+	out_claim->monitor_id = v.monitor_id;
+	out_claim->confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+	out_claim->supported_apis = supported_apis;
+	if (out_binding != NULL) {
+		memset(out_binding, 0, sizeof(*out_binding));
+		out_binding->monitor_id = v.monitor_id;
+		snprintf(out_binding->connector, sizeof(out_binding->connector), "%s", connector);
+	}
+	return true;
+}
+
 
 /*
  *

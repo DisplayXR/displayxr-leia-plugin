@@ -250,6 +250,17 @@ identity, never by name). The runtime's monitors are matched against that list
   connector, then EDID ids + serial. SR's list is authoritative, so a monitor SR lists but
   the frozen table lacks is still claimed. Each claim's `displayId` goes into a
   plug-in-private table for the later per-DP binding (M4/M5). Nothing reads that table yet.
+- **Identical twins** (same EDID ids) are paired only by RandR origin, or when exactly one
+  candidate is left. Two unplaced twins (the XWayland norm) are **ambiguous**: both
+  monitors are claimed at `EDID` with no serial, no SR display and no connector, never
+  with each other's identity.
+- **Fallback claim.** When `probe()` bound the plug-in (`DXR_LEIA_FORCE_PROBE=1`, or a
+  panel the matcher cannot pair with any descriptor) but no monitor matched, the plug-in
+  still claims exactly one monitor at `EDID` confidence. It picks the monitor whose pixel
+  size is the panel's, else the primary monitor, else the first. A plug-in that implements
+  `probe_displays` gets no fallback claim from the runtime, so without this the bound
+  plug-in would own no monitor and sim-display would win the panel. Logged once:
+  `probe() bound but no monitor matched a Leia panel — fallback claim on monitor …`.
 - `supported_apis` = Vulkan only (this arm has no GL DP).
 
 `probe_displays` **never creates an SR context**: it reuses the one `probe()` already
