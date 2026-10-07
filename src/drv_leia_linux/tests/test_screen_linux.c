@@ -150,6 +150,13 @@ test_claim_connector_and_display_id(void)
 	CHECK(s.is_sr_panel);         // by id
 	CHECK(s.screen_left == 9999); // origin is the binding's, always
 
+	// The binding's device name outranks the claim's connector (review B):
+	// a claim made by list order could name the twin.
+	snprintf(b.device_name, sizeof(b.device_name), "DP-2");
+	leia_lnx_screen_resolve(&b, &claim, panels, 2, &sr, DS1_SR_ID, &s);
+	CHECK(strcmp(s.connector, "DP-2") == 0);
+	snprintf(b.device_name, sizeof(b.device_name), "%s", "");
+
 	// The runtime's opaque display_id wins over the claim table.
 	b.display_id = OTHER_SR_ID;
 	leia_lnx_screen_resolve(&b, &claim, panels, 2, &sr, DS1_SR_ID, &s);
