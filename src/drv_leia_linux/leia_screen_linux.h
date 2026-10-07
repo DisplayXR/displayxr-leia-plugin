@@ -89,8 +89,8 @@ struct leia_lnx_screen
  *
  * Rules (each documented at its line in leia_screen_linux.c):
  *   - origin: always the binding's desktop rect (the runtime placed the screen);
- *   - panel: the claim's connector, else the binding's device name (DRM
- *     connector or RandR output), else the panel at the binding's origin;
+ *   - panel: the binding's device name (DRM connector or RandR output),
+ *     else the claim's connector, else the panel at the binding's origin;
  *   - pixels: binding native mode, else the panel's EDID native, else the desktop size;
  *   - SR panel: by displayId when both ids are known, else "the first panel"
  *     (connector order — the one SR 1.38 drives on a one-panel box), else

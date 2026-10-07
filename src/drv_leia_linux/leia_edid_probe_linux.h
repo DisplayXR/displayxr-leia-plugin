@@ -112,10 +112,9 @@ bool
 leia_lnx_edid_panel_desktop_position_cached(const char *connector, int32_t *out_left, int32_t *out_top);
 
 /*!
- * The panel list the position cache resolved (one enumerate-with-positions
- * pass per process, shared with leia_lnx_edid_panel_desktop_position_cached).
- * Multi-screen M4: what a per-screen DP resolves its screen against, without
- * re-scanning sysfs or reconnecting to X per DP. Thread-safe.
+ * The shared panel cache as it is now (no rescan of its own: probe_displays'
+ * TTL and SR topology events keep it fresh). What a per-screen DP resolves
+ * its screen against (multi-screen M4). Thread-safe.
  * @return entries copied to @p out (<= @p cap).
  */
 uint32_t
