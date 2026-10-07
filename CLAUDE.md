@@ -115,6 +115,7 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia_linux/leia_sr_stub.c` | Track A stub backend: canned panel info + passthrough SBS blit, `TODO(Track B)` at every body. |
 | `src/drv_leia_linux/leia_sr_linux_sdk.c` | Track B backend: the real srSDK (C99, API 1.0.0) behind the same seam — instance/display/lens/weaver + event latching. Selected by `-DDXR_LEIA_LINUX_WEAVER=sdk`. |
 | `src/drv_leia_linux/leia_plugin_linux.c` | Linux `xrtPluginNegotiate` + iface (VK-only factories; env-gated probe). |
+| `src/drv_leia_linux/leia_display_claims_linux.{c,h}` | Linux `probe_displays` matching (multi-screen M0): runtime monitors × EDID panel list × SR display enumeration → per-monitor claims + private `displayId` table. Pure logic, unit-tested. |
 | `src/drv_leia_linux/leia_display_processor_linux.c` | Linux VK DP — 1×1 grid blits, multi-view goes through the seam. Reuses `../drv_leia/leia_device.c`. |
 | `installer/DisplayXRLeiaSRInstaller.nsi` | NSIS installer. Drops DLL at `C:\Program Files\DisplayXR\Plugins\LeiaSR\`; writes registry entry `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` with values `Binary`, `ProbeOrder`, `Version`, `DisplayName`, `Vendor`, `UninstallString`. No prerequisites; see `docs/installer.md`. |
 | `installer/rm-helper/` | `dxr-rm-close.exe` — generic Restart Manager driver the installer/uninstaller use to close and restart whatever maps the plug-in's files (one `session` process spans both phases). `rm_test_holder.cpp` is a test-only holder (EXCLUDE_FROM_ALL). |

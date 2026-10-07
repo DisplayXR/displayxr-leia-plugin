@@ -76,6 +76,9 @@ fi
 echo "==> Unit test: stereo camera source parsing (runtime ADR-043, L1)"
 "$BUILD_DIR/src/drv_leia_linux/test_stereo_camera_parse"
 
+echo "==> Unit test: EDID panel list + per-monitor claims (multi-screen M0)"
+"$BUILD_DIR/src/drv_leia_linux/test_display_claims_linux"
+
 echo "==> Asserting single-export discipline (#496 / ADR-019)"
 SYMS="$(nm -D --defined-only "$SO" | awk '{print $NF}')"
 if [ "$SYMS" != "xrtPluginNegotiate" ]; then

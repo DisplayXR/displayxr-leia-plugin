@@ -77,6 +77,7 @@
 #include "leia_sr_linux.h"
 #include "leia_edid_probe_linux.h"
 #include "leia_lens_owner_linux.h"
+#include "leia_display_claims_linux.h"
 
 #include "leia_interface.h"
 
@@ -89,6 +90,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -165,6 +167,9 @@ struct sr_ctx
 	_Atomic int64_t last_pair_mono_ns;
 	atomic_bool lens_on;
 	atomic_bool display_info_dirty;
+	//! SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED latched (new SR API only):
+	//! the cached srEnumerateDisplays answer is stale.
+	atomic_bool display_topology_dirty;
 
 	/*
 	 * Context loss (SR_EVENT_TYPE_CONTEXT_INVALID). The SDK raises it when the
@@ -250,7 +255,13 @@ sr_ctx_on_system_event(const SrSystemEvent *event, void *user_data)
 	case SR_EVENT_TYPE_LENS_ON: atomic_store(&g_ctx.lens_on, true); break;
 	case SR_EVENT_TYPE_LENS_OFF: atomic_store(&g_ctx.lens_on, false); break;
 	case SR_EVENT_TYPE_DISPLAY_CONNECTED:
-	case SR_EVENT_TYPE_DISPLAY_NOT_CONNECTED: atomic_store(&g_ctx.display_info_dirty, true); break;
+	case SR_EVENT_TYPE_DISPLAY_NOT_CONNECTED:
+		atomic_store(&g_ctx.display_info_dirty, true);
+		atomic_store(&g_ctx.display_topology_dirty, true);
+		break;
+#ifdef DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM
+	case SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED: atomic_store(&g_ctx.display_topology_dirty, true); break;
+#endif
 	default: break;
 	}
 	U_LOG_I("leia_sr_sdk: system event %d%s%s", (int)event->eventType, event->message != NULL ? ": " : "",
@@ -2113,3 +2124,168 @@ leiasr_lnx_get_hardware_3d_state(struct leiasr_lnx *lnx, bool *out_is_3d)
 	*out_is_3d = atomic_load(&g_ctx.lens_on);
 	return true;
 }
+
+
+/*
+ *
+ * Multi-screen M0 — per-monitor identity (leia_sr_linux.h). Neither entry
+ * point creates an SR context: see the seam header for why.
+ *
+ */
+
+bool
+leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap)
+{
+	if (out_serial == NULL || cap == 0) {
+		return false;
+	}
+	out_serial[0] = '\0';
+	bool ok = false;
+	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.state == SR_CTX_READY && !atomic_load(&g_ctx.context_invalid) && g_ctx.lens != NULL) {
+		uint32_t written = 0;
+		const SrResult res = srLensGetSerialNumber(g_ctx.lens, out_serial, (uint32_t)cap, &written);
+		if (SR_SUCCEEDED(res)) {
+			ok = out_serial[0] != '\0';
+		} else {
+			LOG_SR_ONCE("srLensGetSerialNumber", res);
+			out_serial[0] = '\0';
+		}
+	}
+	pthread_mutex_unlock(&g_ctx_lock);
+	return ok;
+}
+
+#ifdef DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM
+
+/* Cache of the last enumeration, guarded by g_ctx_lock. Keyed by the context
+ * generation: a new context (SRService restart) re-enumerates. */
+static struct leia_lnx_sr_display g_sr_displays[LEIA_LNX_SR_MAX_DISPLAYS];
+static int32_t g_sr_display_count = -1;
+static uint32_t g_sr_displays_generation = 0; // 0 = never enumerated
+static uint32_t g_sr_caps_logged_generation = 0;
+
+/*! Capability query, once per context: logged for bring-up and gating. A
+ *  runtime that predates the structs leaves them at "not supported". */
+static void
+sr_log_display_caps_locked(uint32_t gen)
+{
+	if (g_sr_caps_logged_generation == gen) {
+		return;
+	}
+	g_sr_caps_logged_generation = gen;
+
+	SrDisplayBindingCapabilities bind_caps = SrDisplayBindingCapabilities();
+	SrWeaverRoutingCapabilities route_caps = SrWeaverRoutingCapabilities();
+	SrRuntimeCapabilities caps = SrRuntimeCapabilities();
+	route_caps.pNext = &bind_caps;
+	caps.pNext = &route_caps;
+	const SrResult res = srGetRuntimeCapabilities(g_ctx.instance, &caps);
+	if (SR_FAILED(res)) {
+		U_LOG_W("leia_sr_sdk: srGetRuntimeCapabilities failed: %s", srResultToString(res));
+		return;
+	}
+	U_LOG_W("leia_sr_sdk: SR multi-display caps: externalRouting=%u displayBinding=%u maxBoundDisplays=%u",
+	        (unsigned)route_caps.externalRouting, (unsigned)bind_caps.displayBinding,
+	        (unsigned)bind_caps.maxBoundDisplays);
+}
+
+static void
+sr_display_from_descriptor(const SrDisplayDescriptor *d, struct leia_lnx_sr_display *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->display_id = d->displayId;
+	out->fpc_verified = d->confidence == SR_DISPLAY_CONFIDENCE_FPC_VERIFIED;
+	if (out->fpc_verified) {
+		snprintf(out->serial, sizeof(out->serial), "%.*s", (int)sizeof(d->serial), d->serial);
+	}
+	snprintf(out->product_code, sizeof(out->product_code), "%.*s", (int)sizeof(d->productCode) - 1, d->productCode);
+	out->manufacturer_id = leia_lnx_pnp_to_manufacturer_id(d->edidVendor);
+	out->product_id = d->edidProduct;
+	out->edid_serial = d->edidSerial;
+	snprintf(out->connector, sizeof(out->connector), "%.*s", (int)sizeof(d->connector), d->connector);
+	snprintf(out->output_name, sizeof(out->output_name), "%.*s", (int)sizeof(d->outputName), d->outputName);
+	out->native_w = d->nativeWidth > 0 ? (uint32_t)d->nativeWidth : 0;
+	out->native_h = d->nativeHeight > 0 ? (uint32_t)d->nativeHeight : 0;
+	out->refresh_hz = d->refreshHz;
+}
+
+int32_t
+leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
+{
+	int32_t ret = -1;
+	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.state != SR_CTX_READY || atomic_load(&g_ctx.context_invalid)) {
+		goto out; // no live context — never create one just to probe
+	}
+
+	const uint32_t gen = atomic_load(&g_ctx.generation);
+	sr_log_display_caps_locked(gen);
+
+	const bool dirty = atomic_exchange(&g_ctx.display_topology_dirty, false);
+	if (dirty || g_sr_displays_generation != gen) {
+		g_sr_display_count = -1;
+		g_sr_displays_generation = gen;
+
+		uint32_t count = 0;
+		SrResult res = srEnumerateDisplays(g_ctx.instance, &count, NULL);
+		if (SR_FAILED(res)) {
+			// SR_ERROR_FUNCTION_UNSUPPORTED = the installed runtime is older
+			// than these headers (e.g. 1.38): the 1.38 path takes over.
+			LOG_SR_ONCE("srEnumerateDisplays (count)", res);
+			goto out;
+		}
+		SrDisplayDescriptor descs[LEIA_LNX_SR_MAX_DISPLAYS];
+		if (count > LEIA_LNX_SR_MAX_DISPLAYS) {
+			count = LEIA_LNX_SR_MAX_DISPLAYS;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			descs[i] = SrDisplayDescriptor();
+		}
+		if (count > 0) {
+			res = srEnumerateDisplays(g_ctx.instance, &count, descs);
+			if (SR_FAILED(res)) { // SR_INCOMPLETE is a success code: keep the first `count`
+				LOG_SR_ONCE("srEnumerateDisplays", res);
+				goto out;
+			}
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			sr_display_from_descriptor(&descs[i], &g_sr_displays[i]);
+			U_LOG_W(
+			    "leia_sr_sdk: SR display #%u id=0x%016llx %s connector=%s output=%s edid=%u/%u/%u "
+			    "%ux%u %.2f Hz product=%s",
+			    i, (unsigned long long)g_sr_displays[i].display_id,
+			    g_sr_displays[i].fpc_verified ? "FPC_VERIFIED" : "EDID_ONLY", g_sr_displays[i].connector,
+			    g_sr_displays[i].output_name, g_sr_displays[i].manufacturer_id, g_sr_displays[i].product_id,
+			    g_sr_displays[i].edid_serial, g_sr_displays[i].native_w, g_sr_displays[i].native_h,
+			    g_sr_displays[i].refresh_hz, g_sr_displays[i].product_code);
+		}
+		g_sr_display_count = (int32_t)count;
+	}
+
+	if (g_sr_display_count >= 0) {
+		const uint32_t n = (uint32_t)g_sr_display_count < cap ? (uint32_t)g_sr_display_count : cap;
+		if (out != NULL && n > 0) {
+			memcpy(out, g_sr_displays, n * sizeof(out[0]));
+		}
+		ret = (int32_t)n;
+	}
+
+out:
+	pthread_mutex_unlock(&g_ctx_lock);
+	return ret;
+}
+
+#else // !DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM
+
+int32_t
+leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
+{
+	// SDK headers/loader predate srEnumerateDisplays (e.g. LeiaSR 1.38):
+	// probe_displays falls back to the SR 1.38 evidence (lens serial).
+	(void)out;
+	(void)cap;
+	return -1;
+}
+
+#endif // DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM

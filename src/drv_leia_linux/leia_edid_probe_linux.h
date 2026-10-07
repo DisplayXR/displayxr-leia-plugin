@@ -13,15 +13,93 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/*! Upper bound on panels one scan reports (a box with more Leia panels than
+ *  this keeps the first ones in connector order). */
+#define LEIA_LNX_EDID_MAX_PANELS 8
+
+/*!
+ * One connected monitor whose EDID matched the frozen Leia panel table, as one
+ * scan of /sys/class/drm (+ optionally RandR) sees it. Multi-screen M0: the
+ * probe used to stop at the first match and forget which connector it was on;
+ * this keeps every match and its identity so per-monitor claims
+ * (probe_displays) and per-connector caches can tell two panels apart.
+ */
+struct leia_lnx_edid_panel
+{
+	//! DRM connector without the "cardN-" prefix, e.g. "HDMI-A-1" (the same
+	//! spelling SrDisplayDescriptor::connector uses). Empty for a panel seen
+	//! only through RandR (no sysfs entry, e.g. inside a container).
+	char connector[32];
+	//! RandR output name ("HDMI-1", NVIDIA "HDMI-0"), when an X server was
+	//! queried and this panel joined one of its outputs. Empty otherwise.
+	char randr_output[32];
+
+	uint16_t manufacturer_id; //!< EDID bytes 8-9, little-endian word (table convention)
+	uint16_t product_id;      //!< EDID bytes 10-11, little-endian word
+	uint32_t serial;          //!< EDID bytes 12-15, little-endian; 0 = none (tie-breaker only)
+
+	uint32_t width_mm;  //!< image size: DTD #1 mm, else bytes 21/22 cm*10; 0 = unknown
+	uint32_t height_mm; //!< see @ref width_mm
+	uint32_t native_w;  //!< DTD #1 active pixels; 0 = unknown
+	uint32_t native_h;  //!< see @ref native_w
+
+	bool internal; //!< eDP / LVDS / DSI connector
+
+	//! RandR CRTC placement — valid only when @ref has_position.
+	bool has_position;
+	int32_t left, top;
+	uint32_t crtc_w, crtc_h;
+};
+
+/*!
+ * Parse identity, serial, image size and native resolution out of one EDID
+ * base block. Pure — no I/O — so the unit test feeds it fixture blobs. Leaves
+ * the connector / RandR fields zeroed.
+ * @return false when @p len < 128 or the header magic is wrong.
+ */
+bool
+leia_lnx_edid_parse(const uint8_t *edid, size_t len, struct leia_lnx_edid_panel *out);
+
+//! True when (manufacturer, product) is in the frozen Leia panel table.
+bool
+leia_lnx_edid_table_contains(uint16_t manufacturer_id, uint16_t product_id);
+
+/*!
+ * One pass over /sys/class/drm: every connected connector whose EDID matches
+ * the Leia table, sorted by connector name (readdir order is arbitrary, and
+ * "first panel" must mean the same panel on every call). With
+ * @p with_positions, also connects to the X server once and joins each panel
+ * to its RandR output by EDID (manufacturer, product, serial) to fill the CRTC
+ * origin/size; a table-matching RandR output that joins no sysfs entry is
+ * appended with an empty connector. Headless-tolerant (no X / no RandR just
+ * leaves has_position false).
+ * @return the number of entries written to @p out (<= @p cap).
+ */
+uint32_t
+leia_lnx_edid_enumerate_panels(struct leia_lnx_edid_panel *out, uint32_t cap, bool with_positions);
+
+/*!
+ * Desktop position of one panel, cached per connector for the process
+ * lifetime (the first miss runs one enumerate-with-positions pass and caches
+ * every panel it saw). @p connector NULL = the first panel in connector order —
+ * the one a single-panel session binds today; M4/M5 pass the DP's own
+ * connector. Thread-safe.
+ * @return true when that panel sits on an active RandR output.
+ */
+bool
+leia_lnx_edid_panel_desktop_position_cached(const char *connector, int32_t *out_left, int32_t *out_top);
+
 /*!
  * Scan /sys/class/drm/<connector>/edid for a connected monitor whose EDID
- * manufacturer+product IDs match the known Leia panel table.
+ * manufacturer+product IDs match the known Leia panel table. Single-panel
+ * accessor: the first entry of leia_lnx_edid_enumerate_panels().
  *
  * @param[out] out_manufacturer_id  Matched EDID manufacturer ID — may be NULL.
  * @param[out] out_product_id       Matched EDID product ID — may be NULL.
@@ -37,8 +115,10 @@ leia_lnx_edid_panel_present(uint16_t *out_manufacturer_id, uint16_t *out_product
  * EDID rather than connector name sidesteps DRM-vs-RandR naming drift
  * ("HDMI-A-1" vs "HDMI-1" vs NVIDIA's "HDMI-0").
  *
+ * Single-panel accessor: the first panel (connector order) of
+ * leia_lnx_edid_enumerate_panels(.., true) that has a desktop position.
  * Transient query — connects to the X server, resolves, disconnects. Callers
- * should cache the result. Fails gracefully headless (no DISPLAY / no RandR /
+ * should use leia_lnx_edid_panel_desktop_position_cached() instead. Fails gracefully headless (no DISPLAY / no RandR /
  * no match), e.g. the CI selftest.
  *
  * @param[out] out_left  Panel left edge in root-window pixels — may be NULL.

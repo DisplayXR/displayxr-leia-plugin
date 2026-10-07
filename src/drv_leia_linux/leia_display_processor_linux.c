@@ -1910,15 +1910,11 @@ leia_lnx_dp_get_display_pixel_info(struct xrt_display_processor *xdp,
 	// shoves the content off-screen. Apply the SAME RandR override the plugin's
 	// get_display_info uses (leia_plugin_linux.c), cached once.
 	int32_t sl = info.screen_left, st = info.screen_top;
+	// Same per-connector cache as get_display_info (NULL = first panel until
+	// the DP is bound to its own connector, M4/M5).
 	{
-		static bool resolved = false;
-		static bool randr_found = false;
-		static int32_t randr_left = 0, randr_top = 0;
-		if (!resolved) {
-			randr_found = leia_lnx_edid_panel_desktop_position(&randr_left, &randr_top);
-			resolved = true;
-		}
-		if (randr_found) {
+		int32_t randr_left = 0, randr_top = 0;
+		if (leia_lnx_edid_panel_desktop_position_cached(NULL, &randr_left, &randr_top)) {
 			sl = randr_left;
 			st = randr_top;
 		}

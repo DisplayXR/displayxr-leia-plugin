@@ -40,6 +40,7 @@
 #include "leia_sr_linux.h"
 #include "leia_display_processor_linux.h"
 #include "leia_edid_probe_linux.h"
+#include "leia_display_claims_linux.h"
 
 #include <stddef.h>
 
@@ -167,22 +168,19 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	// Neither backend has a real desktop position on Linux — the stub cans
 	// (0, 0) and srDisplayGetLocation's Linux getScreenRect returns (0, 0)
 	// — so resolve the panel's actual position from RandR (EDID-matched,
-	// #91 / runtime#715) and prefer it. Resolved once; headless (no X /
-	// no match) keeps the backend value, so the CI selftest is unaffected.
+	// #91 / runtime#715) and prefer it. Cached per connector in the EDID
+	// module (NULL = the first panel, the one a single-panel session binds;
+	// M4/M5 pass the DP's bound connector). Headless (no X / no match) keeps
+	// the backend value, so the CI selftest is unaffected.
 	{
-		static bool resolved = false;
-		static bool randr_found = false;
-		static int32_t randr_left = 0;
-		static int32_t randr_top = 0;
-		if (!resolved) {
-			randr_found = leia_lnx_edid_panel_desktop_position(&randr_left, &randr_top);
-			if (randr_found && (randr_left != info.screen_left || randr_top != info.screen_top)) {
+		int32_t randr_left = 0, randr_top = 0;
+		if (leia_lnx_edid_panel_desktop_position_cached(NULL, &randr_left, &randr_top)) {
+			static bool logged = false;
+			if (!logged && (randr_left != info.screen_left || randr_top != info.screen_top)) {
 				U_LOG_W("leia_lnx_plugin: RandR panel position (%d, %d) overrides backend (%d, %d)",
 				        randr_left, randr_top, info.screen_left, info.screen_top);
 			}
-			resolved = true;
-		}
-		if (randr_found) {
+			logged = true;
 			out_info->display_screen_left = randr_left;
 			out_info->display_screen_top = randr_top;
 		}
@@ -200,6 +198,75 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	}
 
 	return true;
+}
+
+static uint32_t
+leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
+                               const struct xrt_display_descriptor *displays,
+                               uint32_t display_count,
+                               struct xrt_display_claim *out_claims,
+                               uint32_t max_claims)
+{
+	(void)inst;
+	if (displays == NULL || display_count == 0 || out_claims == NULL || max_claims == 0) {
+		return 0;
+	}
+
+	/*
+	 * Per-monitor claims (multi-screen plan M0; #69 / ADR-015 shape, Windows
+	 * parity with leia_plugin.c). Matching + confidence rules live in
+	 * leia_display_claims_linux.c; this gathers the evidence:
+	 *   - every Leia panel on this box (one /sys/class/drm pass + RandR join);
+	 *   - the new SR API's display list when it is compiled in AND a live SR
+	 *     context exists (FPC confidence, serial, displayId);
+	 *   - otherwise SR 1.38's only per-device fact: the live context's lens
+	 *     serial (verifies a single panel).
+	 * Never creates an SR context (seam header explains why) — on a box where
+	 * probe() did not bring one up, claims stay at EDID confidence.
+	 */
+	struct leia_lnx_edid_panel panels[LEIA_LNX_EDID_MAX_PANELS];
+	const uint32_t panel_count = leia_lnx_edid_enumerate_panels(panels, LEIA_LNX_EDID_MAX_PANELS, true);
+
+	struct leia_lnx_sr_display sr_displays[LEIA_LNX_SR_MAX_DISPLAYS];
+	const int32_t sr_count = leia_lnx_sr_enumerate_displays(sr_displays, LEIA_LNX_SR_MAX_DISPLAYS);
+
+	char fpc_serial[64] = {0};
+	const bool have_legacy_serial = sr_count < 0 && leiasr_lnx_peek_fpc_serial(fpc_serial, sizeof(fpc_serial));
+
+	const struct leia_lnx_claim_inputs in = {
+	    .panels = panels,
+	    .panel_count = panel_count,
+	    .sr_displays = sr_displays,
+	    .sr_display_count = sr_count,
+	    .legacy_fpc_serial = have_legacy_serial ? fpc_serial : NULL,
+	    /* Vulkan only: create_dp_vk is the arm's sole factory (no GL DP). */
+	    .supported_apis = XRT_DP_API_BIT_VK,
+	};
+
+	struct leia_lnx_claim_binding bindings[LEIA_LNX_EDID_MAX_PANELS + LEIA_LNX_SR_MAX_DISPLAYS];
+	const uint32_t cap = max_claims < (uint32_t)(sizeof(bindings) / sizeof(bindings[0]))
+	                         ? max_claims
+	                         : (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
+	const uint32_t n = leia_lnx_compute_claims(displays, display_count, &in, out_claims, bindings, cap);
+
+	// Plug-in-private monitor table: displayId per claimed monitor, for the
+	// per-DP SR binding (M4/M5). Nothing consumes it yet.
+	leia_lnx_claims_store(bindings, n);
+
+	for (uint32_t i = 0; i < n; i++) {
+		U_LOG_W("leia_lnx_plugin: claim monitor 0x%016llx on %s confidence=%s serial='%s' sr_display=0x%016llx",
+		        (unsigned long long)out_claims[i].monitor_id,
+		        bindings[i].connector[0] ? bindings[i].connector : "(unknown connector)",
+		        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID",
+		        out_claims[i].serial, (unsigned long long)bindings[i].sr_display_id);
+	}
+	if (n == 0) {
+		U_LOG_I(
+		    "leia_lnx_plugin: probe_displays — no Leia panel among %u monitor(s) (%u panel(s) in EDID scan, "
+		    "SR enumeration %s)",
+		    display_count, panel_count, sr_count < 0 ? "unavailable" : "available");
+	}
+	return n;
 }
 
 
@@ -257,9 +324,8 @@ static struct xrt_plugin_iface g_leia_lnx_iface = {
 
     .set_pose_source = leia_lnx_plugin_set_pose_source,
 
-    /* TODO(Track B): per-monitor claims once the DRM/EDID probe exists
-     * (issue #69 / ADR-015 shape — see the Windows arm's probe_displays). */
-    .probe_displays = NULL,
+    /* Per-monitor claims (multi-screen M0; #69 / ADR-015 shape). */
+    .probe_displays = leia_lnx_plugin_probe_displays,
 };
 
 
