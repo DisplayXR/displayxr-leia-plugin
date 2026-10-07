@@ -429,6 +429,18 @@ bool
 leiasr_lnx_has_sr_snap(const char **out_reason);
 
 /*!
+ * Multi-screen M4: the weaver was asked to bind to an SR display
+ * (create_info.sr_display_id with a runtime that honours binding) but SR
+ * refused (SR_ERROR_DEVICE_NOT_AVAILABLE for an EDID-only display,
+ * SR_ERROR_DISPLAY_NOT_FOUND for an unknown id) and the weaver fell back to
+ * the ACTIVE display — whose calibration and tracking are another panel's.
+ * The DP must then not weave (wrong-phase output) but blit flat.
+ * False on the stub and whenever no binding was attempted.
+ */
+bool
+leiasr_lnx_display_binding_refused(struct leiasr_lnx *lnx);
+
+/*!
  * Can this backend's weaver composite a 2D layer inside the weave (ADR-027
  * Amendment, "2D under the lens"; LeiaSR ST-5801/ST-5792)?
  *

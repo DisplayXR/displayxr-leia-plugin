@@ -58,6 +58,12 @@ struct leia_dp_linux
 	//! the target). False = the plain factory: today's behaviour exactly.
 	bool screen_bound;
 	struct leia_lnx_screen screen;
+	//! Multi-screen M4 (review 3): this segment DP must NOT weave — its screen
+	//! is not the panel the SR context drives, or SR refused to bind the
+	//! weaver to it and fell back to the active (other) display. Weaving
+	//! would apply another panel's calibration and tracking (wrong-phase
+	//! output), so every frame takes the flat blit path instead.
+	bool flat_only;
 	bool segment_alpha_gate_logged; //!< one line when a segment skips the alpha-gate
 
 	//! XR_DXR_display_zones (ADR-027). Zones need NO special weaver support on
@@ -1689,7 +1695,7 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 		const uint32_t vp_w = canvas_width != 0 ? canvas_width : target_width;
 		const uint32_t vp_h = canvas_height != 0 ? canvas_height : target_height;
 		const char *why = NULL;
-		if (tile_columns != 2 || tile_rows != 1 || target_image == (VkImage_XDP)0) {
+		if (ldp->flat_only || tile_columns != 2 || tile_rows != 1 || target_image == (VkImage_XDP)0) {
 			why = "this frame is not a 2x1 weave";
 		} else if (overlay_w != vp_w || overlay_h != vp_h) {
 			why = "layer size != weave viewport";
@@ -1707,8 +1713,10 @@ leia_lnx_dp_process_atlas(struct xrt_display_processor *xdp,
 	}
 
 	// Single-view content: bypass the weaver, blit atlas content to target
-	// (same convention as the Windows DP's 2D path).
-	if (ldp->view_count == 1 && target_image != (VkImage_XDP)0) {
+	// (same convention as the Windows DP's 2D path). A flat-only segment DP
+	// (review 3) takes this path for every frame: the blit's source is the
+	// first view tile, i.e. the left eye, shown flat.
+	if ((ldp->view_count == 1 || ldp->flat_only) && target_image != (VkImage_XDP)0) {
 		VkImageMemoryBarrier pre[2] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2582,6 +2590,17 @@ leia_lnx_dp_create(void *vk_bundle,
 		leia_lnx_screen_resolve(binding, have_claim ? &claim : NULL, panels, panel_count, &sr_info,
 		                        leia_lnx_sr_active_display_id(), &ldp->screen);
 		ldp->screen_bound = true;
+		const bool binding_refused = leiasr_lnx_display_binding_refused(sr);
+		ldp->flat_only = !ldp->screen.is_sr_panel || binding_refused;
+		if (ldp->flat_only) {
+			U_LOG_W("leia_lnx_dp: segment DP for monitor 0x%016llx presents FLAT (no weave): %s",
+			        (unsigned long long)binding->monitor_id,
+			        binding_refused
+			            ? "SR refused to bind the weaver to this display, and the active display "
+			              "it fell back to is another panel"
+			            : "this screen is not the panel the SR context drives (no calibration or "
+			              "tracking for it until LeiaSR phase D)");
+		}
 		U_LOG_W(
 		    "leia_lnx_dp: segment DP for monitor 0x%016llx ('%s', connector '%s'): %ux%u px at (%d,%d), "
 		    "%.3fx%.3f m, %s, SR display 0x%016llx%s",
