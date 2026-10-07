@@ -26,21 +26,23 @@ find_panel(const struct leia_lnx_screen_binding *b,
 	if (panels == NULL || panel_count == 0) {
 		return NULL;
 	}
-	// 1. The claim knows the DRM connector it matched at probe_displays.
-	if (claim != NULL && claim->connector[0] != '\0') {
-		for (uint32_t i = 0; i < panel_count; i++) {
-			if (strcmp(panels[i].connector, claim->connector) == 0) {
-				return &panels[i];
-			}
-		}
-	}
-	// 2. The binding's OS output name: a DRM connector, or (X11) a RandR
+	// 1. The binding's OS output name: a DRM connector, or (X11) a RandR
 	//    output — matched against both spellings the panel list carries.
+	//    The runtime resolved it for THIS monitor, so it outranks the claim
+	//    table (review B: twins paired by list order could swap connectors).
 	if (b->device_name[0] != '\0') {
 		for (uint32_t i = 0; i < panel_count; i++) {
 			if (strcmp(panels[i].connector, b->device_name) == 0 ||
 			    (panels[i].randr_output[0] != '\0' &&
 			     strcmp(panels[i].randr_output, b->device_name) == 0)) {
+				return &panels[i];
+			}
+		}
+	}
+	// 2. The claim's DRM connector from probe_displays.
+	if (claim != NULL && claim->connector[0] != '\0') {
+		for (uint32_t i = 0; i < panel_count; i++) {
+			if (strcmp(panels[i].connector, claim->connector) == 0) {
 				return &panels[i];
 			}
 		}
