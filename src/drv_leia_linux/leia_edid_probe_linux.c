@@ -477,6 +477,14 @@ leia_lnx_edid_panels_snapshot(struct leia_lnx_edid_panel *out, uint32_t cap, uin
 	return out != NULL ? n : 0;
 }
 
+uint32_t
+leia_lnx_edid_panels_cached(struct leia_lnx_edid_panel *out, uint32_t cap)
+{
+	// Per-DP screen resolution: whatever the cache holds now (refreshed by
+	// probe_displays' TTL and by SR topology events), no rescan of its own.
+	return leia_lnx_edid_panels_snapshot(out, cap, UINT64_MAX);
+}
+
 void
 leia_lnx_edid_cache_invalidate(void)
 {

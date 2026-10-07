@@ -260,6 +260,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_edid_probe_linux.h
     leia_display_claims_linux.c
     leia_display_claims_linux.h
+    leia_screen_linux.c
+    leia_screen_linux.h
     leia_sr_routing_linux.h
     leia_bg_capture_linux.c
     leia_bg_capture_linux.h
@@ -376,6 +378,18 @@ target_include_directories(test_display_claims_linux PRIVATE
 )
 target_link_libraries(test_display_claims_linux PRIVATE xrt-interfaces aux_util PkgConfig::PLUGIN_XCB)
 add_test(NAME test_display_claims_linux COMMAND test_display_claims_linux)
+
+# --- Host unit test: per-DP screen state (multi-screen M4) ----------------
+# leia_screen_linux.c resolves one DP's screen from a binding + the EDID list +
+# the SR query, into state the DP owns. Fixtures only — no SDK, no Vulkan
+# device, no panel, no X — so both weaver arms and both runtime pins run it.
+add_executable(test_screen_linux
+    tests/test_screen_linux.c
+    leia_screen_linux.c
+)
+target_include_directories(test_screen_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_screen_linux PRIVATE xrt-interfaces Vulkan::Vulkan m)
+add_test(NAME test_screen_linux COMMAND test_screen_linux)
 
 # --- Host unit test: SR weaver chain plan (multi-screen M4) ---------------
 # leia_sr_routing_linux.h decides routing + binding from the SR caps; pure
