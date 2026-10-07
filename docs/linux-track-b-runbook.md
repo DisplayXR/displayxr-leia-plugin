@@ -276,6 +276,109 @@ Today's runtime builds no monitor list on Linux (`os_display_edid` is a stub the
 nothing calls `probe_displays` on this platform until the runtime half of M0 lands.
 `test_display_claims_linux` covers the parser and the matching without hardware.
 
+### One DP per screen, windowless EXTERNAL weaver (multi-screen M4)
+
+M4's goal on this box: one window straddling the laptop panel (eDP-1, sim_display,
+anaglyph) and the DS1 (HDMI-A-1, leia-sr) is woven on the DS1 half by the Leia DP, with
+DS1 eye tracking, and anaglyph on the other half. The runtime splits the window into
+per-screen **segments** and creates one DP per screen through the appended plug-in slot
+`create_dp_vk_for_screen` (runtime M2, #1853). The plug-in side:
+
+**The weaver is always windowless (`window = 0`).** `leiasr_lnx_create` no longer forwards
+the X11 window to `SrWeaverCreateInfoVulkan.window`, on every path (plain factory too). The
+runtime supplies the phase origin per frame (`set_present_origin` →
+`srWeaverSetPresentOrigin`, ADR-033), which is all the Linux SDK ever used a window for (its
+`getScreenRect` is (0,0), contract R-W3). With an X11 id the SDK refuses a resampled panel,
+which forced 2D under the fractionally scaled XWayland desktop this box runs. A weaver
+*constructed* windowless always weaves (§3, "Native Wayland weaves windowless"). The weave
+log line now always reads `window=0x0 = windowless`. If an X11 window was handed in, one
+INFO line says it was not forwarded.
+
+**What a DP does with a screen binding.** `create_dp_vk_for_screen` hands the DP an
+`xrt_screen_binding` (monitor id, desktop rect, native px, EDID mm, serial, vendor display
+id). The DP resolves it **once, at creation**, into a `struct leia_lnx_screen` it owns
+(`leia_screen_linux.c`), and from then on `get_display_dimensions` and
+`get_display_pixel_info` answer from that and nothing else. They no longer read the
+process-wide SR display or the "first panel" RandR cache, so two DPs can never answer for
+each other. The resolution rules:
+
+| Fact | Source |
+|---|---|
+| desktop origin | the binding's rect, always (the runtime placed the screen) |
+| panel / connector | the `probe_displays` claim's connector → the binding's device name (DRM or RandR spelling) → the panel at the binding's origin |
+| pixels | binding native mode → panel EDID native → desktop size |
+| "is this the SR-driven panel?" | by SR `displayId` when both sides know one; else the first panel in connector order (SR 1.38's single panel); else (no EDID list, forced probe) yes |
+| size, nominal viewer, recommended view, refresh | the SR panel: SR's numbers (the same `get_display_info` reports, so system and per-screen answers agree); any other Leia panel: binding mm → EDID mm, centred viewer at SR's distance/height ratio, no recommended view |
+
+`get_display_info_for_monitor` (runtime M1 slot, `XR_DXR_display_info` v22) uses the same
+resolution and answers only for a claimed monitor that **is** the SR-driven panel
+(MANAGED eye tracking, the probe-seeded view scale). It returns `false` for any other Leia
+panel, so the runtime derives EDID defaults with no eye tracking.
+
+A **segment DP** (one made by `create_dp_vk_for_screen`) with a sub-rect canvas confines
+every write to the canvas, clamped to the target. The 2D (1×1) blit goes to the canvas
+rect only, and the weave's render pass begins with `renderArea` = the canvas (viewport and
+scissor already were). The whole-target post-weave alpha-gate is skipped, with one WARN, so
+a transparent window spanning screens presents opaque on the Leia segment. The plain
+`create_dp_vk` keeps today's behaviour exactly. `get_scanout_caps` now states the answer
+explicitly: weave scope `CANVAS`, `flags = 0` (no `TOLERATES_RESAMPLE`, the weave needs
+1:1 pixels), so the runtime's per-segment 1:1 gate keeps a resampled Leia segment flat.
+
+**The SR routing / binding chain** (LeiaSR Linux line 876620d62, phases A-C). Compiled
+only when the SDK headers declare the structs (CMake `DXR_LEIA_LNX_HAVE_SR_ROUTING`, a
+type-only compile check), and used only when the **installed** runtime says it honours
+them. `srGetRuntimeCapabilities` is called with `SrWeaverRoutingCapabilities` →
+`SrDisplayBindingCapabilities` chained, once per context, and logs
+`SR multi-display caps: externalRouting=… displayBinding=… maxBoundDisplays=…`. Each weaver
+create then chains:
+
+- `SrWeaverRoutingInfo{mode = SR_WEAVER_ROUTING_EXTERNAL, flags = 0}` when
+  `externalRouting`. This means no `canWeave` gate, one full-input region, phase =
+  present origin + viewport only, no lens vote, and no polling. `KEEP_DRAG_SNAP` is not
+  set: it only acts on a real window, and drag snapping is the runtime's
+  `snap_window_rect` → `srWeaverSnapToPhase`.
+- `SrDisplayBindingInfo{displayId}` when the screen has an SR `displayId` (the binding's,
+  else the `probe_displays` table's), the runtime reports `displayBinding`, and
+  `maxBoundDisplays >= 1`.
+
+If the create is refused, the binding is dropped first (`SR_ERROR_DEVICE_NOT_AVAILABLE`
+for an EDID-only display, `SR_ERROR_DISPLAY_NOT_FOUND` for an unknown id). If it is still
+refused, the routing is dropped too. Each step logs one INFO line and ends in exactly the
+pre-M4 weaver. The weaver-created INFO line names the routing (`EXTERNAL`/`SDK`) and the
+display (`bound to 0x…` / `active (unbound)`). Against the installed 1.38 runtime, the
+caps come back all false, and nothing is chained even from new headers.
+
+**Lens ownership under EXTERNAL routing.** An EXTERNAL weaver never votes the lens. The
+header says the controller owns it, so "leave 3D to the weaver until something asks for 2D"
+(LeiaSR #266) cannot hold while one is alive. The plug-in therefore sends
+`srLensEnable` when an EXTERNAL weaver is created, unless the last request was 2D. A 3D
+`request_display_mode` is always sent while one is alive. When the **last** EXTERNAL
+weaver is destroyed with the lens on because of us, the plug-in sends `srLensDisable`.
+That release is recorded as "nothing to re-apply", not as a 2D wish. Without it the
+long-lived service process would hold an ENABLE preference forever, and SRService keeps
+the lens on while any client does (§4, "Co-existing"). The rules and their test live in
+`leia_lens_owner_linux.h` / `test_lens_owner_linux`.
+
+**Refresh** (#184): `srDisplayGetRefreshRate` when the SDK has it (CMake
+`DXR_LEIA_LNX_HAVE_SR_REFRESH`, compile + link probe) and the runtime answers a plausible
+value. Otherwise it stays at 60 Hz, with one INFO line saying why. The display line logs
+`refresh … Hz from srDisplayGetRefreshRate` or the fallback reason.
+
+**Not per DP yet, by design.** The SR instance, eye tracker, lens and the process display
+handle are still one per process and unbound. With **one** Leia panel that is correct:
+`maxBoundDisplays` is 1, so only the FPC-verified display binds, and that is the active
+display these objects already follow. The tracker also has to exist before
+`srInitialize`, while display ids only come from `srEnumerateDisplays` on an initialised
+context. **Two Leia panels wait on LeiaSR phase D** (a service driving more than one
+device). Until then a second Leia panel's segment DP resolves as "not the SR-driven panel"
+(EDID facts, no tracking), and a bound weaver for it is refused and falls back to the
+active display.
+
+Hardware-free coverage: `test_screen_linux` (binding → screen, two instances never share
+state), `test_sr_routing_linux` (the chain plan everywhere, plus the real `pNext` chains
+and the caps chain against SDK headers that carry the structs), and
+`test_lens_owner_linux` (the EXTERNAL lens rules).
+
 ## 3. Real weave on the panel
 
 ```bash
@@ -382,6 +485,8 @@ present (runtime#1698).
 | `DXR_LEIA_FORCE_PROBE=1` | Bypass the plugin probe. **Only** needed when no Leia panel is connected — a real panel auto-binds via DRM/EDID. |
 | `DXR_LEIA_SR_FB_SDK=1` | Hand the caller framebuffer to the SDK (its own render pass) instead of the default plug-in-owned pass + fb=0 mode. Fallback only; reach for it if Vulkan validation complains about the render pass. |
 | `SR_RUNTIME_PATH` | Explicit path to `libLeiaSR_runtime.so` (overrides the baked rpath / active_runtime.json). |
+| `DXR_LEIA_SR_EXTERNAL_ROUTING=0` | Do not chain `SrWeaverRoutingInfo{EXTERNAL}` (multi-screen M4): weavers stay SDK-routed even on a runtime that honours routing. An on-panel A/B, not a setting. |
+| `SR_WEAVER_ROUTING=external\|external,keep-drag-snap\|sdk` | **SR's own** override, read by the SR runtime at weaver creation. It wins over whatever the plug-in chained, in either direction, so it tests EXTERNAL without a plug-in rebuild. Caveat: with `sdk` forced over a chained EXTERNAL, the plug-in still takes the lens (it believes the weaver will not vote). |
 
 Formerly-open behavior questions (render-pass shape, input width semantics,
 recommended-texture-size units, windowless weaving, image layouts) were settled by
