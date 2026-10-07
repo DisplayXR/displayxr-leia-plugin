@@ -266,6 +266,28 @@ test_external_weaver_respects_2d(void)
 	CHECK(o.last_sent == LEIA_LENS_REQ_2D);
 }
 
+/* Review 4: the last EXTERNAL weaver dies after SRService invalidated the
+ * context, so srLensDisable fails on the dead lens. The release is recorded
+ * anyway, so the NEXT context does not re-apply ENABLE with no weaver alive. */
+static void
+test_failed_release_is_still_recorded(void)
+{
+	struct leia_lens_owner o = {0};
+	struct fake_ctx c;
+	new_context(&c, &o);
+	external_created(&c, &o);
+	CHECK(o.last_sent == LEIA_LENS_REQ_3D);
+
+	// SRService restarts: the context is invalid, the disable fails.
+	CHECK(leia_lens_owner_on_external_weaver_destroyed(&o) == LEIA_LENS_ACTION_DISABLE);
+	leia_lens_owner_commit_release(&o); // recorded despite the failure
+	CHECK(o.external_weavers == 0 && o.last_sent == LEIA_LENS_REQ_NONE);
+
+	// The replacement context gets nothing re-applied: the lens stays off.
+	new_context(&c, &o);
+	CHECK(c.enables == 0 && c.disables == 0 && !c.app_owns);
+}
+
 int
 main(void)
 {
@@ -277,6 +299,7 @@ main(void)
 	test_external_weaver_turns_the_lens_on_and_releases_it();
 	test_external_weaver_3d_request_is_sent();
 	test_external_weaver_respects_2d();
+	test_failed_release_is_still_recorded();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_lens_owner_linux: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
