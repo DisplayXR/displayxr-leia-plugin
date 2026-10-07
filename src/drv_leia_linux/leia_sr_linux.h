@@ -90,8 +90,15 @@ struct leiasr_lnx_create_info
 	 * `Display*` / `xcb_connection_t*` (backend's preference).
 	 *
 	 * srSDK 1.0.0: `SrWeaverCreateInfoVulkan.window` takes the XID (0 =
-	 * windowless, honored). `x11_connection` has NO srSDK counterpart (the
-	 * SDK opens its own X connection) — the sdk backend ignores it.
+	 * windowless, honored) — but the sdk backend now ALWAYS passes 0
+	 * (multi-screen M4, ADR-033): the runtime supplies the phase origin per
+	 * frame (set_present_origin -> srWeaverSetPresentOrigin), the Linux SDK
+	 * never tracked the window's position anyway (getScreenRect is (0,0)),
+	 * and with an X11 id the SDK's resampled-panel refusal forces 2D under a
+	 * fractionally scaled XWayland desktop. `x11_window` is kept on the seam
+	 * for the stub and for diagnostics only. `x11_connection` has NO srSDK
+	 * counterpart (the SDK opens its own X connection) — the sdk backend
+	 * ignores it.
 	 * `graphics_queue_family` likewise has no counterpart (the command pool
 	 * implies the family); kept because the stub and future backends want it.
 	 */
@@ -111,6 +118,15 @@ struct leiasr_lnx_create_info
 	 * baseline VK_FORMAT_B8G8R8A8_UNORM. The stub (blit path) ignores it.
 	 */
 	VkFormat target_format;
+
+	/*!
+	 * The SR display this weaver is for (multi-screen M4): the opaque
+	 * `displayId` srEnumerateDisplays reported, chained as
+	 * SrDisplayBindingInfo when the installed SR runtime honours binding.
+	 * 0 = none (SR 1.38, a monitor SR does not list, the plain factory):
+	 * the weaver follows the active SR display, as before. Stub: ignored.
+	 */
+	uint64_t sr_display_id;
 };
 
 /*!
@@ -167,6 +183,14 @@ struct leiasr_lnx_weave_output
 	uint32_t width;
 	uint32_t height;
 	VkFormat format;
+	/*!
+	 * Multi-screen M4: begin the backend's render pass with renderArea =
+	 * the weave viewport instead of the whole target. Set for a SEGMENT DP
+	 * (created for one screen) with a sub-rect canvas, which must not touch
+	 * the pixels a sibling DP wove (runtime create_dp_vk_for_screen
+	 * contract). The draw is already viewport+scissor-confined either way.
+	 */
+	bool confine_to_viewport;
 };
 
 /*!
@@ -216,7 +240,7 @@ struct leiasr_lnx_display_info
 	int32_t screen_top;
 	uint32_t recommended_view_width; //!< recommended per-view render size
 	uint32_t recommended_view_height;
-	uint32_t refresh_mhz; //!< refresh rate in milli-Hz (60000 = 60 Hz); srSDK 1.0.0 has NO getter — sdk backend reports 60000 (carried ask)
+	uint32_t refresh_mhz; //!< milli-Hz (60000 = 60 Hz): srDisplayGetRefreshRate when available (#184), else 60000
 	float nominal_viewer_x_m; //!< recommended viewing position, display-center meters
 	float nominal_viewer_y_m;
 	float nominal_viewer_z_m;
@@ -537,6 +561,17 @@ leiasr_lnx_peek_fpc_serial(char *out_serial, size_t cap);
  */
 int32_t
 leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap);
+
+/*!
+ * The displayId of the SR display the process-wide context drives (the one
+ * the instance, tracker, lens and the display query describe): the first
+ * FPC-verified entry of the cached srEnumerateDisplays answer. Never
+ * enumerates and never creates a context. 0 = unknown (API compiled out, no
+ * enumeration yet, nothing FPC-verified) — callers then fall back to the
+ * one-panel rule (leia_screen_linux.h).
+ */
+uint64_t
+leia_lnx_sr_active_display_id(void);
 
 #ifdef __cplusplus
 }

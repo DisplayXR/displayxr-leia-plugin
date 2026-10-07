@@ -51,6 +51,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +82,14 @@ struct leia_lens_owner
 	//! marked this context's preference application-owned. Cleared by
 	//! leia_lens_owner_on_new_context().
 	bool ctx_app_owned;
+	/*!
+	 * Weavers alive with SR_WEAVER_ROUTING_EXTERNAL (multi-screen M4). Such a
+	 * weaver NEVER votes the lens (sr_weaver.h: "the controller owns the lens
+	 * through srLensEnable / srLensDisable"), so while one is alive "3D before
+	 * any 2D is delegated, not sent" no longer holds: nobody would turn the
+	 * lens on. See leia_lens_owner_on_external_weaver_created().
+	 */
+	uint32_t external_weavers;
 };
 
 /*!
@@ -91,10 +100,12 @@ struct leia_lens_owner
 static inline enum leia_lens_action
 leia_lens_owner_on_request(const struct leia_lens_owner *o, bool want_3d)
 {
-	if (want_3d && o->last_sent == LEIA_LENS_REQ_NONE) {
+	if (want_3d && o->last_sent == LEIA_LENS_REQ_NONE && !o->ctx_app_owned && o->external_weavers == 0) {
 		// Never turned the lens off: the weaver still owns it and brings it
 		// up when it weaves. Sending srLensEnable here would take ownership
-		// for nothing and lose the weaver's off-panel release.
+		// for nothing and lose the weaver's off-panel release. (Not so with
+		// an EXTERNAL-routed weaver alive, which never votes, nor once this
+		// context is ours: then a 3D wish must be sent.)
 		return LEIA_LENS_ACTION_NONE;
 	}
 	return want_3d ? LEIA_LENS_ACTION_ENABLE : LEIA_LENS_ACTION_DISABLE;
@@ -134,6 +145,60 @@ leia_lens_owner_on_new_context(struct leia_lens_owner *o)
 	case LEIA_LENS_REQ_NONE:
 	default: return LEIA_LENS_ACTION_NONE;
 	}
+}
+
+/*!
+ * An SR_WEAVER_ROUTING_EXTERNAL weaver was just created (multi-screen M4).
+ * It never votes the lens, so the lens is ours to turn on: returns ENABLE
+ * unless the last request sent was 2D (respect it — the runtime asks for 3D
+ * again at xrBeginSession or when the reason for 2D clears) or this context
+ * already has 3D from us. Commit the result with leia_lens_owner_commit()
+ * once the call succeeded. Always counts the weaver.
+ */
+static inline enum leia_lens_action
+leia_lens_owner_on_external_weaver_created(struct leia_lens_owner *o)
+{
+	o->external_weavers++;
+	if (o->last_sent == LEIA_LENS_REQ_2D) {
+		return LEIA_LENS_ACTION_NONE;
+	}
+	if (o->ctx_app_owned && o->last_sent == LEIA_LENS_REQ_3D) {
+		return LEIA_LENS_ACTION_NONE;
+	}
+	return LEIA_LENS_ACTION_ENABLE;
+}
+
+/*!
+ * An SR_WEAVER_ROUTING_EXTERNAL weaver was destroyed. When it was the last
+ * one and the lens is on because of us, returns DISABLE: SRService keeps the
+ * lens ON while ANY client holds an ENABLE preference, and the plug-in's SR
+ * context outlives the session (it is process-lifetime, and the service
+ * process is long-lived), so without this release the panel would stay
+ * lenticular over a 2D desktop. Commit a DISABLE from here with
+ * leia_lens_owner_commit_release(), NOT leia_lens_owner_commit(): this is not
+ * a 2D wish to re-apply, and the next EXTERNAL weaver must turn the lens back
+ * on.
+ */
+static inline enum leia_lens_action
+leia_lens_owner_on_external_weaver_destroyed(struct leia_lens_owner *o)
+{
+	if (o->external_weavers > 0) {
+		o->external_weavers--;
+	}
+	if (o->external_weavers == 0 && o->ctx_app_owned && o->last_sent == LEIA_LENS_REQ_3D) {
+		return LEIA_LENS_ACTION_DISABLE;
+	}
+	return LEIA_LENS_ACTION_NONE;
+}
+
+//! Record a successful release from leia_lens_owner_on_external_weaver_destroyed():
+//! the context stays ours (the SDK does not hand it back), but there is no wish
+//! left to re-apply to a later context.
+static inline void
+leia_lens_owner_commit_release(struct leia_lens_owner *o)
+{
+	o->last_sent = LEIA_LENS_REQ_NONE;
+	o->ctx_app_owned = true;
 }
 
 #ifdef __cplusplus

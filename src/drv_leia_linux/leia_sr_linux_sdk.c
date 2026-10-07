@@ -78,6 +78,10 @@
 #include "leia_edid_probe_linux.h"
 #include "leia_lens_owner_linux.h"
 #include "leia_display_claims_linux.h"
+#include "leia_sr_routing_linux.h"
+#ifdef DXR_LEIA_LNX_HAVE_SR_ROUTING
+#include "leia_sr_chain_sdk_linux.h"
+#endif
 
 #include "leia_interface.h"
 
@@ -102,6 +106,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(sr_fb_sdk, "DXR_LEIA_SR_FB_SDK", false)
  * v14 reuse) — the escape hatch should the SDK-owned pass misbehave. */
 DEBUG_GET_ONCE_BOOL_OPTION(sr_compose, "DXR_LEIA_SR_COMPOSE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(sr_compose_inline, "DXR_LEIA_SR_COMPOSE_INLINE", false)
+/* Multi-screen M4: chain SrWeaverRoutingInfo{EXTERNAL} on every weaver when the
+ * SR runtime honours it. DXR_LEIA_SR_EXTERNAL_ROUTING=0 keeps the SDK-routed
+ * weaver — an on-panel A/B, not a setting (SR's own SR_WEAVER_ROUTING env
+ * overrides whatever we chain, in either direction). */
+DEBUG_GET_ONCE_BOOL_OPTION(sr_external_routing, "DXR_LEIA_SR_EXTERNAL_ROUTING", true)
 
 #define SDK_HALF_IPD_MM 31.5f /* nominal 63 mm IPD — R-T2 fallback pair */
 
@@ -539,6 +548,56 @@ sr_ctx_shutdown(void)
 	pthread_mutex_unlock(&g_ctx_lock);
 }
 
+/*
+ * Multi-screen capabilities of the INSTALLED SR runtime (weaver routing +
+ * display binding), queried once per context and logged once. Fixed for a
+ * runtime build (sr_instance.h), so the generation key only matters across an
+ * SRService restart onto a different runtime. A runtime that predates the
+ * structs leaves them at "not supported" (the installed 1.38: everything
+ * false), and an SDK whose headers predate them compiles this to "unknown".
+ * Caller holds g_ctx_lock and has a READY context.
+ */
+#ifdef DXR_LEIA_LNX_HAVE_SR_ROUTING
+static struct leia_lnx_sr_multi_caps g_multi_caps;
+static uint32_t g_multi_caps_generation = 0; // 0 = never queried
+
+static struct leia_lnx_sr_multi_caps
+sdk_multi_caps_locked(void)
+{
+	const uint32_t gen = atomic_load(&g_ctx.generation);
+	if (g_multi_caps_generation != gen) {
+		g_multi_caps_generation = gen;
+		struct leia_lnx_sr_caps_chain chain;
+		leia_lnx_sr_caps_chain_init(&chain);
+		const SrResult res = srGetRuntimeCapabilities(g_ctx.instance, &chain.caps);
+		g_multi_caps = leia_lnx_sr_caps_chain_reduce(res, &chain);
+		if (SR_FAILED(res)) {
+			U_LOG_W(
+			    "leia_sr_sdk: srGetRuntimeCapabilities failed: %s — no weaver routing / display binding",
+			    srResultToString(res));
+		} else {
+			U_LOG_W(
+			    "leia_sr_sdk: SR multi-display caps: externalRouting=%u displayBinding=%u "
+			    "maxBoundDisplays=%u%s",
+			    (unsigned)g_multi_caps.external_routing, (unsigned)g_multi_caps.display_binding,
+			    (unsigned)g_multi_caps.max_bound_displays,
+			    (!g_multi_caps.external_routing && !g_multi_caps.display_binding)
+			        ? " (runtime predates both: plain SDK-routed, unbound weavers)"
+			        : "");
+		}
+	}
+	return g_multi_caps;
+}
+#else
+static struct leia_lnx_sr_multi_caps
+sdk_multi_caps_locked(void)
+{
+	// SDK headers predate SrWeaverRoutingInfo / SrDisplayBindingInfo
+	// (LeiaSR 1.38): nothing to chain, whatever the runtime could do.
+	return (struct leia_lnx_sr_multi_caps){0};
+}
+#endif
+
 /*! Refresh the cached display query from the SDK. Caller holds g_ctx_lock. */
 static bool
 sr_ctx_refresh_display_info_locked(void)
@@ -582,8 +641,31 @@ sr_ctx_refresh_display_info_locked(void)
 	 * consumes and logs as "per eye" (leia_sr_d3d11.cpp) — settled. */
 	info.recommended_view_width = (uint32_t)rec_w;
 	info.recommended_view_height = (uint32_t)rec_h;
-	/* No refresh getter in srSDK 1.0.0 (contract §8 R-D1 carried ask). */
+	/* Refresh (leia-plugin #184): srDisplayGetRefreshRate (slot 98) when the
+	 * SDK has it and the installed runtime answers; else the 60 Hz constant
+	 * (SR 1.38 has no getter — contract §8 R-D1). */
 	info.refresh_mhz = 60000;
+	const char *refresh_src = "HARDCODED 60 Hz (SDK has no srDisplayGetRefreshRate)";
+#ifdef DXR_LEIA_LNX_HAVE_SR_REFRESH
+	{
+		float hz = 0.0f;
+		const SrResult rr = srDisplayGetRefreshRate(g_ctx.display, &hz);
+		if (SR_SUCCEEDED(rr) && hz >= 1.0f && hz <= 1000.0f) {
+			info.refresh_mhz = (uint32_t)(hz * 1000.0f + 0.5f);
+			refresh_src = "from srDisplayGetRefreshRate";
+		} else {
+			// SR_ERROR_FUNCTION_UNSUPPORTED = a runtime older than the header.
+			refresh_src = SR_FAILED(rr) ? "60 Hz fallback (srDisplayGetRefreshRate failed)"
+			                            : "60 Hz fallback (srDisplayGetRefreshRate out of range)";
+			static bool rr_logged;
+			if (!rr_logged) {
+				U_LOG_I("leia_sr_sdk: srDisplayGetRefreshRate: %s (%.2f Hz) — keeping 60 Hz",
+				        SR_FAILED(rr) ? srResultToString(rr) : "implausible", hz);
+				rr_logged = true;
+			}
+		}
+	}
+#endif
 	info.nominal_viewer_x_m = nx / 1000.0f;
 	info.nominal_viewer_y_m = ny / 1000.0f;
 	info.nominal_viewer_z_m = nz / 1000.0f;
@@ -630,9 +712,11 @@ sr_ctx_refresh_display_info_locked(void)
 
 	static bool logged;
 	if (!logged) {
-		U_LOG_I("leia_sr_sdk: display %dx%d px, %.1fx%.1f cm, at (%d,%d), recommended %dx%d "
-		        "per view, nominal viewer Z %.0f mm, refresh HARDCODED 60 Hz",
-		        px_w, px_h, w_cm, h_cm, (int)rect.left, (int)rect.top, rec_w, rec_h, nz);
+		U_LOG_I(
+		    "leia_sr_sdk: display %dx%d px, %.1fx%.1f cm, at (%d,%d), recommended %dx%d "
+		    "per view, nominal viewer Z %.0f mm, refresh %.3f Hz %s",
+		    px_w, px_h, w_cm, h_cm, (int)rect.left, (int)rect.top, rec_w, rec_h, nz, info.refresh_mhz / 1000.0,
+		    refresh_src);
 		logged = true;
 	}
 
@@ -710,6 +794,12 @@ struct leiasr_lnx
 {
 	struct leiasr_lnx_create_info info;
 	SrWeaver weaver;
+
+	/* Multi-screen M4: what the weaver was actually created with (after any
+	 * fallback). An EXTERNAL-routed weaver never votes the lens, so its
+	 * creation and destruction drive the lens owner (leia_lens_owner_linux.h). */
+	bool external_routed;
+	bool display_bound;
 
 	VkRenderPass render_pass; //!< backend-owned, single color attachment (loadOp LOAD)
 	VkFormat render_pass_format;
@@ -1478,17 +1568,87 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		        "(the SDK opens its own X connection)");
 	}
 
-	/* srSDK takes no queue-family index — the command pool implies it. */
-	SrWeaverCreateInfoVulkan wci = SrWeaverCreateInfoVulkan(
-	    .device = (SrVkDevice)info->device, .physicalDevice = (SrVkPhysicalDevice)info->physical_device,
-	    .graphicsQueue = (SrVkQueue)info->graphics_queue, .commandPool = (SrVkCommandPool)info->command_pool,
-	    .window = (SrNativeWindowHandle)(uintptr_t)info->x11_window);
-	SrResult sres = srCreateWeaverVulkan(g_ctx.instance, &wci, &lnx->weaver);
+	/* Multi-screen M4: what to chain — weaver routing (EXTERNAL) and display
+	 * binding — decided against what the INSTALLED SR runtime honours. */
+	pthread_mutex_lock(&g_ctx_lock);
+	const struct leia_lnx_sr_multi_caps mcaps = sdk_multi_caps_locked();
+	pthread_mutex_unlock(&g_ctx_lock);
+	struct leia_lnx_sr_weaver_plan plan =
+	    leia_lnx_sr_plan_weaver(&mcaps, debug_get_bool_option_sr_external_routing(), info->sr_display_id);
+
+	SrResult sres = SR_SUCCESS;
+	for (;;) {
+		/* srSDK takes no queue-family index — the command pool implies it.
+		 *
+		 * window = 0, ALWAYS (multi-screen M4, ADR-033). The runtime supplies
+		 * the phase origin every frame (set_present_origin ->
+		 * srWeaverSetPresentOrigin), which is all the Linux SDK ever used a
+		 * window for (its getScreenRect is (0,0)); and an X11 id makes the
+		 * SDK refuse a resampled panel, which forces 2D under a fractionally
+		 * scaled XWayland desktop. A weaver CONSTRUCTED windowless always
+		 * weaves (WeaverBaseImpl.ipp, runbook §3). info->x11_window is
+		 * deliberately not forwarded. */
+		SrWeaverCreateInfoVulkan wci =
+		    SrWeaverCreateInfoVulkan(.device = (SrVkDevice)info->device,
+		                             .physicalDevice = (SrVkPhysicalDevice)info->physical_device,
+		                             .graphicsQueue = (SrVkQueue)info->graphics_queue,
+		                             .commandPool = (SrVkCommandPool)info->command_pool, .window = 0);
+#ifdef DXR_LEIA_LNX_HAVE_SR_ROUTING
+		struct leia_lnx_sr_weaver_chain chain;
+		wci.pNext = leia_lnx_sr_build_weaver_chain(&plan, &chain, wci.pNext);
+#endif
+		sres = srCreateWeaverVulkan(g_ctx.instance, &wci, &lnx->weaver);
+		if (SR_SUCCEEDED(sres)) {
+			break;
+		}
+		struct leia_lnx_sr_weaver_plan next;
+		if (!leia_lnx_sr_plan_weaver_fallback(&plan, &next)) {
+			break;
+		}
+		/* One INFO per fallback step: a refused binding (EDID-only display =
+		 * SR_ERROR_DEVICE_NOT_AVAILABLE, unknown id = SR_ERROR_DISPLAY_NOT_FOUND)
+		 * falls back to the active display, then a refused routing to the
+		 * SDK-routed weaver — both are exactly the pre-M4 weaver. */
+		U_LOG_I("leia_sr_sdk: srCreateWeaverVulkan with %s%s refused (%s) — retrying without %s",
+		        plan.routing_external ? "EXTERNAL routing" : "",
+		        plan.bind_display ? (plan.routing_external ? " + display binding" : "display binding") : "",
+		        srResultToString(sres), plan.bind_display ? "the display binding" : "EXTERNAL routing");
+		plan = next;
+	}
 	if (SR_FAILED(sres)) {
 		U_LOG_W("leia_sr_sdk: srCreateWeaverVulkan failed: %s", srResultToString(sres));
 		free(lnx);
 		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
+	}
+	lnx->external_routed = plan.routing_external;
+	lnx->display_bound = plan.bind_display;
+	if (info->x11_window != NULL) {
+		static bool window_logged;
+		if (!window_logged) {
+			U_LOG_I(
+			    "leia_sr_sdk: X11 window 0x%lx not forwarded — the weaver is windowless (phase from "
+			    "set_present_origin)",
+			    (unsigned long)(uintptr_t)info->x11_window);
+			window_logged = true;
+		}
+	}
+	if (lnx->external_routed) {
+		/* An EXTERNAL weaver never votes the lens: it is ours to turn on
+		 * (and to release when the last one goes — leiasr_lnx_destroy). */
+		pthread_mutex_lock(&g_ctx_lock);
+		const enum leia_lens_action la = leia_lens_owner_on_external_weaver_created(&g_lens_owner);
+		if (la != LEIA_LENS_ACTION_NONE) {
+			if (g_ctx.lens != NULL) {
+				(void)sr_ctx_send_lens_locked(
+				    la, "EXTERNAL-routed weaver created — it never votes the lens");
+			} else {
+				U_LOG_W(
+				    "leia_sr_sdk: EXTERNAL-routed weaver but no lens handle — the lens cannot be "
+				    "turned on (panel stays 2D)");
+			}
+		}
+		pthread_mutex_unlock(&g_ctx_lock);
 	}
 
 	VkFormat rp_format = info->target_format != VK_FORMAT_UNDEFINED ? info->target_format
@@ -1512,13 +1672,14 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 	lnx->hw_encodes = sdk_format_is_srgb(rp_format);
 	sdk_apply_srgb_conversion(lnx);
 
-	U_LOG_I("leia_sr_sdk: Vulkan weaver created (window=0x%lx%s, target format %d%s, "
-	        "atlas encoding awaiting the runtime's declaration (ADR-021 default ENCODED), "
-	        "weave sRGB read=%u write=%u)",
-	        (unsigned long)(uintptr_t)info->x11_window,
-	        info->x11_window == NULL ? " = windowless/display-scoped" : "", rp_format,
-	        lnx->hw_encodes ? " = *_SRGB, HW encodes on store" : " = *_UNORM, stores verbatim",
-	        (unsigned)lnx->srgb_read, (unsigned)lnx->srgb_write);
+	U_LOG_I(
+	    "leia_sr_sdk: Vulkan weaver created (window=0x0 = windowless, routing %s, display %s0x%016llx, "
+	    "target format %d%s, atlas encoding awaiting the runtime's declaration (ADR-021 default ENCODED), "
+	    "weave sRGB read=%u write=%u)",
+	    lnx->external_routed ? "EXTERNAL" : "SDK", lnx->display_bound ? "bound to " : "active (unbound), wanted ",
+	    (unsigned long long)info->sr_display_id, rp_format,
+	    lnx->hw_encodes ? " = *_SRGB, HW encodes on store" : " = *_UNORM, stores verbatim",
+	    (unsigned)lnx->srgb_read, (unsigned)lnx->srgb_write);
 	*out_lnx = lnx;
 	return LEIASR_LNX_SUCCESS;
 }
@@ -1533,6 +1694,23 @@ leiasr_lnx_destroy(struct leiasr_lnx *lnx)
 	 * stays up (see file header) and is torn down at .so unload. */
 	if (lnx->weaver != NULL) {
 		srDestroyWeaver(lnx->weaver);
+	}
+	if (lnx->external_routed) {
+		/* Last EXTERNAL weaver gone with the lens on because of us: release it.
+		 * SRService keeps the lens ON while ANY client holds an ENABLE, and
+		 * this SR context outlives the session (runbook §4, "Co-existing"). */
+		pthread_mutex_lock(&g_ctx_lock);
+		if (leia_lens_owner_on_external_weaver_destroyed(&g_lens_owner) == LEIA_LENS_ACTION_DISABLE &&
+		    g_ctx.lens != NULL) {
+			const SrResult lr = srLensDisable(g_ctx.lens);
+			if (SR_SUCCEEDED(lr)) {
+				leia_lens_owner_commit_release(&g_lens_owner);
+				U_LOG_W("leia_sr_sdk: lens OFF — the last EXTERNAL-routed weaver is gone");
+			} else {
+				LOG_SR_ONCE("srLensDisable (EXTERNAL weaver release)", lr);
+			}
+		}
+		pthread_mutex_unlock(&g_ctx_lock);
 	}
 	sdk_fb_cache_flush(lnx);
 	sdk_flip_cache_flush(lnx);
@@ -1676,11 +1854,18 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 			U_LOG_W("leia_sr_sdk: no framebuffer for weave target — skipping frame");
 			return;
 		}
+		VkRect2D area = {.offset = {0, 0}, .extent = {output->width, output->height}};
+		if (output->confine_to_viewport) {
+			/* Segment DP (multi-screen M4): touch only our canvas — a
+			 * sibling DP may already have woven the rest of the target.
+			 * The DP clamped the viewport to the target. */
+			area = viewport;
+		}
 		VkRenderPassBeginInfo begin = {
 		    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		    .renderPass = lnx->render_pass,
 		    .framebuffer = fb,
-		    .renderArea = {.offset = {0, 0}, .extent = {output->width, output->height}},
+		    .renderArea = area,
 		};
 		vkCmdBeginRenderPass(cmd_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -2178,7 +2363,9 @@ sr_log_display_caps_locked(uint32_t gen)
 		return;
 	}
 	g_sr_caps_logged_generation = gen;
-
+#ifdef DXR_LEIA_LNX_HAVE_SR_ROUTING
+	(void)sdk_multi_caps_locked(); // queries + logs once per context (shared with weaver creation)
+#else
 	SrDisplayBindingCapabilities bind_caps = SrDisplayBindingCapabilities();
 	SrWeaverRoutingCapabilities route_caps = SrWeaverRoutingCapabilities();
 	SrRuntimeCapabilities caps = SrRuntimeCapabilities();
@@ -2192,6 +2379,7 @@ sr_log_display_caps_locked(uint32_t gen)
 	U_LOG_W("leia_sr_sdk: SR multi-display caps: externalRouting=%u displayBinding=%u maxBoundDisplays=%u",
 	        (unsigned)route_caps.externalRouting, (unsigned)bind_caps.displayBinding,
 	        (unsigned)bind_caps.maxBoundDisplays);
+#endif
 }
 
 static void
@@ -2288,7 +2476,30 @@ out:
 	return ret;
 }
 
+uint64_t
+leia_lnx_sr_active_display_id(void)
+{
+	uint64_t id = 0;
+	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.state == SR_CTX_READY && g_sr_displays_generation == atomic_load(&g_ctx.generation)) {
+		for (int32_t i = 0; i < g_sr_display_count; i++) {
+			if (g_sr_displays[i].fpc_verified) {
+				id = g_sr_displays[i].display_id;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&g_ctx_lock);
+	return id;
+}
+
 #else // !DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM
+
+uint64_t
+leia_lnx_sr_active_display_id(void)
+{
+	return 0; // no srEnumerateDisplays in these SDK headers
+}
 
 int32_t
 leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)

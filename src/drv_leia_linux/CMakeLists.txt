@@ -120,6 +120,49 @@ elseif(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk")
         message(STATUS "DisplayXR-LeiaSR: SR display enumeration COMPILED OUT — no srEnumerateDisplays in "
                        "${_srsdk_snap_inc} (or this loader archive); probe_displays uses EDID + lens serial")
     endif()
+    # Multi-screen M4 (SR-P1/P2 of the plan; LeiaSR Linux line 876620d62
+    # phases A-C): weaver routing (SrWeaverRoutingInfo, EXTERNAL) and display
+    # binding (SrDisplayBindingInfo), both chained on create-infos and both
+    # gated at RUN time on the capability structs. Types only — no new call,
+    # so a compile check is the whole question (nothing to link). A 1.38 root
+    # lacks them: everything compiles out and every weaver is the plain one.
+    include(CheckCSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${_srsdk_snap_inc}")
+    check_c_source_compiles("
+#include <sr/sr.h>
+#include <sr/sr_vk.h>
+int main(void)
+{
+	SrWeaverRoutingInfo r = SrWeaverRoutingInfo(.mode = SR_WEAVER_ROUTING_EXTERNAL);
+	SrWeaverRoutingCapabilities rc = SrWeaverRoutingCapabilities();
+	SrDisplayBindingInfo b = SrDisplayBindingInfo(.displayId = 1);
+	SrDisplayBindingCapabilities bc = SrDisplayBindingCapabilities();
+	SrWeaverCreateInfoVulkan w = SrWeaverCreateInfoVulkan(.pNext = &r);
+	(void)rc; (void)b; (void)bc; (void)w;
+	return 0;
+}" DXR_LEIA_LNX_HAVE_SR_ROUTING)
+    # leia-plugin #184: srDisplayGetRefreshRate (slot 98) — a call, so the
+    # snap's compile-AND-link probe (it must be in THIS loader archive).
+    set(CMAKE_REQUIRED_LIBRARIES srSDK::loader)
+    check_symbol_exists(srDisplayGetRefreshRate "sr/sr.h" DXR_LEIA_LNX_HAVE_SR_REFRESH)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(DXR_LEIA_LNX_HAVE_SR_ROUTING)
+        target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_ROUTING=1)
+        message(STATUS "DisplayXR-LeiaSR: SR weaver routing + display binding ENABLED (SrWeaverRoutingInfo / "
+                       "SrDisplayBindingInfo declared) — used when the installed SR runtime reports them")
+    else()
+        message(STATUS "DisplayXR-LeiaSR: SR weaver routing + display binding COMPILED OUT — the SDK at "
+                       "${_srsdk_snap_inc} predates SrWeaverRoutingInfo; weavers are SDK-routed and unbound")
+    endif()
+    if(DXR_LEIA_LNX_HAVE_SR_REFRESH)
+        target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_REFRESH=1)
+        message(STATUS "DisplayXR-LeiaSR: SR refresh rate ENABLED (srDisplayGetRefreshRate)")
+    else()
+        message(STATUS "DisplayXR-LeiaSR: SR refresh rate COMPILED OUT — no srDisplayGetRefreshRate in this SDK; "
+                       "display info reports 60 Hz")
+    endif()
+
     if(DXR_LEIA_LNX_HAVE_SR_SNAP)
         target_compile_definitions(leia_weaver_backend INTERFACE DXR_LEIA_LNX_HAVE_SR_SNAP=1)
         message(STATUS "DisplayXR-LeiaSR: drag phase-snap ENABLED "
@@ -217,6 +260,7 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_edid_probe_linux.h
     leia_display_claims_linux.c
     leia_display_claims_linux.h
+    leia_sr_routing_linux.h
     leia_bg_capture_linux.c
     leia_bg_capture_linux.h
     leia_bg_capture_worker_linux.c
@@ -332,3 +376,16 @@ target_include_directories(test_display_claims_linux PRIVATE
 )
 target_link_libraries(test_display_claims_linux PRIVATE xrt-interfaces aux_util PkgConfig::PLUGIN_XCB)
 add_test(NAME test_display_claims_linux COMMAND test_display_claims_linux)
+
+# --- Host unit test: SR weaver chain plan (multi-screen M4) ---------------
+# leia_sr_routing_linux.h decides routing + binding from the SR caps; pure
+# C, so it runs everywhere. Where the SDK headers carry the structs, the same
+# test also builds the REAL pNext chains (leia_sr_chain_sdk_linux.h: SR types
+# and macros only, no SR call, no loader) and walks them.
+add_executable(test_sr_routing_linux tests/test_sr_routing_linux.c)
+target_include_directories(test_sr_routing_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(DXR_LEIA_LINUX_WEAVER STREQUAL "sdk" AND DXR_LEIA_LNX_HAVE_SR_ROUTING)
+    target_include_directories(test_sr_routing_linux PRIVATE ${_srsdk_snap_inc})
+    target_compile_definitions(test_sr_routing_linux PRIVATE DXR_LEIA_LNX_HAVE_SR_ROUTING=1)
+endif()
+add_test(NAME test_sr_routing_linux COMMAND test_sr_routing_linux)
