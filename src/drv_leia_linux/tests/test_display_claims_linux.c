@@ -284,6 +284,72 @@ test_claims_new_api(void)
 	CHECK(n == 1 && c[0].confidence == XRT_DISPLAY_CLAIM_EDID);
 }
 
+/* Identical twins without RandR positions (the XWayland norm): the panel list
+ * is in DRM connector order, the descriptors in RandR order, so nothing pairs
+ * them. Both monitors are claimed at EDID confidence with NO identity — never
+ * one twin's serial / SR display / connector on the other monitor. */
+static void
+test_claims_ambiguous_twins(void)
+{
+	struct xrt_display_descriptor d[2] = {
+	    desc(0xB, ACR_ID, DS1_PROD, 3840, 2160, 0, 0),
+	    desc(0xC, ACR_ID, DS1_PROD, 3840, 2160, 3840, 0),
+	};
+	struct leia_lnx_edid_panel p2[2] = {panel("DP-1", 1, false, 0, 0), panel("HDMI-A-1", 2, false, 0, 0)};
+	struct leia_lnx_sr_display sr[2];
+	memset(sr, 0, sizeof(sr));
+	for (int i = 0; i < 2; i++) {
+		sr[i].display_id = 0xD150 + (uint64_t)i;
+		sr[i].fpc_verified = i == 0;
+		snprintf(sr[i].serial, sizeof(sr[i].serial), "%s", i == 0 ? "QI012321D10117" : "");
+		sr[i].manufacturer_id = ACR_ID;
+		sr[i].product_id = DS1_PROD;
+		sr[i].edid_serial = (uint32_t)(i + 1);
+	}
+	snprintf(sr[0].connector, sizeof(sr[0].connector), "DP-1");
+	snprintf(sr[1].connector, sizeof(sr[1].connector), "HDMI-A-1");
+
+	struct leia_lnx_claim_inputs in = {
+	    .panels = p2, .panel_count = 2, .sr_display_count = -1, .supported_apis = XRT_DP_API_BIT_VK};
+	struct xrt_display_claim c[4];
+	struct leia_lnx_claim_binding b[4];
+
+	// 1.38: both claimed, both EDID, no serial, no connector.
+	uint32_t n = leia_lnx_compute_claims(d, 2, &in, c, b, 4);
+	CHECK(n == 2);
+	for (uint32_t i = 0; i < n; i++) {
+		CHECK(c[i].confidence == XRT_DISPLAY_CLAIM_EDID && c[i].serial[0] == '\0');
+		CHECK(b[i].connector[0] == '\0' && b[i].sr_display_id == 0);
+	}
+
+	// New API: SR's per-connector identity cannot be attributed either.
+	in.sr_displays = sr;
+	in.sr_display_count = 2;
+	n = leia_lnx_compute_claims(d, 2, &in, c, b, 4);
+	CHECK(n == 2);
+	for (uint32_t i = 0; i < n; i++) {
+		CHECK(c[i].confidence == XRT_DISPLAY_CLAIM_EDID && c[i].serial[0] == '\0');
+		CHECK(b[i].sr_display_id == 0 && b[i].connector[0] == '\0');
+	}
+
+	// SR lists the twins but the EDID scan does not: still ambiguous.
+	in.panel_count = 0;
+	n = leia_lnx_compute_claims(d, 2, &in, c, b, 4);
+	CHECK(n == 2 && c[0].serial[0] == '\0' && b[0].sr_display_id == 0 && b[1].sr_display_id == 0);
+
+	// One twin placed by RandR: it pairs by origin, the other is then
+	// the only candidate left for the other monitor — unambiguous.
+	in.panel_count = 2;
+	in.sr_display_count = -1;
+	p2[1].has_position = true;
+	p2[1].left = 0;
+	p2[1].top = 0;
+	n = leia_lnx_compute_claims(d, 2, &in, c, b, 4);
+	CHECK(n == 2);
+	CHECK(c[0].monitor_id == 0xB && strcmp(b[0].connector, "HDMI-A-1") == 0);
+	CHECK(c[1].monitor_id == 0xC && strcmp(b[1].connector, "DP-1") == 0);
+}
+
 /*! A future runtime appended fields: walk with ITS stride, not ours. */
 struct bigger_descriptor
 {
@@ -331,6 +397,7 @@ main(void)
 	test_claims_edid_ids();
 	test_claims_no_ids();
 	test_claims_new_api();
+	test_claims_ambiguous_twins();
 	test_claims_stride();
 	test_binding_table();
 	if (g_failures != 0) {

@@ -122,6 +122,9 @@ panel_size_is(const struct leia_lnx_edid_panel *p, uint32_t w, uint32_t h)
 	return (p->native_w == w && p->native_h == h) || (p->has_position && p->crtc_w == w && p->crtc_h == h);
 }
 
+//! match_panel(): identical twins this descriptor cannot be told apart from.
+#define MATCH_AMBIGUOUS (-2)
+
 static int32_t
 match_panel(const struct desc_view *v,
             const struct xrt_display_descriptor *displays,
@@ -130,20 +133,34 @@ match_panel(const struct desc_view *v,
             const bool *panel_taken)
 {
 	if (v->has_ids) {
-		int32_t first_free = -1;
+		// Candidates: free panels with the descriptor's EDID ids that are not
+		// known to sit somewhere ELSE on the desktop. A panel at the
+		// descriptor's origin wins outright (identical twins: the origin
+		// decides). Two or more candidates with no origin to decide between
+		// them — twins without RandR positions, the XWayland norm — are
+		// AMBIGUOUS: the panel list is in DRM connector order and the
+		// runtime's descriptors in RandR order, so pairing them by order would
+		// swap serial / sr_display_id / connector between the two monitors.
+		int32_t cand = -1;
+		uint32_t cand_count = 0;
 		for (uint32_t k = 0; k < in->panel_count; k++) {
 			const struct leia_lnx_edid_panel *p = &in->panels[k];
 			if (panel_taken[k] || p->manufacturer_id != v->man || p->product_id != v->prod) {
 				continue;
 			}
-			if (p->has_position && p->left == v->left && p->top == v->top) {
-				return (int32_t)k; // identical twins: the origin decides
+			if (p->has_position) {
+				if (p->left == v->left && p->top == v->top) {
+					return (int32_t)k;
+				}
+				continue; // placed elsewhere: not this monitor
 			}
-			if (first_free < 0) {
-				first_free = (int32_t)k;
-			}
+			cand = (int32_t)k;
+			cand_count++;
 		}
-		return first_free;
+		if (cand_count > 1) {
+			return MATCH_AMBIGUOUS;
+		}
+		return cand;
 	}
 
 	// No EDID ids on the descriptor: origin + size first.
@@ -215,13 +232,18 @@ match_sr_for_ids(const struct desc_view *v, const struct leia_lnx_claim_inputs *
 	if (in->sr_display_count <= 0 || !v->has_ids) {
 		return -1;
 	}
+	// Same rule as match_panel: two free SR displays with these ids and
+	// nothing to tell them apart is ambiguous, not "the first one".
+	int32_t hit = -1;
+	uint32_t hits = 0;
 	for (uint32_t j = 0; j < (uint32_t)in->sr_display_count; j++) {
 		const struct leia_lnx_sr_display *s = &in->sr_displays[j];
 		if (!sr_taken[j] && s->manufacturer_id == v->man && s->product_id == v->prod) {
-			return (int32_t)j;
+			hit = (int32_t)j;
+			hits++;
 		}
 	}
-	return -1;
+	return hits > 1 ? MATCH_AMBIGUOUS : hit;
 }
 
 uint32_t
@@ -255,8 +277,25 @@ leia_lnx_compute_claims(const struct xrt_display_descriptor *displays,
 		const struct desc_view v = desc_read(desc_at(displays, i));
 
 		const int32_t pk = match_panel(&v, displays, display_count, in, panel_taken);
-		int32_t sj =
-		    pk >= 0 ? match_sr_for_panel(&in->panels[pk], in, sr_taken) : match_sr_for_ids(&v, in, sr_taken);
+		const int32_t sj_ids = pk == -1 ? match_sr_for_ids(&v, in, sr_taken) : -1;
+		if (pk == MATCH_AMBIGUOUS || sj_ids == MATCH_AMBIGUOUS) {
+			// One of several identical Leia panels, but which one is unknown:
+			// claim the monitor (it IS a Leia panel) at EDID confidence with
+			// no serial, no SR display and no connector — never someone
+			// else's identity.
+			struct xrt_display_claim *c = &out_claims[n];
+			memset(c, 0, sizeof(*c));
+			c->monitor_id = v.monitor_id;
+			c->supported_apis = in->supported_apis;
+			c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
+			if (out_bindings != NULL) {
+				memset(&out_bindings[n], 0, sizeof(out_bindings[n]));
+				out_bindings[n].monitor_id = v.monitor_id;
+			}
+			n++;
+			continue;
+		}
+		int32_t sj = pk >= 0 ? match_sr_for_panel(&in->panels[pk], in, sr_taken) : sj_ids;
 		if (pk < 0 && sj < 0) {
 			continue;
 		}
