@@ -468,6 +468,13 @@ leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
 	return -1; // claims stay at EDID confidence
 }
 
+bool
+leiasr_lnx_display_binding_refused(struct leiasr_lnx *lnx)
+{
+	(void)lnx;
+	return false; // the stub binds nothing
+}
+
 uint64_t
 leia_lnx_sr_active_display_id(void)
 {
