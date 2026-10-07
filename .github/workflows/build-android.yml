@@ -129,7 +129,13 @@ env:
   # NOT credited here, deliberately: 0.10.69 also carries two foreground-status fixes
   # that CNSDK reports as untested on any device. Nothing observed after this bump
   # should be attributed to them.
-  CNSDK_TAG: v0.10.69
+  #
+  # 0.10.75: 2D under the lens (LeiaInc/CNSDK#746). It publishes the experimental
+  # leia_interlacer_vulkan_set_overlay_2d (with its _VERSION macro), so the local
+  # fallback typedef in leia_cnsdk.cpp compiles out. The filter itself lives in the
+  # impl, i.e. it reaches a device only with the 0.10.75 device-service APK; an older
+  # service just lacks the entry point and the DP declines the layer (today's look).
+  CNSDK_TAG: v0.10.75
 
 jobs:
   Android:
