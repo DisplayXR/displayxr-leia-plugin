@@ -9,6 +9,7 @@
 #include "leia_lift_depth.h"
 
 #include <math.h>
+#include <stddef.h>
 
 static float
 ld_clamp(float v, float lo, float hi)
