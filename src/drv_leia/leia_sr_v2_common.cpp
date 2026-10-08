@@ -22,6 +22,9 @@
 #ifdef DXR_LEIA_HAS_SR_LENS_BINDING
 #include <sr/sr_lens.h> // SrLensBindingCapabilities (SR D3)
 #endif
+#ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING
+#include <sr/sr_eye_tracker.h> // SrEyeTrackerBindingCapabilities (SR D4)
+#endif
 
 #include <atomic>
 #include <stdlib.h>
@@ -482,6 +485,12 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
 	SrLensBindingCapabilities lens_caps{};
 	lens_caps.sType = SR_TYPE_LENS_BINDING_CAPABILITIES;
 	bind_caps.pNext = &lens_caps;
+#ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING
+	// SR D4: tracker per device (tag 28), chained after the lens caps.
+	SrEyeTrackerBindingCapabilities et_caps{};
+	et_caps.sType = SR_TYPE_EYE_TRACKER_BINDING_CAPABILITIES;
+	lens_caps.pNext = &et_caps;
+#endif
 #endif
 	SrWeaverRoutingCapabilities route_caps{};
 	route_caps.sType = SR_TYPE_WEAVER_ROUTING_CAPABILITIES;
@@ -502,6 +511,9 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
 	out->max_bound_displays = bind_caps.maxBoundDisplays;
 #ifdef DXR_LEIA_HAS_SR_LENS_BINDING
 	out->lens_per_device = lens_caps.lensPerDevice != SR_FALSE;
+#ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING
+	out->eye_tracker_per_device = et_caps.eyeTrackerPerDevice != SR_FALSE;
+#endif
 #endif
 #else
 	(void)instance;

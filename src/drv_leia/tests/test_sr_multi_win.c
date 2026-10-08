@@ -122,6 +122,26 @@ test_bound_lens(void)
 }
 
 static void
+test_segment_tracked(void)
+{
+	const struct leia_win_sr_multi_caps d4 = {.known = true,
+	                                          .external_routing = true,
+	                                          .display_binding = true,
+	                                          .max_bound_displays = 2,
+	                                          .lens_per_device = true,
+	                                          .eye_tracker_per_device = true};
+	// D4 on: the DS1-bound weaver tracks its own camera — no pin.
+	CHECK(leia_win_sr_plan_segment_tracked(&d4, DS1_ID, AL_ID));
+	CHECK(!leia_win_sr_plan_pin_simulated_viewer(DS1_ID, AL_ID) || leia_win_sr_plan_segment_tracked(&d4, DS1_ID, AL_ID));
+	// Gate off / pre-D4: not tracked, the pin stays.
+	CHECK(!leia_win_sr_plan_segment_tracked(&k_caps_2056, DS1_ID, AL_ID));
+	// The active display is always tracked; unknown active = assume tracked.
+	CHECK(leia_win_sr_plan_segment_tracked(&k_caps_2056, AL_ID, AL_ID));
+	CHECK(leia_win_sr_plan_segment_tracked(&k_caps_unknown, DS1_ID, 0));
+	CHECK(leia_win_sr_plan_segment_tracked(&k_caps_2056, 0, AL_ID));
+}
+
+static void
 test_simulated_viewer_pin(void)
 {
 	// The DS1-bound weaver on a rig whose tracker follows the AL: pin.
@@ -143,6 +163,7 @@ main(void)
 	test_caps_gate();
 	test_fallback_order();
 	test_bound_lens();
+	test_segment_tracked();
 	test_simulated_viewer_pin();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_multi_win: %d failure(s)\n", g_failures);
