@@ -42,6 +42,11 @@ struct leia_win_sr_multi_caps
 	//! SrLensBindingCapabilities::lensPerDevice (SR D3): a lens bound to a
 	//! display drives THAT display's FPC, whichever display is active.
 	bool lens_per_device;
+	//! SrEyeTrackerBindingCapabilities::eyeTrackerPerDevice (SR D4): a weaver
+	//! bound to a calibrated non-active display tracks that display's own
+	//! camera (EXTERNAL included); false while the service has no tracker
+	//! for it (gate off, old service).
+	bool eye_tracker_per_device;
 };
 
 //! The chain to build on the weaver create-info.
@@ -133,6 +138,29 @@ static inline bool
 leia_win_sr_plan_bind_lens(const struct leia_win_sr_multi_caps *caps, const struct leia_win_sr_weaver_plan *p)
 {
 	return caps != NULL && caps->known && caps->lens_per_device && p->bind_display && p->display_id != 0;
+}
+
+/*!
+ * Does this segment have a tracker of its own (SR D4)? The active display
+ * always does (the primary feed). Any other display does once the runtime
+ * reports eyeTrackerPerDevice: its bound weaver then tracks that display's
+ * camera automatically, so the DP must NOT pin a simulated viewer (an explicit
+ * pin overrides tracking), must initialise its instance (the senses feed the
+ * tracker) and may keep late latching.
+ *
+ * @param caps               The runtime's answer.
+ * @param bound_display_id   The display the weaver was bound to (0 = unbound).
+ * @param active_display_id  The runtime's active display (0 = unknown).
+ */
+static inline bool
+leia_win_sr_plan_segment_tracked(const struct leia_win_sr_multi_caps *caps,
+                                 uint64_t bound_display_id,
+                                 uint64_t active_display_id)
+{
+	if (bound_display_id == 0 || active_display_id == 0 || bound_display_id == active_display_id) {
+		return true; // the active display, or unknown: today's primary feed
+	}
+	return caps != NULL && caps->known && caps->eye_tracker_per_device;
 }
 
 /*!

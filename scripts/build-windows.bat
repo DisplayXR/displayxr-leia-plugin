@@ -104,8 +104,8 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: used by the d3d11 DP under DXR_LEIA_HAS_SR_COMPOSE_STRENGTH (XR_DXR_weave v15).
 :: 1895 = final RC @ c0384431e: no new functions -- 104 slot declarations, 95 live (an
 :: exact ordered copy of 1874's) + 9 reserved NULL (Metal, GL/VK compose inputs).
-set SR_V2_TAG=sr-sdk-v2-1.38.0.2083
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+2083.a4a00a6531-win64-Release
+set SR_V2_TAG=sr-sdk-v2-1.38.0.2141
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+2141.68f7307e8d-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 

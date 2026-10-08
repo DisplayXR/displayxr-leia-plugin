@@ -290,6 +290,9 @@ struct leiasr_d3d11
 	//! lens_v2 is bound to bind_display_id (SR D3): the vote outlives
 	//! srDestroyLens (context-owned), so it is disabled before destroy.
 	bool lens_bound = false;
+	//! This segment has a tracker of its own (the active display, or SR D4
+	//! reporting a tracker per device): senses on, late latching on, no pin.
+	bool segment_tracked = true;
 	float pin_left_mm[3] = {0.0f, 0.0f, 0.0f};
 	float pin_right_mm[3] = {0.0f, 0.0f, 0.0f};
 	bool pin_eyes_logged = false;
@@ -627,8 +630,20 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	 * weaver back to 2D. Its instance is therefore never initialised; the
 	 * weaver weaves from the simulated viewer alone.
 	 */
-	const bool pin_viewer = leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0,
-	                                                                sr.active_display_id);
+	/*
+	 * SR D4 (tracker per device): once the runtime reports
+	 * eyeTrackerPerDevice, a weaver bound to a calibrated non-active
+	 * display tracks that display's own camera automatically — then this
+	 * DP must NOT pin a viewer (a pin overrides tracking), and it needs its
+	 * senses like the active one. Until then (gate off, older service) the
+	 * untracked-screen path below stands.
+	 */
+	const bool segment_tracked = leia_win_sr_plan_segment_tracked(
+	    &mcaps, sr.display_bound ? sr.bind_display_id : 0, sr.active_display_id);
+	const bool pin_viewer = !segment_tracked &&
+	                        leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0,
+	                                                              sr.active_display_id);
+	sr.segment_tracked = segment_tracked;
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		// The recorder's senses belong to this instance — take them down
 		// before it, never after.
@@ -685,12 +700,19 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	 * display and drives it from the runtime's 2D/3D requests itself — its
 	 * EXTERNAL weaver never votes; before D3 that screen's lens is left alone.
 	 */
-	const bool bind_lens = pin_viewer && leia_win_sr_plan_bind_lens(&mcaps, &plan);
-	if (!pin_viewer) {
+	const bool non_active = sr.display_bound && sr.active_display_id != 0 && sr.bind_display_id != sr.active_display_id;
+	const bool bind_lens = non_active && leia_win_sr_plan_bind_lens(&mcaps, &plan);
+	if (!non_active) {
 		leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
 	} else if (bind_lens) {
 		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
 		sr.lens_bound = sr.lens_v2 != nullptr;
+	}
+	if (non_active && segment_tracked) {
+		U_LOG_W("SR D3D11 per-screen weaver: display 0x%016llx is not the active 0x%016llx but the runtime "
+		        "reports a tracker per device (D4) — tracked by its own camera, no simulated viewer, lens %s",
+		        (unsigned long long)sr.bind_display_id, (unsigned long long)sr.active_display_id,
+		        sr.lens_bound ? "BOUND to this display" : "left to the active panel");
 	}
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN
 	if (pin_viewer) {
