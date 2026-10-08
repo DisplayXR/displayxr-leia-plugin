@@ -206,6 +206,93 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	return any_populated;
 }
 
+#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR
+/*
+ * Multi-screen M1 (and what M3's per-segment views need): describe ONE
+ * monitor this plug-in claimed — its physical size and nominal viewer — so
+ * the runtime's screen registry carries metres for every Leia panel, not only
+ * the active one. The size comes from SR's own calibration (the enumeration
+ * descriptor's cm, cached 2 s, non-blocking); the nominal viewer is the
+ * active panel's, scaled to this panel's height (the Linux arm's rule).
+ * Cheap and callable from any thread, as the slot requires. False for a
+ * monitor this plug-in did not claim, or one SR cannot size: the runtime then
+ * derives EDID defaults.
+ */
+static bool
+leia_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
+                                         const struct xrt_display_descriptor *display,
+                                         const struct xrt_display_physical *physical,
+                                         struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+	if (display == NULL || out_info == NULL ||
+	    display->struct_size < offsetof(struct xrt_display_descriptor, screen_top) + sizeof(display->screen_top)) {
+		return false;
+	}
+	struct leia_win_claim_binding claim;
+	memset(&claim, 0, sizeof(claim));
+	if (!leia_win_claims_lookup(display->monitor_id, &claim)) {
+		return false;
+	}
+
+	uint32_t width_mm = 0, height_mm = 0, px_w = 0, px_h = 0;
+	if (claim.sr_display_id != 0) {
+		struct leia_win_sr_display sd[LEIA_WIN_SR_MAX_DISPLAYS];
+		const int32_t n = leia_win_sr_enumerate_displays(sd, LEIA_WIN_SR_MAX_DISPLAYS);
+		for (int32_t i = 0; i < n; i++) {
+			if (sd[i].display_id == claim.sr_display_id) {
+				width_mm = sd[i].width_mm;
+				height_mm = sd[i].height_mm;
+				px_w = sd[i].native_w;
+				px_h = sd[i].native_h;
+				break;
+			}
+		}
+	}
+	if ((width_mm == 0 || height_mm == 0) && physical != NULL &&
+	    physical->struct_size >= offsetof(struct xrt_display_physical, physical_height_mm) + sizeof(uint32_t)) {
+		width_mm = physical->physical_width_mm;
+		height_mm = physical->physical_height_mm;
+	}
+	if (width_mm == 0 || height_mm == 0) {
+		return false; // nothing better than the runtime's own defaults
+	}
+	if (px_w == 0 || px_h == 0) {
+		px_w = display->pixel_width;
+		px_h = display->pixel_height;
+	}
+
+	out_info->display_width_m = (float)width_mm / 1000.0f;
+	out_info->display_height_m = (float)height_mm / 1000.0f;
+	out_info->display_pixel_width = px_w;
+	out_info->display_pixel_height = px_h;
+	out_info->display_screen_left = display->screen_left;
+	out_info->display_screen_top = display->screen_top;
+	out_info->refresh_mhz = display->refresh_mhz;
+
+	// Nominal viewer: centred, at the active panel's nominal distance scaled
+	// by the height ratio (identical panels => identical viewer). 0.6 m when
+	// the active panel's geometry is not resolved yet.
+	struct leiasr_geometry g = {0};
+	float z = 0.6f;
+	if (leiasr_geometry_get(&g) && g.height_m > 0.0f && g.nominal_z_m > 0.0f) {
+		z = g.nominal_z_m * (out_info->display_height_m / g.height_m);
+	}
+	out_info->nominal_viewer_x_m = 0.0f;
+	out_info->nominal_viewer_y_m = 0.0f;
+	out_info->nominal_viewer_z_m = z;
+
+	// View scale 0 = the runtime derives (a non-default screen renders at
+	// native). MANAGED eye tracking, like the active panel: with SR D4 the
+	// panel's own camera tracks it; before D4 its DP pins the nominal viewer.
+	out_info->recommended_view_scale_x = 0.0f;
+	out_info->recommended_view_scale_y = 0.0f;
+	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
+	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+	return true;
+}
+#endif
+
 /*
  * The last SR-deferral claim probe_displays() reported, so its WARN fires
  * once per (monitor, EDID identity) rather than once per registry refresh —
@@ -503,6 +590,10 @@ static struct xrt_plugin_iface g_leia_iface = {
     .set_pose_source = leia_plugin_set_pose_source,
 
     .probe_displays = leia_plugin_probe_displays,
+#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR
+    /* Multi-screen M1: per-monitor size + nominal viewer for every Leia panel claimed. */
+    .get_display_info_for_monitor = leia_plugin_get_display_info_for_monitor,
+#endif
 
     /*
      * ADR-042 lift-only D3D11 DP: no weaver / window / tracker, only the NeurD
