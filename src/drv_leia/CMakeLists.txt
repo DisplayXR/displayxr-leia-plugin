@@ -356,7 +356,7 @@ if(LEIA_SR_D3D11_AVAILABLE AND NEURD_SDK_ROOT
    AND EXISTS "${NEURD_SDK_ROOT}/include/_NeurD_detail.h"
    AND EXISTS "${NEURD_SDK_ROOT}/include/_NeurD_table.h")
     set(LEIA_NEURD_AVAILABLE TRUE)
-    list(APPEND LEIA_SOURCES leia_lift_neurd.cpp leia_lift_neurd.h)
+    list(APPEND LEIA_SOURCES leia_lift_neurd.cpp leia_lift_neurd.h leia_lift_viewpoint.c leia_lift_viewpoint.h)
     message(STATUS "NeurD headers found at ${NEURD_SDK_ROOT} - enabling the D3D11 2D->3D lift slots")
 elseif(LEIA_SR_D3D11_AVAILABLE)
     message(STATUS "NeurD headers NOT found (NEURD_SDK_ROOT='${NEURD_SDK_ROOT}') - 2D->3D lift compiled OUT; "

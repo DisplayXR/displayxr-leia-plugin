@@ -74,15 +74,32 @@ struct leia_lift_neurd_params
 	float strength;    //!< NeurD gain multiplier: 1 = calibrated budget, 0 = flat; <0 = 1.0; max 10.
 	uint32_t inpaint;  //!< 0 stretch fill, non-zero blur fill.
 	uint32_t view_count; //!< NVIEW only (2..max_views).
+
+	/*
+	 * Viewpoint policy (runtime ADR-048). has_policy = the runtime filled these
+	 * (its xrt_dp_lift_params covers them); false = the legacy contract
+	 * (panel-centred eyes, x only, fixed 63 mm unit, ±3 clamp). Applied only to
+	 * viewpoints the RUNTIME passed — eyes the DP reads from its own tracker
+	 * are panel-centred and unprocessed, so they always map the legacy way.
+	 */
+	bool has_policy;
+	float rect_width_m;       //!< Lifted rect size, metres; 0 = unknown (logged only).
+	float rect_height_m;      //!< ditto
+	float baseline_m;         //!< Eye separation the runtime used, metres; 0 = unknown. Clamp margin + log only.
+	uint32_t axis_mode;       //!< LEIA_LIFT_AXIS_* (leia_lift_viewpoint.h).
+	float max_offset_m;       //!< The runtime's x/y midpoint clamp, metres; 0 = unclamped.
+	uint32_t viewpoint_frame; //!< 0 = panel centre, 1 = rect centre (logged only).
+	float ref_z_m;            //!< Reference viewing distance (panel nominal), metres; <= 0 = 0.5.
 };
 
 struct leia_lift_neurd;
 
 /*!
- * Create a per-DP handle. Reads the env knobs (DXR_LEIA_LIFT,
- * DXR_LEIA_LIFT_BACKEND, DXR_LEIA_LIFT_SCALE, DXR_LEIA_LIFT_VIEW_GAIN) once.
- * Cheap: no DLL load, no thread. Never fails (a disabled handle reports
- * unavailable).
+ * Create a per-DP handle. Reads the knobs (env > HKLM > default) once for the
+ * process-level ones (enable, backend, versions, video model). The per-convert
+ * knobs (ViewGain, YGain, ZGain, ConvGain, DepthGain, Dilate, Scale) are
+ * re-read and snapshotted per STREAM at stream create. Cheap: no DLL load, no
+ * thread. Never fails (a disabled handle reports unavailable).
  */
 struct leia_lift_neurd *
 leia_lift_neurd_create(void);
@@ -112,9 +129,11 @@ leia_lift_neurd_stream_destroy(struct leia_lift_neurd *lift, uint64_t id);
  *                       enabled here if it is not.
  * @param input          ID3D11Texture2D* (as ID3D11Resource*), RGBA8 or BGRA8
  *                       family, single-sampled; the top-left w x h is used.
- * @param viewpoints_m   Optional explicit viewpoints: (x,y,z) triplets in
- *                       METRES, display space (same space as tracked eyes).
- *                       NULL/0 = use @p eye_left / @p eye_right.
+ * @param viewpoints_m   Optional viewpoints from the runtime: (x,y,z) triplets
+ *                       in METRES — rect-relative and policy-processed when
+ *                       @p params has_policy, else panel-centred display
+ *                       space. NULL/0 = use @p eye_left / @p eye_right (the
+ *                       DP's own tracker; always mapped the legacy way).
  * @param eyes_valid     False (or NULL eyes) = no tracked viewer: NeurD's
  *                       default pattern is used.
  * @param out_resource   ID3D11Texture2D* on the caller's device, owned by the
@@ -141,13 +160,11 @@ leia_lift_neurd_convert(struct leia_lift_neurd *lift,
                         uint32_t *out_format);
 
 /*!
- * Pure helper, exposed for tests + docs: map display-space positions (metres)
- * to NeurD's dimensionless viewpoint units. See docs/lift-neurd.md.
- *
- * x_n = clamp(gain * x_m / 0.063), y_n = clamp(gain * y_m / 0.063), z_n = 0.
- * A centred viewer at 63 mm IPD maps to x = -0.5 / +0.5 — exactly NeurD's
- * default stereo pattern — so gain 1.0 reproduces the untracked output and
- * head motion becomes look-around.
+ * LEGACY mapping (kept for callers of the old helper): x_n = clamp(gain *
+ * x_m / 0.063, ±3), y_n = z_n = 0. A centred viewer at 63 mm IPD maps to
+ * x = -0.5 / +0.5 — exactly NeurD's default stereo pattern. The full mapping,
+ * including the runtime's viewpoint policy, is leia_lift_vp_map()
+ * (leia_lift_viewpoint.h); see docs/lift-neurd.md.
  */
 void
 leia_lift_neurd_map_viewpoint(const float in_m[3], float gain, float out_n[3]);

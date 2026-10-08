@@ -231,6 +231,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_sr_multi_win
 
+      - name: Unit test — Windows-arm lift viewpoint mapping (runtime ADR-048, host-run)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_lift_viewpoint
+
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
