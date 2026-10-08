@@ -330,7 +330,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	// returns a hardcoded false). It needs the same submit hook Vulkan has —
 	// D3D12 hands submission to the application too — and that hook does not
 	// exist. Calling enable here would return SR_SUCCESS and do nothing.
-	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+	leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
 
 	U_LOG_W("SR D3D12 weaver created via the v2 C API");
 	return true;

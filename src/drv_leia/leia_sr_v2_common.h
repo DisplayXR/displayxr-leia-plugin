@@ -137,9 +137,14 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
  * A display with no switchable lens is not an error: `*out_lens` is set to NULL
  * and the caller degrades to "cannot switch", exactly as the v1 path does when
  * `SwitchableLensHint::create` throws.
+ *
+ * @param bind_display_id SR D3 (lens per device): chain SrDisplayBindingInfo
+ *             with this id so the lens drives THAT display's FPC (0 = the
+ *             active display, today's behaviour). Ignored when the SDK headers
+ *             predate the struct.
  */
 void
-leia_sr_v2_create_lens(SrInstance instance, SrLens *out_lens);
+leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *out_lens);
 
 /*!
  * Human-readable name for an `SrResult`, for log lines. Never NULL.

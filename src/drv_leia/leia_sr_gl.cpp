@@ -274,7 +274,7 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 			        ll == SR_TRUE ? "ENABLED (effective)" : "declined by the backend");
 		}
 	}
-	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+	leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
 
 	U_LOG_W("SR GL weaver created via the v2 C API");
 	return true;

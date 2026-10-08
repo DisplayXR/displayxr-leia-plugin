@@ -287,6 +287,9 @@ struct leiasr_d3d11
 	//! before every weave: once the senses run, the weaver's own tracking
 	//! feed (no face on this display) wins over a one-time pin.
 	bool viewer_pinned = false;
+	//! lens_v2 is bound to bind_display_id (SR D3): the vote outlives
+	//! srDestroyLens (context-owned), so it is disabled before destroy.
+	bool lens_bound = false;
 	float pin_left_mm[3] = {0.0f, 0.0f, 0.0f};
 	float pin_right_mm[3] = {0.0f, 0.0f, 0.0f};
 	bool pin_eyes_logged = false;
@@ -674,8 +677,20 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	 * weaver falls back to 2D every frame, exactly like the active one with
 	 * nobody in front of it.
 	 */
+	/*
+	 * The lens. An unbound DP (every pre-M6 caller) and a screen-bound DP on
+	 * the active display take the plain (active-display) lens, as always. A
+	 * DP bound to another display must NOT: that handle would switch the
+	 * active panel. With SR D3 (lens per device) it binds a lens to ITS
+	 * display and drives it from the runtime's 2D/3D requests itself — its
+	 * EXTERNAL weaver never votes; before D3 that screen's lens is left alone.
+	 */
+	const bool bind_lens = pin_viewer && leia_win_sr_plan_bind_lens(&mcaps, &plan);
 	if (!pin_viewer) {
-		leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+		leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
+	} else if (bind_lens) {
+		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
+		sr.lens_bound = sr.lens_v2 != nullptr;
 	}
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN
 	if (pin_viewer) {
@@ -699,9 +714,12 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 		const SrResult vr = srWeaverSetSimulatedViewer(sr.weaver_v2, &viewer);
 		sr.viewer_pinned = SR_SUCCEEDED(vr);
 		U_LOG_W("SR D3D11 per-screen weaver: display 0x%016llx is not the active 0x%016llx — simulated "
-		        "nominal viewer %s, lens left to the active panel",
+		        "nominal viewer %s, lens %s",
 		        (unsigned long long)sr.bind_display_id, (unsigned long long)sr.active_display_id,
-		        sr.viewer_pinned ? "PINNED" : "REFUSED (will fall back to 2D)");
+		        sr.viewer_pinned ? "PINNED" : "REFUSED (will fall back to 2D)",
+		        sr.lens_bound ? "BOUND to this display (D3)"
+		                      : (bind_lens ? "bind REFUSED — left to the active panel"
+		                                   : "left to the active panel (runtime predates D3)"));
 	}
 #endif
 
@@ -1694,8 +1712,16 @@ destroy_sdk_objects(leiasr_d3d11 *sr)
 		// runtime source — sr_lens.h documents neither, so do not go looking for
 		// it there.
 		if (sr->lens_v2 != nullptr) {
+			// SR D3: a bound lens's request is context-owned and survives
+			// srDestroyLens; a segment DP going away (the window left that
+			// screen) must hand the panel back to 2D explicitly. The
+			// active-display lens keeps today's behaviour (the service owns it).
+			if (sr->lens_bound) {
+				(void)srLensDisable(sr->lens_v2);
+			}
 			srDestroyLens(sr->lens_v2);
 			sr->lens_v2 = nullptr;
+			sr->lens_bound = false;
 		}
 		srDestroyWeaver(sr->weaver_v2);
 		sr->weaver_v2 = nullptr;
