@@ -176,7 +176,7 @@ endif()
 # plug-in ABI still v5; an older pin compiles the NeurD lift module OUT.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.30.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.31.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin so it can move independently of the Windows
 # installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
