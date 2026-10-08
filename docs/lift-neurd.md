@@ -304,6 +304,127 @@ eyes).
   build whose reported version matches its table).
 - A working 0.4.6 package.
 
+## NeurD 0.4.9: per-stream props, depth export, off-axis camera
+
+Three NeurD additions, each from its own media_sdk PR, each gated twice — at **build** time
+on the fetched header declaring it (CMake greps `NeurD.h`: `DXR_LEIA_NEURD_HAS_FLOAT_DEPTH`
+for #559, `DXR_LEIA_NEURD_HAS_OFFAXIS` for #560; configure prints `NeurD header features:
+…`), and at **run** time on the loaded NeurD's table (`LEIA_NEURD_HAS`). A NeurD 0.4.6–0.4.8
+runs exactly the pre-0.4.9 paths; the activation WARN says which features are live:
+
+```
+Leia lift: NeurD READY — backend neurd-directml, interactive viewpoints available, per-stream props yes, float depth METRIC, off-axis camera available
+```
+
+| Feature | NeurD entry points (all `INTRODUCED_IN` 0.4.9) | Runtime side | Without it |
+|---|---|---|---|
+| Per-stream props | `NeurD_set/get_stream_prop_1f/1i` (#559) | — | process-global props (one stream's convergence / gain / auto-convergence leaks into the next) |
+| Depth export | `NEURD_PROP_RETAIN_FLOAT_DEPTH`, `NeurD_get_stream_depth_dx` (#559), DirectML only | `XRT_DP_LIFT_HAS_AUX_DEPTH` + slot 33 `lift_get_depth` (`XRT_DP_D3D11_HAS_LIFT_DEPTH`) | caps `aux_outputs = 0`; slot left NULL |
+| Off-axis camera | `NeurD_convert_stream_dx_offaxis` (#560) | `XRT_DP_LIFT_HAS_VIEWPOINT_POLICY` (rect size + rect-relative eyes); `XRT_DP_LIFT_HAS_APP_RIG` for rig sources | the dimensionless interactive convert |
+
+**Per-stream props.** When NeurD has them, inpaint type, auto-convergence, gain multiplier,
+dilation and convergence are set on each NeurD stream (`NeurD_set_stream_prop_*`) instead
+of globally, so two lifted videos never see each other's values. `CONVERGENCE` is always
+overridden on the stream (initially 0 under auto) because NeurD keeps a stream's own
+auto-convergence result only once that stream overrides it. Output type, tiles and input
+autoscaling stay global (NeurD has no per-stream form). A setter refusal flips that stream
+back to the global path with one WARN.
+
+### Depth export (aux depth)
+
+An SBS stream created with `XRT_DP_LIFT_AUX_DEPTH` in `xrt_dp_lift_stream_info::aux_outputs`
+gets `NEURD_PROP_RETAIN_FLOAT_DEPTH` on its NeurD stream. After each successful convert the
+plug-in calls `NeurD_get_stream_depth_dx` — the depth **of the same inference** as the views
+just returned (`same_inference = 1`, `vendor_frame_id` = NeurD's per-stream `frame_id`) —
+and bridges NeurD's R32F texture to the caller's device exactly like the views: a
+legacy-shared R32F texture on NeurD's device, opened on ours, filled with
+`CopySubresourceRegion` on NeurD's context and CPU-drained with the same event query as the
+SBS output. `lift_get_depth` (slot 33) then only reports it; the texture stays valid until
+the next convert on the stream. Caps report `aux_outputs = AUX_DEPTH` once READY when NeurD
+has the float-depth path, with `aux_depth_semantics` = METRIC under `VideoModel=metric`,
+RELATIVE otherwise (the per-frame `units` is NeurD's own and authoritative).
+
+What the R32F map holds — read from #559's `RawDepthToR32FCS`, not assumed:
+
+| Model | Samples | `xrt_dp_lift_depth` |
+|---|---|---|
+| metric video model | **metres**: the shader already computed `inverse_depth_scale / raw` (S = 100); texels with no signal (raw ≤ S / 1000, e.g. sky) are written as `far_m` = 1000 | `units` METRIC, `encoding` **LINEAR**, `value_scale` 1, `near` = `near_m` (0.39 m — the model's 8-bit range limit; nearer texels are extrapolated, not clamped), `far` = 1000 |
+| relative (fast) model | the raw model value, 0..255, larger = nearer (min-max normalised per frame) | `units` RELATIVE, `encoding` INVERSE, `value_scale` 1/255 (decoded = the renderer's `h`, depth = 1/h in relative units), near/far 0 (unknown) |
+
+Intrinsics: NeurD reports its *assumed* pinhole (focal = 0.78 · max(source w, h), principal
+point at the centre — no model estimates it) already in depth-texture texels, separately per
+axis because the model stretches the source to 640×416; they are passed through. If a NeurD
+reports no focal, the same nominal pinhole is rescaled here. `source_width/height` are the
+`lift_convert` call's `w × h`.
+
+**`convergence_depth`** — the decoded depth NeurD put at zero disparity. NeurD's renderers
+read the 8-bit disparity `h = sample / 255` (relative: the normalised model output; metric:
+`raw / 255`, raw = S / depth, clamped at 255) and march normalised depth `n = 1 − h`:
+
+- legacy renderer (`StretchCS`): the ray crosses its source column at `n = 5 · c + 0.5`, c =
+  the `CONVERGENCE` NeurD used (`NeurD_depth_info::convergence` — the auto-convergence result
+  when auto is on), so **h₀ = 0.5 − 5c**;
+- off-axis renderer: `z = C − n · D`, so **h₀ = 1 − C / D** (the screen the plug-in sent);
+
+then metric `convergence_depth = S / (255 · h₀)` metres, relative `= 1 / h₀`; `h₀ ≤ 0`
+(zero disparity at or past infinity) reports 0 = unknown. Code + tests:
+`leia_lift_depth.{h,c}`, `tests/test_lift_depth.c`.
+
+Not done: un-dilated depth is what #559 returns already (taken before `DILATE_RADIO`); no
+watermark on the DirectML path. CUDA / TensorRT / OpenVINO have no float-depth path
+(`UNAVAILABLE_OUTDATED_RUNTIME` → one WARN, no depth).
+
+### Off-axis camera
+
+With NeurD's `NeurD_convert_stream_dx_offaxis` and a runtime that sends the viewpoint policy
+(`viewpoint_frame` RECT and `rect_width_m / rect_height_m > 0`), SBS streams are synthesised
+with a **metric off-axis (Kooima) camera** — the projection the runtime uses for native 3D —
+instead of the dimensionless `(x, y, z)` pattern. `OffAxis=0` forces the legacy path (A/B).
+If NeurD refuses a call (`INVALID_ARG`), that frame falls back to the legacy camera with one
+WARN.
+
+Mapping (`leia_lift_oa_build`):
+
+| NeurD | From |
+|---|---|
+| `screen_width_m / screen_height_m` | the lifted rect's size in metres (one output view = the rect) |
+| `views[i].eye_{x,y}_m` | the runtime's viewpoints, rect-relative metres. Tracked / explicit: `x · ViewGain`, `y · ViewGain · YGain`. **App rig** (`viewpoint_source` DISPLAY_RIG / CAMERA_RIG): reproduced **as given**, no gain — they are the eyes the app renders its own 3D from. |
+| `views[i].eye_z_m` | the viewpoint's z as given: the runtime's RECT frame z **is** the distance from the rect plane (pinned to `nominal_z_m` under axis X / XY), so no offset is added. z ≤ 0 (unknown) → the nominal distance. ZGain does not apply (z is physical here). |
+| `nominal_eye_z_m` | the runtime's `nominal_z_m`, else the panel's nominal viewing distance, else 0.5 m. From there the synthesised view reproduces the source frame exactly. |
+| `depth_scale_m` (D), `convergence_depth_m` (C) | below |
+
+No runtime viewpoints (no viewer) → the default pair `(±baseline/2, 0, nominal)` — never the
+DP tracker's panel-centred eyes.
+
+Depth (normalised depth n, 0 nearest … 1 farthest, sits at `z = C − n·D` in front of the screen):
+
+- **Relative model:** `D = ReliefDepthM · strength` (default 0.08 m — the panel-calibrated
+  legacy look: DepthGain 2 gives ~1 % of the width of disparity at the ends of the range,
+  i.e. about ±3.5 cm in front of / behind a 32 cm rect seen from 0.6 m). `n₀` = the
+  runtime's `convergence` (0 = nearest on the glass … 1 = farthest — it maps 1:1 onto n),
+  under AUTO the last convert's NeurD auto-convergence (`h₀ = 0.5 − 5c`, read back with
+  `NeurD_get_stream_prop_1f`, or the global getter on a NeurD without per-stream props),
+  mid-depth (0.5) until one exists. `C = n₀ · D`.
+- **Metric model** (needs the scale S from the depth info, so the stream retains depth even
+  without aux depth): the scene depth on the screen is `d₀ = S / (255 h₀)` (h₀ from n₀ as
+  above). The metric scene is scaled so that, seen from the nominal eye at distance N, d₀
+  lands on the screen: `z(d) = N (1 − d / d₀)`. NeurD's relief is linear in h (inverse
+  depth), a metric scene is not, so D is chosen to match the **metric depth gradient at the
+  screen plane**: `D = 255 N d₀ / S · strength = N / h₀ · strength`, then capped at
+  `MetricReliefMaxM` (default 0.3 m). Exact at the screen, first-order around it; in
+  practice the cap usually binds (a metric scene scaled onto a 32 cm rect is metres deep).
+- **Pop-out limit:** `C ≤ 0.9 · min(eye z, N)` — NeurD rejects an eye at or behind the
+  nearest relief plane; n₀ moves when this binds.
+
+`convergence_depth` reported with aux depth then uses `h₀ = 1 − C / D` (above).
+
+Each stream logs its camera once per change:
+
+```
+Leia lift: stream 3 camera = OFF-AXIS (screen 320x180 mm, relief 80 mm relative (ReliefDepthM), screen 40 mm behind the nearest relief plane, nominal eye 600 mm; viewpoints tracked/explicit x ViewGain/YGain)
+Leia lift: stream 3 camera = LEGACY dimensionless (NeurD has no off-axis convert (< 0.4.9))
+```
+
 ## Parameters
 
 | `xrt_dp_lift_params` | NeurD |
@@ -331,8 +452,9 @@ height`; outside that range the 720p default applies, and an explicitly set
 advisory: NeurD's DX stream path always runs its video model (photo mode is an
 init-time, process-wide property).
 
-Depth output is NeurD's **relative** disparity, min-max normalised per frame at the
-inference resolution.
+A DEPTH **stream**'s output is NeurD's **relative** disparity, min-max normalised per frame
+at the inference resolution (R8, flipped to larger = farther). The metric float depth of an
+SBS stream is the auxiliary output above (*Depth export*).
 
 ## Knobs
 
@@ -341,7 +463,7 @@ Each knob comes from the **environment**, else the **registry**
 else its default — env > registry > default. Two lifetimes:
 
 - **Per stream** — `ViewGain`, `YGain`, `ZGain`, `ConvGain`, `DepthGain`, `Dilate`,
-  `Scale`: re-read and snapshotted at each `lift_stream_create`, so a registry edit
+  `Scale`, `OffAxis`, `ReliefDepthM`, `MetricReliefMaxM`: re-read and snapshotted at each `lift_stream_create`, so a registry edit
   applies to the next stream without a service restart. Each create logs them:
   `Leia lift: stream 3 created (mode 2, video) knobs view_gain=1.00(default) y_gain=1.00(default) z_gain=0.50(default) conv_gain=0.40(default) depth_gain=2.00(default) dilate=2(default)`.
 - **Per process / DP** — `DXR_LEIA_LIFT`, `Backend`, `MinVersion`, `InteractiveMin`,
@@ -375,6 +497,9 @@ before; with neither set, nothing changes.
 | `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. Per stream. |
 | `DXR_LEIA_LIFT_DEPTH_GAIN` | `DepthGain` | `2.0` | NeurD `GAIN_MULTIPLIER` at `strength` 1, [0, 10] (the element's strength multiplies it). Panel-calibrated 2026-09-26. Per stream. |
 | `DXR_LEIA_LIFT_DILATE` | `Dilate` | `2` | NeurD `DILATE_RADIO` (disparity-map dilation, px), [0, 16]; NeurD's own default 3 grew the foreground past its silhouette. Per stream. |
+| `DXR_LEIA_LIFT_OFFAXIS` | `OffAxis` | `1` | `1` = use NeurD's metric off-axis camera when NeurD has it (≥ 0.4.9) and the runtime sends the viewpoint policy; `0` = always the legacy dimensionless convert (A/B). Per stream. |
+| `DXR_LEIA_LIFT_RELIEF_DEPTH_M` | `ReliefDepthM` | `0.08` | Off-axis, relative model: relief thickness in metres for the full normalised depth range, [0.001, 5]; `strength` multiplies it. Per stream. |
+| `DXR_LEIA_LIFT_METRIC_RELIEF_MAX_M` | `MetricReliefMaxM` | `0.3` | Off-axis, metric model: cap on the metric relief, metres, [0.001, 50] — the panel's depth budget. Per stream. |
 | `DXR_LEIA_LIFT_VIDEO_MODEL` | `VideoModel` | `fast` | Video streams' depth model: `fast` (relative real-time) \| `metric` (`NEURD_MODEL_VIDEO_METRIC_QUALITY`, NeurD ≥ 0.4.6). Init-time: the first activation in the process wins. |
 | `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). Only matters when `MinVersion` admits that NeurD (the default 0.4.6 floor refuses 0.4.4 before this is consulted); the two knobs are independent. |
 | `DXR_LEIA_LIFT_MIN_VERSION` | `MinVersion` | `0.4.6` | Oldest NeurD lift accepts, `major.minor.patch`. Older → refused at load (one WARN), lift unavailable exactly as if NeurD were absent, so callers fall back. Lower it only for demos/testing (e.g. `0.4.4`, `0.3.11`); below 0.3.11 changes nothing — the stream-API check still refuses those. Garbage → WARN, default kept. |
@@ -412,6 +537,11 @@ exactly like the SR SDK:
 | Auth | `gh` with read access to `LeiaInc/media_sdk` (`gh auth login`, or `GH_TOKEN`). CI uses `secrets.LEIALOFT_GITHUB_TOKEN`, the SR SDK token — that token must be granted read on `media_sdk`. |
 | Failure | Soft. The .bat prints a WARN and builds without lift; CI emits a `::warning::` annotation (`continue-on-error`) and ships without lift. CMake prints `NeurD headers NOT found ... lift compiled OUT`. |
 | Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |
+
+The 0.4.9 features (per-stream props / depth export / off-axis camera) compile only when the
+fetched `NeurD.h` declares them, detected per feature (they come from separate PRs). Until a
+media_sdk release tag carries them, build locally against headers from the PR branches with
+`NEURD_SDK_ROOT` (never commit them); the pinned `v0.4.6` build compiles them out.
 
 `NeurD_version.h` is generated the way media_sdk's CMake does it, from
 `sdk/NeurD_version.h.in` and the top-level `project(mediasdk VERSION x.y.z)` at the same
@@ -463,6 +593,12 @@ lift-enabled runtime + this plug-in registered:
    stream with a tracked viewer logs `Leia lift: stream N viewpoints = runtime policy
    (frame rect, axis X, baseline ~6x mm, …)` once; against an older runtime the same line
    reads `legacy mapping (… runtime predates the viewpoint policy)`.
+2c. NeurD ≥ 0.4.9 (DirectML): the READY line lists `per-stream props yes, float depth …,
+   off-axis camera available`. A lifted SBS stream logs `camera = OFF-AXIS (…)` once; with
+   `OffAxis=0` it logs `camera = LEGACY dimensionless (OffAxis=0)` — A/B the two on the panel
+   (same parallax direction and comparable depth at ReliefDepthM 0.08). A stream created with
+   aux depth logs `RETAIN_FLOAT_DEPTH -> SUCCESS (aux depth requested)`, and the runtime's
+   lift result carries a depth texture (R32F, 640×416 today).
 3. Absent-NeurD check: `set DXR_LEIA_LIFT=0` (or rename the NeurD install key) →
    `lift caps` reports `modes=0 state=unavailable`, and a normal
    `cube_handle_d3d11_win` session weaves exactly as before.
