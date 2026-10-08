@@ -275,7 +275,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	}
 
 	leia_sr_v2_display_info info{};
-	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, &info)) {
+	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, 0, &info)) {
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
 		return false;

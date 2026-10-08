@@ -7,6 +7,7 @@
  */
 
 #include "leia_sr_v2_common.h"
+#include "leia_sr_multi_win.h" // multi-screen M6 caps (plain C)
 
 #ifdef DXR_LEIA_HAS_SR_V2
 
@@ -15,6 +16,9 @@
 #include <sr/sr_instance.h>
 #include <sr/sr_version.h>
 #include <sr/sr_weaver.h>
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+#include <sr/sr_display.h> // SrDisplayBindingInfo / capabilities, srDisplayGetIdentifier
+#endif
 
 #include <atomic>
 #include <stdlib.h>
@@ -337,7 +341,11 @@ leia_sr_v2_initialize(SrInstance instance)
 }
 
 bool
-leia_sr_v2_query_display(SrInstance instance, void *hwnd, double max_time, struct leia_sr_v2_display_info *out_info)
+leia_sr_v2_query_display(SrInstance instance,
+                         void *hwnd,
+                         double max_time,
+                         uint64_t bind_display_id,
+                         struct leia_sr_v2_display_info *out_info)
 {
 	*out_info = {};
 
@@ -348,6 +356,19 @@ leia_sr_v2_query_display(SrInstance instance, void *hwnd, double max_time, struc
 	// unconditionally (getPrimaryActiveSRDisplay). Passing the window when we
 	// have one is strictly better on a multi-display box.
 	ci.window = (SrNativeWindowHandle)hwnd;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	// Multi-screen M6: a screen-bound DP asks for ITS display by id, so the
+	// geometry below describes that panel whatever window (or none) it has.
+	SrDisplayBindingInfo binding{};
+	binding.sType = SR_TYPE_DISPLAY_BINDING_INFO;
+	binding.pNext = nullptr;
+	binding.displayId = bind_display_id;
+	if (bind_display_id != 0) {
+		ci.pNext = &binding;
+	}
+#else
+	(void)bind_display_id;
+#endif
 
 	SrDisplay display = nullptr;
 	const SrResult cr = srCreateDisplay(instance, &ci, &display);
@@ -393,6 +414,14 @@ leia_sr_v2_query_display(SrInstance instance, void *hwnd, double max_time, struc
 	out_info->pixel_height = (uint32_t)(loc.bottom - loc.top);
 	out_info->screen_left = (int32_t)loc.left;
 	out_info->screen_top = (int32_t)loc.top;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	{
+		uint64_t id = 0;
+		if (SR_SUCCEEDED(srDisplayGetIdentifier(display, &id))) {
+			out_info->display_id = id;
+		}
+	}
+#endif
 
 	float width_cm = 0.0f;
 	float height_cm = 0.0f;
@@ -432,6 +461,38 @@ leia_sr_v2_query_display(SrInstance instance, void *hwnd, double max_time, struc
 	// benefit — v1 did not hold one either.
 	srDestroyDisplay(display);
 	return true;
+}
+
+void
+leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *out)
+{
+	memset(out, 0, sizeof(*out));
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	if (instance == nullptr) {
+		return;
+	}
+	SrDisplayBindingCapabilities bind_caps{};
+	bind_caps.sType = SR_TYPE_DISPLAY_BINDING_CAPABILITIES;
+	SrWeaverRoutingCapabilities route_caps{};
+	route_caps.sType = SR_TYPE_WEAVER_ROUTING_CAPABILITIES;
+	route_caps.pNext = &bind_caps;
+	SrRuntimeCapabilities caps{};
+	caps.sType = SR_TYPE_RUNTIME_CAPABILITIES;
+	caps.pNext = &route_caps;
+	const SrResult r = srGetRuntimeCapabilities(instance, &caps);
+	if (SR_FAILED(r)) {
+		U_LOG_W("SR v2: srGetRuntimeCapabilities failed: %s (%d) — per-screen weaver plan stays SDK-default",
+		        leia_sr_v2_result_str(r), (int)r);
+		return;
+	}
+	out->known = true;
+	out->external_routing = route_caps.externalRouting != SR_FALSE;
+	out->keep_drag_snap = (route_caps.supportedFlags & SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT) != 0;
+	out->display_binding = bind_caps.displayBinding != SR_FALSE;
+	out->max_bound_displays = bind_caps.maxBoundDisplays;
+#else
+	(void)instance;
+#endif
 }
 
 void

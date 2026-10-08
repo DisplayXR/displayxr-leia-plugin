@@ -35,6 +35,23 @@ leia_dp_factory_d3d11(void *d3d11_device,
                       void *window_handle,
                       struct xrt_display_processor_d3d11 **out_xdp);
 
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN
+/*!
+ * Multi-screen M6: one D3D11 DP per screen a spanning window covers
+ * (`xrt_plugin_iface::create_dp_d3d11_for_screen`). The binding is resolved
+ * to an SR display id (the binding's own, else this plug-in's per-monitor
+ * claim), the weaver is bound to it with EXTERNAL routing, and — with
+ * @p window_handle NULL — phases from the runtime's present origin.
+ */
+xrt_result_t
+leia_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
+                                 void *d3d11_device,
+                                 void *d3d11_context,
+                                 void *window_handle,
+                                 const struct xrt_screen_binding *binding,
+                                 struct xrt_display_processor_d3d11 **out_xdp);
+#endif
+
 #if defined(DXR_LEIA_HAS_NEURD)
 /*!
  * Lift-only D3D11 DP (xrt_plugin_iface::create_dp_d3d11_lift, ADR-042): no

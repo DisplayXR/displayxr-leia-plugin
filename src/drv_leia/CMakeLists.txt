@@ -197,8 +197,25 @@ if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h
        AND _leia_sr_weav_h MATCHES "SrWeaverRoutingCapabilities")
         set(LEIA_SR_DISPLAY_ENUM_AVAILABLE TRUE)
     endif()
+    # Multi-screen M6: the per-screen weaver chain (routing + binding INFO
+    # structs on the create-info), the windowless present origin and the
+    # simulated viewer the untracked screen renders from.
+    if(LEIA_SR_DISPLAY_ENUM_AVAILABLE
+       AND _leia_sr_disp_h MATCHES "SrDisplayBindingInfo"
+       AND _leia_sr_disp_h MATCHES "srDisplayGetIdentifier"
+       AND _leia_sr_weav_h MATCHES "SrWeaverRoutingInfo"
+       AND _leia_sr_weav_h MATCHES "srWeaverSetPresentOrigin"
+       AND _leia_sr_weav_h MATCHES "srWeaverSetSimulatedViewer")
+        set(LEIA_SR_MULTI_WIN_AVAILABLE TRUE)
+    endif()
     unset(_leia_sr_disp_h)
     unset(_leia_sr_weav_h)
+endif()
+if(LEIA_SR_MULTI_WIN_AVAILABLE)
+    message(STATUS "SR per-screen weaver (multi-screen M6): ENABLED - a screen-bound D3D11 DP chains "
+                   "EXTERNAL routing + display binding and phases from the runtime's present origin")
+else()
+    message(STATUS "SR per-screen weaver (multi-screen M6): DISABLED (SDK predates ST-5481 phases A-C)")
 endif()
 if(LEIA_SR_DISPLAY_ENUM_AVAILABLE)
     message(STATUS "SR display enumeration: ENABLED (SDK declares srEnumerateDisplays) - "
@@ -452,6 +469,9 @@ if(LEIA_SR_V2_AVAILABLE)
     endif()
     if(LEIA_SR_DISPLAY_ENUM_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_DISPLAY_ENUM=1)
+    endif()
+    if(LEIA_SR_MULTI_WIN_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_MULTI_WIN=1)
     endif()
 endif()
 

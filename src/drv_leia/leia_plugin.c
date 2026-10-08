@@ -523,6 +523,15 @@ static struct xrt_plugin_iface g_leia_iface = {
     .get_platform_state = leia_plugin_get_platform_state,
 #endif
 
+#if defined(XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN)
+    /* Multi-screen M6: one D3D11 DP per screen a spanning window covers. */
+#if defined(XRT_HAVE_LEIA_SR_D3D11)
+    .create_dp_d3d11_for_screen = leia_dp_factory_d3d11_for_screen,
+#else
+    .create_dp_d3d11_for_screen = NULL,
+#endif
+#endif
+
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
     /*
      * The SR eye tracker's camera as a runtime stereo camera source

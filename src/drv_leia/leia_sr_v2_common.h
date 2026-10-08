@@ -51,6 +51,11 @@ struct leia_sr_v2_display_info
 	int32_t screen_left;
 	int32_t screen_top;
 
+	//! Multi-screen M6: the display's SR identifier (srDisplayGetIdentifier),
+	//! 0 if the runtime did not answer. For an unbound query this is the
+	//! runtime's ACTIVE display — the one its tracker follows.
+	uint64_t display_id;
+
 	/*!
 	 * Recommended render size, **per eye** — confirmed with the SDK team, who
 	 * pointed out that `srDisplayGetRecommendedTextureSize` forwards directly to
@@ -105,12 +110,26 @@ leia_sr_v2_initialize(SrInstance instance);
  *             display. Passing the real window matters on a multi-display box:
  *             the weaver is bound to the display the window is on, so the
  *             geometry must come from that same display or the two disagree.
+ * @param bind_display_id Multi-screen M6: chain SrDisplayBindingInfo with
+ *             this id on the display create-info (0 = none; the SDK then
+ *             picks by window / the active display). Ignored when the SDK
+ *             headers predate the struct.
  */
 bool
 leia_sr_v2_query_display(SrInstance instance,
                          void *hwnd,
                          double max_time,
+                         uint64_t bind_display_id,
                          struct leia_sr_v2_display_info *out_info);
+
+/*!
+ * Multi-screen M6: srGetRuntimeCapabilities with the routing + binding
+ * capability structs chained. `out->known` is false when the SDK headers
+ * predate the structs or the query failed.
+ */
+struct leia_win_sr_multi_caps;
+void
+leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *out);
 
 /*!
  * Create the lens handle used for 2D/3D switching.
