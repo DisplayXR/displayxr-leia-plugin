@@ -439,7 +439,7 @@ create_v2(double max_time,
 	} else {
 		U_LOG_W("SR Vulkan late latching: not enabled (unsupported, or the enable did not take)");
 	}
-	leia_sr_v2_create_lens(sr.instance_v2, &sr.lens_v2);
+	leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
 
 	U_LOG_W("SR Vulkan weaver created via the v2 C API");
 	return true;

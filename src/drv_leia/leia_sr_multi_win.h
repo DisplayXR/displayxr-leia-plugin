@@ -26,29 +26,34 @@ extern "C" {
 #endif
 
 //! What srGetRuntimeCapabilities answered (routing + binding caps chained).
-struct leia_win_sr_multi_caps {
-  //! The query ran and succeeded. False = unknown: the SDK this plug-in was
-  //! built against predates the structs, or the query failed.
-  bool known;
-  //! SrWeaverRoutingCapabilities::externalRouting.
-  bool external_routing;
-  //! SrWeaverRoutingCapabilities::supportedFlags carries KEEP_DRAG_SNAP.
-  bool keep_drag_snap;
-  //! SrDisplayBindingCapabilities::displayBinding.
-  bool display_binding;
-  //! SrDisplayBindingCapabilities::maxBoundDisplays (the live bindable count).
-  uint32_t max_bound_displays;
+struct leia_win_sr_multi_caps
+{
+	//! The query ran and succeeded. False = unknown: the SDK this plug-in was
+	//! built against predates the structs, or the query failed.
+	bool known;
+	//! SrWeaverRoutingCapabilities::externalRouting.
+	bool external_routing;
+	//! SrWeaverRoutingCapabilities::supportedFlags carries KEEP_DRAG_SNAP.
+	bool keep_drag_snap;
+	//! SrDisplayBindingCapabilities::displayBinding.
+	bool display_binding;
+	//! SrDisplayBindingCapabilities::maxBoundDisplays (the live bindable count).
+	uint32_t max_bound_displays;
+	//! SrLensBindingCapabilities::lensPerDevice (SR D3): a lens bound to a
+	//! display drives THAT display's FPC, whichever display is active.
+	bool lens_per_device;
 };
 
 //! The chain to build on the weaver create-info.
-struct leia_win_sr_weaver_plan {
-  //! Chain SrWeaverRoutingInfo{mode = SR_WEAVER_ROUTING_EXTERNAL}.
-  bool routing_external;
-  //! ...with SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT (only with a real window).
-  bool keep_drag_snap;
-  //! Chain SrDisplayBindingInfo{displayId = @ref display_id}.
-  bool bind_display;
-  uint64_t display_id;
+struct leia_win_sr_weaver_plan
+{
+	//! Chain SrWeaverRoutingInfo{mode = SR_WEAVER_ROUTING_EXTERNAL}.
+	bool routing_external;
+	//! ...with SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT (only with a real window).
+	bool keep_drag_snap;
+	//! Chain SrDisplayBindingInfo{displayId = @ref display_id}.
+	bool bind_display;
+	uint64_t display_id;
 };
 
 /*!
@@ -65,22 +70,23 @@ struct leia_win_sr_weaver_plan {
  */
 static inline struct leia_win_sr_weaver_plan
 leia_win_sr_plan_weaver(const struct leia_win_sr_multi_caps *caps,
-                        bool screen_bound, bool has_window,
-                        uint64_t display_id) {
-  struct leia_win_sr_weaver_plan p = {0};
-  if (caps == NULL || !caps->known || !screen_bound) {
-    return p;
-  }
-  p.routing_external = caps->external_routing;
-  // KEEP_DRAG_SNAP only matters with a real window: the SDK installs its
-  // WndProc phase-snap only there, and a windowless weaver installs nothing.
-  p.keep_drag_snap = p.routing_external && has_window && caps->keep_drag_snap;
-  if (display_id != 0 && caps->display_binding &&
-      caps->max_bound_displays >= 1) {
-    p.bind_display = true;
-    p.display_id = display_id;
-  }
-  return p;
+                        bool screen_bound,
+                        bool has_window,
+                        uint64_t display_id)
+{
+	struct leia_win_sr_weaver_plan p = {0};
+	if (caps == NULL || !caps->known || !screen_bound) {
+		return p;
+	}
+	p.routing_external = caps->external_routing;
+	// KEEP_DRAG_SNAP only matters with a real window: the SDK installs its
+	// WndProc phase-snap only there, and a windowless weaver installs nothing.
+	p.keep_drag_snap = p.routing_external && has_window && caps->keep_drag_snap;
+	if (display_id != 0 && caps->display_binding && caps->max_bound_displays >= 1) {
+		p.bind_display = true;
+		p.display_id = display_id;
+	}
+	return p;
 }
 
 /*!
@@ -89,18 +95,19 @@ leia_win_sr_plan_weaver(const struct leia_win_sr_multi_caps *caps,
  * when nothing is left to drop — the caller then fails the create.
  */
 static inline bool
-leia_win_sr_plan_weaver_fallback(struct leia_win_sr_weaver_plan *p) {
-  if (p->bind_display) {
-    p->bind_display = false;
-    p->display_id = 0;
-    return true;
-  }
-  if (p->routing_external) {
-    p->routing_external = false;
-    p->keep_drag_snap = false;
-    return true;
-  }
-  return false;
+leia_win_sr_plan_weaver_fallback(struct leia_win_sr_weaver_plan *p)
+{
+	if (p->bind_display) {
+		p->bind_display = false;
+		p->display_id = 0;
+		return true;
+	}
+	if (p->routing_external) {
+		p->routing_external = false;
+		p->keep_drag_snap = false;
+		return true;
+	}
+	return false;
 }
 
 /*!
@@ -110,9 +117,22 @@ leia_win_sr_plan_weaver_fallback(struct leia_win_sr_weaver_plan *p) {
  * override it, or the SDK's drag snap and the origin disagree).
  */
 static inline bool
-leia_win_sr_plan_needs_present_origin(const struct leia_win_sr_weaver_plan *p,
-                                      bool has_window) {
-  return p->routing_external && !has_window;
+leia_win_sr_plan_needs_present_origin(const struct leia_win_sr_weaver_plan *p, bool has_window)
+{
+	return p->routing_external && !has_window;
+}
+
+/*!
+ * Should a screen-bound DP create a lens bound to ITS display and drive it
+ * (SR D3)? Only with the display bound and the runtime reporting lens per
+ * device: on an older runtime a bind to a non-active display is refused, and
+ * an unbound lens handle would switch the ACTIVE panel — the wrong one. An
+ * EXTERNAL weaver never votes, so without this the segment's lens stays 2D.
+ */
+static inline bool
+leia_win_sr_plan_bind_lens(const struct leia_win_sr_multi_caps *caps, const struct leia_win_sr_weaver_plan *p)
+{
+	return caps != NULL && caps->known && caps->lens_per_device && p->bind_display && p->display_id != 0;
 }
 
 /*!
@@ -127,10 +147,9 @@ leia_win_sr_plan_needs_present_origin(const struct leia_win_sr_weaver_plan *p,
  *                           tracked panel would weave with no viewer).
  */
 static inline bool
-leia_win_sr_plan_pin_simulated_viewer(uint64_t bound_display_id,
-                                      uint64_t active_display_id) {
-  return bound_display_id != 0 && active_display_id != 0 &&
-         bound_display_id != active_display_id;
+leia_win_sr_plan_pin_simulated_viewer(uint64_t bound_display_id, uint64_t active_display_id)
+{
+	return bound_display_id != 0 && active_display_id != 0 && bound_display_id != active_display_id;
 }
 
 #ifdef __cplusplus

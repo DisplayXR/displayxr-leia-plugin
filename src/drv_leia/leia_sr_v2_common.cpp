@@ -19,6 +19,9 @@
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN
 #include <sr/sr_display.h> // SrDisplayBindingInfo / capabilities, srDisplayGetIdentifier
 #endif
+#ifdef DXR_LEIA_HAS_SR_LENS_BINDING
+#include <sr/sr_lens.h> // SrLensBindingCapabilities (SR D3)
+#endif
 
 #include <atomic>
 #include <stdlib.h>
@@ -473,6 +476,13 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
 	}
 	SrDisplayBindingCapabilities bind_caps{};
 	bind_caps.sType = SR_TYPE_DISPLAY_BINDING_CAPABILITIES;
+#ifdef DXR_LEIA_HAS_SR_LENS_BINDING
+	// SR D3: lens per device (tag 27), chained after the binding caps. A
+	// runtime that predates it leaves the struct untouched (lensPerDevice 0).
+	SrLensBindingCapabilities lens_caps{};
+	lens_caps.sType = SR_TYPE_LENS_BINDING_CAPABILITIES;
+	bind_caps.pNext = &lens_caps;
+#endif
 	SrWeaverRoutingCapabilities route_caps{};
 	route_caps.sType = SR_TYPE_WEAVER_ROUTING_CAPABILITIES;
 	route_caps.pNext = &bind_caps;
@@ -490,13 +500,16 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
 	out->keep_drag_snap = (route_caps.supportedFlags & SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT) != 0;
 	out->display_binding = bind_caps.displayBinding != SR_FALSE;
 	out->max_bound_displays = bind_caps.maxBoundDisplays;
+#ifdef DXR_LEIA_HAS_SR_LENS_BINDING
+	out->lens_per_device = lens_caps.lensPerDevice != SR_FALSE;
+#endif
 #else
 	(void)instance;
 #endif
 }
 
 void
-leia_sr_v2_create_lens(SrInstance instance, SrLens *out_lens)
+leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *out_lens)
 {
 	*out_lens = nullptr;
 
@@ -504,12 +517,31 @@ leia_sr_v2_create_lens(SrInstance instance, SrLens *out_lens)
 	ci.sType = SR_TYPE_LENS_CREATE_INFO;
 	ci.pNext = nullptr;
 	ci.admin = SR_FALSE;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	// SR D3: a lens bound to a display drives that display's FPC. The
+	// runtime refuses the bind on a non-active display unless it reports
+	// lensPerDevice (the caller gates on that), and falls back to the active
+	// display's lens for an active-display bind on an older service.
+	SrDisplayBindingInfo binding{};
+	binding.sType = SR_TYPE_DISPLAY_BINDING_INFO;
+	binding.pNext = nullptr;
+	binding.displayId = bind_display_id;
+	if (bind_display_id != 0) {
+		ci.pNext = &binding;
+	}
+#else
+	(void)bind_display_id;
+#endif
 
 	SrLens lens = nullptr;
 	const SrResult r = srCreateLens(instance, &ci, &lens);
 	if (SR_SUCCEEDED(r) && lens != nullptr) {
 		*out_lens = lens;
-		U_LOG_W("SR v2 lens created");
+		if (bind_display_id != 0) {
+			U_LOG_W("SR v2 lens created, bound to display 0x%016llx", (unsigned long long)bind_display_id);
+		} else {
+			U_LOG_W("SR v2 lens created");
+		}
 		return;
 	}
 
