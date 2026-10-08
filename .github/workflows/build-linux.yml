@@ -235,6 +235,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lift_viewpoint
 
+      - name: Unit test — Windows-arm lift depth metadata + off-axis camera mapping (host-run)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_lift_depth
+
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |

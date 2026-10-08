@@ -387,6 +387,15 @@ target_include_directories(test_lift_viewpoint PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(test_lift_viewpoint PRIVATE m)
 add_test(NAME test_lift_viewpoint COMMAND test_lift_viewpoint)
 
+# Windows-arm lift depth metadata + NeurD off-axis camera mapping (leia_lift_depth.c,
+# NeurD >= 0.4.9): same pattern — pure C, no NeurD / SR / D3D.
+add_executable(test_lift_depth
+    ../drv_leia/tests/test_lift_depth.c
+    ../drv_leia/leia_lift_depth.c)
+target_include_directories(test_lift_depth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+target_link_libraries(test_lift_depth PRIVATE m)
+add_test(NAME test_lift_depth COMMAND test_lift_depth)
+
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
