@@ -21,6 +21,13 @@
 #include "leia_sr_d3d11.h"
 #include "leia_platform_state.h"
 #include "leia_bg_capture_win.h"
+#include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
+#include "xrt/xrt_plugin.h"          // xrt_screen_binding
+
+#ifdef XRT_DP_D3D11_HAS_PRESENT_ORIGIN
+static void
+leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_t panel_x, int32_t panel_y);
+#endif
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
@@ -478,6 +485,16 @@ struct AlphaGateConstants {
 /*!
  * Implementation struct wrapping leiasr_d3d11 as xrt_display_processor_d3d11.
  */
+//! Per-DP state of the throttled weave-parameter diagnostic in process_atlas.
+struct leia_dp_d3d11_weave_diag
+{
+	uint32_t frame_ctr;
+	uint32_t last_tgt_w, last_tgt_h;
+	int32_t last_vp_x, last_vp_y;
+	uint32_t last_vp_w, last_vp_h;
+	uint32_t last_view_w, last_view_h;
+};
+
 struct leia_display_processor_d3d11_impl
 {
 	struct xrt_display_processor_d3d11 base;
@@ -500,6 +517,7 @@ struct leia_display_processor_d3d11_impl
 	//! @}
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
+	struct leia_dp_d3d11_weave_diag weave_diag; //!< process_atlas diagnostic, per DP (multi-screen M6).
 
 	//! ADR-021: atlas encoding the runtime declared for the next process_atlas
 	//! (set via set_atlas_encoding). Zero-init ⟹ XRT_ATLAS_ENCODING_ENCODED
@@ -2320,30 +2338,37 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &viewport);
-
-	// Diagnostic: log weave params (throttled to every 60 frames + on change)
+	// Multi-screen M6: the weaver also reads the current scissor and writes
+	// only inside it — confine it to the canvas too, so a segment DP can never
+	// touch a sibling segment's pixels (runtime contract: viewport AND
+	// scissor = canvas). For the whole-target canvas this is a no-op.
 	{
-		static uint32_t frame_ctr = 0;
-		static uint32_t last_tgt_w = 0, last_tgt_h = 0;
-		static int32_t last_vp_x = -1, last_vp_y = -1;
-		static uint32_t last_vp_w = 0, last_vp_h = 0;
-		static uint32_t last_view_w = 0, last_view_h = 0;
-		bool changed = (target_width != last_tgt_w || target_height != last_tgt_h ||
-		                vp_x != last_vp_x || vp_y != last_vp_y ||
-		                vp_w != last_vp_w || vp_h != last_vp_h ||
-		                view_width != last_view_w || view_height != last_view_h);
-		if (changed || (frame_ctr % 300 == 0)) {
+		D3D11_RECT sc = {vp_x, vp_y, vp_x + (LONG)vp_w, vp_y + (LONG)vp_h};
+		ctx->RSSetScissorRects(1, &sc);
+	}
+
+	// Diagnostic: log weave params (throttled to every 300 frames + on change).
+	// Per DP, not static: with one DP per screen (multi-screen M6) two DPs
+	// alternate every frame with different viewports, and shared statics would
+	// see a "change" on every weave — a per-frame WARN.
+	{
+		struct leia_dp_d3d11_weave_diag *dg = &ldp->weave_diag;
+		bool changed = (target_width != dg->last_tgt_w || target_height != dg->last_tgt_h ||
+		                vp_x != dg->last_vp_x || vp_y != dg->last_vp_y ||
+		                vp_w != dg->last_vp_w || vp_h != dg->last_vp_h ||
+		                view_width != dg->last_view_w || view_height != dg->last_view_h);
+		if (changed || (dg->frame_ctr % 300 == 0)) {
 			U_LOG_W("weave: target=%ux%u vp=(%d,%d %ux%u) view=%ux%u canvas=(%d,%d %ux%u)%s",
 			        target_width, target_height, vp_x, vp_y, vp_w, vp_h,
 			        view_width, view_height,
 			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
 			        changed ? " [CHANGED]" : "");
-			last_tgt_w = target_width; last_tgt_h = target_height;
-			last_vp_x = vp_x; last_vp_y = vp_y;
-			last_vp_w = vp_w; last_vp_h = vp_h;
-			last_view_w = view_width; last_view_h = view_height;
+			dg->last_tgt_w = target_width; dg->last_tgt_h = target_height;
+			dg->last_vp_x = vp_x; dg->last_vp_y = vp_y;
+			dg->last_vp_w = vp_w; dg->last_vp_h = vp_h;
+			dg->last_view_w = view_width; dg->last_view_h = view_height;
 		}
-		frame_ctr++;
+		dg->frame_ctr++;
 	}
 
 	leia_dp_timing_stamp(timing, ctx, LDT_TS_WEAVE);
@@ -3314,6 +3339,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #endif
 #ifdef XRT_DP_D3D11_HAS_OVERLAY_2D_FILTER_STRENGTH
 	ldp->base.set_overlay_2d_filter_strength = leia_dp_d3d11_set_overlay_2d_filter_strength; // v15
+#ifdef XRT_DP_D3D11_HAS_PRESENT_ORIGIN
+	ldp->base.set_present_origin = leia_dp_d3d11_set_present_origin; // multi-screen M6 (slot 32)
+#endif
 #endif
 	// The struct is calloc'd: 0.0 would mean "no lens filtering". Start (and,
 	// against a runtime without the v15 slot, stay) at "SR default".
@@ -3537,6 +3565,95 @@ leia_dp_factory_d3d11(void *d3d11_device,
 
 	return XRT_SUCCESS;
 }
+
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN
+/*
+ * Multi-screen M6: one DP per screen a spanning window covers. The screen's
+ * SR display id comes from the binding when the runtime carries one, else from
+ * this plug-in's own per-monitor claim (probe_displays joined
+ * srEnumerateDisplays and kept the monitor -> displayId map). Ids are not
+ * stable across display-config events, so they are resolved here, at create,
+ * never cached beyond the DP's life.
+ */
+extern "C" xrt_result_t
+leia_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
+                                 void *d3d11_device,
+                                 void *d3d11_context,
+                                 void *window_handle,
+                                 const struct xrt_screen_binding *binding,
+                                 struct xrt_display_processor_d3d11 **out_xdp)
+{
+	(void)inst;
+	if (binding == nullptr || out_xdp == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia D3D11 per-screen DP: SR platform client DLLs not usable — not creating");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	uint64_t display_id = 0;
+	if (binding->struct_size > offsetof(struct xrt_screen_binding, display_id)) {
+		display_id = binding->display_id;
+	}
+	if (display_id == 0) {
+		struct leia_win_claim_binding claim = {};
+		if (leia_win_claims_lookup(binding->monitor_id, &claim)) {
+			display_id = claim.sr_display_id;
+		}
+	}
+	U_LOG_W("Leia D3D11 per-screen DP: monitor 0x%016llx ('%s', %dx%d @ %d,%d, serial '%s') -> SR display "
+	        "0x%016llx, window %p",
+	        (unsigned long long)binding->monitor_id, binding->device_name, (int)binding->desktop_width,
+	        (int)binding->desktop_height, (int)binding->desktop_left, (int)binding->desktop_top, binding->serial,
+	        (unsigned long long)display_id, window_handle);
+
+	const char *async_env = std::getenv("DXR_LEIA_ASYNC_WEAVER");
+	const bool async_weaver = !(async_env != NULL && async_env[0] == '0');
+	struct leiasr_d3d11 *weaver = NULL;
+	xrt_result_t ret = leiasr_d3d11_create_for_screen(5.0, d3d11_device, d3d11_context, window_handle, display_id,
+	                                                  async_weaver, &weaver);
+	if (ret != XRT_SUCCESS || weaver == NULL) {
+		U_LOG_W("Failed to create the SR D3D11 per-screen weaver");
+		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct leia_display_processor_d3d11_impl *ldp =
+	    (struct leia_display_processor_d3d11_impl *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		if (async_weaver) {
+			leiasr_d3d11_destroy_async(&weaver);
+		} else {
+			leiasr_d3d11_destroy(&weaver);
+		}
+		return XRT_ERROR_ALLOCATION;
+	}
+	leia_dp_d3d11_init_vtable(ldp);
+	ldp->leiasr = weaver;
+	ldp->async_weaver = async_weaver;
+	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
+	ldp->hwnd = static_cast<HWND>(window_handle);
+	ldp->view_count = 2;
+	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
+	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
+	leiasr_d3d11_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
+	if (!leia_dp_d3d11_init_blit(ldp)) {
+		U_LOG_W("Leia D3D11 per-screen DP: blit shader init failed — 2D mode will be unavailable");
+	}
+	*out_xdp = &ldp->base;
+	U_LOG_W("Created Leia SR D3D11 per-screen display processor (multi-screen M6)");
+	return XRT_SUCCESS;
+}
+#endif
+
+#ifdef XRT_DP_D3D11_HAS_PRESENT_ORIGIN
+static void
+leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	leiasr_d3d11_set_present_origin(ldp->leiasr, panel_x, panel_y);
+}
+#endif
 
 
 #ifdef DXR_LEIA_DP_D3D11_LIFT

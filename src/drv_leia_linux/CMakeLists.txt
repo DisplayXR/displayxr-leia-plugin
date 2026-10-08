@@ -372,6 +372,12 @@ target_include_directories(test_display_claims_win PRIVATE ${CMAKE_CURRENT_SOURC
 target_link_libraries(test_display_claims_win PRIVATE xrt-interfaces pthread)
 add_test(NAME test_display_claims_win COMMAND test_display_claims_win)
 
+# Windows-arm per-screen weaver plan (leia_sr_multi_win.h, multi-screen M6):
+# header-only plain C, host-tested here for the same reason.
+add_executable(test_sr_multi_win ../drv_leia/tests/test_sr_multi_win.c)
+target_include_directories(test_sr_multi_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+add_test(NAME test_sr_multi_win COMMAND test_sr_multi_win)
+
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
