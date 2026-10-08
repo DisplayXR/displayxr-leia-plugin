@@ -719,6 +719,8 @@ from_descriptor(const SrDisplayDescriptor &d, struct leia_win_sr_display &out)
 	out.native_w = d.nativeWidth > 0 ? (uint32_t)d.nativeWidth : 0;
 	out.native_h = d.nativeHeight > 0 ? (uint32_t)d.nativeHeight : 0;
 	out.refresh_hz = d.refreshHz;
+	out.width_mm = d.physicalWidthCm > 0.0f ? (uint32_t)(d.physicalWidthCm * 10.0f + 0.5f) : 0;
+	out.height_mm = d.physicalHeightCm > 0.0f ? (uint32_t)(d.physicalHeightCm * 10.0f + 0.5f) : 0;
 	snprintf(out.device_name, sizeof(out.device_name), "%.*s", (int)sizeof(d.connector), d.connector);
 	out.hmonitor = d.platformHandle;
 }

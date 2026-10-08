@@ -63,6 +63,9 @@ struct leia_win_sr_display
 
 	uint32_t native_w, native_h;
 	float refresh_hz;
+	//! Physical size from SR's own calibration (the descriptor's cm, x10);
+	//! 0 = SR did not say. Multi-screen M1/M3: the per-monitor display info.
+	uint32_t width_mm, height_mm;
 
 	char device_name[32]; //!< GDI device name (SR's `connector` on Windows), may be empty
 	uint64_t hmonitor;    //!< HMONITOR at enumeration time (SR's `platformHandle`), 0 = none
