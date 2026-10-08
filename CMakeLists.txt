@@ -220,7 +220,7 @@ set(DXR_RUNTIME_GIT_TAG "v2.30.0" CACHE STRING
 # on displayxr-runtime (>= 2.27.1) (scripts/package_deb_leia.sh) — an older
 # runtime would weave a scaled X11 window into a double image. vk_bundle /
 # os_mutex / xrt_plugin.h are unchanged v2.27.0..v2.29.0.
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.29.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.30.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
