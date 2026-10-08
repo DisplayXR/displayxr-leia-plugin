@@ -202,28 +202,83 @@ bytes pass through encoded — what NeurD expects).
 
 NeurD's `*_interactive` converts take one `(x, y, z)` triplet per output view in
 **dimensionless model units**: `x` horizontal disparity gain, `y` vertical offset, `z`
-depth offset. Its default stereo pattern is `x = −0.5 / +0.5`, i.e. one unit of `x` is
-one nominal eye baseline. The plug-in maps display-space positions in **metres** (the
-same eyes `get_predicted_eye_positions` reports) with:
+depth offset. Its default stereo pattern is `x = −0.5 / +0.5`, i.e. **one unit of `x` is
+one nominal (63 mm) eye baseline**. The mapping lives in `src/drv_leia/leia_lift_viewpoint.{h,c}` (pure C,
+host-tested by `tests/test_lift_viewpoint.c` on the Linux CI lane) and has two contracts.
+
+### Viewpoint policy (runtime ADR-048, `XRT_DP_LIFT_HAS_VIEWPOINT_POLICY`)
+
+A runtime whose `xrt_dp_lift_params::struct_size` covers the appended policy block
+(`rect_width_m`, `rect_height_m`, `baseline_m`, `axis_mode`, `max_offset_m`,
+`viewpoint_frame`) owns the policy: the viewpoints it passes are **relative to the lifted
+rect's centre** (display axes, +z toward the viewer, metres), with its ipd / parallax
+factors, axis mask, clamp and recentering ease **already applied**. The plug-in only
+translates units:
+
+```
+b   = baseline_m (0 / unknown -> 0.063)  -- clamp margin only
+L   = G · (max_offset_m + b/2) / 0.063  when max_offset_m > 0, else 3
+x_n = clamp(G · x_m / 0.063, ±L)
+y_n = clamp(Gy · G · y_m / 0.063, ±Gy·L)   when axis_mode >= XY, else 0
+z_n = clamp(Gz · (z_m − z_ref) / z_ref, ±1)   when axis_mode == XYZ, else 0
+G   = ViewGain (1.0)   Gy = YGain (1.0)   Gz = ZGain (0.5)
+```
+
+- **Unit = the nominal 63 mm, not `baseline_m`.** NeurD's default `±0.5` pair stands for a
+  63 mm IPD. The runtime has already applied its ipd factor to the eye positions, so
+  dividing by the post-factor `baseline_m` would undo it (every pair would land on
+  `±0.5`). With the fixed unit an app that halves `ipdFactor` gets a 32 mm pair →
+  `±0.254·G`, i.e. softer stereo, as it asked. `baseline_m` is used only for the clamp
+  margin and the log.
+- **Clamp.** The runtime clamps the eyes' *midpoint*; an eye sits half the pair's
+  separation (`b/2`) off it — clamping each eye at the midpoint's limit would collapse
+  the pair at the edge. A runtime clamp wider than `±3` is honoured (the runtime owns the
+  policy).
+- **`y`** is honoured whenever the runtime lets it through (`axis_mode` XY / XYZ; the
+  default is X, so nothing changes unless an app asks). The legacy contract dropped y
+  because raw panel-centred eye height made the image jump; now y is rect-relative and
+  recentred by the runtime. The first time a process honours y it logs
+  `Leia lift: honouring VERTICAL look-around (axis XY, y_gain 1.00) — …`; if the image
+  still jumps, lower `YGain`.
+- **`z` assumption.** With z pinned (X / XY) the runtime places the eyes at its nominal
+  viewing distance, which it takes from this plug-in's own display info. The DP reads
+  the same cached panel geometry (`leiasr_geometry_get` → `nominal_z_m`; unknown →
+  0.5 m, the runtime's own default) as `z_ref`, so a viewer at the reference distance
+  maps to `z_n = 0`. `z_n` is the fractional distance change times `ZGain`, clamped to
+  `±1`. NeurD does not specify how its `z` relates to viewing distance: **uncalibrated** —
+  the conservative 0.5 default and the sign (negative `ZGain` flips it) are tuning knobs.
+- `rect_width_m` / `rect_height_m` / `viewpoint_frame` are logged, not used: the runtime
+  already rebased the viewpoints, and NeurD's units are baseline-relative.
+
+### Legacy contract (older runtime, or eyes from the DP's own tracker)
+
+A short `struct_size` (a runtime before the policy) — and any eyes the DP read from its
+own SR tracker rather than from the runtime — keep the original mapping exactly:
 
 ```
 x_n = clamp(G · x_m / 0.063, ±3)
-y_n = clamp(G · y_m / 0.063, ±3)
+y_n = 0
 z_n = 0
-G   = DXR_LEIA_LIFT_VIEW_GAIN (default 1.0)
 ```
 
-A centred viewer at 63 mm IPD therefore reproduces NeurD's default pattern exactly
-(G = 1), and head motion becomes look-around parallax. `G = 0` pins every view to the
-centre; `G > 1` exaggerates. Head `z` is deliberately not mapped: NeurD does not specify
-how its `z` relates to viewing distance, so mapping it would be a guess.
+Panel-centred eyes, x only: a centred viewer at 63 mm IPD reproduces NeurD's default
+pattern (G = 1), and head motion becomes look-around. Vertical offset is dropped because
+raw eye height made NeurD render the frame from above/below the panel centre (jumps and a
+filled top band, panel 2026-09-26); z has no reference here.
+
+Which contract a stream is on is logged once per change:
+`Leia lift: stream N viewpoints = runtime policy (frame rect, axis X, baseline 63.0 mm, …)`
+or `… = legacy mapping (x only, 63 mm unit, ±3: runtime predates the viewpoint policy)`.
 
 Viewpoint source, in order:
 
-1. **Explicit viewpoints** from the runtime (always sent to the lift-only DP) (`viewpoints_xyz`, metres, display space):
-   `view_count` triplets are used 1:1; exactly two are treated as an eye pair.
-2. **Tracked eyes** from the SR eye path, when tracking is live (inter-eye distance
-   > 1 mm — the same tracking-loss test as the eye slot).
+1. **Viewpoints from the runtime** (always sent to the lift-only DP when it has them —
+   the app's explicit viewpoints, else the tracked eyes; `viewpoints_xyz`, metres, rect- or
+   panel-relative per the contract above): `view_count` triplets are used 1:1; exactly two
+   are treated as an eye pair.
+2. **Tracked eyes** from the DP's own SR eye path (only when the runtime passed none),
+   when tracking is live (inter-eye distance > 1 mm — the same tracking-loss test as the
+   eye slot). Always mapped with the legacy contract.
 3. **Untracked**: SBS uses NeurD's own default pattern (non-interactive convert); NVIEW
    uses `x = i − (N−1)/2`.
 
@@ -281,13 +336,22 @@ inference resolution.
 
 ## Knobs
 
-Read once per DP at create (`leia_lift_neurd_create`). Each knob comes from the
-**environment**, else the **registry** (`HKLM\SOFTWARE\DisplayXR\Leia\Lift`, REG_SZ,
-64-bit view, same grammar as the env var), else its default — env > registry > default.
-At activation one WARN lists every knob's effective value and where it came from:
+Each knob comes from the **environment**, else the **registry**
+(`HKLM\SOFTWARE\DisplayXR\Leia\Lift`, REG_SZ, 64-bit view, same grammar as the env var),
+else its default — env > registry > default. Two lifetimes:
+
+- **Per stream** — `ViewGain`, `YGain`, `ZGain`, `ConvGain`, `DepthGain`, `Dilate`,
+  `Scale`: re-read and snapshotted at each `lift_stream_create`, so a registry edit
+  applies to the next stream without a service restart. Each create logs them:
+  `Leia lift: stream 3 created (mode 2, video) knobs view_gain=1.00(default) y_gain=1.00(default) z_gain=0.50(default) conv_gain=0.40(default) depth_gain=2.00(default) dilate=2(default)`.
+- **Per process / DP** — `DXR_LEIA_LIFT`, `Backend`, `MinVersion`, `InteractiveMin`,
+  `VideoModel`: read at DP create; NeurD's init-time state follows the first activation.
+
+At activation one WARN lists every knob's effective value (the per-stream ones as the
+defaults the first DP saw) and where it came from:
 
 ```
-Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) conv_gain=0.40(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default]
+Leia lift: knobs backend=directml(reg) interactive_min=0.4.4(reg) min_version=0.4.4(reg) scale=per-stream(default) view_gain=1.00(default) y_gain=1.00(default) z_gain=0.50(default) conv_gain=0.40(default) video_model=fast(default) depth_gain=2.00(default) dilate=2(default) [env > HKLM\SOFTWARE\DisplayXR\Leia\Lift > default; per-convert knobs re-read per stream]
 ```
 
 That line prints only after a successful init. A NeurD refused by `MinVersion` logs only
@@ -305,8 +369,13 @@ before; with neither set, nothing changes.
 | `DXR_LEIA_LIFT` | — (env only) | on | `0` / `off` → caps `modes=0, state=0`; NeurD is never probed or loaded. |
 | `DXR_LEIA_LIFT_BACKEND` | `Backend` | `directml` | `auto` \| `directml` \| `cuda` \| `openvino`. First activation in the process wins (NeurD's forced backend is sticky). On NeurD 0.4.3+ only DirectML yields a D3D11 device; on 0.3.x use `cuda` (see *NeurD 0.3.x*). |
 | `DXR_LEIA_LIFT_SCALE` | `Scale` | unset (→ stream `input_scale`, else 720p) | Inference height bucket: `720` \| `1080` \| `1440` \| `none`. When set it overrides every stream's `input_scale`. NeurD's own default is 1440p; 720p is the fallback for latency. |
-| `DXR_LEIA_LIFT_VIEW_GAIN` | `ViewGain` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. |
-| `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. |
+| `DXR_LEIA_LIFT_VIEW_GAIN` | `ViewGain` | `1.0` | `G` in the eye → viewpoint mapping above, [0, 10]. Per stream. |
+| `DXR_LEIA_LIFT_Y_GAIN` | `YGain` | `1.0` | `Gy`: extra vertical look-around scale, [0, 10]. Only matters when the runtime sends y (axis mode XY / XYZ). Per stream. |
+| `DXR_LEIA_LIFT_Z_GAIN` | `ZGain` | `0.5` | `Gz`: viewer distance → NeurD `z`, [−2, 2]; negative flips the sign. Only matters on axis mode XYZ. Uncalibrated. Per stream. |
+| `DXR_LEIA_LIFT_CONV_GAIN` | `ConvGain` | `0.4` | `K` in the convergence map above, [−2, 2]; negative flips the sign. Calibration knob. Per stream. |
+| `DXR_LEIA_LIFT_DEPTH_GAIN` | `DepthGain` | `2.0` | NeurD `GAIN_MULTIPLIER` at `strength` 1, [0, 10] (the element's strength multiplies it). Panel-calibrated 2026-09-26. Per stream. |
+| `DXR_LEIA_LIFT_DILATE` | `Dilate` | `2` | NeurD `DILATE_RADIO` (disparity-map dilation, px), [0, 16]; NeurD's own default 3 grew the foreground past its silhouette. Per stream. |
+| `DXR_LEIA_LIFT_VIDEO_MODEL` | `VideoModel` | `fast` | Video streams' depth model: `fast` (relative real-time) \| `metric` (`NEURD_MODEL_VIDEO_METRIC_QUALITY`, NeurD ≥ 0.4.6). Init-time: the first activation in the process wins. |
 | `DXR_LEIA_LIFT_INTERACTIVE_MIN` | `InteractiveMin` | unset (→ header, 0.4.5) | **Demo-only.** A NeurD version, e.g. `0.4.4` (clamped to ≥ 0.4.4), from which `convert_stream_dx_interactive` is trusted. For the 0.4.4 *internal-interactive* dev package, which reports 0.4.4 but carries the interactive entries. The version is the only discriminator (only `NeurD_load` is exported, and a stock 0.4.4 table is too short to probe), so on a **stock 0.4.4 this crashes** — never set it elsewhere. One extra WARN when in effect. When it admits a NeurD older than 0.4.5, the plug-in calls the table slot directly (the header's inline wrapper re-checks 0.4.5). Only matters when `MinVersion` admits that NeurD (the default 0.4.6 floor refuses 0.4.4 before this is consulted); the two knobs are independent. |
 | `DXR_LEIA_LIFT_MIN_VERSION` | `MinVersion` | `0.4.6` | Oldest NeurD lift accepts, `major.minor.patch`. Older → refused at load (one WARN), lift unavailable exactly as if NeurD were absent, so callers fall back. Lower it only for demos/testing (e.g. `0.4.4`, `0.3.11`); below 0.3.11 changes nothing — the stream-API check still refuses those. Garbage → WARN, default kept. |
 
@@ -384,12 +453,16 @@ On a Windows box with NeurD installed (`HKLM\SOFTWARE\LeiaInc\NeurD` present) an
 lift-enabled runtime + this plug-in registered:
 
 1. `displayxr-cli lift caps` — first call reports `state=activating` (the background
-   worker is loading NeurD); repeat until `state=ready`, `modes=0x7`,
+   worker is loading NeurD); repeat until `state=ready`, `modes=0x3` (DEPTH | SBS — NVIEW is never offered),
    `backend=neurd-directml`. The runtime log shows `Leia lift: loaded NeurD x.y.z from
    ...` and `Leia lift: NeurD READY`.
 2. `displayxr-cli lift probe` — runs a stream create + convert + destroy. Check the log
    for the adapter-LUID line and no `Leia lift:` WARN after it; the probe's reported
    latency should sit near 22 ms (DirectML) at 720p.
+2b. Viewpoint policy: with a runtime that has `XRT_DP_LIFT_HAS_VIEWPOINT_POLICY`, a lifted
+   stream with a tracked viewer logs `Leia lift: stream N viewpoints = runtime policy
+   (frame rect, axis X, baseline ~6x mm, …)` once; against an older runtime the same line
+   reads `legacy mapping (… runtime predates the viewpoint policy)`.
 3. Absent-NeurD check: `set DXR_LEIA_LIFT=0` (or rename the NeurD install key) →
    `lift caps` reports `modes=0 state=unavailable`, and a normal
    `cube_handle_d3d11_win` session weaves exactly as before.

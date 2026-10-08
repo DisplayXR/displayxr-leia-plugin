@@ -378,6 +378,15 @@ add_executable(test_sr_multi_win ../drv_leia/tests/test_sr_multi_win.c)
 target_include_directories(test_sr_multi_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_multi_win COMMAND test_sr_multi_win)
 
+# Windows-arm lift viewpoint mapping (leia_lift_viewpoint.c, runtime ADR-048):
+# platform-neutral C (no NeurD / SR / D3D), host-tested here for the same reason.
+add_executable(test_lift_viewpoint
+    ../drv_leia/tests/test_lift_viewpoint.c
+    ../drv_leia/leia_lift_viewpoint.c)
+target_include_directories(test_lift_viewpoint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+target_link_libraries(test_lift_viewpoint PRIVATE m)
+add_test(NAME test_lift_viewpoint COMMAND test_lift_viewpoint)
+
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c

@@ -73,6 +73,8 @@ leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_
 #if defined(XRT_DP_D3D11_HAS_LIFT) && defined(DXR_LEIA_HAS_NEURD)
 #define DXR_LEIA_DP_D3D11_LIFT 1
 #include "leia_lift_neurd.h"
+#include "leia_lift_viewpoint.h"
+#include "leia_sr_ready.h" // leiasr_geometry_get: nominal viewing distance = lift z reference
 #include <cstddef> // offsetof
 #endif
 
@@ -3127,6 +3129,11 @@ static_assert(LEIA_LIFT_STATE_UNAVAILABLE == XRT_DP_LIFT_STATE_UNAVAILABLE &&
                   LEIA_LIFT_STATE_ACTIVATING == XRT_DP_LIFT_STATE_ACTIVATING &&
                   LEIA_LIFT_STATE_READY == XRT_DP_LIFT_STATE_READY,
               "lift states must match the runtime's XRT_DP_LIFT_STATE_*");
+#ifdef XRT_DP_LIFT_HAS_VIEWPOINT_POLICY
+static_assert(LEIA_LIFT_AXIS_X == XRT_DP_LIFT_AXIS_X && LEIA_LIFT_AXIS_XY == XRT_DP_LIFT_AXIS_XY &&
+                  LEIA_LIFT_AXIS_XYZ == XRT_DP_LIFT_AXIS_XYZ,
+              "lift axis modes must match the runtime's XRT_DP_LIFT_AXIS_*");
+#endif
 
 #define LEIA_LIFT_COVERS(ptr, type, field)                                                                     \
 	((ptr)->struct_size >= offsetof(type, field) + sizeof(((type *)0)->field))
@@ -3210,6 +3217,28 @@ leia_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
 		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, view_count)) {
 			lp.view_count = p->view_count;
 		}
+#ifdef XRT_DP_LIFT_HAS_VIEWPOINT_POLICY
+		// Viewpoint policy (runtime ADR-048): the runtime already rebased,
+		// scaled, masked, clamped and eased the viewpoints; we translate units.
+		// viewpoint_frame is the LAST appended field, so covering it means the
+		// runtime filled the whole block. A shorter struct = legacy behaviour.
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, viewpoint_frame)) {
+			lp.has_policy = true;
+			lp.rect_width_m = p->rect_width_m;
+			lp.rect_height_m = p->rect_height_m;
+			lp.baseline_m = p->baseline_m;
+			lp.axis_mode = p->axis_mode;
+			lp.max_offset_m = p->max_offset_m;
+			lp.viewpoint_frame = p->viewpoint_frame;
+			// z reference: the runtime pins z to its nominal viewing distance,
+			// which it takes from this plug-in's own display info — the same
+			// cached panel geometry read here (0 / unknown -> the shared 0.5 m).
+			struct leiasr_geometry geom = {};
+			if (leiasr_geometry_get(&geom) && geom.nominal_z_m > 0.0f) {
+				lp.ref_z_m = geom.nominal_z_m;
+			}
+		}
+#endif
 	}
 
 	// Tracked eyes (metres, display space) — the same source the runtime's

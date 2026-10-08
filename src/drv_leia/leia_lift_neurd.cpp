@@ -63,6 +63,7 @@
 // NeurD signature drift is a compile error in this file.
 #include <NeurD.h>
 
+#include "leia_lift_viewpoint.h"
 #include "util/u_logging.h"
 
 #include <windows.h>
@@ -95,14 +96,13 @@ namespace {
  *
  */
 
-//! Reference inter-pupillary distance: NeurD's default stereo pattern places
-//! the two views at x = -0.5 / +0.5, i.e. ONE unit of x == one "nominal eye
-//! baseline". Mapping metres through this IPD makes a centred, tracked viewer
-//! reproduce the default pattern exactly.
-constexpr float kIpdRefM = 0.063f;
-//! Clamp for mapped viewpoints — well past any comfortable look-around; stops a
-//! tracker glitch from asking NeurD for a wildly extrapolated view.
-constexpr float kViewpointClamp = 3.0f;
+// Viewpoint units: NeurD's default stereo pattern places the two views at
+// x = -0.5 / +0.5, i.e. ONE unit of x == one eye baseline. The mapping and its
+// constants (63 mm legacy baseline, ±3 clamp) live in leia_lift_viewpoint.{h,c}.
+//! YGain knob default: vertical look-around 1:1 with horizontal.
+constexpr float kDefaultYGain = 1.0f;
+//! ZGain knob default: conservative — NeurD's z is an unspecified depth offset.
+constexpr float kDefaultZGain = 0.5f;
 //! NEURD_PROP_GAIN_MULTIPLIER at strength 1 (DepthGain knob). Panel-calibrated 2026-09-26.
 constexpr float kDefaultDepthGain = 2.0f;
 //! NEURD_PROP_DILATE_RADIO (Dilate knob). NeurD's own default is 3; the foreground grew visibly
@@ -236,8 +236,10 @@ struct knobs
 	int32_t video_model;      //!< DXR_LEIA_LIFT_VIDEO_MODEL / VideoModel: fast (default) | metric (NeurD >= 0.4.6)
 	float depth_gain;         //!< DXR_LEIA_LIFT_DEPTH_GAIN / DepthGain (default 2.0): NeurD gain at strength 1
 	int32_t dilate;           //!< DXR_LEIA_LIFT_DILATE / Dilate (default 2): NEURD_PROP_DILATE_RADIO, px
+	float y_gain;             //!< DXR_LEIA_LIFT_Y_GAIN / YGain (default 1.0): extra vertical look-around scale
+	float z_gain;             //!< DXR_LEIA_LIFT_Z_GAIN / ZGain (default 0.5): viewer distance -> NeurD z
 	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_min_version,
-	    src_video_model, src_depth_gain, src_dilate;
+	    src_video_model, src_depth_gain, src_dilate, src_y_gain, src_z_gain;
 };
 
 bool
@@ -402,6 +404,8 @@ read_knobs()
 	k.video_model = NEURD_MODEL_VIDEO_RELATIVE_FAST;
 	k.depth_gain = kDefaultDepthGain;
 	k.dilate = kDefaultDilate;
+	k.y_gain = kDefaultYGain;
+	k.z_gain = kDefaultZGain;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -445,6 +449,26 @@ read_knobs()
 			k.src_view_gain = src;
 		} else {
 			U_LOG_W("Leia lift: view gain '%s' (%s) not a number in [0,10] — using 1.0", v, knob_src_str(src));
+		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_Y_GAIN", L"YGain", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, 0.0f, 10.0f, &k.y_gain)) {
+			k.src_y_gain = src;
+		} else {
+			U_LOG_W("Leia lift: y gain '%s' (%s) not a number in [0,10] — using %.1f", v, knob_src_str(src),
+			        (double)kDefaultYGain);
+		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_Z_GAIN", L"ZGain", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, -2.0f, 2.0f, &k.z_gain)) {
+			k.src_z_gain = src;
+		} else {
+			U_LOG_W("Leia lift: z gain '%s' (%s) not a number in [-2,2] — using %.1f", v, knob_src_str(src),
+			        (double)kDefaultZGain);
 		}
 	}
 
@@ -1162,15 +1186,17 @@ activation_worker()
 			interactive_min = k0.interactive_min;
 		}
 		U_LOG_W("Leia lift: knobs backend=%s(%s) interactive_min=%u.%u.%u(%s) min_version=%u.%u.%u(%s) scale=%s(%s) "
-		        "view_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) depth_gain=%.2f(%s) dilate=%d(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default]",
+		        "view_gain=%.2f(%s) y_gain=%.2f(%s) z_gain=%.2f(%s) conv_gain=%.2f(%s) video_model=%s(%s) "
+		        "depth_gain=%.2f(%s) dilate=%d(%s) [env > HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift > default; "
+		        "per-convert knobs re-read per stream]",
 		        backend_choice_str(k0.backend), knob_src_str(k0.src_backend),
 		        (unsigned)NEURD_GET_VERSION_MAJOR(interactive_min), (unsigned)NEURD_GET_VERSION_MINOR(interactive_min),
 		        (unsigned)NEURD_GET_VERSION_PATCH(interactive_min), knob_src_str(k0.src_interactive_min),
 		        (unsigned)NEURD_GET_VERSION_MAJOR(k0.min_version), (unsigned)NEURD_GET_VERSION_MINOR(k0.min_version),
 		        (unsigned)NEURD_GET_VERSION_PATCH(k0.min_version), knob_src_str(k0.src_min_version),
 		        k0.scale_forced ? scale_str(k0.autoscaling) : "per-stream", knob_src_str(k0.src_scale),
-		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.conv_gain,
-		        knob_src_str(k0.src_conv_gain),
+		        (double)k0.view_gain, knob_src_str(k0.src_view_gain), (double)k0.y_gain, knob_src_str(k0.src_y_gain),
+		        (double)k0.z_gain, knob_src_str(k0.src_z_gain), (double)k0.conv_gain, knob_src_str(k0.src_conv_gain),
 		        k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "metric" : "fast",
 		        knob_src_str(k0.src_video_model), (double)k0.depth_gain, knob_src_str(k0.src_depth_gain), (int)k0.dilate,
 		        knob_src_str(k0.src_dilate));
@@ -1332,6 +1358,14 @@ struct lift_stream
 	uint32_t mode;
 	uint32_t content_hint;
 	float input_scale;
+	//! Knob snapshot taken at stream create (env > HKLM > default, re-read
+	//! then). The per-convert knobs — ViewGain, YGain, ZGain, ConvGain,
+	//! DepthGain, Dilate, Scale — come from here, so a registry edit applies to
+	//! the next stream without a service restart. Process-level knobs (enable,
+	//! backend, versions, video model) stay with the DP / first activation.
+	struct knobs k;
+	//! Last logged viewpoint contract (policy bit | axis_mode << 1); ~0 = none yet.
+	uint32_t vp_logged;
 	struct NeurD_stream *ns; //!< Created lazily on first convert (NeurD must be READY).
 
 	ID3D11Device *dev; //!< Caller's device (AddRef'd) the bridges are opened on.
@@ -1700,17 +1734,9 @@ struct leia_lift_neurd
 extern "C" void
 leia_lift_neurd_map_viewpoint(const float in_m[3], float gain, float out_n[3])
 {
-	out_n[0] = clampf(gain * in_m[0] / kIpdRefM, -kViewpointClamp, kViewpointClamp);
-	// A lenticular panel has horizontal parallax only. Passing the tracked eye
-	// HEIGHT made NeurD render the frame as seen from above/below the display
-	// centre: the lifted image shifted vertically with head height (visible
-	// "jumps" as the head moved) and a filled band appeared at the top edge
-	// (David, panel, 2026-09-26). Vertical viewpoint offset is never wanted.
-	(void)in_m[1];
-	out_n[1] = 0.0f;
-	// NeurD's z is a dimensionless depth offset whose relation to viewer
-	// distance is not specified; head z is deliberately not mapped (see doc).
-	out_n[2] = 0.0f;
+	// The legacy contract (leia_lift_vp_map with no policy): x only, 63 mm, ±3.
+	const struct leia_lift_vp_gains gains = {gain, kDefaultYGain, kDefaultZGain};
+	leia_lift_vp_map(nullptr, &gains, in_m, out_n);
 }
 
 extern "C" struct leia_lift_neurd *
@@ -1827,6 +1853,8 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	if (public_state(g.state.load()) == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return false;
 	}
+	// Per-stream knob snapshot (env + one registry read; stream create is rare).
+	const struct knobs sk = read_knobs();
 
 	std::lock_guard<std::mutex> lock(g.mtx);
 	if (g.streams_live.load() >= kMaxStreams) {
@@ -1841,6 +1869,8 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	s->mode = desc->mode;
 	s->content_hint = desc->content_hint;
 	s->input_scale = desc->input_scale;
+	s->k = sk;
+	s->vp_logged = ~0u;
 	l->streams.push_back(s);
 	g.streams_live.fetch_add(1);
 	if (!l->acquired) {
@@ -1848,8 +1878,12 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 		g.refcount++;
 	}
 	*out_id = s->id;
-	U_LOG_W("Leia lift: stream %llu created (mode %u, %s)", (unsigned long long)s->id, s->mode,
-	        s->content_hint == 1 ? "photo" : "video");
+	U_LOG_W("Leia lift: stream %llu created (mode %u, %s) knobs view_gain=%.2f(%s) y_gain=%.2f(%s) z_gain=%.2f(%s) "
+	        "conv_gain=%.2f(%s) depth_gain=%.2f(%s) dilate=%d(%s)",
+	        (unsigned long long)s->id, s->mode, s->content_hint == 1 ? "photo" : "video", (double)sk.view_gain,
+	        knob_src_str(sk.src_view_gain), (double)sk.y_gain, knob_src_str(sk.src_y_gain), (double)sk.z_gain,
+	        knob_src_str(sk.src_z_gain), (double)sk.conv_gain, knob_src_str(sk.src_conv_gain),
+	        (double)sk.depth_gain, knob_src_str(sk.src_depth_gain), (int)sk.dilate, knob_src_str(sk.src_dilate));
 	return true;
 }
 
@@ -2040,7 +2074,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		// NeurD's own gain 1 read as too weak on the panel (David, 2026-09-26:
 		// strength 2 "stronger, I like this as default").
 		const float strength = (dp.strength >= 0.0f) ? dp.strength : 1.0f;
-		const float gain = clampf(strength * l->k.depth_gain, 0.0f, 10.0f);
+		const float gain = clampf(strength * s->k.depth_gain, 0.0f, 10.0f);
 		// NeurD always fills disocclusions; non-zero picks the blur fill, 0 the
 		// cheaper edge stretch.
 		const int32_t inpaint = (dp.inpaint != 0) ? NEURD_INPAINT_TYPE_V1_BLUR : NEURD_INPAINT_TYPE_V1_STRETCH;
@@ -2049,11 +2083,11 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		                prop_i(NEURD_PROP_OUTPUT_TILES_W, (int32_t)cols, g.p_tiles_w) &&
 		                prop_i(NEURD_PROP_OUTPUT_TILES_H, (int32_t)rows, g.p_tiles_h) &&
 		                prop_i(NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
-		                prop_i(NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, l->k, h),
+		                prop_i(NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, s->k, h),
 		                       g.p_autoscale) &&
 		                prop_i(NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
 		                prop_f(NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain) &&
-		                prop_i(NEURD_PROP_DILATE_RADIO, l->k.dilate, g.p_dilate);
+		                prop_i(NEURD_PROP_DILATE_RADIO, s->k.dilate, g.p_dilate);
 		if (props_ok && !auto_conv) {
 			// Runtime: convergence = RELATIVE depth placed at the display plane,
 			// [0,1] over the frame's depth range (0 = nearest on the glass, 1 =
@@ -2062,7 +2096,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			// NeurD's full range; negate K if the sign proves reversed on a
 			// panel). UNCALIBRATED — see docs/lift-neurd.md.
 			const float c = clampf(dp.convergence, 0.0f, 1.0f);
-			const float nd_conv = clampf(l->k.conv_gain * (c - 0.5f), -0.2f, 0.2f);
+			const float nd_conv = clampf(s->k.conv_gain * (c - 0.5f), -0.2f, 0.2f);
 			props_ok = prop_f(NEURD_PROP_CONVERGENCE, nd_conv, g.p_conv);
 		}
 		g.props_valid = props_ok;
@@ -2075,6 +2109,17 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		if (s->mode != LEIA_LIFT_MODE_DEPTH) {
 			const uint32_t slots = cols * rows; // NeurD wants one triplet per grid tile
 			std::vector<float> src_m; // metres, (x,y,z) per view
+			// The runtime's viewpoint policy covers only viewpoints the RUNTIME
+			// passed (rect-relative, already processed). Eyes the DP read from its
+			// own tracker are panel-centred and raw: legacy mapping.
+			const bool runtime_vp = viewpoints_m != nullptr && viewpoint_floats >= 3;
+			struct leia_lift_vp_policy pol = {};
+			pol.active = dp.has_policy && runtime_vp;
+			pol.baseline_m = dp.baseline_m;
+			pol.axis_mode = dp.axis_mode;
+			pol.max_offset_m = dp.max_offset_m;
+			pol.ref_z_m = dp.ref_z_m;
+			const struct leia_lift_vp_gains gains = {s->k.view_gain, s->k.y_gain, s->k.z_gain};
 			if (viewpoints_m != nullptr && viewpoint_floats >= 3 && viewpoint_floats % 3 == 0) {
 				const uint32_t k = viewpoint_floats / 3;
 				if (k == views) {
@@ -2107,7 +2152,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 				for (uint32_t i = 0; i < slots; i++) {
 					uint32_t v = std::min(i, views - 1); // extra grid slots repeat the last view
 					float n[3];
-					leia_lift_neurd_map_viewpoint(&src_m[v * 3], l->k.view_gain, n);
+					leia_lift_vp_map(&pol, &gains, &src_m[v * 3], n);
 					vp.insert(vp.end(), n, n + 3);
 				}
 			} else if (s->mode == LEIA_LIFT_MODE_NVIEW) {
@@ -2121,6 +2166,38 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 				}
 			}
 			// SBS untracked: vp stays empty -> NeurD's own default ±0.5 pattern.
+
+			// Which viewpoint contract this stream is on, logged once per change
+			// (lifecycle: an app switching axis mode, or an old runtime).
+			const uint32_t vp_key = pol.active ? (1u | (dp.axis_mode << 1)) : 0u;
+			if (!vp.empty() && s->vp_logged != vp_key) {
+				s->vp_logged = vp_key;
+				const char *axis_s = dp.axis_mode == LEIA_LIFT_AXIS_XYZ ? "XYZ"
+				                     : dp.axis_mode == LEIA_LIFT_AXIS_XY ? "XY"
+				                                                         : "X";
+				if (pol.active) {
+					U_LOG_W("Leia lift: stream %llu viewpoints = runtime policy (frame %s, axis %s, baseline "
+					        "%.1f mm%s, max offset %.0f mm%s, rect %.0fx%.0f mm, ref z %.0f mm) view_gain=%.2f "
+					        "y_gain=%.2f z_gain=%.2f",
+					        (unsigned long long)s->id, dp.viewpoint_frame == 1u ? "rect" : "panel", axis_s,
+					        (double)(dp.baseline_m * 1000.0f), dp.baseline_m > 0.0f ? "" : " (unknown: 63)",
+					        (double)(dp.max_offset_m * 1000.0f), dp.max_offset_m > 0.0f ? "" : " (unclamped: ±3)",
+					        (double)(dp.rect_width_m * 1000.0f), (double)(dp.rect_height_m * 1000.0f),
+					        (double)((dp.ref_z_m > 0.0f ? dp.ref_z_m : LEIA_LIFT_VP_DEFAULT_REF_Z_M) * 1000.0f),
+					        (double)s->k.view_gain, (double)s->k.y_gain, (double)s->k.z_gain);
+					if (dp.axis_mode == LEIA_LIFT_AXIS_XY || dp.axis_mode == LEIA_LIFT_AXIS_XYZ) {
+						// Vertical parallax caused jumps under the legacy contract
+						// (panel-centred, never recentred); flag the first time it is honoured.
+						LIFT_WARN_ONCE("Leia lift: honouring VERTICAL look-around (axis %s, y_gain %.2f) — if the "
+						               "image jumps with head height, lower DXR_LEIA_LIFT_Y_GAIN / YGain",
+						               axis_s, (double)s->k.y_gain);
+					}
+				} else {
+					U_LOG_W("Leia lift: stream %llu viewpoints = legacy mapping (x only, 63 mm unit, ±3: %s)",
+					        (unsigned long long)s->id,
+					        runtime_vp ? "runtime predates the viewpoint policy" : "eyes from the DP's own tracker");
+				}
+			}
 
 			// Which viewpoints this convert used, logged once per change: an A/B of
 			// DXR_LEIA_LIFT_VIEW_GAIN with nobody in front of the tracker lands on the
