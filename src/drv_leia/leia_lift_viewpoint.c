@@ -9,6 +9,7 @@
 #include "leia_lift_viewpoint.h"
 
 #include <math.h>
+#include <stddef.h>
 
 static float
 vp_clamp(float v, float lim)
