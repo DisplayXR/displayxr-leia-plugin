@@ -13,22 +13,27 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Three targets: Windows / Leia SR (drv_leia), Android / Leia CNSDK
-# (drv_leia_android), and Linux desktop / stub weaver (drv_leia_linux,
-# Track A of the Linux port — SDK backend lands with Track B, see
-# docs/leia-linux-sdk-contract.md). The Android arm was accidentally
-# dropped by the v1.17.0 re-pin (29fabc7) — restored here.
+# Four targets: Windows / Leia SR (drv_leia), Android / Leia CNSDK
+# (drv_leia_android), Linux desktop (drv_leia_linux, stub or srSDK Vulkan
+# weaver, see docs/leia-linux-sdk-contract.md) and macOS (drv_leia_macos,
+# srSDK Metal weaver). The Android arm was accidentally dropped by the v1.17.0
+# re-pin (29fabc7) — restored here.
 set(DXR_LINUX_DESKTOP FALSE)
 if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT WIN32)
     set(DXR_LINUX_DESKTOP TRUE) # CMake-side twin of the XRT_OS_LINUX && !XRT_OS_ANDROID code gate
 endif()
-if(NOT WIN32 AND NOT ANDROID AND NOT DXR_LINUX_DESKTOP)
+set(DXR_MACOS FALSE)
+if(APPLE AND NOT IOS)
+    set(DXR_MACOS TRUE)
+endif()
+if(NOT WIN32 AND NOT ANDROID AND NOT DXR_LINUX_DESKTOP AND NOT DXR_MACOS)
     message(FATAL_ERROR
-        "The Leia plug-in supports three targets:\n"
+        "The Leia plug-in supports four targets:\n"
         "  - Windows / Leia SR (DisplayXR-LeiaSR.dll, drv_leia)\n"
         "  - Android / Leia CNSDK (libdxrp050_leia_cnsdk.so, drv_leia_android)\n"
-        "  - Linux desktop / stub weaver (DisplayXR-LeiaSR.so, drv_leia_linux)\n"
-        "Configured platform is none of these (macOS is not supported).")
+        "  - Linux desktop (DisplayXR-LeiaSR.so, drv_leia_linux)\n"
+        "  - macOS / Leia SR Metal weaver (DisplayXR-LeiaSR.dylib, drv_leia_macos)\n"
+        "Configured platform is none of these.")
 endif()
 
 if(NOT DEFINED BUILD_NUM)
@@ -114,6 +119,25 @@ endif()
 # Post-#263 the runtime tree no longer carries any drv_leia source, so
 # there's no conflict to gate against here — the runtime always builds
 # vendor-source-clean.
+
+if(DXR_MACOS)
+    # macOS runtime defaults — the set the runtime's own scripts/build_macos.sh
+    # passes, as cache defaults so the runtime subdir configures identically.
+    # CLI stays ON: displayxr-cli selftest / info / displays is the headless
+    # validation vehicle for this arm too.
+    set(XRT_MODULE_CLI ON CACHE BOOL "displayxr-cli selftest vehicle (leia-plugin macOS default)")
+    set(XRT_BUILD_DRIVER_QWERTY ON CACHE BOOL "macOS default (leia-plugin, matches build_macos.sh)")
+    foreach(_dxr_off
+            XRT_FEATURE_SERVICE
+            XRT_FEATURE_DEBUG_GUI
+            XRT_FEATURE_WINDOW_PEEK
+            XRT_HAVE_SDL2
+            XRT_HAVE_OPENCV
+            XRT_HAVE_LIBUSB
+            XRT_BUILD_DRIVER_EUROC)
+        set(${_dxr_off} OFF CACHE BOOL "macOS default (leia-plugin, matches build_macos.sh)")
+    endforeach()
+endif()
 
 if(DXR_LINUX_DESKTOP)
     # Headless-Linux runtime defaults — the exact set the runtime's own
@@ -223,6 +247,15 @@ set(DXR_RUNTIME_GIT_TAG "v2.31.0" CACHE STRING
 set(DXR_RUNTIME_GIT_TAG_LINUX "v2.30.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
+# macOS carries its own pin for the same reason as _LINUX / _ANDROID: the Metal
+# arm can move without dragging the Windows installer's derived
+# MIN_RUNTIME_VERSION along. Same value as the Windows pin today. The _MACOS
+# suffix is invisible to the runtime's check_plugin_abi.py regex
+# (DXR_RUNTIME_GIT_TAG\s+") for the same reason _LINUX is. Dev builds point
+# DXR_RUNTIME_SOURCE_DIR at a local checkout instead (scripts/build-macos.sh).
+set(DXR_RUNTIME_GIT_TAG_MACOS "v2.31.0" CACHE STRING
+    "Runtime git ref for macOS builds.")
+
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
 # is AHEAD of the Windows tag (v2.16.19 vs v2.16.9) -- which is the whole reason
 # the suffixed key exists: the Android arm moves independently without dragging
@@ -270,6 +303,8 @@ else()
                 "Set DXR_RUNTIME_GIT_TAG_LINUX to a Linux-capable ref, or point DXR_RUNTIME_SOURCE_DIR "
                 "at a local runtime checkout.")
         endif()
+    elseif(DXR_MACOS)
+        set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_MACOS}")
     elseif(ANDROID)
         set(_dxr_runtime_ref "${DXR_RUNTIME_GIT_TAG_ANDROID}")
         string(REGEX REPLACE "^v" "" _dxr_android_ver "${_dxr_runtime_ref}")
@@ -332,4 +367,13 @@ elseif(DXR_LINUX_DESKTOP)
     # find_package, no installer — the .so is discovered via a JSON
     # manifest (XRT_PLUGIN_SEARCH_PATH / XDG DisplayProcessors roots).
     add_subdirectory(src/drv_leia_linux)
+elseif(DXR_MACOS)
+    # --- macOS (LeiaSR srSDK Metal weaver) ------------------------------
+    # The runtime's Metal compositor calls create_dp_metal; the DP drives the
+    # srSDK v2 C API's Metal weaver (sr/sr_metal.h) through the static loader
+    # (libsrSDK_loader.a), which resolves libLeiaSR_runtime.dylib at run time
+    # (SR_RUNTIME_PATH overrides). Discovery is a JSON manifest
+    # (XRT_PLUGIN_SEARCH_PATH / ~/Library/Application Support/DisplayXR/
+    # DisplayProcessors), generated next to the dylib at build time.
+    add_subdirectory(src/drv_leia_macos)
 endif()

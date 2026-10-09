@@ -1,0 +1,792 @@
+// Copyright 2026, Leia Inc / DisplayXR
+// SPDX-License-Identifier: Apache-2.0
+/*!
+ * @file
+ * @brief  macOS Metal display processor over the srSDK Metal weaver
+ *         (sr/sr_metal.h, v2 C API).
+ *
+ * Per frame (process_atlas, on the compositor's render thread):
+ *
+ *   - clear the target, so pixels outside the canvas are defined;
+ *   - 2x1 atlas  -> srSDK Metal weaver. The atlas is the runtime's
+ *                   content-sized crop (ADR-030), i.e. exactly the
+ *                   side-by-side stereo pair the weaver consumes (each view
+ *                   half the panel width — "anamorphic SBS"). Recorded into
+ *                   the RUNTIME's command buffer, rendered into the target,
+ *                   viewport + scissor = canvas;
+ *   - anything else (1x1 2D frame, an N-view grid) -> passthrough blit of
+ *     view 0 into the canvas, weaver bypassed — the Linux/Windows 2D path.
+ *
+ * Window phase: srWeaverSetPresentOrigin gets the app window's content origin
+ * relative to the panel's CGDisplayBounds, in panel (backing) pixels, every
+ * frame. On the current macOS SR line the Metal weaver tracks its NSWindow
+ * itself and rejects the call (SR_ERROR_FEATURE_NOT_SUPPORTED) — logged once,
+ * kept so the plug-in picks the fix up without a rebuild.
+ *
+ * Colour: macOS colour-matches every window from its layer's colour space to
+ * the display profile, which mixes subpixels across views on a lenticular
+ * panel. The SR weaver tags `window.contentView.layer` with the display's
+ * colour space itself, but only when that layer IS the CAMetalLayer; the
+ * runtime adds its CAMetalLayer as a SUBLAYER for views that are not
+ * layer-backed by Metal (GL apps). So this DP tags the layer it actually
+ * presents into, with CGDisplayCopyColorSpace(the window's screen), once a
+ * second at most and only on change. DXR_LEIA_MAC_KEEP_COLOR_MATCHING=1 skips
+ * it (A/B), as SR_METAL_KEEP_COLOR_MATCHING=1 does on the SR side.
+ *
+ * @ingroup drv_leia
+ */
+
+#include "leia_display_processor_macos.h"
+#include "leia_sr_macos.h"
+#include "leia_lens_owner_linux.h" // pure-C lens ownership rules (LeiaSR #266); not Linux-specific
+
+#include "xrt/xrt_display_processor_metal.h"
+#include "xrt/xrt_display_metrics.h"
+
+#include "util/u_debug.h"
+#include "util/u_logging.h"
+#include "os/os_time.h"
+
+#include <sr/sr.h>
+#include <sr/sr_metal.h>
+
+#import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <ImageIO/ImageIO.h>
+#include <unistd.h>
+
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+
+DEBUG_GET_ONCE_BOOL_OPTION(leia_mac_keep_color_matching, "DXR_LEIA_MAC_KEEP_COLOR_MATCHING", false)
+
+#define LEIA_MAC_HALF_IPD_MM 31.5f
+#define LEIA_MAC_EYE_FRESH_NS (250ll * 1000 * 1000)
+#define LEIA_MAC_TAG_CHECK_NS (1000ull * 1000 * 1000)
+
+static NSString *const k_blit_msl =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+     "vertex VOut leia_blit_vs(uint vid [[vertex_id]]) {\n"
+     "    VOut o; o.uv = float2((vid << 1) & 2, vid & 2);\n"
+     "    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+     "struct Tile { float2 scale; };\n"
+     "fragment float4 leia_blit_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+     "                             sampler s [[sampler(0)]], constant Tile &tile [[buffer(0)]]) {\n"
+     "    return t.sample(s, in.uv * tile.scale); }\n";
+
+struct leia_dp_mac
+{
+	struct xrt_display_processor_metal base; //!< MUST be first
+
+	id<MTLDevice> device;        //!< retained
+	id<MTLCommandQueue> queue;   //!< retained
+	NSView *view;                //!< retained; NULL for hosted apps
+	NSWindow *window;            //!< retained; the view's window at creation
+
+	SrInstance inst;
+	SrWeaver weaver;
+	SrEyeTracker tracker;
+	SrLens lens;
+	struct leia_lens_owner lens_owner;
+
+	_Atomic int64_t last_pair_ns; //!< monotonic time of the last raw eye sample (tracking freshness)
+	SrPoint3f last_good_l, last_good_r;
+	bool have_last_good;
+
+	//! Passthrough (2D) pipeline, built for one target pixel format.
+	id<MTLRenderPipelineState> blit_pipeline;
+	MTLPixelFormat blit_format;
+	id<MTLSamplerState> sampler;
+
+	//! Colour-space tagging state (see file header).
+	void *tagged_layer;
+	uint32_t tagged_did;
+	uint64_t last_tag_check_ns;
+
+	bool present_origin_unsupported;
+	int32_t last_origin_x, last_origin_y;
+	bool origin_logged;
+
+	uint64_t frames;
+	uint64_t last_eye_log_ns;
+	bool weave_logged, blit_logged, grid_logged, size_logged;
+};
+
+static inline struct leia_dp_mac *
+leia_dp_mac(struct xrt_display_processor_metal *xdp)
+{
+	return (struct leia_dp_mac *)xdp;
+}
+
+
+/*
+ *
+ * Eye samples (SR thread).
+ *
+ */
+
+static void SR_CALL
+leia_dp_mac_on_eye_pair(const SrEyePair *pair, void *user_data)
+{
+	(void)pair;
+	struct leia_dp_mac *ldp = (struct leia_dp_mac *)user_data;
+	atomic_store(&ldp->last_pair_ns, (int64_t)os_monotonic_get_ns());
+}
+
+
+/*
+ *
+ * Window geometry helpers.
+ *
+ */
+
+//! The CAMetalLayer the compositor presents into: the view's own layer, or the
+//! sublayer the runtime adds to a non-Metal view (setup_external_window).
+static CAMetalLayer *
+find_metal_layer(NSView *view)
+{
+	if (view == nil) {
+		return nil;
+	}
+	CALayer *layer = view.layer;
+	if ([layer isKindOfClass:[CAMetalLayer class]]) {
+		return (CAMetalLayer *)layer;
+	}
+	for (CALayer *sub in layer.sublayers) {
+		if ([sub isKindOfClass:[CAMetalLayer class]]) {
+			return (CAMetalLayer *)sub;
+		}
+	}
+	return nil;
+}
+
+//! The view's top-left in CoreGraphics global points (origin = top-left of the
+//! primary display, y down) — the space CGDisplayBounds is in.
+static bool
+view_origin_cg_points(NSView *view, CGFloat *out_x, CGFloat *out_y)
+{
+	NSWindow *win = view.window;
+	NSArray<NSScreen *> *screens = [NSScreen screens];
+	if (win == nil || screens.count == 0) {
+		return false;
+	}
+	const NSRect in_win = [view convertRect:view.bounds toView:nil];
+	const NSRect in_screen = [win convertRectToScreen:in_win]; // AppKit global, y up
+	const CGFloat primary_h = screens[0].frame.size.height;   // screens[0] = the menu-bar screen
+	*out_x = in_screen.origin.x;
+	*out_y = primary_h - (in_screen.origin.y + in_screen.size.height);
+	return true;
+}
+
+static void
+update_present_origin(struct leia_dp_mac *ldp)
+{
+	if (ldp->present_origin_unsupported || ldp->view == nil) {
+		return;
+	}
+	struct leia_mac_display_info info;
+	if (!leia_mac_get_display_info(&info) || info.cg_display_id == 0) {
+		return;
+	}
+	CGFloat vx = 0, vy = 0;
+	if (!view_origin_cg_points(ldp->view, &vx, &vy)) {
+		return;
+	}
+	const CGRect b = CGDisplayBounds(info.cg_display_id);
+	const double scale = info.backing_scale > 0.0f ? info.backing_scale : 1.0;
+	const int32_t ox = (int32_t)llround((vx - b.origin.x) * scale);
+	const int32_t oy = (int32_t)llround((vy - b.origin.y) * scale);
+
+	const SrResult res = srWeaverSetPresentOrigin(ldp->weaver, ox, oy);
+	if (res == SR_ERROR_FEATURE_NOT_SUPPORTED || res == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		ldp->present_origin_unsupported = true;
+		U_LOG_W("leia_mac_dp: srWeaverSetPresentOrigin(%d, %d) -> %s — this SR runtime's Metal weaver "
+		        "derives the window phase from its NSWindow itself; not calling it again",
+		        ox, oy, leia_mac_sr_result_str(res));
+		return;
+	}
+	if (!ldp->origin_logged || ox != ldp->last_origin_x || oy != ldp->last_origin_y) {
+		// INFO: changes only on window moves, not per frame.
+		U_LOG_I("leia_mac_dp: present origin (%d, %d) panel px -> %s", ox, oy, leia_mac_sr_result_str(res));
+		ldp->origin_logged = true;
+		ldp->last_origin_x = ox;
+		ldp->last_origin_y = oy;
+	}
+}
+
+//! Tag the presenting layer (and window) with the colour space of the screen
+//! the window is on, so WindowServer applies no colour matching. See header.
+static void
+update_colorspace_tag(struct leia_dp_mac *ldp)
+{
+	if (ldp->view == nil || debug_get_bool_option_leia_mac_keep_color_matching()) {
+		return;
+	}
+	const uint64_t now = os_monotonic_get_ns();
+	if (ldp->last_tag_check_ns != 0 && now - ldp->last_tag_check_ns < LEIA_MAC_TAG_CHECK_NS) {
+		return;
+	}
+	ldp->last_tag_check_ns = now;
+
+	CAMetalLayer *layer = find_metal_layer(ldp->view);
+	NSWindow *win = ldp->view.window;
+	NSScreen *screen = win.screen;
+	if (layer == nil || screen == nil) {
+		return;
+	}
+	const uint32_t did = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+	if (did == 0 || ((void *)layer == ldp->tagged_layer && did == ldp->tagged_did)) {
+		return;
+	}
+	CGColorSpaceRef cs = CGDisplayCopyColorSpace(did);
+	if (cs == NULL) {
+		return;
+	}
+	ldp->tagged_layer = (void *)layer;
+	ldp->tagged_did = did;
+
+	[layer retain];
+	[win retain];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		layer.colorspace = cs;
+		NSColorSpace *ns = [[NSColorSpace alloc] initWithCGColorSpace:cs];
+		win.colorSpace = ns;
+		[ns release];
+		CGColorSpaceRelease(cs);
+		[layer release];
+		[win release];
+	});
+	struct leia_mac_display_info info;
+	const bool on_panel = leia_mac_get_display_info(&info) && info.cg_display_id == did;
+	U_LOG_W("leia_mac_dp: tagged the presenting CAMetalLayer (%s) + NSWindow with the colour space of "
+	        "display %u%s — WindowServer applies no colour matching to the woven frame",
+	        (CALayer *)layer == ldp->view.layer ? "the view's layer" : "a runtime-added sublayer", did,
+	        on_panel ? " (the Leia panel)" : " (NOT the Leia panel)");
+}
+
+
+/*
+ *
+ * 2D / fallback path.
+ *
+ */
+
+static bool
+ensure_blit_pipeline(struct leia_dp_mac *ldp, MTLPixelFormat format)
+{
+	if (ldp->blit_pipeline != nil && ldp->blit_format == format) {
+		return true;
+	}
+	[ldp->blit_pipeline release];
+	ldp->blit_pipeline = nil;
+
+	NSError *err = nil;
+	id<MTLLibrary> lib = [ldp->device newLibraryWithSource:k_blit_msl options:nil error:&err];
+	if (lib == nil) {
+		U_LOG_E("leia_mac_dp: blit shader compile failed: %s", err.localizedDescription.UTF8String);
+		return false;
+	}
+	id<MTLFunction> vs = [lib newFunctionWithName:@"leia_blit_vs"];
+	id<MTLFunction> fs = [lib newFunctionWithName:@"leia_blit_fs"];
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = vs;
+	desc.fragmentFunction = fs;
+	desc.colorAttachments[0].pixelFormat = format;
+	ldp->blit_pipeline = [ldp->device newRenderPipelineStateWithDescriptor:desc error:&err];
+	[desc release];
+	[vs release];
+	[fs release];
+	[lib release];
+	if (ldp->blit_pipeline == nil) {
+		U_LOG_E("leia_mac_dp: blit pipeline failed: %s", err.localizedDescription.UTF8String);
+		return false;
+	}
+	ldp->blit_format = format;
+
+	if (ldp->sampler == nil) {
+		MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+		sd.minFilter = MTLSamplerMinMagFilterLinear;
+		sd.magFilter = MTLSamplerMinMagFilterLinear;
+		sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+		sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+		ldp->sampler = [ldp->device newSamplerStateWithDescriptor:sd];
+		[sd release];
+	}
+	return ldp->sampler != nil;
+}
+
+//! Clear the whole target; when @p src is non-nil also draw the view-0 tile of
+//! a @p cols x @p rows atlas into @p vp.
+static void
+encode_clear_and_blit(struct leia_dp_mac *ldp,
+                      id<MTLCommandBuffer> cmd,
+                      id<MTLTexture> target,
+                      id<MTLTexture> src,
+                      uint32_t cols,
+                      uint32_t rows,
+                      MTLViewport vp)
+{
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+	if (src != nil && ensure_blit_pipeline(ldp, target.pixelFormat)) {
+		const float scale[2] = {1.0f / (float)(cols ? cols : 1), 1.0f / (float)(rows ? rows : 1)};
+		[enc setViewport:vp];
+		[enc setRenderPipelineState:ldp->blit_pipeline];
+		[enc setFragmentTexture:src atIndex:0];
+		[enc setFragmentSamplerState:ldp->sampler atIndex:0];
+		[enc setFragmentBytes:scale length:sizeof(scale) atIndex:0];
+		[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	}
+	[enc endEncoding];
+}
+
+
+/*
+ *
+ * Post-weave capture (debug): touch /tmp/dxr_leia_woven_trigger and the next
+ * woven frame's target is written to /tmp/dxr_leia_woven.png — the pixels the
+ * weaver produced, before WindowServer composites them (the runtime's
+ * /tmp/dxr_atlas_trigger captures the PRE-weave atlas).
+ *
+ */
+
+#define LEIA_MAC_WOVEN_TRIGGER "/tmp/dxr_leia_woven_trigger"
+#define LEIA_MAC_WOVEN_PNG "/tmp/dxr_leia_woven.png"
+
+static void
+maybe_capture_woven(struct leia_dp_mac *ldp, id<MTLCommandBuffer> cmd, id<MTLTexture> target)
+{
+	if ((ldp->frames % 15) != 0 || access(LEIA_MAC_WOVEN_TRIGGER, F_OK) != 0) {
+		return;
+	}
+	unlink(LEIA_MAC_WOVEN_TRIGGER);
+	if (target.pixelFormat != MTLPixelFormatBGRA8Unorm && target.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB) {
+		U_LOG_W("leia_mac_dp: woven capture skipped: target format %lu", (unsigned long)target.pixelFormat);
+		return;
+	}
+	const NSUInteger w = target.width, h = target.height, row = w * 4;
+	id<MTLBuffer> buf = [ldp->device newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+	if (buf == nil) {
+		return;
+	}
+	id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+	[blit copyFromTexture:target
+	                 sourceSlice:0
+	                 sourceLevel:0
+	                sourceOrigin:MTLOriginMake(0, 0, 0)
+	                  sourceSize:MTLSizeMake(w, h, 1)
+	                    toBuffer:buf
+	           destinationOffset:0
+	      destinationBytesPerRow:row
+	    destinationBytesPerImage:row * h];
+	[blit endEncoding];
+	[cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+		(void)cb;
+		CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+		CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs,
+		                                         kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+		CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+		bool ok = false;
+		if (img != NULL) {
+			CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)LEIA_MAC_WOVEN_PNG,
+			                                                       strlen(LEIA_MAC_WOVEN_PNG), false);
+			CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+			if (dst != NULL) {
+				CGImageDestinationAddImage(dst, img, NULL);
+				ok = CGImageDestinationFinalize(dst);
+				CFRelease(dst);
+			}
+			CFRelease(url);
+			CGImageRelease(img);
+		}
+		if (ctx != NULL) {
+			CGContextRelease(ctx);
+		}
+		CGColorSpaceRelease(cs);
+		U_LOG_W("leia_mac_dp: woven capture %lux%lu -> %s: %s", (unsigned long)w, (unsigned long)h,
+		        LEIA_MAC_WOVEN_PNG, ok ? "ok" : "FAILED");
+		[buf release];
+	}];
+}
+
+
+/*
+ *
+ * Vtable.
+ *
+ */
+
+static void
+leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
+                          void *command_buffer,
+                          void *atlas_texture,
+                          uint32_t view_width,
+                          uint32_t view_height,
+                          uint32_t tile_columns,
+                          uint32_t tile_rows,
+                          uint32_t format,
+                          void *target_texture,
+                          uint32_t target_width,
+                          uint32_t target_height,
+                          int32_t canvas_offset_x,
+                          int32_t canvas_offset_y,
+                          uint32_t canvas_width,
+                          uint32_t canvas_height)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)command_buffer;
+	id<MTLTexture> atlas = (__bridge id<MTLTexture>)atlas_texture;
+	id<MTLTexture> target = (__bridge id<MTLTexture>)target_texture;
+	if (cmd == nil || atlas == nil || target == nil) {
+		return;
+	}
+	ldp->frames++;
+
+	// Canvas (ADR-010): 0 = the whole target.
+	const bool use_canvas = canvas_width > 0 && canvas_height > 0;
+	const int32_t cx = use_canvas ? canvas_offset_x : 0;
+	const int32_t cy = use_canvas ? canvas_offset_y : 0;
+	const uint32_t cw = use_canvas ? canvas_width : target_width;
+	const uint32_t ch = use_canvas ? canvas_height : target_height;
+	const MTLViewport vp = {(double)cx, (double)cy, (double)cw, (double)ch, 0.0, 1.0};
+
+	update_colorspace_tag(ldp);
+
+	const bool stereo = tile_columns == 2 && tile_rows == 1 && ldp->weaver != NULL;
+	if (!stereo) {
+		// 2D frame (1x1), an N-view grid, or no weaver: view 0 flat, weaver bypassed.
+		if (tile_columns * tile_rows > 1 && !ldp->grid_logged) {
+			ldp->grid_logged = true;
+			U_LOG_W("leia_mac_dp: %ux%u atlas — the SR Metal weaver takes a 2x1 stereo pair only; "
+			        "showing view 0 flat (logged once)",
+			        tile_columns, tile_rows);
+		}
+		if (!ldp->blit_logged) {
+			ldp->blit_logged = true;
+			U_LOG_W("leia_mac_dp: first passthrough frame: %ux%u grid of %ux%u views -> target %ux%u, "
+			        "canvas (%d,%d %ux%u)",
+			        tile_columns, tile_rows, view_width, view_height, target_width, target_height, cx, cy, cw,
+			        ch);
+		}
+		encode_clear_and_blit(ldp, cmd, target, atlas, tile_columns, tile_rows, vp);
+		return;
+	}
+
+	// Defined pixels outside the canvas (SR loads, it does not clear).
+	if (use_canvas && (cx != 0 || cy != 0 || cw != target_width || ch != target_height)) {
+		encode_clear_and_blit(ldp, cmd, target, nil, 1, 1, vp);
+	}
+
+	const uint32_t in_w = view_width * tile_columns;
+	const uint32_t in_h = view_height * tile_rows;
+	if (!ldp->size_logged && (atlas.width != in_w || atlas.height != in_h)) {
+		ldp->size_logged = true;
+		U_LOG_W("leia_mac_dp: atlas texture is %lux%lu but the content is %ux%u — the weaver samples the "
+		        "whole texture, so this frame is not cropped as ADR-030 promises (logged once)",
+		        (unsigned long)atlas.width, (unsigned long)atlas.height, in_w, in_h);
+	}
+
+	update_present_origin(ldp);
+
+	SrResult res = srWeaverSetInputTextureMetal(ldp->weaver, (__bridge void *)atlas, in_w, in_h,
+	                                            (SrMetalPixelFormat)format);
+	if (SR_SUCCEEDED(res)) {
+		res = srWeaverSetOutputTextureMetal(ldp->weaver, (__bridge void *)target, target_width,
+		                                    target_height, (SrMetalPixelFormat)target.pixelFormat);
+	}
+	if (SR_SUCCEEDED(res)) {
+		res = srWeaverSetCommandBufferMetal(ldp->weaver, (__bridge void *)cmd);
+	}
+	if (SR_SUCCEEDED(res)) {
+		(void)srWeaverSetViewportMetal(ldp->weaver, cx, cy, cx + (int32_t)cw, cy + (int32_t)ch);
+		(void)srWeaverSetScissorRectMetal(ldp->weaver, cx, cy, cx + (int32_t)cw, cy + (int32_t)ch);
+		res = srWeaverWeave(ldp->weaver);
+	}
+	if (SR_FAILED(res)) {
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("leia_mac_dp: weave failed: %s — passthrough this frame (logged once)",
+			        leia_mac_sr_result_str(res));
+		}
+		encode_clear_and_blit(ldp, cmd, target, atlas, tile_columns, tile_rows, vp);
+		return;
+	}
+	maybe_capture_woven(ldp, cmd, target);
+	if (!ldp->weave_logged) {
+		ldp->weave_logged = true;
+		U_LOG_W("leia_mac_dp: first SR weave: atlas %ux%u (2x1 of %ux%u, fmt %u) -> target %ux%u (fmt %lu), "
+		        "canvas (%d,%d %ux%u)",
+		        in_w, in_h, view_width, view_height, format, target_width, target_height,
+		        (unsigned long)target.pixelFormat, cx, cy, cw, ch);
+	}
+}
+
+static bool
+leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp, struct xrt_eye_positions *out)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	SrPoint3f l = {0}, r = {0};
+	const SrResult res =
+	    ldp->weaver != NULL ? srWeaverGetPredictedEyePositions(ldp->weaver, &l, &r) : SR_ERROR_HANDLE_INVALID;
+	const bool plausible = SR_SUCCEEDED(res) && !(l.x == 0.0f && l.y == 0.0f && l.z == 0.0f && r.x == 0.0f &&
+	                                              r.y == 0.0f && r.z == 0.0f);
+	if (plausible) {
+		ldp->last_good_l = l;
+		ldp->last_good_r = r;
+		ldp->have_last_good = true;
+	} else if (ldp->have_last_good) {
+		l = ldp->last_good_l;
+		r = ldp->last_good_r;
+	} else {
+		struct leia_mac_display_info info;
+		const float nz = leia_mac_get_display_info(&info) && info.nominal_z_m > 0.0f
+		                     ? info.nominal_z_m * 1000.0f
+		                     : 600.0f;
+		l = (SrPoint3f){-LEIA_MAC_HALF_IPD_MM, 0.0f, nz};
+		r = (SrPoint3f){LEIA_MAC_HALF_IPD_MM, 0.0f, nz};
+	}
+
+	// SR: millimetres, display-centred, +X right, +Y up, +Z toward the viewer.
+	memset(out, 0, sizeof(*out));
+	out->eyes[0] = (struct xrt_eye_position){l.x / 1000.0f, l.y / 1000.0f, l.z / 1000.0f};
+	out->eyes[1] = (struct xrt_eye_position){r.x / 1000.0f, r.y / 1000.0f, r.z / 1000.0f};
+	out->count = 2;
+	out->timestamp_ns = (int64_t)os_monotonic_get_ns();
+	out->valid = true;
+	const int64_t last = atomic_load(&ldp->last_pair_ns);
+	out->is_tracking = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < LEIA_MAC_EYE_FRESH_NS;
+
+	// Throttled diagnostic (INFO, every ~5 s): what the weaver itself will weave for.
+	const uint64_t now = os_monotonic_get_ns();
+	if (now - ldp->last_eye_log_ns > 5ull * 1000 * 1000 * 1000) {
+		ldp->last_eye_log_ns = now;
+		U_LOG_I("leia_mac_dp: weaver eyes L(%.1f %.1f %.1f) R(%.1f %.1f %.1f) mm rc=%s fresh_raw=%d",
+		        l.x, l.y, l.z, r.x, r.y, r.z, leia_mac_sr_result_str(res), (int)out->is_tracking);
+	}
+	return true;
+}
+
+static bool
+leia_dp_mac_request_display_mode(struct xrt_display_processor_metal *xdp, bool enable_3d)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (ldp->lens == NULL) {
+		return false;
+	}
+	const enum leia_lens_action action = leia_lens_owner_on_request(&ldp->lens_owner, enable_3d);
+	if (action == LEIA_LENS_ACTION_NONE) {
+		return true; // 3D before any 2D: the weaver owns the lens and raises it itself.
+	}
+	const bool enable = action == LEIA_LENS_ACTION_ENABLE;
+	const SrResult res = enable ? srLensEnable(ldp->lens) : srLensDisable(ldp->lens);
+	if (SR_FAILED(res)) {
+		U_LOG_W("leia_mac_dp: srLens%s failed: %s", enable ? "Enable" : "Disable", leia_mac_sr_result_str(res));
+		return false;
+	}
+	leia_lens_owner_commit(&ldp->lens_owner, action);
+	U_LOG_W("leia_mac_dp: lens %s (request_display_mode)", enable ? "ON" : "OFF");
+	return true;
+}
+
+static bool
+leia_dp_mac_get_hardware_3d_state(struct xrt_display_processor_metal *xdp, bool *out_is_3d)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (ldp->lens == NULL || out_is_3d == NULL) {
+		return false;
+	}
+	SrBool32 enabled = SR_FALSE;
+	if (SR_FAILED(srLensIsEnabled(ldp->lens, &enabled))) {
+		return false;
+	}
+	*out_is_3d = enabled == SR_TRUE;
+	return true;
+}
+
+static bool
+leia_dp_mac_get_display_dimensions(struct xrt_display_processor_metal *xdp, float *out_w_m, float *out_h_m)
+{
+	(void)xdp;
+	struct leia_mac_display_info info;
+	if (!leia_mac_get_display_info(&info) || !info.valid) {
+		return false;
+	}
+	*out_w_m = info.width_m;
+	*out_h_m = info.height_m;
+	return true;
+}
+
+static bool
+leia_dp_mac_get_display_pixel_info(struct xrt_display_processor_metal *xdp,
+                                   uint32_t *out_px_w,
+                                   uint32_t *out_px_h,
+                                   int32_t *out_left,
+                                   int32_t *out_top)
+{
+	(void)xdp;
+	struct leia_mac_display_info info;
+	if (!leia_mac_get_display_info(&info) || !info.valid) {
+		return false;
+	}
+	*out_px_w = info.pixel_width;
+	*out_px_h = info.pixel_height;
+	// The Metal compositor's window metrics are screen-relative (its
+	// display_screen_left/top are 0), so the panel origin is 0,0 here too.
+	*out_left = 0;
+	*out_top = 0;
+	return true;
+}
+
+static void
+leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (ldp->weaver != NULL) {
+		srDestroyWeaver(ldp->weaver);
+	}
+	if (ldp->tracker != NULL) {
+		srDestroyEyeTracker(ldp->tracker);
+	}
+	if (ldp->lens != NULL) {
+		srDestroyLens(ldp->lens);
+	}
+	if (ldp->inst != NULL) {
+		srDestroyInstance(ldp->inst);
+	}
+	[ldp->blit_pipeline release];
+	[ldp->sampler release];
+	[ldp->window release];
+	[ldp->view release];
+	[ldp->queue release];
+	[ldp->device release];
+	U_LOG_W("leia_mac_dp: destroyed after %llu frames", (unsigned long long)ldp->frames);
+	free(ldp);
+}
+
+
+/*
+ *
+ * Factory.
+ *
+ */
+
+xrt_result_t
+leia_mac_dp_factory_metal(void *metal_device,
+                          void *command_queue,
+                          void *window_handle,
+                          struct xrt_display_processor_metal **out_xdp)
+{
+	if (out_xdp == NULL || metal_device == NULL || command_queue == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	(void)leia_mac_sr_probe(); // panel geometry + CGDirectDisplayID (cached)
+
+	struct leia_dp_mac *ldp = calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	ldp->device = [(__bridge id<MTLDevice>)metal_device retain];
+	ldp->queue = [(__bridge id<MTLCommandQueue>)command_queue retain];
+
+	// window_handle is the app's NSView for handle/texture apps (NULL for
+	// hosted). SR wants the NSWindow (geometry + window tracking).
+	id handle = (__bridge id)window_handle;
+	if (handle != nil && [handle isKindOfClass:[NSView class]]) {
+		ldp->view = [(NSView *)handle retain];
+		ldp->window = [((NSView *)handle).window retain];
+	} else if (handle != nil && [handle isKindOfClass:[NSWindow class]]) {
+		ldp->window = [(NSWindow *)handle retain];
+		ldp->view = [((NSWindow *)handle).contentView retain];
+	}
+
+	// Own SR instance: on macOS the weaver + eye callback must exist BEFORE
+	// srInitialize (leia_sr_macos.h explains why).
+	SrInstanceCreateInfo ci = SrInstanceCreateInfo(.applicationName = "DisplayXR-LeiaSR",
+	                                               .networkMode = SR_NETWORK_MODE_CLIENT);
+	SrResult res = srCreateInstance(&ci, &ldp->inst);
+	if (SR_FAILED(res)) {
+		U_LOG_E("leia_mac_dp: srCreateInstance failed: %s (loader: %s)", leia_mac_sr_result_str(res),
+		        srGetLastLoaderError() ? srGetLastLoaderError() : "-");
+		ldp->inst = NULL;
+		goto fail;
+	}
+	srSetLogCallback(ldp->inst, leia_mac_sr_log_cb, NULL);
+
+	SrRuntimeCapabilities caps = SrRuntimeCapabilities();
+	if (SR_SUCCEEDED(srGetRuntimeCapabilities(ldp->inst, &caps)) &&
+	    !(caps.weaverBackends & SR_WEAVER_BACKEND_METAL_BIT)) {
+		U_LOG_E("leia_mac_dp: the SR runtime has no Metal weaver backend");
+		goto fail;
+	}
+
+	SrEyeTrackerCreateInfo eci = SrEyeTrackerCreateInfo(.enablePrediction = SR_FALSE);
+	res = srCreateEyeTracker(ldp->inst, &eci, &ldp->tracker);
+	if (SR_SUCCEEDED(res)) {
+		srEyeTrackerAddCallback(ldp->tracker, leia_dp_mac_on_eye_pair, ldp);
+	} else {
+		U_LOG_W("leia_mac_dp: srCreateEyeTracker failed (%s) — is_tracking stays false",
+		        leia_mac_sr_result_str(res));
+		ldp->tracker = NULL;
+	}
+
+	SrWeaverCreateInfoMetal wci = SrWeaverCreateInfoMetal(.device = metal_device, .commandQueue = command_queue,
+	                                                      .window = (__bridge void *)ldp->window);
+	res = srCreateWeaverMetal(ldp->inst, &wci, &ldp->weaver);
+	if (SR_FAILED(res)) {
+		U_LOG_E("leia_mac_dp: srCreateWeaverMetal failed: %s", leia_mac_sr_result_str(res));
+		ldp->weaver = NULL;
+		goto fail;
+	}
+
+	res = srInitialize(ldp->inst);
+	if (SR_FAILED(res)) {
+		U_LOG_E("leia_mac_dp: srInitialize failed: %s", leia_mac_sr_result_str(res));
+		goto fail;
+	}
+
+	SrLensCreateInfo lci = SrLensCreateInfo();
+	res = srCreateLens(ldp->inst, &lci, &ldp->lens);
+	if (SR_FAILED(res)) {
+		U_LOG_W("leia_mac_dp: srCreateLens failed (%s) — no 2D/3D switching", leia_mac_sr_result_str(res));
+		ldp->lens = NULL;
+	}
+
+	ldp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_metal);
+	ldp->base.process_atlas = leia_dp_mac_process_atlas;
+	ldp->base.get_predicted_eye_positions = leia_dp_mac_get_predicted_eye_positions;
+	ldp->base.request_display_mode = leia_dp_mac_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_mac_get_hardware_3d_state;
+	ldp->base.get_display_dimensions = leia_dp_mac_get_display_dimensions;
+	ldp->base.get_display_pixel_info = leia_dp_mac_get_display_pixel_info;
+	ldp->base.destroy = leia_dp_mac_destroy;
+	// Left NULL, as on the Linux arm's first cut: get_window_metrics (the
+	// Metal compositor computes it from the view), is_alpha_native (a weave is
+	// opaque), colour capability / encoding (ENCODED default), background,
+	// zones, scanout caps, background preview.
+
+	struct leia_mac_display_info info = {0};
+	(void)leia_mac_get_display_info(&info);
+	U_LOG_W("leia_mac_dp: created SR Metal weaver (window %p, view %p, panel display %u, %ux%u px)",
+	        (void *)ldp->window, (void *)ldp->view, info.cg_display_id, info.pixel_width, info.pixel_height);
+	if (ldp->window == nil) {
+		U_LOG_W("leia_mac_dp: no window handed to the DP (hosted app) — SR weaves windowless: the "
+		        "phase assumes the target sits at the panel origin");
+	}
+
+	*out_xdp = &ldp->base;
+	return XRT_SUCCESS;
+
+fail:
+	ldp->base.destroy = leia_dp_mac_destroy;
+	leia_dp_mac_destroy(&ldp->base);
+	return XRT_ERROR_DEVICE_CREATION_FAILED;
+}
