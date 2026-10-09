@@ -35,14 +35,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build-macos"
 PARENT="$(cd "$ROOT/.." && pwd)"
-# DEV OVERRIDE (remove once runtime #1872/#1873/#1875 merge and a tag carries them):
-# the macOS arm's per-screen slots (create_dp_metal_for_screen,
-# xrt_display_processor_metal::set_present_origin) and macOS monitor
-# enumeration exist only on runtime branch feat/macos-window-placement (#1875, stacked on #1873/#1872; adds snap_window_rect). Unless
-# DXR_RUNTIME_SOURCE_DIR names a checkout, that ref is exported READ-ONLY
-# (git archive, no worktree, no checkout change) from ../displayxr-runtime into
-# build-macos/_runtime-src. DXR_RUNTIME_DEV_REF="" uses ../displayxr-runtime as is.
-DXR_RUNTIME_DEV_REF="${DXR_RUNTIME_DEV_REF-feat/macos-window-placement}"
+# Runtime source for the macOS arm. Its per-screen slots (create_dp_metal_for_screen,
+# xrt_display_processor_metal::set_present_origin / snap_window_rect) and macOS
+# monitor enumeration landed on runtime main (#1872/#1873/#1875) after the
+# DXR_RUNTIME_GIT_TAG_MACOS pin; until a tag carries them, build against
+# runtime main (fetched from origin). Unless DXR_RUNTIME_SOURCE_DIR names a checkout, that ref is
+# exported READ-ONLY (git archive, no worktree, no checkout change) from
+# ../displayxr-runtime into build-macos/_runtime-src. DXR_RUNTIME_DEV_REF=""
+# uses ../displayxr-runtime as is.
+DXR_RUNTIME_DEV_REF="${DXR_RUNTIME_DEV_REF-main}"
 if [ -n "${DXR_RUNTIME_SOURCE_DIR:-}" ]; then
     RUNTIME_DIR="$DXR_RUNTIME_SOURCE_DIR"
 elif [ -n "$DXR_RUNTIME_DEV_REF" ]; then
