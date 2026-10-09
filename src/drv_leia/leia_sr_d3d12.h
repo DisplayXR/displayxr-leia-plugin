@@ -51,6 +51,38 @@ leiasr_d3d12_create(double max_time,
                     struct leiasr_d3d12 **out);
 
 /*!
+ * Multi-screen M6: create the weaver for ONE screen (create_dp_d3d12_for_screen),
+ * the D3D12 twin of leiasr_d3d11_create_for_screen. Like
+ * @ref leiasr_d3d12_create, plus: the weaver is bound to @p display_id (0 =
+ * unknown: EXTERNAL routing on the active display) with EXTERNAL routing,
+ * keeps the SDK's drag snap only when @p hwnd is real, phases from
+ * @ref leiasr_d3d12_set_present_origin when @p hwnd is NULL, and pins a
+ * simulated viewer when the bound display is not the runtime's active
+ * (tracked) one and it has no tracker of its own. Synchronous (this arm has
+ * no async create).
+ *
+ * @ingroup drv_leia
+ */
+xrt_result_t
+leiasr_d3d12_create_for_screen(double max_time,
+                               void *d3d12_device,
+                               void *d3d12_command_queue,
+                               void *hwnd,
+                               uint64_t display_id,
+                               struct leiasr_d3d12 **out);
+
+/*!
+ * Multi-screen M6: where the window's client area sits on this weaver's
+ * screen (device px, relative to the screen's top-left; may be negative).
+ * Applied before every weave on a windowless EXTERNAL weaver; ignored by a
+ * weaver that has the real window (the SDK derives its phase from it).
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d12_set_present_origin(struct leiasr_d3d12 *leiasr, int32_t panel_x, int32_t panel_y);
+
+/*!
  * Destroy a D3D12 SR weaver instance.
  *
  * @param leiasr_ptr Pointer to the instance pointer (set to NULL on return).
