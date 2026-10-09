@@ -376,22 +376,22 @@ if(LEIA_SR_D3D11_AVAILABLE AND NEURD_SDK_ROOT
     list(APPEND LEIA_SOURCES leia_lift_neurd.cpp leia_lift_neurd.h leia_lift_viewpoint.c leia_lift_viewpoint.h
          leia_lift_depth.c leia_lift_depth.h)
     message(STATUS "NeurD headers found at ${NEURD_SDK_ROOT} - enabling the D3D11 2D->3D lift slots")
-    # NeurD >= 0.4.9 entry points (media_sdk #559 float depth + per-stream props, #560 off-axis
-    # camera) arrived in separate PRs, so each is detected from the header itself, not from
-    # NEURD_VERSION: the code using them compiles only when the fetched header declares them, and
-    # is still gated at run time on the LOADED NeurD's table (LEIA_NEURD_HAS).
-    file(STRINGS "${NEURD_SDK_ROOT}/include/NeurD.h" _neurd_float_depth REGEX "NeurD_get_stream_depth_dx[ ]*[(]")
-    file(STRINGS "${NEURD_SDK_ROOT}/include/NeurD.h" _neurd_offaxis REGEX "NeurD_convert_stream_dx_offaxis[ ]*[(]")
-    set(LEIA_NEURD_HAS_FLOAT_DEPTH FALSE)
-    set(LEIA_NEURD_HAS_OFFAXIS FALSE)
-    if(_neurd_float_depth)
-        set(LEIA_NEURD_HAS_FLOAT_DEPTH TRUE)
+    # NeurD >= 0.4.9 entry points (media_sdk #561): per-stream props, and NeurD_convert_stream_dx_ex
+    # (views + float depth of the same inference, metric off-axis camera). Detected from the header
+    # itself, not from NEURD_VERSION: the code using them compiles only when the fetched header
+    # declares them, and is still gated at run time on the LOADED NeurD's table (LEIA_NEURD_HAS).
+    file(STRINGS "${NEURD_SDK_ROOT}/include/NeurD.h" _neurd_stream_props REGEX "NeurD_set_stream_prop_1i[ ]*[(]")
+    file(STRINGS "${NEURD_SDK_ROOT}/include/NeurD.h" _neurd_convert_ex REGEX "NeurD_convert_stream_dx_ex[ ]*[(]")
+    set(LEIA_NEURD_HAS_STREAM_PROPS FALSE)
+    set(LEIA_NEURD_HAS_CONVERT_EX FALSE)
+    if(_neurd_stream_props)
+        set(LEIA_NEURD_HAS_STREAM_PROPS TRUE)
     endif()
-    if(_neurd_offaxis)
-        set(LEIA_NEURD_HAS_OFFAXIS TRUE)
+    if(_neurd_convert_ex)
+        set(LEIA_NEURD_HAS_CONVERT_EX TRUE)
     endif()
-    message(STATUS "NeurD header features: float depth + per-stream props=${LEIA_NEURD_HAS_FLOAT_DEPTH}, "
-                   "off-axis camera=${LEIA_NEURD_HAS_OFFAXIS}")
+    message(STATUS "NeurD header features: per-stream props=${LEIA_NEURD_HAS_STREAM_PROPS}, "
+                   "convert_stream_dx_ex (float depth + off-axis camera)=${LEIA_NEURD_HAS_CONVERT_EX}")
 elseif(LEIA_SR_D3D11_AVAILABLE)
     message(STATUS "NeurD headers NOT found (NEURD_SDK_ROOT='${NEURD_SDK_ROOT}') - 2D->3D lift compiled OUT; "
                    "the plug-in is otherwise unchanged. Fetch them with scripts/build-windows.bat "
@@ -597,11 +597,11 @@ endif()
 if(LEIA_NEURD_AVAILABLE)
     target_include_directories(DisplayXR-LeiaSR PRIVATE "${NEURD_SDK_ROOT}/include")
     target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_NEURD)
-    if(LEIA_NEURD_HAS_FLOAT_DEPTH)
-        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_NEURD_HAS_FLOAT_DEPTH)
+    if(LEIA_NEURD_HAS_STREAM_PROPS)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_NEURD_HAS_STREAM_PROPS)
     endif()
-    if(LEIA_NEURD_HAS_OFFAXIS)
-        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_NEURD_HAS_OFFAXIS)
+    if(LEIA_NEURD_HAS_CONVERT_EX)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_NEURD_HAS_CONVERT_EX)
     endif()
 endif()
 

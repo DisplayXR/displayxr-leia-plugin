@@ -306,10 +306,11 @@ eyes).
 
 ## NeurD 0.4.9: per-stream props, depth export, off-axis camera
 
-Three NeurD additions, each from its own media_sdk PR, each gated twice — at **build** time
-on the fetched header declaring it (CMake greps `NeurD.h`: `DXR_LEIA_NEURD_HAS_FLOAT_DEPTH`
-for #559, `DXR_LEIA_NEURD_HAS_OFFAXIS` for #560; configure prints `NeurD header features:
-…`), and at **run** time on the loaded NeurD's table (`LEIA_NEURD_HAS`). A NeurD 0.4.6–0.4.8
+Two NeurD additions (media_sdk #561), each gated twice — at **build** time on the fetched
+header declaring it (CMake greps `NeurD.h`: `DXR_LEIA_NEURD_HAS_STREAM_PROPS` for the
+per-stream props, `DXR_LEIA_NEURD_HAS_CONVERT_EX` for `NeurD_convert_stream_dx_ex`; configure
+prints `NeurD header features: …`), and at **run** time on the loaded NeurD's table
+(`LEIA_NEURD_HAS`). A NeurD 0.4.6–0.4.8
 runs exactly the pre-0.4.9 paths; the activation WARN says which features are live:
 
 ```
@@ -318,9 +319,9 @@ Leia lift: NeurD READY — backend neurd-directml, interactive viewpoints availa
 
 | Feature | NeurD entry points (all `INTRODUCED_IN` 0.4.9) | Runtime side | Without it |
 |---|---|---|---|
-| Per-stream props | `NeurD_set/get_stream_prop_1f/1i` (#559) | — | process-global props (one stream's convergence / gain / auto-convergence leaks into the next) |
-| Depth export | `NEURD_PROP_RETAIN_FLOAT_DEPTH`, `NeurD_get_stream_depth_dx` (#559), DirectML only | `XRT_DP_LIFT_HAS_AUX_DEPTH` + slot 33 `lift_get_depth` (`XRT_DP_D3D11_HAS_LIFT_DEPTH`) | caps `aux_outputs = 0`; slot left NULL |
-| Off-axis camera | `NeurD_convert_stream_dx_offaxis` (#560) | `XRT_DP_LIFT_HAS_VIEWPOINT_POLICY` (rect size + rect-relative eyes); `XRT_DP_LIFT_HAS_APP_RIG` for rig sources | the dimensionless interactive convert |
+| Per-stream props | `NeurD_set/get_stream_prop_1f/1i` | — | process-global props (one stream's convergence / gain / auto-convergence leaks into the next) |
+| Depth export | `NeurD_convert_stream_dx_ex` with `want_depth` (views + depth of ONE call), DirectML only | `XRT_DP_LIFT_HAS_AUX_DEPTH` + slot 33 `lift_get_depth` (`XRT_DP_D3D11_HAS_LIFT_DEPTH`) | caps `aux_outputs = 0`; slot left NULL |
+| Off-axis camera | `NeurD_convert_stream_dx_ex` with `camera = NEURD_CAMERA_MODEL_OFFAXIS` | `XRT_DP_LIFT_HAS_VIEWPOINT_POLICY` (rect size + rect-relative eyes); `XRT_DP_LIFT_HAS_APP_RIG` for rig sources | the dimensionless interactive convert |
 
 **Per-stream props.** When NeurD has them, inpaint type, auto-convergence, gain multiplier,
 dilation and convergence are set on each NeurD stream (`NeurD_set_stream_prop_*`) instead
@@ -333,9 +334,9 @@ back to the global path with one WARN.
 ### Depth export (aux depth)
 
 An SBS stream created with `XRT_DP_LIFT_AUX_DEPTH` in `xrt_dp_lift_stream_info::aux_outputs`
-gets `NEURD_PROP_RETAIN_FLOAT_DEPTH` on its NeurD stream. After each successful convert the
-plug-in calls `NeurD_get_stream_depth_dx` — the depth **of the same inference** as the views
-just returned (`same_inference = 1`, `vendor_frame_id` = NeurD's per-stream `frame_id`) —
+converts with `NeurD_convert_stream_dx_ex` and `want_depth` (the off-axis camera when it
+applies, else the dimensionless pattern — NeurD's default ±0.5 pair when untracked). The one
+call returns the views and the depth **of the same inference** (`same_inference = 1`, `vendor_frame_id` = NeurD's per-stream `frame_id`) —
 and bridges NeurD's R32F texture to the caller's device exactly like the views: a
 legacy-shared R32F texture on NeurD's device, opened on ours, filled with
 `CopySubresourceRegion` on NeurD's context and CPU-drained with the same event query as the
@@ -370,13 +371,13 @@ then metric `convergence_depth = S / (255 · h₀)` metres, relative `= 1 / h₀
 (zero disparity at or past infinity) reports 0 = unknown. Code + tests:
 `leia_lift_depth.{h,c}`, `tests/test_lift_depth.c`.
 
-Not done: un-dilated depth is what #559 returns already (taken before `DILATE_RADIO`); no
+Not done: un-dilated depth is what NeurD returns already (taken before `DILATE_RADIO`); no
 watermark on the DirectML path. CUDA / TensorRT / OpenVINO have no float-depth path
 (`UNAVAILABLE_OUTDATED_RUNTIME` → one WARN, no depth).
 
 ### Off-axis camera
 
-With NeurD's `NeurD_convert_stream_dx_offaxis` and a runtime that sends the viewpoint policy
+With NeurD's `NeurD_convert_stream_dx_ex` (OFFAXIS camera) and a runtime that sends the viewpoint policy
 (`viewpoint_frame` RECT and `rect_width_m / rect_height_m > 0`), SBS streams are synthesised
 with a **metric off-axis (Kooima) camera** — the projection the runtime uses for native 3D —
 instead of the dimensionless `(x, y, z)` pattern. `OffAxis=0` forces the legacy path (A/B).
@@ -539,8 +540,8 @@ exactly like the SR SDK:
 | Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |
 
 The 0.4.9 features (per-stream props / depth export / off-axis camera) compile only when the
-fetched `NeurD.h` declares them, detected per feature (they come from separate PRs). Until a
-media_sdk release tag carries them, build locally against headers from the PR branches with
+fetched `NeurD.h` declares them, detected per feature. Until a media_sdk release tag carries
+them (#561), build locally against headers from the PR branches with
 `NEURD_SDK_ROOT` (never commit them); the pinned `v0.4.6` build compiles them out.
 
 `NeurD_version.h` is generated the way media_sdk's CMake does it, from
@@ -597,7 +598,7 @@ lift-enabled runtime + this plug-in registered:
    off-axis camera available`. A lifted SBS stream logs `camera = OFF-AXIS (…)` once; with
    `OffAxis=0` it logs `camera = LEGACY dimensionless (OffAxis=0)` — A/B the two on the panel
    (same parallax direction and comparable depth at ReliefDepthM 0.08). A stream created with
-   aux depth logs `RETAIN_FLOAT_DEPTH -> SUCCESS (aux depth requested)`, and the runtime's
+   aux depth logs `float depth per convert (NeurD_convert_stream_dx_ex, aux depth requested)`, and the runtime's
    lift result carries a depth texture (R32F, 640×416 today).
 3. Absent-NeurD check: `set DXR_LEIA_LIFT=0` (or rename the NeurD install key) →
    `lift caps` reports `modes=0 state=unavailable`, and a normal
