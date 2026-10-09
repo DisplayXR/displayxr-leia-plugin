@@ -72,6 +72,7 @@ leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_
  */
 #if defined(XRT_DP_D3D11_HAS_LIFT) && defined(DXR_LEIA_HAS_NEURD)
 #define DXR_LEIA_DP_D3D11_LIFT 1
+#include "leia_lift_depth.h"
 #include "leia_lift_neurd.h"
 #include "leia_lift_viewpoint.h"
 #include "leia_sr_ready.h" // leiasr_geometry_get: nominal viewing distance = lift z reference
@@ -3134,6 +3135,22 @@ static_assert(LEIA_LIFT_AXIS_X == XRT_DP_LIFT_AXIS_X && LEIA_LIFT_AXIS_XY == XRT
                   LEIA_LIFT_AXIS_XYZ == XRT_DP_LIFT_AXIS_XYZ,
               "lift axis modes must match the runtime's XRT_DP_LIFT_AXIS_*");
 #endif
+static_assert(LEIA_LIFT_DEPTH_UNITS_RELATIVE == XRT_DP_LIFT_DEPTH_RELATIVE &&
+                  LEIA_LIFT_DEPTH_UNITS_METRIC == XRT_DP_LIFT_DEPTH_METRIC,
+              "lift depth semantics must match the runtime's XRT_DP_LIFT_DEPTH_*");
+#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
+static_assert(LEIA_LIFT_AUX_DEPTH == XRT_DP_LIFT_AUX_DEPTH, "aux output bit must match XRT_DP_LIFT_AUX_DEPTH");
+static_assert(LEIA_LIFT_DEPTH_ENCODING_LINEAR == XRT_DP_LIFT_DEPTH_ENCODING_LINEAR &&
+                  LEIA_LIFT_DEPTH_ENCODING_INVERSE == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE,
+              "depth encodings must match the runtime's XRT_DP_LIFT_DEPTH_ENCODING_*");
+#endif
+#ifdef XRT_DP_LIFT_HAS_APP_RIG
+static_assert(LEIA_LIFT_VIEWPOINTS_TRACKED == XRT_DP_LIFT_VIEWPOINTS_TRACKED &&
+                  LEIA_LIFT_VIEWPOINTS_EXPLICIT == XRT_DP_LIFT_VIEWPOINTS_EXPLICIT &&
+                  LEIA_LIFT_VIEWPOINTS_DISPLAY_RIG == XRT_DP_LIFT_VIEWPOINTS_DISPLAY_RIG &&
+                  LEIA_LIFT_VIEWPOINTS_CAMERA_RIG == XRT_DP_LIFT_VIEWPOINTS_CAMERA_RIG,
+              "viewpoint sources must match the runtime's XRT_DP_LIFT_VIEWPOINTS_*");
+#endif
 
 #define LEIA_LIFT_COVERS(ptr, type, field)                                                                     \
 	((ptr)->struct_size >= offsetof(type, field) + sizeof(((type *)0)->field))
@@ -3157,6 +3174,12 @@ leia_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_
 	full.depth_semantics = c.depth_semantics;
 	full.state = c.state;
 	full.typical_latency_ns = c.typical_latency_ns;
+#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
+	// Appended (ADR-048 Addendum A): copied out only as far as struct_size
+	// covers.
+	full.aux_outputs = c.aux_outputs;
+	full.aux_depth_semantics = c.aux_depth_semantics;
+#endif
 	static_assert(sizeof(full.backend) <= sizeof(c.backend), "backend name buffers");
 	memcpy(full.backend, c.backend, sizeof(full.backend));
 	full.backend[sizeof(full.backend) - 1] = '\0';
@@ -3177,6 +3200,9 @@ leia_dp_d3d11_lift_stream_create(struct xrt_display_processor_d3d11 *xdp,
 	d.mode = info->mode;
 	d.content_hint = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, content_hint) ? info->content_hint : 0;
 	d.input_scale = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, input_scale) ? info->input_scale : 0.0f;
+#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
+	d.aux_outputs = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, aux_outputs) ? info->aux_outputs : 0u;
+#endif
 	return leia_lift_neurd_stream_create(ldp->lift, &d, out_id);
 }
 
@@ -3239,6 +3265,16 @@ leia_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
 			}
 		}
 #endif
+#ifdef XRT_DP_LIFT_HAS_APP_RIG
+		// App rig (ADR-048 Addendum A): where the viewpoints came from
+		// + the runtime's reference distance. nominal_z_m is the LAST
+		// appended field.
+		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, nominal_z_m)) {
+			lp.has_app_rig = true;
+			lp.viewpoint_source = p->viewpoint_source;
+			lp.nominal_z_m = p->nominal_z_m;
+		}
+#endif
 	}
 
 	// Tracked eyes (metres, display space) — the same source the runtime's
@@ -3256,6 +3292,56 @@ leia_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
 	                               (viewpoint_floats > 0) ? viewpoints_xyz : NULL, viewpoint_floats, left, right,
 	                               eyes_valid, out_resource, out_w, out_h, out_format);
 }
+
+#if defined(XRT_DP_D3D11_HAS_LIFT_DEPTH) && defined(XRT_DP_LIFT_HAS_AUX_DEPTH)
+/*
+ * Slot 33 lift_get_depth (ADR-048 Addendum A): the depth of the conversion
+ * lift_convert just returned, bridged during that convert (same inference,
+ * NeurD >= 0.4.9). Non-blocking.
+ */
+static bool
+leia_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
+                             uint64_t id,
+                             void *d3d11_context,
+                             struct xrt_dp_lift_depth *out)
+{
+	(void)d3d11_context; // the depth was staged on the caller's device during
+	                     // lift_convert
+	if (out == NULL || !LEIA_LIFT_COVERS(out, struct xrt_dp_lift_depth, height)) {
+		return false;
+	}
+	struct leia_lift_neurd_depth d = {};
+	if (!leia_lift_neurd_get_depth(leia_dp_d3d11(xdp)->lift, id, &d)) {
+		return false;
+	}
+	struct xrt_dp_lift_depth full = {};
+	full.struct_size = out->struct_size;
+	full.format = d.format;
+	full.resource = d.resource;
+	full.width = d.width;
+	full.height = d.height;
+	full.units = d.units;
+	full.encoding = d.encoding;
+	full.value_scale = d.value_scale;
+	full.value_offset = d.value_offset;
+	full.source_width = d.source_width;
+	full.source_height = d.source_height;
+	full.focal_x_px = d.focal_x_px;
+	full.focal_y_px = d.focal_y_px;
+	full.principal_x_px = d.principal_x_px;
+	full.principal_y_px = d.principal_y_px;
+	full.near_depth = d.near_depth;
+	full.far_depth = d.far_depth;
+	full.convergence_depth = d.convergence_depth;
+	full.same_inference = d.same_inference;
+	full.vendor_frame_id = d.vendor_frame_id;
+	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
+	return true;
+}
+#define LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp) ((ldp)->base.lift_get_depth = leia_dp_d3d11_lift_get_depth)
+#else
+#define LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp) ((void)0)
+#endif
 #endif // DXR_LEIA_DP_D3D11_LIFT
 
 static void
@@ -3411,6 +3497,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
 	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
 	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
+	LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp);   // slot 33, when the runtime headers carry it
 	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
 	U_LOG_W("Leia D3D11 DP: lift slots WIRED (NeurD, loaded on first use)");
 #else
@@ -3722,6 +3809,7 @@ leia_dp_factory_d3d11_lift(void *d3d11_device,
 	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
 	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
 	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
+	LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp); // slot 33, when the runtime headers carry it
 	// lift_convert_blob (GAUSSIANS) stays NULL: NeurD has no splat path.
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
 	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing

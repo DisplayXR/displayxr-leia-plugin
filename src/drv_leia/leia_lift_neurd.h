@@ -57,7 +57,18 @@ struct leia_lift_neurd_caps
 	uint32_t state;           //!< LEIA_LIFT_STATE_*.
 	uint64_t typical_latency_ns;
 	char backend[32]; //!< e.g. "neurd-directml"; "" when unavailable.
+	//! LEIA_LIFT_AUX_DEPTH when SBS / NVIEW streams can return the depth of
+	//! the same inference (NeurD >= 0.4.9 convert_stream_dx_ex want_depth,
+	//! DirectML).
+	uint32_t aux_outputs;
+	//! LEIA_LIFT_DEPTH_UNITS_* (leia_lift_depth.h) of that depth: METRIC
+	//! with the metric video model, RELATIVE otherwise.
+	uint32_t aux_depth_semantics;
 };
+
+//! Auxiliary output bit (identical value to the runtime's
+//! XRT_DP_LIFT_AUX_DEPTH).
+#define LEIA_LIFT_AUX_DEPTH 1u
 
 struct leia_lift_neurd_stream_desc
 {
@@ -65,6 +76,8 @@ struct leia_lift_neurd_stream_desc
 	uint32_t content_hint; //!< 0 video, 1 photo (advisory; the DX path is video-model only).
 	float input_scale;     //!< (0,1] fraction of input height to infer at (1 = native);
 	                       //!< outside that, or DXR_LEIA_LIFT_SCALE set = the knob.
+	uint32_t aux_outputs;  //!< LEIA_LIFT_AUX_* the runtime asked for (SBS /
+	                       //!< NVIEW only).
 };
 
 struct leia_lift_neurd_params
@@ -90,6 +103,38 @@ struct leia_lift_neurd_params
 	float max_offset_m;       //!< The runtime's x/y midpoint clamp, metres; 0 = unclamped.
 	uint32_t viewpoint_frame; //!< 0 = panel centre, 1 = rect centre (logged only).
 	float ref_z_m;            //!< Reference viewing distance (panel nominal), metres; <= 0 = 0.5.
+
+	/*
+	 * App rig (runtime ADR-048 Addendum A). has_app_rig = the runtime
+	 * filled these. viewpoint_source DISPLAY_RIG / CAMERA_RIG = the app's
+	 * rig eyes: reproduced exactly on the off-axis path (no ViewGain /
+	 * YGain).
+	 */
+	bool has_app_rig;
+	uint32_t viewpoint_source; //!< LEIA_LIFT_VIEWPOINTS_* (leia_lift_depth.h).
+	float nominal_z_m;         //!< The runtime's reference viewing distance,
+	                           //!< metres; 0 = unknown (use ref_z_m).
+};
+
+/*!
+ * The auxiliary depth of the last conversion on a stream (mirrors the
+ * runtime's xrt_dp_lift_depth). resource is owned by the stream and valid
+ * until the next convert on it.
+ */
+struct leia_lift_neurd_depth
+{
+	void *resource;  //!< ID3D11Texture2D* (R32_FLOAT) on the caller's device.
+	uint32_t format; //!< DXGI_FORMAT (R32_FLOAT).
+	uint32_t width, height;
+	uint32_t units,
+	    encoding; //!< LEIA_LIFT_DEPTH_UNITS_* / _ENCODING_* (leia_lift_depth.h)
+	float value_scale, value_offset;
+	uint32_t source_width, source_height; //!< w x h of the convert call
+	float focal_x_px, focal_y_px, principal_x_px, principal_y_px;
+	float near_depth, far_depth;
+	float convergence_depth;
+	uint32_t same_inference;
+	uint64_t vendor_frame_id;
 };
 
 struct leia_lift_neurd;
@@ -97,9 +142,10 @@ struct leia_lift_neurd;
 /*!
  * Create a per-DP handle. Reads the knobs (env > HKLM > default) once for the
  * process-level ones (enable, backend, versions, video model). The per-convert
- * knobs (ViewGain, YGain, ZGain, ConvGain, DepthGain, Dilate, Scale) are
- * re-read and snapshotted per STREAM at stream create. Cheap: no DLL load, no
- * thread. Never fails (a disabled handle reports unavailable).
+ * knobs (ViewGain, YGain, ZGain, ConvGain, DepthGain, Dilate, Scale, OffAxis,
+ * ReliefDepthM, MetricReliefMaxM) are re-read and snapshotted per STREAM at
+ * stream create. Cheap: no DLL load, no thread. Never fails (a disabled handle
+ * reports unavailable).
  */
 struct leia_lift_neurd *
 leia_lift_neurd_create(void);
@@ -158,6 +204,15 @@ leia_lift_neurd_convert(struct leia_lift_neurd *lift,
                         uint32_t *out_w,
                         uint32_t *out_h,
                         uint32_t *out_format);
+
+/*!
+ * The depth NeurD retained for the conversion leia_lift_neurd_convert just
+ * returned on stream @p id (created with LEIA_LIFT_AUX_DEPTH). Non-blocking:
+ * the depth was bridged during that convert. False = none (not requested,
+ * NeurD < 0.4.9 / not DirectML, or the last convert returned no depth).
+ */
+bool
+leia_lift_neurd_get_depth(struct leia_lift_neurd *lift, uint64_t id, struct leia_lift_neurd_depth *out);
 
 /*!
  * LEGACY mapping (kept for callers of the old helper): x_n = clamp(gain *

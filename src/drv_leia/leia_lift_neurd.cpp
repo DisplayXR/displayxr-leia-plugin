@@ -63,6 +63,7 @@
 // NeurD signature drift is a compile error in this file.
 #include <NeurD.h>
 
+#include "leia_lift_depth.h"
 #include "leia_lift_viewpoint.h"
 #include "util/u_logging.h"
 
@@ -113,6 +114,14 @@ constexpr int32_t kDefaultDilate = 2;
 //! NEURD_VERSION: only 0.4.6 is hardware-tested, and older ones fail converts with the default
 //! backend instead of reporting unavailable, so callers would not fall back to their own path.
 constexpr uint64_t kDefaultMinNeurDVersion = NEURD_MAKE_VERSION(0, 4, 6);
+//! ReliefDepthM default: relief thickness of RELATIVE depth on the off-axis
+//! path, metres. Matches the panel-calibrated legacy look (DepthGain 2: ~1 % of
+//! the width of disparity at the ends of the range, i.e. ~±3.5 cm of depth in
+//! front of / behind a 32 cm rect seen from 0.6 m).
+constexpr float kDefaultReliefM = 0.08f;
+//! MetricReliefMaxM default: cap on the METRIC relief, metres (a metric scene
+//! scaled onto the rect is metres deep; the panel's comfortable depth is not).
+constexpr float kDefaultMetricReliefMaxM = 0.3f;
 //! NeurD's MAX_STREAMS.
 constexpr uint32_t kMaxStreams = 32;
 //! N views go side by side in ONE row (runtime contract), so the output is
@@ -238,8 +247,15 @@ struct knobs
 	int32_t dilate;           //!< DXR_LEIA_LIFT_DILATE / Dilate (default 2): NEURD_PROP_DILATE_RADIO, px
 	float y_gain;             //!< DXR_LEIA_LIFT_Y_GAIN / YGain (default 1.0): extra vertical look-around scale
 	float z_gain;             //!< DXR_LEIA_LIFT_Z_GAIN / ZGain (default 0.5): viewer distance -> NeurD z
+	bool offaxis;             //!< DXR_LEIA_LIFT_OFFAXIS / OffAxis (default on): metric
+	                          //!< off-axis camera when NeurD has it
+	float relief_m;           //!< DXR_LEIA_LIFT_RELIEF_DEPTH_M / ReliefDepthM
+	                          //!< (default 0.08): relative relief, metres
+	float metric_relief_max_m; //!< DXR_LEIA_LIFT_METRIC_RELIEF_MAX_M /
+	                           //!< MetricReliefMaxM (default 0.3), metres
 	knob_src src_backend, src_scale, src_view_gain, src_conv_gain, src_interactive_min, src_min_version,
-	    src_video_model, src_depth_gain, src_dilate, src_y_gain, src_z_gain;
+	    src_video_model, src_depth_gain, src_dilate, src_y_gain, src_z_gain, src_offaxis, src_relief,
+	    src_metric_relief;
 };
 
 bool
@@ -406,6 +422,9 @@ read_knobs()
 	k.dilate = kDefaultDilate;
 	k.y_gain = kDefaultYGain;
 	k.z_gain = kDefaultZGain;
+	k.offaxis = true;
+	k.relief_m = kDefaultReliefM;
+	k.metric_relief_max_m = kDefaultMetricReliefMaxM;
 
 	const char *e = std::getenv("DXR_LEIA_LIFT");
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
@@ -527,6 +546,39 @@ read_knobs()
 		} else {
 			U_LOG_W("Leia lift: dilate '%s' (%s) not a number in [0,16] — using %d", v, knob_src_str(src),
 			        (int)kDefaultDilate);
+		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_OFFAXIS", L"OffAxis", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (env_ieq(v, "1") || env_ieq(v, "on") || env_ieq(v, "true")) {
+			k.offaxis = true;
+			k.src_offaxis = src;
+		} else if (env_ieq(v, "0") || env_ieq(v, "off") || env_ieq(v, "false")) {
+			k.offaxis = false;
+			k.src_offaxis = src;
+		} else {
+			U_LOG_W("Leia lift: off-axis '%s' (%s) not recognised (0|1) — using 1", v, knob_src_str(src));
+		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_RELIEF_DEPTH_M", L"ReliefDepthM", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, 0.001f, 5.0f, &k.relief_m)) {
+			k.src_relief = src;
+		} else {
+			U_LOG_W("Leia lift: relief depth '%s' (%s) not a number in [0.001,5] m — using %.2f", v,
+			        knob_src_str(src), (double)kDefaultReliefM);
+		}
+	}
+
+	src = knob_lookup(reg, "DXR_LEIA_LIFT_METRIC_RELIEF_MAX_M", L"MetricReliefMaxM", v, sizeof(v));
+	if (src != KSRC_DEFAULT) {
+		if (parse_float_in(v, 0.001f, 50.0f, &k.metric_relief_max_m)) {
+			k.src_metric_relief = src;
+		} else {
+			U_LOG_W("Leia lift: metric relief max '%s' (%s) not a number in [0.001,50] m — using %.2f", v,
+			        knob_src_str(src), (double)kDefaultMetricReliefMaxM);
 		}
 	}
 
@@ -671,6 +723,14 @@ struct global
 	//! INTRODUCED_IN: call the table slot directly (the inline wrapper would
 	//! re-check 0.4.5 and return OUTDATED_RUNTIME). Set at activation.
 	bool interactive_direct_slot = false;
+
+	//! NeurD >= 0.4.9 entry points (media_sdk #561), resolved at
+	//! activation. Written once before the store that publishes G_READY
+	//! (caps reads them lock-free after it).
+	bool stream_props = false; //!< NeurD_set/get_stream_prop_1f/1i:
+	                           //!< per-stream convert props
+	bool float_depth = false;  //!< NeurD_convert_stream_dx_ex want_depth (DirectML only)
+	bool offaxis = false;      //!< NeurD_convert_stream_dx_ex OFFAXIS camera
 
 	//! Last-applied global NeurD properties (avoid a worker round-trip per prop per frame).
 	bool props_valid = false;
@@ -1213,10 +1273,29 @@ activation_worker()
 		g.interactive_direct_slot = !g.interactive_unavailable.load() &&
 		                            nd->version < NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
 		g.props_valid = false;
+#ifdef DXR_LEIA_NEURD_HAS_STREAM_PROPS
+		g.stream_props = LEIA_NEURD_HAS(nd, set_stream_prop_1f) && LEIA_NEURD_HAS(nd, set_stream_prop_1i) &&
+		                 LEIA_NEURD_HAS(nd, get_stream_prop_1f);
+#endif
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+		// One call returns the views and (want_depth) the float depth of
+		// the same inference; NeurD implements the depth on DirectML only
+		// (TensorRT / OpenVINO return UNAVAILABLE_OUTDATED_RUNTIME, views
+		// still delivered).
+		g.offaxis = LEIA_NEURD_HAS(nd, convert_stream_dx_ex);
+		g.float_depth = g.offaxis && be == NEURD_BACKEND_DIRECTML;
+#endif
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
 		if (next == G_READY) {
-			U_LOG_W("Leia lift: NeurD READY — backend %s, interactive viewpoints %s", g.backend_name,
-			        g.interactive_unavailable ? "UNAVAILABLE (NeurD < 0.4.5)" : "available");
+			U_LOG_W(
+			    "Leia lift: NeurD READY — backend %s, interactive viewpoints %s, per-stream props %s, "
+			    "float depth %s, off-axis camera %s",
+			    g.backend_name, g.interactive_unavailable ? "UNAVAILABLE (NeurD < 0.4.5)" : "available",
+			    g.stream_props ? "yes" : "no (NeurD < 0.4.9: global props)",
+			    g.float_depth ? (k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "METRIC" : "relative")
+			                  : "no (NeurD < 0.4.9 or not DirectML)",
+			    g.offaxis ? (k0.offaxis ? "available" : "available, OFF (OffAxis=0)")
+			              : "no (NeurD < 0.4.9)");
 		}
 	}
 	g.state.store(next);
@@ -1388,6 +1467,39 @@ struct lift_stream
 	ID3D11UnorderedAccessView *out_uav;
 	ID3D11Resource *out_src_key; //!< NeurD output resource the raw UAV below was made for.
 	ID3D11UnorderedAccessView *out_src_uav;
+
+	// ---- NeurD >= 0.4.9 (media_sdk #559 / #560).
+	bool aux_depth; //!< The runtime asked for the depth of each conversion
+	                //!< (LEIA_LIFT_AUX_DEPTH).
+	bool retain;    //!< Convert with NeurD_convert_stream_dx_ex want_depth (aux
+	                //!< depth, or the metric off-axis scale).
+	//! Per-stream NeurD props (NeurD_set_stream_prop_*): last values
+	//! applied to ns; sp_valid false = re-apply all. Used instead of the
+	//! global props when g.stream_props, so streams stay independent.
+	bool sp_valid;
+	int32_t sp_inpaint, sp_autoconv, sp_dilate;
+	float sp_gain, sp_conv;
+	bool sp_conv_set; //!< CONVERGENCE overridden on ns (so its
+	                  //!< auto-convergence result stays its own).
+	bool sp_off;      //!< A per-stream setter failed: this stream uses the
+	                  //!< global props from then on.
+	//! h at zero disparity of the module's own auto-convergence after the
+	//! last convert (leia_lift_nd_legacy_zero_h of NeurD's effective
+	//! convergence); <= 0 = unknown.
+	float auto_zero_h;
+	//! Metric model scale from the last depth info (raw = S / depth_m); 0 =
+	//! unknown / relative.
+	float metric_scale;
+	//! Last logged camera path (0 legacy, 1 off-axis) | policy bits; ~0 =
+	//! none yet.
+	uint32_t cam_logged;
+
+	// Depth bridge (R32_FLOAT, NeurD's device -> caller's).
+	uint32_t depth_w, depth_h;
+	ID3D11Texture2D *depth_nd;
+	ID3D11Texture2D *depth_ours;
+	bool depth_valid; //!< depth_out describes the LAST convert's depth.
+	struct leia_lift_neurd_depth depth_out;
 };
 
 void
@@ -1399,6 +1511,15 @@ release_in_bridge(lift_stream *s)
 	safe_release(s->in_ours);
 	safe_release(s->in_nd);
 	s->in_w = s->in_h = 0;
+}
+
+void
+release_depth_bridge(lift_stream *s)
+{
+	safe_release(s->depth_ours);
+	safe_release(s->depth_nd);
+	s->depth_w = s->depth_h = 0;
+	s->depth_valid = false;
 }
 
 void
@@ -1419,6 +1540,7 @@ release_stream_locked(lift_stream *s)
 {
 	release_in_bridge(s);
 	release_out_bridge(s);
+	release_depth_bridge(s);
 	safe_release(s->our_done);
 	safe_release(s->dev);
 	if (s->ns != nullptr && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, destroy_stream)) {
@@ -1693,6 +1815,173 @@ prop_f(enum NeurD_prop p, float v, float &cache)
 	return true;
 }
 
+#ifdef DXR_LEIA_NEURD_HAS_STREAM_PROPS
+//! Per-stream counterparts of prop_i / prop_f (NeurD >= 0.4.9). Called with
+//! g.mtx held.
+bool
+sprop_i(lift_stream *s, enum NeurD_prop p, int32_t v, int32_t &cache)
+{
+	if (s->sp_valid && cache == v) {
+		return true;
+	}
+	enum NeurD_status st = NeurD_set_stream_prop_1i(g.nd, s->ns, p, v);
+	if (st != NEURD_SUCCESS) {
+		U_LOG_W("Leia lift: stream %llu NeurD_set_stream_prop_1i(%d, %d) -> %s", (unsigned long long)s->id,
+		        (int)p, (int)v, status_str(st));
+		cache = -1;
+		return false;
+	}
+	cache = v;
+	return true;
+}
+
+bool
+sprop_f(lift_stream *s, enum NeurD_prop p, float v, float &cache)
+{
+	if (s->sp_valid && cache == v) {
+		return true;
+	}
+	enum NeurD_status st = NeurD_set_stream_prop_1f(g.nd, s->ns, p, v);
+	if (st != NEURD_SUCCESS) {
+		U_LOG_W("Leia lift: stream %llu NeurD_set_stream_prop_1f(%d, %f) -> %s", (unsigned long long)s->id,
+		        (int)p, (double)v, status_str(st));
+		cache = -1.0f;
+		return false;
+	}
+	cache = v;
+	return true;
+}
+#endif // DXR_LEIA_NEURD_HAS_STREAM_PROPS
+
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+//! R32F bridge texture for the stream's depth (NeurD device -> caller's).
+//! Called with g.mtx held.
+bool
+ensure_depth_bridge(lift_stream *s, uint32_t w, uint32_t h)
+{
+	if (s->depth_nd != nullptr && s->depth_w == w && s->depth_h == h) {
+		return true;
+	}
+	release_depth_bridge(s);
+	if (w == 0 || h == 0 || w > kMaxTexDim || h > kMaxTexDim ||
+	    !make_shared_tex(s->dev, w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, &s->depth_nd,
+	                     &s->depth_ours)) {
+		LIFT_WARN_ONCE("Leia lift: depth bridge texture %ux%u (R32_FLOAT) create/open failed — no aux depth", w,
+		               h);
+		release_depth_bridge(s);
+		return false;
+	}
+	s->depth_w = w;
+	s->depth_h = h;
+	return true;
+}
+
+/*!
+ * After a successful want_depth convert: read NeurD's depth info (scale + its
+ * auto-convergence) and, when the runtime asked for aux depth, stage the R32F
+ * map @p tex_v (returned by the SAME NeurD_convert_stream_dx_ex call as the
+ * views) into the depth bridge on NeurD's context (drained with the output by
+ * the caller). @p zero_h_offaxis = h at zero disparity of an off-axis convert
+ * (its screen fixed it), or < 0 for the legacy renderer (derived from the
+ * convergence NeurD reports it used). Called with g.mtx held.
+ */
+void
+capture_depth_locked(lift_stream *s, uint32_t w, uint32_t h, float zero_h_offaxis, void *tex_v,
+                     const struct NeurD_depth_info &info)
+{
+	s->metric_scale = (info.units == NEURD_DEPTH_UNITS_METRIC_METERS) ? info.inverse_depth_scale : 0.0f;
+	s->auto_zero_h = leia_lift_nd_legacy_zero_h(info.convergence);
+	if (!s->aux_depth) {
+		return; // retained only for the metric off-axis scale
+	}
+
+	struct leia_lift_nd_depth_info in = {};
+	in.units = (info.units == NEURD_DEPTH_UNITS_METRIC_METERS) ? LEIA_LIFT_DEPTH_UNITS_METRIC
+	                                                           : LEIA_LIFT_DEPTH_UNITS_RELATIVE;
+	in.width = info.width;
+	in.height = info.height;
+	in.source_width = info.source_width;
+	in.source_height = info.source_height;
+	in.focal_px_x = info.focal_px_x;
+	in.focal_px_y = info.focal_px_y;
+	in.principal_px_x = info.principal_px_x;
+	in.principal_px_y = info.principal_px_y;
+	in.near_m = info.near_m;
+	in.far_m = info.far_m;
+	in.inverse_depth_scale = info.inverse_depth_scale;
+	const float zero_h = zero_h_offaxis >= 0.0f ? zero_h_offaxis : leia_lift_nd_legacy_zero_h(info.convergence);
+	struct leia_lift_depth_meta m = {};
+	leia_lift_depth_meta_from_info(&in, zero_h, &m);
+
+	auto *src = static_cast<ID3D11Texture2D *>(tex_v);
+	D3D11_TEXTURE2D_DESC td = {};
+	src->GetDesc(&td);
+	if (td.Format != DXGI_FORMAT_R32_FLOAT) {
+		LIFT_WARN_ONCE("Leia lift: NeurD depth texture is DXGI format %u, expected R32_FLOAT — no aux depth",
+		               (unsigned)td.Format);
+		return;
+	}
+	const uint32_t dw = (info.width > 0 && (uint32_t)info.width <= td.Width) ? (uint32_t)info.width : td.Width;
+	const uint32_t dh = (info.height > 0 && (uint32_t)info.height <= td.Height) ? (uint32_t)info.height : td.Height;
+	if (!ensure_depth_bridge(s, dw, dh)) {
+		return;
+	}
+	D3D11_BOX box = {0, 0, 0, dw, dh, 1};
+	g.nd_ctx->CopySubresourceRegion(s->depth_nd, 0, 0, 0, 0, src, 0, &box);
+
+	struct leia_lift_neurd_depth &o = s->depth_out;
+	o = {};
+	o.resource = static_cast<ID3D11Resource *>(s->depth_ours);
+	o.format = (uint32_t)DXGI_FORMAT_R32_FLOAT;
+	o.width = dw;
+	o.height = dh;
+	o.units = m.units;
+	o.encoding = m.encoding;
+	o.value_scale = m.value_scale;
+	o.value_offset = m.value_offset;
+	o.source_width = w;
+	o.source_height = h;
+	o.focal_x_px = m.focal_x_px;
+	o.focal_y_px = m.focal_y_px;
+	o.principal_x_px = m.principal_x_px;
+	o.principal_y_px = m.principal_y_px;
+	o.near_depth = m.near_depth;
+	o.far_depth = m.far_depth;
+	o.convergence_depth = m.convergence_depth;
+	o.same_inference = 1; // _ex: the depth the views of THIS convert were synthesised from
+	o.vendor_frame_id = info.frame_id;
+	s->depth_valid = true; // published once the caller's drain succeeds (cleared
+	                       // again on failure)
+}
+#endif // DXR_LEIA_NEURD_HAS_CONVERT_EX
+
+//! One WARN per camera-path change of a stream (lifecycle, never per frame).
+void
+log_camera(const lift_stream *s,
+           const struct leia_lift_neurd_params &dp,
+           bool use_oa,
+           bool runtime_vp,
+           const struct leia_lift_oa_screen &sc)
+{
+	if (use_oa) {
+		const bool rig = dp.has_app_rig && (dp.viewpoint_source == LEIA_LIFT_VIEWPOINTS_DISPLAY_RIG ||
+		                                    dp.viewpoint_source == LEIA_LIFT_VIEWPOINTS_CAMERA_RIG);
+		U_LOG_W(
+		    "Leia lift: stream %llu camera = OFF-AXIS (screen %.0fx%.0f mm, relief %.0f mm %s, screen %.0f mm "
+		    "behind the nearest relief plane, nominal eye %.0f mm; viewpoints %s%s)",
+		    (unsigned long long)s->id, (double)(sc.screen_width_m * 1000.0f),
+		    (double)(sc.screen_height_m * 1000.0f), (double)(sc.depth_scale_m * 1000.0f),
+		    s->metric_scale > 0.0f ? "metric (MetricReliefMaxM cap)" : "relative (ReliefDepthM)",
+		    (double)(sc.convergence_depth_m * 1000.0f), (double)(sc.nominal_eye_z_m * 1000.0f),
+		    rig ? "= the app's rig, as given" : "tracked/explicit x ViewGain/YGain",
+		    runtime_vp ? "" : " — none passed: default pair at the nominal distance");
+		return;
+	}
+	U_LOG_W("Leia lift: stream %llu camera = LEGACY dimensionless (%s)", (unsigned long long)s->id,
+	        !s->k.offaxis ? "OffAxis=0"
+	        : !g.offaxis  ? "NeurD has no off-axis convert (< 0.4.9)"
+	                      : "the runtime passed no rect-relative viewpoint policy / rect size");
+}
 
 int32_t
 autoscale_for(const lift_stream *s, const struct knobs &k, uint32_t in_h)
@@ -1814,6 +2103,15 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 		// store that publishes G_READY, and never again — caps must not wait
 		// behind a convert holding g.mtx.
 		snprintf(out->backend, sizeof(out->backend), "%s", g.backend_name);
+		if (g.float_depth) {
+			// The depth of the same inference, per SBS stream (NeurD >=
+			// 0.4.9, #559). Metric = metres from the metric video model;
+			// else relative inverse depth.
+			out->aux_outputs = LEIA_LIFT_AUX_DEPTH;
+			out->aux_depth_semantics = (g.k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY)
+			                               ? LEIA_LIFT_DEPTH_UNITS_METRIC
+			                               : LEIA_LIFT_DEPTH_UNITS_RELATIVE;
+		}
 		if (lat == 0) {
 			lat = (g.backend == NEURD_BACKEND_DIRECTML) ? kPriorLatencyDirectMlNs
 			      : (g.backend == NEURD_BACKEND_CUDA)   ? kPriorLatencyCudaNs
@@ -1871,6 +2169,8 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	s->input_scale = desc->input_scale;
 	s->k = sk;
 	s->vp_logged = ~0u;
+	s->cam_logged = ~0u;
+	s->aux_depth = (desc->aux_outputs & LEIA_LIFT_AUX_DEPTH) != 0 && desc->mode != LEIA_LIFT_MODE_DEPTH;
 	l->streams.push_back(s);
 	g.streams_live.fetch_add(1);
 	if (!l->acquired) {
@@ -1878,12 +2178,16 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 		g.refcount++;
 	}
 	*out_id = s->id;
-	U_LOG_W("Leia lift: stream %llu created (mode %u, %s) knobs view_gain=%.2f(%s) y_gain=%.2f(%s) z_gain=%.2f(%s) "
-	        "conv_gain=%.2f(%s) depth_gain=%.2f(%s) dilate=%d(%s)",
-	        (unsigned long long)s->id, s->mode, s->content_hint == 1 ? "photo" : "video", (double)sk.view_gain,
-	        knob_src_str(sk.src_view_gain), (double)sk.y_gain, knob_src_str(sk.src_y_gain), (double)sk.z_gain,
-	        knob_src_str(sk.src_z_gain), (double)sk.conv_gain, knob_src_str(sk.src_conv_gain),
-	        (double)sk.depth_gain, knob_src_str(sk.src_depth_gain), (int)sk.dilate, knob_src_str(sk.src_dilate));
+	U_LOG_W(
+	    "Leia lift: stream %llu created (mode %u, %s%s) knobs view_gain=%.2f(%s) y_gain=%.2f(%s) z_gain=%.2f(%s) "
+	    "conv_gain=%.2f(%s) depth_gain=%.2f(%s) dilate=%d(%s) offaxis=%d(%s) relief_m=%.3f(%s) "
+	    "metric_relief_max_m=%.3f(%s)",
+	    (unsigned long long)s->id, s->mode, s->content_hint == 1 ? "photo" : "video",
+	    s->aux_depth ? ", +aux depth" : "", (double)sk.view_gain, knob_src_str(sk.src_view_gain), (double)sk.y_gain,
+	    knob_src_str(sk.src_y_gain), (double)sk.z_gain, knob_src_str(sk.src_z_gain), (double)sk.conv_gain,
+	    knob_src_str(sk.src_conv_gain), (double)sk.depth_gain, knob_src_str(sk.src_depth_gain), (int)sk.dilate,
+	    knob_src_str(sk.src_dilate), sk.offaxis ? 1 : 0, knob_src_str(sk.src_offaxis), (double)sk.relief_m,
+	    knob_src_str(sk.src_relief), (double)sk.metric_relief_max_m, knob_src_str(sk.src_metric_relief));
 	return true;
 }
 
@@ -1953,6 +2257,8 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			LIFT_WARN_ONCE("Leia lift: convert on unknown stream id %llu", (unsigned long long)id);
 			return false;
 		}
+		s->depth_valid = false; // describes THIS convert's depth only,
+		                        // once it succeeds
 
 		// ---- Validate the input.
 		auto *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
@@ -1989,6 +2295,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		if (s->dev != dev) {
 			release_in_bridge(s);
 			release_out_bridge(s);
+			release_depth_bridge(s);
 			safe_release(s->our_done);
 			safe_release(s->dev);
 			s->dev = dev; // keeps GetDevice's reference
@@ -2021,6 +2328,33 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 				LIFT_WARN_ONCE("Leia lift: NeurD_create_stream -> %s", status_str(cs));
 				return false;
 			}
+			// NeurD clears per-stream overrides on create_stream:
+			// start from scratch.
+			s->sp_valid = false;
+			s->sp_conv_set = false;
+			s->sp_off = false;
+			s->retain = false;
+			s->auto_zero_h = 0.0f;
+			s->metric_scale = 0.0f;
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+			// Ask for the float depth of each convert (want_depth) when
+			// the runtime asked for it, or when the metric off-axis
+			// camera needs the model's scale (it comes with the depth
+			// info). The depth comes back from the same _ex call as the
+			// views, so it needs a view-synthesis mode.
+			const bool metric_oa = g.k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY && g.offaxis &&
+			                       s->k.offaxis && s->mode != LEIA_LIFT_MODE_DEPTH;
+			if (g.float_depth && s->mode != LEIA_LIFT_MODE_DEPTH && (s->aux_depth || metric_oa)) {
+				s->retain = true;
+				U_LOG_W("Leia lift: stream %llu float depth per convert (NeurD_convert_stream_dx_ex, %s)",
+				        (unsigned long long)s->id,
+				        s->aux_depth ? "aux depth requested" : "metric off-axis scale");
+			} else if (s->aux_depth) {
+				LIFT_WARN_ONCE(
+				    "Leia lift: aux depth requested but NeurD has no float depth (needs >= 0.4.9 "
+				    "convert_stream_dx_ex, DirectML, SBS/N-view) — none will be returned");
+			}
+#endif
 		}
 
 		if (!ensure_in_bridge(s, w, h, family)) {
@@ -2079,25 +2413,62 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		// cheaper edge stretch.
 		const int32_t inpaint = (dp.inpaint != 0) ? NEURD_INPAINT_TYPE_V1_BLUR : NEURD_INPAINT_TYPE_V1_STRETCH;
 
+		// Runtime: convergence = RELATIVE depth placed at the display
+		// plane, [0,1] over the frame's depth range (0 = nearest on the
+		// glass, 1 = farthest). NeurD: a disparity offset in [-0.2,
+		// 0.2]. Linear map about the mid-range, K =
+		// DXR_LEIA_LIFT_CONV_GAIN (default 0.4 spans NeurD's full
+		// range; negate K if the sign proves reversed on a panel).
+		// UNCALIBRATED — see docs/lift-neurd.md.
+		const float nd_conv = clampf(s->k.conv_gain * (clampf(dp.convergence, 0.0f, 1.0f) - 0.5f), -0.2f, 0.2f);
+
+		// Output layout + inference size: process-global in NeurD (no
+		// per-stream form).
 		bool props_ok = prop_i(NEURD_PROP_OUTPUT_TYPE, out_type, g.p_out_type) &&
 		                prop_i(NEURD_PROP_OUTPUT_TILES_W, (int32_t)cols, g.p_tiles_w) &&
 		                prop_i(NEURD_PROP_OUTPUT_TILES_H, (int32_t)rows, g.p_tiles_h) &&
-		                prop_i(NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
-		                prop_i(NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, s->k, h),
-		                       g.p_autoscale) &&
-		                prop_i(NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
-		                prop_f(NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain) &&
-		                prop_i(NEURD_PROP_DILATE_RADIO, s->k.dilate, g.p_dilate);
-		if (props_ok && !auto_conv) {
-			// Runtime: convergence = RELATIVE depth placed at the display plane,
-			// [0,1] over the frame's depth range (0 = nearest on the glass, 1 =
-			// farthest). NeurD: a disparity offset in [-0.2, 0.2]. Linear map
-			// about the mid-range, K = DXR_LEIA_LIFT_CONV_GAIN (default 0.4 spans
-			// NeurD's full range; negate K if the sign proves reversed on a
-			// panel). UNCALIBRATED — see docs/lift-neurd.md.
-			const float c = clampf(dp.convergence, 0.0f, 1.0f);
-			const float nd_conv = clampf(s->k.conv_gain * (c - 0.5f), -0.2f, 0.2f);
-			props_ok = prop_f(NEURD_PROP_CONVERGENCE, nd_conv, g.p_conv);
+		                prop_i(NEURD_PROP_INPUT_AUTOSCALING, autoscale_for(s, s->k, h), g.p_autoscale);
+		bool per_stream = false;
+#ifdef DXR_LEIA_NEURD_HAS_STREAM_PROPS
+		// NeurD >= 0.4.9: the per-convert look (fill, auto-convergence,
+		// gain, dilation, convergence) is set PER STREAM, so two
+		// streams never see each other's values — including each
+		// stream's own auto-convergence result, which NeurD keeps per
+		// stream only once CONVERGENCE is overridden on it (hence the
+		// initial 0).
+		if (props_ok && g.stream_props && !s->sp_off) {
+			per_stream = true;
+			bool sp_ok = sprop_i(s, NEURD_PROP_INPAINT_TYPE, inpaint, s->sp_inpaint) &&
+			             sprop_i(s, NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, s->sp_autoconv) &&
+			             sprop_f(s, NEURD_PROP_GAIN_MULTIPLIER, gain, s->sp_gain) &&
+			             sprop_i(s, NEURD_PROP_DILATE_RADIO, s->k.dilate, s->sp_dilate);
+			if (sp_ok && !auto_conv) {
+				sp_ok = sprop_f(s, NEURD_PROP_CONVERGENCE, nd_conv, s->sp_conv);
+				s->sp_conv_set = sp_ok;
+			} else if (sp_ok && !s->sp_conv_set) {
+				sp_ok = sprop_f(s, NEURD_PROP_CONVERGENCE, 0.0f, s->sp_conv);
+				s->sp_conv_set = sp_ok;
+			}
+			s->sp_valid = sp_ok;
+			if (!sp_ok) {
+				// One WARN above per failed setter; never retry per frame.
+				U_LOG_W(
+				    "Leia lift: stream %llu per-stream props refused — falling back to the global "
+				    "props",
+				    (unsigned long long)s->id);
+				s->sp_off = true;
+				per_stream = false;
+			}
+		}
+#endif
+		if (props_ok && !per_stream) {
+			props_ok = prop_i(NEURD_PROP_INPAINT_TYPE, inpaint, g.p_inpaint) &&
+			           prop_i(NEURD_PROP_AUTO_CONVERGENCE, auto_conv ? 1 : 0, g.p_autoconv) &&
+			           prop_f(NEURD_PROP_GAIN_MULTIPLIER, gain, g.p_gain) &&
+			           prop_i(NEURD_PROP_DILATE_RADIO, s->k.dilate, g.p_dilate);
+			if (props_ok && !auto_conv) {
+				props_ok = prop_f(NEURD_PROP_CONVERGENCE, nd_conv, g.p_conv);
+			}
 		}
 		g.props_valid = props_ok;
 		if (!props_ok) {
@@ -2106,13 +2477,14 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 
 		// ---- 4. Viewpoints (SBS / NVIEW): explicit, else tracked eyes, else default.
 		std::vector<float> vp;
+		std::vector<float> src_m; // metres, (x,y,z) per view
+		// The runtime's viewpoint policy covers only viewpoints the
+		// RUNTIME passed (rect-relative, already processed). Eyes the
+		// DP read from its own tracker are panel-centred and raw:
+		// legacy mapping.
+		const bool runtime_vp = viewpoints_m != nullptr && viewpoint_floats >= 3;
 		if (s->mode != LEIA_LIFT_MODE_DEPTH) {
 			const uint32_t slots = cols * rows; // NeurD wants one triplet per grid tile
-			std::vector<float> src_m; // metres, (x,y,z) per view
-			// The runtime's viewpoint policy covers only viewpoints the RUNTIME
-			// passed (rect-relative, already processed). Eyes the DP read from its
-			// own tracker are panel-centred and raw: legacy mapping.
-			const bool runtime_vp = viewpoints_m != nullptr && viewpoint_floats >= 3;
 			struct leia_lift_vp_policy pol = {};
 			pol.active = dp.has_policy && runtime_vp;
 			pol.baseline_m = dp.baseline_m;
@@ -2211,6 +2583,76 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			}
 		}
 
+		// ---- 4b. Metric off-axis camera (NeurD >= 0.4.9, media_sdk
+		// #561 OFFAXIS): eyes in metres through a screen of known size, instead
+		// of the dimensionless pattern. Needs the runtime's viewpoint
+		// policy (rect-relative eyes + the rect's size); OffAxis=0
+		// forces the legacy path for A/B.
+		bool use_oa = false;
+		float oa_zero_h = -1.0f;
+		struct leia_lift_oa_screen oa_log = {}; // for the camera log line
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+		struct NeurD_screen_desc oa_screen = {};
+		std::vector<struct NeurD_view_frustum> oa_views;
+		if (g.offaxis && s->k.offaxis && s->mode != LEIA_LIFT_MODE_DEPTH && dp.has_policy &&
+		    dp.viewpoint_frame == 1u && dp.rect_width_m > 0.0f && dp.rect_height_m > 0.0f) {
+			struct leia_lift_oa_in oi = {};
+			oi.rect_width_m = dp.rect_width_m;
+			oi.rect_height_m = dp.rect_height_m;
+			// The runtime's reference distance (rig nominal viewer / axis
+			// pinning) when it reports one, else the panel's own nominal
+			// distance.
+			oi.nominal_z_m = (dp.has_app_rig && dp.nominal_z_m > 0.0f) ? dp.nominal_z_m : dp.ref_z_m;
+			oi.viewpoint_source = dp.has_app_rig ? dp.viewpoint_source : LEIA_LIFT_VIEWPOINTS_TRACKED;
+			oi.view_gain = s->k.view_gain;
+			oi.y_gain = s->k.y_gain;
+			oi.baseline_m = dp.baseline_m;
+			oi.strength = dp.strength;
+			oi.convergence = dp.convergence; // < 0 = auto
+			oi.auto_zero_h = s->auto_zero_h;
+			oi.metric = s->metric_scale > 0.0f;
+			oi.inverse_depth_scale = s->metric_scale;
+			oi.relief_m = s->k.relief_m;
+			oi.metric_relief_max_m = s->k.metric_relief_max_m;
+			// Only RUNTIME viewpoints are rect-relative; with none, the
+			// default pair at the nominal distance (never the DP
+			// tracker's panel-centred eyes).
+			const uint32_t n_in = (runtime_vp && !src_m.empty()) ? (uint32_t)(src_m.size() / 3) : 0u;
+			std::vector<float> eyes((size_t)std::max(n_in, 2u) * 3);
+			struct leia_lift_oa_screen sc = {};
+			uint32_t n_out = 0;
+			if (leia_lift_oa_build(&oi, n_in > 0 ? src_m.data() : nullptr, n_in, &sc, eyes.data(), &n_out,
+			                       &oa_zero_h)) {
+				oa_log = sc;
+				oa_screen.struct_size = (uint32_t)sizeof(oa_screen);
+				oa_screen.screen_width_m = sc.screen_width_m;
+				oa_screen.screen_height_m = sc.screen_height_m;
+				oa_screen.depth_scale_m = sc.depth_scale_m;
+				oa_screen.convergence_depth_m = sc.convergence_depth_m;
+				oa_screen.nominal_eye_z_m = sc.nominal_eye_z_m;
+				oa_views.resize(n_out);
+				for (uint32_t i = 0; i < n_out; i++) {
+					oa_views[i].eye_x_m = eyes[i * 3 + 0];
+					oa_views[i].eye_y_m = eyes[i * 3 + 1];
+					oa_views[i].eye_z_m = eyes[i * 3 + 2];
+				}
+				use_oa = true;
+			}
+		}
+#endif
+		if (s->mode != LEIA_LIFT_MODE_DEPTH) {
+			// Which camera this stream is on, logged once per change (not
+			// per frame).
+			const uint32_t src_bits = dp.has_app_rig ? (dp.viewpoint_source & 7u) : 0u;
+			const uint32_t cam_key = (use_oa ? 1u : 0u) | (src_bits << 1) |
+			                         ((s->metric_scale > 0.0f ? 1u : 0u) << 4) |
+			                         (runtime_vp ? 1u << 5 : 0u);
+			if (s->cam_logged != cam_key) {
+				s->cam_logged = cam_key;
+				log_camera(s, dp, use_oa, runtime_vp, oa_log);
+			}
+		}
+
 		// ---- 5. Convert (blocking).
 		struct NeurD_image nin = {};
 		nin.data = s->in_buf;
@@ -2219,8 +2661,67 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		nin.stride = (int32_t)(w * 4);
 		nin.pix_fmt = NEURD_PIXEL_FORMAT_RGBA8;
 		struct NeurD_image nout = {};
-		enum NeurD_status st;
-		if (!vp.empty() && !g.interactive_unavailable) {
+		enum NeurD_status st = NEURD_GENERIC_ERROR;
+		bool converted = false;
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+		// One call for the views and (want_depth) the depth of the same
+		// inference: the off-axis camera, or the dimensionless pattern
+		// when only the depth is wanted (SBS untracked = NeurD's own
+		// default +/-0.5 pair).
+		void *ex_depth = nullptr;
+		struct NeurD_depth_info ex_info = {};
+		static const float kDefaultPair[6] = {-0.5f, 0.0f, 0.0f, 0.5f, 0.0f, 0.0f};
+		const bool ex_dimless = !use_oa && s->retain && (!vp.empty() || s->mode == LEIA_LIFT_MODE_SBS);
+		if (use_oa || ex_dimless) {
+			struct NeurD_convert_params cp = {};
+			cp.struct_size = (uint32_t)sizeof(cp);
+			cp.output_pix_fmt = NEURD_PIXEL_FORMAT_RGBA8;
+			cp.want_depth = s->retain ? NEURD_TRUE : NEURD_FALSE;
+			if (use_oa) {
+				cp.camera = NEURD_CAMERA_MODEL_OFFAXIS;
+				cp.screen = &oa_screen;
+				cp.views = oa_views.data();
+				cp.view_count = (int32_t)oa_views.size();
+			} else {
+				cp.camera = NEURD_CAMERA_MODEL_DIMENSIONLESS;
+				cp.viewpoint_pattern_xyz = vp.empty() ? kDefaultPair : vp.data();
+				cp.viewpoint_pattern_size = vp.empty() ? 6 : (int32_t)vp.size();
+			}
+			ex_info.struct_size = (uint32_t)sizeof(ex_info);
+			struct NeurD_convert_outputs co = {};
+			co.struct_size = (uint32_t)sizeof(co);
+			co.depth_info = &ex_info;
+			st = NeurD_convert_stream_dx_ex(nd, s->ns, &nin, &cp, &co);
+			if (st == NEURD_UNAVAILABLE_OUTDATED_RUNTIME && co.views.data != nullptr) {
+				// Depth unsupported on this backend; the views are fine.
+				LIFT_WARN_ONCE("Leia lift: NeurD returned no float depth (backend without a depth path)");
+				st = NEURD_SUCCESS;
+			}
+			if (st == NEURD_SUCCESS && co.views.data != nullptr) {
+				converted = true;
+				nout = co.views;
+				ex_depth = co.depth.data;
+			} else if (use_oa) {
+				LIFT_WARN_ONCE(
+				    "Leia lift: off-axis convert -> %s (screen %.3fx%.3f m, D %.3f, C %.3f, N %.3f, %u "
+				    "eye(s)) — falling back to the legacy camera for that frame",
+				    status_str(st), (double)oa_screen.screen_width_m, (double)oa_screen.screen_height_m,
+				    (double)oa_screen.depth_scale_m, (double)oa_screen.convergence_depth_m,
+				    (double)oa_screen.nominal_eye_z_m, (unsigned)oa_views.size());
+				use_oa = false;
+				oa_zero_h = -1.0f;
+				nout = {};
+			} else {
+				LIFT_WARN_ONCE("Leia lift: convert_stream_dx_ex (depth) -> %s — falling back to the plain "
+				               "convert, no depth for that frame",
+				               status_str(st));
+				nout = {};
+			}
+		}
+#endif
+		if (converted) {
+			// Off-axis convert done.
+		} else if (!vp.empty() && !g.interactive_unavailable) {
 			st = nd_convert_stream_dx_interactive(nd, s->ns, &nin, vp.data(), (int)vp.size(),
 			                                      NEURD_PIXEL_FORMAT_RGBA8, &nout);
 			if (st == NEURD_UNAVAILABLE_OUTDATED_RUNTIME) {
@@ -2243,11 +2744,40 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			return false;
 		}
 
+		// ---- 5a. Depth of the same inference (aux output / metric
+		// scale) and the module's own auto-convergence (the off-axis
+		// camera's AUTO anchor).
+		bool have_info = false;
+#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+		if (s->retain && ex_depth != nullptr) {
+			capture_depth_locked(s, w, h, use_oa ? oa_zero_h : -1.0f, ex_depth, ex_info);
+			have_info = true;
+		} else if (s->retain) {
+			LIFT_WARN_ONCE("Leia lift: want_depth convert returned no depth — no depth for that frame");
+		}
+#endif
+		if (use_oa && auto_conv && !have_info) {
+			float c = 0.0f;
+			enum NeurD_status cs = NEURD_UNAVAILABLE_OUTDATED_RUNTIME;
+#ifdef DXR_LEIA_NEURD_HAS_STREAM_PROPS
+			if (g.stream_props && !s->sp_off) {
+				cs = NeurD_get_stream_prop_1f(nd, s->ns, NEURD_PROP_CONVERGENCE, &c);
+			}
+#endif
+			if (cs != NEURD_SUCCESS && LEIA_NEURD_HAS(nd, get_prop_1f)) {
+				cs = NeurD_get_prop_1f(nd, NEURD_PROP_CONVERGENCE, &c);
+			}
+			if (cs == NEURD_SUCCESS) {
+				s->auto_zero_h = leia_lift_nd_legacy_zero_h(c);
+			}
+		}
+
 		// ---- 5b. Trust NeurD's actual layout, not the requested one: tiles in
 		// the one-row output = output aspect / input aspect (robust to NeurD's
 		// inference autoscaling). A mismatch would be mislabelled downstream.
 		if (nout.width <= 0 || nout.height <= 0) {
 			LIFT_WARN_ONCE("Leia lift: NeurD output has no size (%dx%d)", nout.width, nout.height);
+			s->depth_valid = false;
 			return false;
 		}
 		const double tiles_f =
@@ -2257,11 +2787,14 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			LIFT_WARN_ONCE("Leia lift: NeurD returned %dx%d (%u tile(s)) for a %ux%u input, expected %u — "
 			               "frame dropped",
 			               nout.width, nout.height, tiles, w, h, cols * rows);
+			s->depth_valid = false;
 			return false;
 		}
 
-		// ---- 6. Output -> bridge (NeurD device), drained; hand ours back.
+		// ---- 6. Output (+ depth) -> bridges (NeurD device), drained;
+		// hand ours back.
 		if (!stage_output(s, nout) || !drain(g.nd_ctx, g.nd_done, "NeurD (unpack)")) {
+			s->depth_valid = false;
 			return false;
 		}
 
@@ -2280,4 +2813,23 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 	const uint64_t prev = g.latency_ns.load();
 	g.latency_ns.store(prev == 0 ? ns : (prev * 7 + ns) / 8);
 	return true;
+}
+
+extern "C" bool
+leia_lift_neurd_get_depth(struct leia_lift_neurd *l, uint64_t id, struct leia_lift_neurd_depth *out)
+{
+	if (l == nullptr || out == nullptr) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(g.mtx);
+	for (lift_stream *s : l->streams) {
+		if (s->id == id) {
+			if (!s->depth_valid || s->depth_out.resource == nullptr) {
+				return false;
+			}
+			*out = s->depth_out;
+			return true;
+		}
+	}
+	return false;
 }
