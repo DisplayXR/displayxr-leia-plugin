@@ -847,12 +847,150 @@ leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
 	return ret;
 }
 
+#ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
+/* ------------------------------------------------------------------ *
+ * SR's monitor list (srEnumerateMonitors, Windows slot 108, LeiaSR
+ * 1.38.0+2192): every active OS monitor with the SR display it is. SR joins
+ * its displays to monitors by HMONITOR itself, so probe_displays binds a
+ * monitor SR lists without the EDID/origin heuristic. Same probe instance,
+ * lock and TTL as the display list; its own cache and its own "unsupported"
+ * latch (an older SR runtime answers SR_ERROR_FUNCTION_UNSUPPORTED here
+ * while srEnumerateDisplays still works, so the instance is kept).
+ * ------------------------------------------------------------------ */
+
+namespace {
+
+bool g_mon_unsupported = false; // installed SR runtime predates slot 108: final for this process
+struct leia_win_sr_monitor g_mon_cache[LEIA_WIN_SR_MAX_MONITORS];
+int32_t g_mon_cache_count = -1;
+uint64_t g_mon_cache_ns = 0;
+uint64_t g_mon_logged_fingerprint = 0;
+
+void
+from_monitor(const SrMonitorDescriptor &m, struct leia_win_sr_monitor &out)
+{
+	memset(&out, 0, sizeof(out));
+	out.sr_display_id = m.srDisplayId;
+	out.hmonitor = m.platformHandle;
+	snprintf(out.device_name, sizeof(out.device_name), "%.*s", (int)sizeof(m.connector), m.connector);
+	out.x = m.x;
+	out.y = m.y;
+	out.width = m.width;
+	out.height = m.height;
+	out.native_w = m.nativeWidth;
+	out.native_h = m.nativeHeight;
+	out.is_primary = m.isPrimary == SR_TRUE;
+	out.edid_manufacturer = m.edidVendor;
+	out.edid_product = m.edidProduct;
+	out.edid_serial = m.edidSerial;
+}
+
+bool
+refresh_monitors_locked(uint64_t now_ns)
+{
+	uint32_t count = 0;
+	SrResult r = srEnumerateMonitors(g_probe_instance, &count, nullptr);
+	if (SR_FAILED(r)) {
+		if (r == SR_ERROR_FUNCTION_UNSUPPORTED || r == SR_ERROR_FEATURE_NOT_SUPPORTED) {
+			U_LOG_W(
+			    "leia_plugin: srEnumerateMonitors not available on the installed SR runtime (%s) -- "
+			    "claims join monitors to SR displays by EDID ids + desktop origin",
+			    leia_sr_v2_result_str(r));
+			g_mon_unsupported = true;
+			g_mon_cache_count = -1;
+			return false;
+		}
+		U_LOG_W("leia_plugin: srEnumerateMonitors (count) failed: %s (%d) -- probe instance dropped",
+		        leia_sr_v2_result_str(r), (int)r);
+		probe_instance_drop_locked();
+		g_mon_cache_count = -1;
+		return false;
+	}
+
+	SrMonitorDescriptor descs[LEIA_WIN_SR_MAX_MONITORS];
+	if (count > LEIA_WIN_SR_MAX_MONITORS) {
+		count = LEIA_WIN_SR_MAX_MONITORS;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		descs[i] = SrMonitorDescriptor{};
+		descs[i].sType = SR_TYPE_MONITOR_DESCRIPTOR;
+	}
+	if (count > 0) {
+		r = srEnumerateMonitors(g_probe_instance, &count, descs);
+		if (SR_FAILED(r)) { // SR_INCOMPLETE is a success code: keep the first `count`
+			U_LOG_W("leia_plugin: srEnumerateMonitors failed: %s (%d) -- probe instance dropped",
+			        leia_sr_v2_result_str(r), (int)r);
+			probe_instance_drop_locked();
+			g_mon_cache_count = -1;
+			return false;
+		}
+	}
+
+	struct leia_win_sr_monitor fresh[LEIA_WIN_SR_MAX_MONITORS];
+	uint64_t fp = 1469598103934665603ull ^ count;
+	for (uint32_t i = 0; i < count; i++) {
+		from_monitor(descs[i], fresh[i]);
+		const uint64_t parts[] = {fresh[i].sr_display_id,         fresh[i].hmonitor,
+		                          (uint64_t)(uint32_t)fresh[i].x, (uint64_t)(uint32_t)fresh[i].y,
+		                          fresh[i].edid_manufacturer,     fresh[i].edid_product};
+		for (uint64_t p : parts) {
+			fp = (fp ^ p) * 1099511628211ull;
+		}
+	}
+	if (fp != g_mon_logged_fingerprint) {
+		g_mon_logged_fingerprint = fp;
+		U_LOG_W("leia_plugin: SR enumerates %u monitor(s):", count);
+		for (uint32_t i = 0; i < count; i++) {
+			const struct leia_win_sr_monitor &m = fresh[i];
+			U_LOG_W(
+			    "leia_plugin:   SR monitor #%u device='%s' hmonitor=0x%llx at (%d,%d) %dx%d%s "
+			    "edid=0x%04X/0x%04X sr_display=0x%016llx",
+			    i, m.device_name, (unsigned long long)m.hmonitor, m.x, m.y, m.width, m.height,
+			    m.is_primary ? " primary" : "", m.edid_manufacturer, m.edid_product,
+			    (unsigned long long)m.sr_display_id);
+		}
+	}
+	memcpy(g_mon_cache, fresh, count * sizeof(fresh[0]));
+	g_mon_cache_count = (int32_t)count;
+	g_mon_cache_ns = now_ns;
+	return true;
+}
+
+} // namespace
+
+extern "C" int32_t
+leia_win_sr_enumerate_monitors(struct leia_win_sr_monitor *out, uint32_t cap)
+{
+	int32_t ret = -1;
+	AcquireSRWLockExclusive(&g_enum_lock);
+	if (!g_enum_unsupported && !g_mon_unsupported) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const bool fresh = g_mon_cache_count >= 0 && now_ns - g_mon_cache_ns < CACHE_TTL_NS;
+		if (!fresh && probe_instance_ensure_locked(now_ns)) {
+			(void)refresh_monitors_locked(now_ns);
+		}
+		if (g_mon_cache_count >= 0 && now_ns - g_mon_cache_ns < CACHE_TTL_NS) {
+			const uint32_t n = (uint32_t)g_mon_cache_count < cap ? (uint32_t)g_mon_cache_count : cap;
+			if (out != nullptr && n > 0) {
+				memcpy(out, g_mon_cache, n * sizeof(out[0]));
+			}
+			ret = g_mon_cache_count;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_enum_lock);
+	return ret;
+}
+#endif // DXR_LEIA_HAS_SR_MONITOR_ENUM
+
 extern "C" void
 leia_win_sr_enumerate_shutdown(void)
 {
 	AcquireSRWLockExclusive(&g_enum_lock);
 	probe_instance_drop_locked();
 	g_cache_count = -1;
+#ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
+	g_mon_cache_count = -1;
+#endif
 	ReleaseSRWLockExclusive(&g_enum_lock);
 }
 

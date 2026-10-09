@@ -123,6 +123,51 @@ match_sr(const struct desc_view *v, const struct leia_win_claim_inputs *in, cons
 	return cand;
 }
 
+//! join_target(): SR's monitor list says this monitor is not an SR display.
+#define JOIN_NOT_SR (-3)
+
+/*!
+ * SR's own join for one descriptor: its row in SR's monitor list (by
+ * HMONITOR, else by desktop origin), mapped to an index into SR's display
+ * list. -1 = no usable row (absent, contradicting EDID ids, or an SR display
+ * id the display list does not carry): the heuristic decides. JOIN_NOT_SR =
+ * SR lists the monitor as not an SR display.
+ */
+static int32_t
+join_target(const struct desc_view *v, const struct leia_win_claim_inputs *in)
+{
+	if (in->sr_display_count < 0 || in->sr_monitors == NULL || in->sr_monitor_count <= 0 || !v->has_pos) {
+		return -1;
+	}
+	const uint64_t hmon = in->monitor_at != NULL ? in->monitor_at(v->left, v->top) : 0;
+	const struct leia_win_sr_monitor *row = NULL;
+	for (uint32_t k = 0; k < (uint32_t)in->sr_monitor_count; k++) {
+		const struct leia_win_sr_monitor *m = &in->sr_monitors[k];
+		if (hmon != 0 ? m->hmonitor == hmon : (m->x == v->left && m->y == v->top)) {
+			row = m;
+			break;
+		}
+	}
+	if (row == NULL) {
+		return -1;
+	}
+	// Both sides know the panel's EDID ids and they differ: the topology
+	// changed between the runtime's enumeration and SR's. Not this monitor.
+	if (v->man != 0 && row->edid_manufacturer != 0 &&
+	    (row->edid_manufacturer != v->man || row->edid_product != v->prod)) {
+		return -1;
+	}
+	if (row->sr_display_id == 0) {
+		return JOIN_NOT_SR;
+	}
+	for (uint32_t j = 0; j < (uint32_t)in->sr_display_count; j++) {
+		if (in->sr_displays[j].display_id == row->sr_display_id) {
+			return (int32_t)j;
+		}
+	}
+	return -1;
+}
+
 uint32_t
 leia_win_compute_claims(const struct xrt_display_descriptor *displays,
                         uint32_t display_count,
@@ -140,8 +185,27 @@ leia_win_compute_claims(const struct xrt_display_descriptor *displays,
 	if (clamped.sr_display_count > LEIA_WIN_SR_MAX_DISPLAYS) {
 		clamped.sr_display_count = LEIA_WIN_SR_MAX_DISPLAYS;
 	}
+	if (clamped.sr_monitor_count > LEIA_WIN_SR_MAX_MONITORS) {
+		clamped.sr_monitor_count = LEIA_WIN_SR_MAX_MONITORS;
+	}
 	in = &clamped;
 	const bool sr_available = in->sr_display_count >= 0;
+
+	// SR's own join first: each SR display it ties to a monitor belongs to
+	// the first descriptor that joins it, and is taken before the heuristic
+	// runs. No join (list unavailable / empty) leaves everything untouched.
+	int32_t join_owner[LEIA_WIN_SR_MAX_DISPLAYS];
+	for (uint32_t j = 0; j < LEIA_WIN_SR_MAX_DISPLAYS; j++) {
+		join_owner[j] = -1;
+	}
+	for (uint32_t i = 0; i < display_count; i++) {
+		const struct desc_view v = desc_read(desc_at(displays, i));
+		const int32_t jt = join_target(&v, in);
+		if (jt >= 0 && join_owner[jt] < 0) {
+			join_owner[jt] = (int32_t)i;
+			sr_taken[jt] = true;
+		}
+	}
 
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
@@ -166,7 +230,16 @@ leia_win_compute_claims(const struct xrt_display_descriptor *displays,
 				c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
 			}
 		} else {
-			const int32_t sj = match_sr(&v, in, sr_taken);
+			const int32_t jt = join_target(&v, in);
+			int32_t sj;
+			if (jt >= 0 && join_owner[jt] == (int32_t)i) {
+				sj = jt; // SR's own join: bound, no heuristic
+				b.sr_joined = true;
+			} else if (jt == JOIN_NOT_SR) {
+				sj = -1; // SR says it is not an SR display: table hit only
+			} else {
+				sj = match_sr(&v, in, sr_taken);
+			}
 			if (sj == MATCH_AMBIGUOUS) {
 				// One of several identical Leia panels, but which one is
 				// unknown: EDID confidence, no serial, no displayId.
@@ -180,6 +253,10 @@ leia_win_compute_claims(const struct xrt_display_descriptor *displays,
 				b.sr_display_id = s->display_id;
 				b.hmonitor = s->hmonitor;
 				snprintf(b.device_name, sizeof(b.device_name), "%s", s->device_name);
+				b.width_mm = s->width_mm;
+				b.height_mm = s->height_mm;
+				b.native_w = s->native_w;
+				b.native_h = s->native_h;
 			} else if (!in_table) {
 				continue; // neither SR nor the table knows it
 			}
@@ -256,6 +333,31 @@ leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out)
  * when the SDK headers declare srEnumerateDisplays.
  *
  */
+
+uint64_t
+leia_win_monitor_at(int32_t left, int32_t top)
+{
+#ifdef _WIN32
+	POINT pt;
+	pt.x = left;
+	pt.y = top;
+	return (uint64_t)(uintptr_t)MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+#else
+	(void)left;
+	(void)top;
+	return 0;
+#endif
+}
+
+#ifndef DXR_LEIA_HAS_SR_MONITOR_ENUM
+int32_t
+leia_win_sr_enumerate_monitors(struct leia_win_sr_monitor *out, uint32_t cap)
+{
+	(void)out;
+	(void)cap;
+	return -1;
+}
+#endif
 
 #ifndef DXR_LEIA_HAS_SR_DISPLAY_ENUM
 int32_t

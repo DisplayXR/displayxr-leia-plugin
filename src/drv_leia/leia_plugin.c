@@ -212,7 +212,8 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
  * monitor this plug-in claimed — its physical size and nominal viewer — so
  * the runtime's screen registry carries metres for every Leia panel, not only
  * the active one. The size comes from SR's own calibration (the enumeration
- * descriptor's cm, cached 2 s, non-blocking); the nominal viewer is the
+ * descriptor's cm), captured in the claim table when probe_displays bound the
+ * monitor — a lock-guarded lookup, no SR call here; the nominal viewer is the
  * active panel's, scaled to this panel's height (the Linux arm's rule).
  * Cheap and callable from any thread, as the slot requires. False for a
  * monitor this plug-in did not claim, or one SR cannot size: the runtime then
@@ -235,20 +236,9 @@ leia_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
 		return false;
 	}
 
-	uint32_t width_mm = 0, height_mm = 0, px_w = 0, px_h = 0;
-	if (claim.sr_display_id != 0) {
-		struct leia_win_sr_display sd[LEIA_WIN_SR_MAX_DISPLAYS];
-		const int32_t n = leia_win_sr_enumerate_displays(sd, LEIA_WIN_SR_MAX_DISPLAYS);
-		for (int32_t i = 0; i < n; i++) {
-			if (sd[i].display_id == claim.sr_display_id) {
-				width_mm = sd[i].width_mm;
-				height_mm = sd[i].height_mm;
-				px_w = sd[i].native_w;
-				px_h = sd[i].native_h;
-				break;
-			}
-		}
-	}
+	// The bound SR display's calibrated size + native mode, captured at claim
+	// time (zero when the claim has no SR display).
+	uint32_t width_mm = claim.width_mm, height_mm = claim.height_mm, px_w = claim.native_w, px_h = claim.native_h;
 	if ((width_mm == 0 || height_mm == 0) && physical != NULL &&
 	    physical->struct_size >= offsetof(struct xrt_display_physical, physical_height_mm) + sizeof(uint32_t)) {
 		width_mm = physical->physical_width_mm;
@@ -377,11 +367,19 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 *     -> EDID confidence, no serial;
 	 *   - SR does not enumerate (older runtime, service down, compiled out)
 	 *     -> today's rule: table hit + READY = VERIFIED, no serial.
-	 * The per-monitor binding (displayId, HMONITOR, device name) is kept in a
-	 * plug-in-private table for the M5/M6 per-DP binding.
+	 * Which SR display a monitor IS comes from SR's own monitor list
+	 * (srEnumerateMonitors, slot 108, SR joins by HMONITOR) when the installed
+	 * SR runtime has it; monitors it does not list, or every monitor on an
+	 * older SR runtime, fall back to EDID ids + desktop origin.
+	 * The per-monitor binding (displayId, HMONITOR, device name, SR size) is
+	 * kept in a plug-in-private table for the M5/M6 per-DP binding and
+	 * get_display_info_for_monitor.
 	 */
 	struct leia_win_sr_display sr_displays[LEIA_WIN_SR_MAX_DISPLAYS];
 	const int32_t sr_count = leia_win_sr_enumerate_displays(sr_displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	struct leia_win_sr_monitor sr_monitors[LEIA_WIN_SR_MAX_MONITORS];
+	const int32_t sr_mon_count =
+	    sr_count >= 0 ? leia_win_sr_enumerate_monitors(sr_monitors, LEIA_WIN_SR_MAX_MONITORS) : -1;
 
 	const struct leia_win_claim_inputs in = {
 	    .sr_displays = sr_displays,
@@ -389,6 +387,9 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	    .table_contains = leia_edid_table_contains,
 	    .legacy_table_verified = true, /* platform state is READY here */
 	    .supported_apis = apis,
+	    .sr_monitors = sr_monitors,
+	    .sr_monitor_count = sr_mon_count,
+	    .monitor_at = leia_win_monitor_at,
 	};
 	struct leia_win_claim_binding bindings[LEIA_WIN_SR_MAX_DISPLAYS * 2];
 	const uint32_t bind_cap = max_claims < (uint32_t)(LEIA_WIN_SR_MAX_DISPLAYS * 2) ? max_claims
@@ -398,10 +399,12 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 
 	/* One WARN per change of the claim set, INFO otherwise (the runtime
 	 * re-runs this per registry refresh). */
-	uint64_t fp = 1469598103934665603ull ^ (uint64_t)n ^ ((uint64_t)(sr_count + 1) << 32);
+	uint64_t fp = 1469598103934665603ull ^ (uint64_t)n ^ ((uint64_t)(sr_count + 1) << 32) ^
+	              ((uint64_t)(sr_mon_count + 1) << 48);
 	for (uint32_t i = 0; i < n; i++) {
 		fp = (fp ^ out_claims[i].monitor_id) * 1099511628211ull;
 		fp = (fp ^ out_claims[i].confidence) * 1099511628211ull;
+		fp = (fp ^ bindings[i].sr_display_id ^ (uint64_t)bindings[i].sr_joined) * 1099511628211ull;
 		for (const char *c = out_claims[i].serial; *c != '\0'; c++) {
 			fp = (fp ^ (uint64_t)(uint8_t)*c) * 1099511628211ull;
 		}
@@ -413,11 +416,14 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		const struct xrt_display_claim *c = &out_claims[i];
 		const char *conf = c->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID";
 		if (changed) {
-			U_LOG_W("leia_plugin: claim monitor 0x%016llx confidence=%s serial='%s' sr_display=0x%016llx "
-			        "device='%s' (%s)",
-			        (unsigned long long)c->monitor_id, conf, c->serial,
-			        (unsigned long long)bindings[i].sr_display_id, bindings[i].device_name,
-			        sr_count >= 0 ? "SR enumeration" : "frozen EDID table");
+			U_LOG_W(
+			    "leia_plugin: claim monitor 0x%016llx confidence=%s serial='%s' sr_display=0x%016llx "
+			    "device='%s' (%s)",
+			    (unsigned long long)c->monitor_id, conf, c->serial,
+			    (unsigned long long)bindings[i].sr_display_id, bindings[i].device_name,
+			    bindings[i].sr_joined ? "SR monitor join"
+			    : sr_count >= 0       ? "SR enumeration, EDID/origin match"
+			                          : "frozen EDID table");
 		} else {
 			U_LOG_I("leia_plugin: claim monitor 0x%016llx confidence=%s serial='%s' -- unchanged",
 			        (unsigned long long)c->monitor_id, conf, c->serial);

@@ -189,6 +189,7 @@ endif()
 # logs alongside it. Same header-grep reasoning. Absent => probe_displays
 # keeps today's frozen-table behaviour.
 set(LEIA_SR_DISPLAY_ENUM_AVAILABLE FALSE)
+set(LEIA_SR_MONITOR_ENUM_AVAILABLE FALSE)
 if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h")
     file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h" _leia_sr_disp_h)
     file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_weav_h)
@@ -216,6 +217,15 @@ if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h
             set(LEIA_SR_LENS_BINDING_AVAILABLE TRUE)
         endif()
         unset(_leia_sr_lens_h)
+    endif()
+    # SR monitor list (sr-sdk-v2-1.38.0.2192+, Windows slot 108): every OS
+    # monitor with the SR display it is -- probe_displays binds by SR's own
+    # HMONITOR join instead of EDID ids + desktop origin. Shares the display
+    # enumeration's probe instance, hence the DISPLAY_ENUM prerequisite.
+    if(LEIA_SR_DISPLAY_ENUM_AVAILABLE
+       AND _leia_sr_disp_h MATCHES "srEnumerateMonitors"
+       AND _leia_sr_disp_h MATCHES "SrMonitorDescriptor")
+        set(LEIA_SR_MONITOR_ENUM_AVAILABLE TRUE)
     endif()
     # SR D4 (tracker per device, sr-sdk-v2-1.38.0.2141+): a weaver bound to a
     # calibrated non-active display tracks that display's own camera.
@@ -246,6 +256,13 @@ if(LEIA_SR_DISPLAY_ENUM_AVAILABLE)
 else()
     message(STATUS "SR display enumeration: DISABLED (SDK predates ST-5481 phase B, or no v2 SDK) - "
                    "probe_displays uses the frozen EDID table alone")
+endif()
+if(LEIA_SR_MONITOR_ENUM_AVAILABLE)
+    message(STATUS "SR monitor enumeration: ENABLED (SDK declares srEnumerateMonitors) - "
+                   "probe_displays binds monitors by SR's own HMONITOR join")
+else()
+    message(STATUS "SR monitor enumeration: DISABLED (SDK predates sr-sdk-v2-1.38.0.2192) - "
+                   "probe_displays joins by EDID ids + desktop origin")
 endif()
 if(LEIA_SR_COMPOSE_AVAILABLE)
     message(STATUS "SR weaver 2D compose: ENABLED (SDK declares srWeaverSetComposeInputsDX11) - "
@@ -501,6 +518,9 @@ if(LEIA_SR_V2_AVAILABLE)
     endif()
     if(LEIA_SR_TRACKER_BINDING_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_TRACKER_BINDING=1)
+    endif()
+    if(LEIA_SR_MONITOR_ENUM_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_MONITOR_ENUM=1)
     endif()
 endif()
 
