@@ -27,9 +27,10 @@
  * the panel sends its origin even when negative (origin + canvas offset is the
  * segment's top-left on the panel). Multi-screen: segment DPs made by
  * create_dp_metal_for_screen get the origin from the runtime
- * (set_present_origin) and forward it; once that slot is called, this polling
- * stands down. The runtime does not call it on the session's primary DP, so
- * there the polling is the live path.
+ * (set_present_origin) and forward it. The runtime also sends the APPLIED
+ * origin to the session DP while it owns the window's placement (ADR-050);
+ * polling yields on every frame the slot was called for, and runs on the
+ * rest (e.g. split frames, where the primary DP is not sent one).
  *
  * Colour: macOS colour-matches every window from its layer's colour space to
  * the display profile, which mixes subpixels across views on a lenticular
@@ -125,8 +126,14 @@ struct leia_dp_mac
 	//! the first writer to the target this frame (load, never clear; every
 	//! write confined to the canvas).
 	bool screen_bound;
-	//! The runtime drives set_present_origin: the DP-side polling stands down.
+	//! The runtime has called set_present_origin at least once (logging only).
 	bool runtime_origin;
+	//! Frame (ldp->frames numbering) the runtime's set_present_origin was last
+	//! called for. Polling yields on that frame only: the runtime sends the
+	//! APPLIED origin of a window it is moving (ADR-050) while the view still
+	//! reports the pre-move position until the CA transaction commits, but it
+	//! does not send it on every path (split frames skip the primary DP).
+	uint64_t runtime_origin_frame;
 
 	//! Present-origin state: last origin SENT (any result), so the call is
 	//! repeated only when the window moves; result codes already logged.
@@ -227,8 +234,8 @@ first_time_result(struct leia_dp_mac *ldp, SrResult res)
 static void
 update_present_origin(struct leia_dp_mac *ldp)
 {
-	if (ldp->runtime_origin || ldp->view == nil || ldp->weaver == NULL) {
-		return; // the runtime's set_present_origin is authoritative once it calls
+	if (ldp->runtime_origin_frame == ldp->frames || ldp->view == nil || ldp->weaver == NULL) {
+		return; // the runtime's set_present_origin is authoritative for this frame
 	}
 	struct leia_mac_display_info info;
 	if (!leia_mac_get_display_info(&info) || info.cg_display_id == 0) {
@@ -644,10 +651,13 @@ static void
 leia_dp_mac_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t panel_x, int32_t panel_y)
 {
 	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	// Called before process_atlas, which increments ldp->frames: tag the
+	// frame about to be woven.
+	ldp->runtime_origin_frame = ldp->frames + 1;
 	if (!ldp->runtime_origin) {
 		ldp->runtime_origin = true;
 		U_LOG_W("leia_mac_dp: the runtime drives set_present_origin (first: %d, %d) — DP-side origin "
-		        "polling off",
+		        "polling yields on every frame it is called for",
 		        panel_x, panel_y);
 	}
 	if (ldp->weaver == NULL ||
@@ -665,6 +675,47 @@ leia_dp_mac_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t 
 		U_LOG_I("leia_mac_dp: present origin (%d, %d) panel px (runtime) -> %s", panel_x, panel_y,
 		        leia_mac_sr_result_str(res));
 	}
+}
+#endif
+
+#ifdef XRT_DP_METAL_HAS_SNAP_WINDOW_RECT
+/*!
+ * Window-drag phase lock (ADR-050): a pure query. srWeaverSnapToPhase returns
+ * the phase-equivalent position nearest @p target that preserves the phase the
+ * window had at @p origin (backing px, top-down; only the displacement
+ * matters). SR_SUCCESS -> snapped; SR_DECLINED (no viewing distance yet) or
+ * any error -> false, and the runtime keeps the target. Each distinct result
+ * code is logged once; results at INFO are per drag step, not per frame.
+ */
+static bool
+leia_dp_mac_snap_window_rect(struct xrt_display_processor_metal *xdp,
+                             int32_t origin_x,
+                             int32_t origin_y,
+                             int32_t target_x,
+                             int32_t target_y,
+                             int32_t *out_x,
+                             int32_t *out_y)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (ldp->weaver == NULL || out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	int32_t x = target_x, y = target_y;
+	const SrResult res = srWeaverSnapToPhase(ldp->weaver, origin_x, origin_y, target_x, target_y, &x, &y);
+	if (first_time_result(ldp, res)) {
+		U_LOG_W("leia_mac_dp: srWeaverSnapToPhase(origin %d,%d target %d,%d) -> %s (%d,%d)%s", origin_x,
+		        origin_y, target_x, target_y, leia_mac_sr_result_str(res), x, y,
+		        res == SR_SUCCESS ? "" : " — runtime keeps the target (this code logged once)");
+	} else {
+		U_LOG_I("leia_mac_dp: snap (%d,%d)->(%d,%d) from (%d,%d): %s", target_x, target_y, x, y, origin_x,
+		        origin_y, leia_mac_sr_result_str(res));
+	}
+	if (res != SR_SUCCESS) {
+		return false;
+	}
+	*out_x = x;
+	*out_y = y;
+	return true;
 }
 #endif
 
@@ -910,6 +961,9 @@ leia_dp_mac_create(void *metal_device,
 	ldp->base.destroy = leia_dp_mac_destroy;
 #ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_mac_set_present_origin;
+#endif
+#ifdef XRT_DP_METAL_HAS_SNAP_WINDOW_RECT
+	ldp->base.snap_window_rect = leia_dp_mac_snap_window_rect;
 #endif
 	// Left NULL, as on the Linux arm's first cut: get_window_metrics (the
 	// Metal compositor computes it from the view), is_alpha_native (a weave is
