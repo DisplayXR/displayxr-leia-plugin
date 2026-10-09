@@ -623,6 +623,15 @@ static struct xrt_plugin_iface g_leia_iface = {
 #endif
 #endif
 
+#if defined(XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN)
+    /* Multi-screen M6 (D3D12): one D3D12 DP per screen a spanning window covers. */
+#if defined(XRT_HAVE_LEIA_SR_D3D12)
+    .create_dp_d3d12_for_screen = leia_dp_factory_d3d12_for_screen,
+#else
+    .create_dp_d3d12_for_screen = NULL,
+#endif
+#endif
+
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
     /*
      * The SR eye tracker's camera as a runtime stereo camera source
