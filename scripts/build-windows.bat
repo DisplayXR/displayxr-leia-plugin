@@ -54,7 +54,7 @@ set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
 :: is the newest tag and its headers are byte-identical to dev@25a713d93 (the
 :: tip the module was written against). A failed fetch is SOFT: lift compiles
 :: out, nothing else changes.
-set NEURD_SDK_REF=v0.4.6
+set NEURD_SDK_REF=v0.4.9-DEV
 set NEURD_SDK_REPO=LeiaInc/media_sdk
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
