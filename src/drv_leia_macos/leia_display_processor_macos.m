@@ -18,10 +18,13 @@
  *     view 0 into the canvas, weaver bypassed — the Linux/Windows 2D path.
  *
  * Window phase: srWeaverSetPresentOrigin gets the app window's content origin
- * relative to the panel's CGDisplayBounds, in panel (backing) pixels, every
- * frame. On the current macOS SR line the Metal weaver tracks its NSWindow
- * itself and rejects the call (SR_ERROR_FEATURE_NOT_SUPPORTED) — logged once,
- * kept so the plug-in picks the fix up without a rebuild.
+ * relative to the panel's CGDisplayBounds, in panel (backing) pixels, whenever
+ * that origin changes (window moves; first frame). Never latched off: an SR
+ * runtime without IWeaverPresentOrigin1 answers FEATURE_NOT_SUPPORTED and the
+ * next move retries, so a runtime swap is picked up live. Each distinct result
+ * code is logged once. A content origin outside the panel means the window is
+ * not on the panel: the call is skipped (logged once per off-panel episode)
+ * rather than sending negative / out-of-range coordinates.
  *
  * Colour: macOS colour-matches every window from its layer's colour space to
  * the display profile, which mixes subpixels across views on a lenticular
@@ -29,9 +32,13 @@
  * colour space itself, but only when that layer IS the CAMetalLayer; the
  * runtime adds its CAMetalLayer as a SUBLAYER for views that are not
  * layer-backed by Metal (GL apps). So this DP tags the layer it actually
- * presents into, with CGDisplayCopyColorSpace(the window's screen), once a
- * second at most and only on change. DXR_LEIA_MAC_KEEP_COLOR_MATCHING=1 skips
- * it (A/B), as SR_METAL_KEEP_COLOR_MATCHING=1 does on the SR side.
+ * presents into, with CGDisplayCopyColorSpace(the Leia PANEL) — the weave is
+ * computed for the panel's subpixels whatever screen the window is on now —
+ * falling back to the window's screen only when the panel's CGDirectDisplayID
+ * is unknown. The window's screen is re-checked every 250 ms (a screen change
+ * is logged and re-tags); the tag is re-applied when the presenting layer or
+ * the target display changes. DXR_LEIA_MAC_KEEP_COLOR_MATCHING=1 skips it
+ * (A/B), as SR_METAL_KEEP_COLOR_MATCHING=1 does on the SR side.
  *
  * @ingroup drv_leia
  */
@@ -64,7 +71,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(leia_mac_keep_color_matching, "DXR_LEIA_MAC_KEEP_COLO
 
 #define LEIA_MAC_HALF_IPD_MM 31.5f
 #define LEIA_MAC_EYE_FRESH_NS (250ll * 1000 * 1000)
-#define LEIA_MAC_TAG_CHECK_NS (1000ull * 1000 * 1000)
+#define LEIA_MAC_TAG_CHECK_NS (250ull * 1000 * 1000)
+#define LEIA_MAC_MAX_LOGGED_RESULTS 8
 
 static NSString *const k_blit_msl =
     @"#include <metal_stdlib>\n"
@@ -104,12 +112,17 @@ struct leia_dp_mac
 
 	//! Colour-space tagging state (see file header).
 	void *tagged_layer;
-	uint32_t tagged_did;
+	uint32_t tagged_did;    //!< display whose colour space the layer carries
+	uint32_t window_did;    //!< screen the window was last seen on (0 = never)
 	uint64_t last_tag_check_ns;
 
-	bool present_origin_unsupported;
+	//! Present-origin state: last origin SENT (any result), so the call is
+	//! repeated only when the window moves; result codes already logged.
+	bool origin_sent;
 	int32_t last_origin_x, last_origin_y;
-	bool origin_logged;
+	bool origin_off_panel;  //!< current episode of "content origin not on the panel" logged
+	SrResult logged_results[LEIA_MAC_MAX_LOGGED_RESULTS];
+	uint32_t logged_result_count;
 
 	uint64_t frames;
 	uint64_t last_eye_log_ns;
@@ -182,10 +195,25 @@ view_origin_cg_points(NSView *view, CGFloat *out_x, CGFloat *out_y)
 	return true;
 }
 
+//! True the first time @p res is seen (per DP) — for once-per-code logging.
+static bool
+first_time_result(struct leia_dp_mac *ldp, SrResult res)
+{
+	for (uint32_t i = 0; i < ldp->logged_result_count; i++) {
+		if (ldp->logged_results[i] == res) {
+			return false;
+		}
+	}
+	if (ldp->logged_result_count < LEIA_MAC_MAX_LOGGED_RESULTS) {
+		ldp->logged_results[ldp->logged_result_count++] = res;
+	}
+	return true;
+}
+
 static void
 update_present_origin(struct leia_dp_mac *ldp)
 {
-	if (ldp->present_origin_unsupported || ldp->view == nil) {
+	if (ldp->view == nil || ldp->weaver == NULL) {
 		return;
 	}
 	struct leia_mac_display_info info;
@@ -197,29 +225,59 @@ update_present_origin(struct leia_dp_mac *ldp)
 		return;
 	}
 	const CGRect b = CGDisplayBounds(info.cg_display_id);
-	const double scale = info.backing_scale > 0.0f ? info.backing_scale : 1.0;
-	const int32_t ox = (int32_t)llround((vx - b.origin.x) * scale);
-	const int32_t oy = (int32_t)llround((vy - b.origin.y) * scale);
+	const CGFloat rx = vx - b.origin.x;
+	const CGFloat ry = vy - b.origin.y;
 
-	const SrResult res = srWeaverSetPresentOrigin(ldp->weaver, ox, oy);
-	if (res == SR_ERROR_FEATURE_NOT_SUPPORTED || res == SR_ERROR_FUNCTION_UNSUPPORTED) {
-		ldp->present_origin_unsupported = true;
-		U_LOG_W("leia_mac_dp: srWeaverSetPresentOrigin(%d, %d) -> %s — this SR runtime's Metal weaver "
-		        "derives the window phase from its NSWindow itself; not calling it again",
-		        ox, oy, leia_mac_sr_result_str(res));
+	// Content origin outside the panel = the window is not on the panel: a
+	// present origin would be negative / beyond the panel. Skip, log once per
+	// episode, and send again as soon as it is back on the panel.
+	if (rx < 0.0 || ry < 0.0 || rx >= b.size.width || ry >= b.size.height) {
+		if (!ldp->origin_off_panel) {
+			ldp->origin_off_panel = true;
+			U_LOG_W("leia_mac_dp: window content origin (%.0f, %.0f) pt is outside the Leia panel "
+			        "(display %u, bounds %.0f,%.0f %.0fx%.0f pt) — not calling srWeaverSetPresentOrigin "
+			        "until it is on the panel",
+			        vx, vy, info.cg_display_id, b.origin.x, b.origin.y, b.size.width, b.size.height);
+		}
+		ldp->origin_sent = false;
 		return;
 	}
-	if (!ldp->origin_logged || ox != ldp->last_origin_x || oy != ldp->last_origin_y) {
-		// INFO: changes only on window moves, not per frame.
+	if (ldp->origin_off_panel) {
+		ldp->origin_off_panel = false;
+		U_LOG_W("leia_mac_dp: window content origin is on the Leia panel again (%.0f, %.0f pt panel-relative)",
+		        rx, ry);
+	}
+
+	const double scale = info.backing_scale > 0.0f ? info.backing_scale : 1.0;
+	const int32_t ox = (int32_t)llround(rx * scale);
+	const int32_t oy = (int32_t)llround(ry * scale);
+	if (ldp->origin_sent && ox == ldp->last_origin_x && oy == ldp->last_origin_y) {
+		return; // unchanged since the last call, whatever it answered
+	}
+
+	const SrResult res = srWeaverSetPresentOrigin(ldp->weaver, ox, oy);
+	ldp->origin_sent = true;
+	ldp->last_origin_x = ox;
+	ldp->last_origin_y = oy;
+	if (first_time_result(ldp, res)) {
+		U_LOG_W("leia_mac_dp: srWeaverSetPresentOrigin(%d, %d) panel px -> %s%s", ox, oy,
+		        leia_mac_sr_result_str(res),
+		        SR_SUCCEEDED(res) ? " (accepted)"
+		                          : " — retried on every window move; this code is logged once");
+	} else {
+		// INFO: only on window moves, never per frame.
 		U_LOG_I("leia_mac_dp: present origin (%d, %d) panel px -> %s", ox, oy, leia_mac_sr_result_str(res));
-		ldp->origin_logged = true;
-		ldp->last_origin_x = ox;
-		ldp->last_origin_y = oy;
 	}
 }
 
-//! Tag the presenting layer (and window) with the colour space of the screen
-//! the window is on, so WindowServer applies no colour matching. See header.
+static uint32_t
+screen_display_id(NSScreen *screen)
+{
+	return screen != nil ? [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue] : 0;
+}
+
+//! Tag the presenting layer (and window) with the Leia panel's colour space so
+//! WindowServer applies no colour matching to the woven frame. See header.
 static void
 update_colorspace_tag(struct leia_dp_mac *ldp)
 {
@@ -234,11 +292,24 @@ update_colorspace_tag(struct leia_dp_mac *ldp)
 
 	CAMetalLayer *layer = find_metal_layer(ldp->view);
 	NSWindow *win = ldp->view.window;
-	NSScreen *screen = win.screen;
-	if (layer == nil || screen == nil) {
+	const uint32_t win_did = screen_display_id(win.screen);
+	if (layer == nil || win == nil) {
 		return;
 	}
-	const uint32_t did = [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue];
+	struct leia_mac_display_info info;
+	const uint32_t panel_did = leia_mac_get_display_info(&info) ? info.cg_display_id : 0;
+
+	if (win_did != ldp->window_did) {
+		U_LOG_W("leia_mac_dp: window is on display %u%s", win_did,
+		        panel_did == 0 ? " (Leia panel display unknown)"
+		        : win_did == panel_did ? " (the Leia panel)"
+		                               : " (NOT the Leia panel — move it onto the panel to see the weave)");
+		ldp->window_did = win_did;
+		ldp->origin_sent = false; // re-send the present origin after a screen change
+	}
+
+	// The weave targets the panel: its colour space, wherever the window is.
+	const uint32_t did = panel_did != 0 ? panel_did : win_did;
 	if (did == 0 || ((void *)layer == ldp->tagged_layer && did == ldp->tagged_did)) {
 		return;
 	}
@@ -260,12 +331,10 @@ update_colorspace_tag(struct leia_dp_mac *ldp)
 		[layer release];
 		[win release];
 	});
-	struct leia_mac_display_info info;
-	const bool on_panel = leia_mac_get_display_info(&info) && info.cg_display_id == did;
 	U_LOG_W("leia_mac_dp: tagged the presenting CAMetalLayer (%s) + NSWindow with the colour space of "
 	        "display %u%s — WindowServer applies no colour matching to the woven frame",
 	        (CALayer *)layer == ldp->view.layer ? "the view's layer" : "a runtime-added sublayer", did,
-	        on_panel ? " (the Leia panel)" : " (NOT the Leia panel)");
+	        did == panel_did ? " (the Leia panel)" : " (window's screen; Leia panel display unknown)");
 }
 
 

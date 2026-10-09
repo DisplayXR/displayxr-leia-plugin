@@ -13,11 +13,14 @@
 #                           plug-in are built from the SAME tree, so the plug-in
 #                           and the runtime it is tested against share headers.
 #   SRSDK_ROOT              LeiaSR macOS install tree (include/sr + lib/libsrSDK_loader.a).
-#   LEIASR_MACOS_DIR        Or: a LeiaSR-macos checkout with a build tree
-#                           (default ../LeiaSR-macos). Headers come from
-#                           modules/srSDK/include, the loader from
-#                           build/macos/sr/libsrSDK_loader.a — the packaged
-#                           build/macos/install can lag the build.
+#   LEIASR_MACOS_DIR        Or: a LeiaSR-macos checkout (default ../LeiaSR-macos).
+#                           Preferred: its packaged install tree
+#                           build/macos/install/{include,lib/libsrSDK_loader.a}
+#                           + lib/libLeiaSR_runtime.dylib (SR_RUNTIME_PATH).
+#                           Fallback when no install tree exists: headers from
+#                           modules/srSDK/include, loader + runtime from
+#                           build/macos/sr. LEIASR_DATA_DIR is always
+#                           build/macos/sr (where build.py stages the inis).
 #
 # Output (build-macos/):
 #   _plugins/DisplayXR-LeiaSR.dylib + 050-leia-sr.json
@@ -54,6 +57,10 @@ SR_RUNTIME_DYLIB=""
 if [ -n "${SRSDK_ROOT:-}" ]; then
     SR_ARGS+=("-DSRSDK_ROOT=$SRSDK_ROOT")
     SR_RUNTIME_DYLIB="$SRSDK_ROOT/lib/libLeiaSR_runtime.dylib"
+elif [ -f "$LEIASR_MACOS_DIR/build/macos/install/lib/libsrSDK_loader.a" ]; then
+    SR_ARGS+=("-DSRSDK_INCLUDE_DIR=$LEIASR_MACOS_DIR/build/macos/install/include"
+              "-DSRSDK_LOADER_LIBRARY=$LEIASR_MACOS_DIR/build/macos/install/lib/libsrSDK_loader.a")
+    SR_RUNTIME_DYLIB="$LEIASR_MACOS_DIR/build/macos/install/lib/libLeiaSR_runtime.dylib"
 elif [ -f "$LEIASR_MACOS_DIR/build/macos/sr/libsrSDK_loader.a" ]; then
     SR_ARGS+=("-DSRSDK_INCLUDE_DIR=$LEIASR_MACOS_DIR/modules/srSDK/include"
               "-DSRSDK_LOADER_LIBRARY=$LEIASR_MACOS_DIR/build/macos/sr/libsrSDK_loader.a")
@@ -70,7 +77,7 @@ cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
     "${SR_ARGS[@]}"
 
 echo "==> Building plug-in + runtime dylib + displayxr-cli + sim-display (one tree)"
-cmake --build "$BUILD_DIR" --target DisplayXR-LeiaSR openxr_displayxr cli drv_sim_display_plugin
+cmake --build "$BUILD_DIR" -j "${DXR_BUILD_JOBS:-4}" --target DisplayXR-LeiaSR openxr_displayxr cli drv_sim_display_plugin
 
 DYLIB="$BUILD_DIR/src/drv_leia_macos/DisplayXR-LeiaSR.dylib"
 echo "==> Export check"
@@ -128,12 +135,14 @@ export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
 export DYLD_LIBRARY_PATH="$(dirname "$RUNTIME_DYLIB")\${DYLD_LIBRARY_PATH:+:\$DYLD_LIBRARY_PATH}"
 # Dev SR tree (nothing installed to /opt/leiasr): the static loader resolves the
 # SR runtime from SR_RUNTIME_PATH; LEIASR_* must match the running SRService.
-export SR_RUNTIME_PATH="$SR_RUNTIME_DYLIB"
 if [ -f "\$HOME/.leiasr-fpc/env.local" ]; then
     . "\$HOME/.leiasr-fpc/env.local"
-    export LEIASR_DATA_DIR LEIASR_RUNTIME_DIR
+    export LEIASR_RUNTIME_DIR
     export DYLD_LIBRARY_PATH="\$DYLD_LIBRARY_PATH:\${LEIASR_DYLD:-}"
 fi
+# Set AFTER env.local, which may point SR_RUNTIME_PATH elsewhere.
+export SR_RUNTIME_PATH="\${DXR_SR_RUNTIME_PATH:-$SR_RUNTIME_DYLIB}"
+export LEIASR_DATA_DIR="\${DXR_LEIASR_DATA_DIR:-$LEIASR_MACOS_DIR/build/macos/sr}"
 EOF
 
 if [ "$RUN_TEST" = "1" ]; then
