@@ -21,6 +21,7 @@
 #include "leia_sr_d3d12.h"
 #include "leia_platform_state.h"
 #include "leia_bg_capture_win.h"
+#include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
@@ -2898,42 +2899,31 @@ leia_dp_d3d12_init_blit(struct leia_display_processor_d3d12_impl *ldp)
 }
 
 
+#ifdef XRT_DP_D3D12_HAS_PRESENT_ORIGIN
 /*
- *
- * Factory function — matches xrt_dp_factory_d3d12_fn_t signature.
- *
+ * Multi-screen M6: where the window's client area sits on this DP's screen.
+ * Only a windowless EXTERNAL weaver reads it (leiasr_d3d12 applies it before
+ * every weave); the DP with the real HWND phases from the window itself.
  */
-
-extern "C" xrt_result_t
-leia_dp_factory_d3d12(void *d3d12_device,
-                      void *d3d12_command_queue,
-                      void *window_handle,
-                      struct xrt_display_processor_d3d12 **out_xdp)
+static void
+leia_dp_d3d12_set_present_origin(struct xrt_display_processor_d3d12 *xdp, int32_t panel_x, int32_t panel_y)
 {
-	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
-	// before the first SR call, or a missing/mismatched SR platform faults at
-	// the call site. The bind logs its own outcome once.
-	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
-		U_LOG_W("Leia D3D12 DP: SR platform client DLLs not usable — not creating the display processor");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
-	// so we pass 0,0 here.
-	struct leiasr_d3d12 *weaver = NULL;
-	xrt_result_t ret = leiasr_d3d12_create(5.0, d3d12_device, d3d12_command_queue,
-	                                       window_handle, 0, 0, &weaver);
-	if (ret != XRT_SUCCESS || weaver == NULL) {
-		U_LOG_W("Failed to create SR D3D12 weaver");
-		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
+	leiasr_d3d12_set_present_origin(leia_dp_d3d12(xdp)->leiasr, panel_x, panel_y);
+}
+#endif
 
-	struct leia_display_processor_d3d12_impl *ldp =
-	    (struct leia_display_processor_d3d12_impl *)calloc(1, sizeof(*ldp));
-	if (ldp == NULL) {
-		leiasr_d3d12_destroy(&weaver);
-		return XRT_ERROR_ALLOCATION;
-	}
-
+/*!
+ * Fill the vtable and the per-DP state both factories share, around a weaver
+ * that already exists. The plain factory and the per-screen one (multi-screen
+ * M6) differ only in how the weaver was created.
+ */
+static void
+leia_dp_d3d12_init(struct leia_display_processor_d3d12_impl *ldp,
+                   struct leiasr_d3d12 *weaver,
+                   void *d3d12_device,
+                   void *d3d12_command_queue,
+                   void *window_handle)
+{
 	// ADR-020 rule 1: advertise the vtable size (calloc zeroed reserved_0).
 	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d12));
 	ldp->base.process_atlas = leia_dp_d3d12_process_atlas;
@@ -2959,6 +2949,9 @@ leia_dp_factory_d3d12(void *d3d12_device,
 #endif
 #if defined(XRT_DP_D3D12_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
 	ldp->base.get_background_preview = leia_dp_d3d12_get_background_preview; // #224 rear depth budget (slot 23)
+#endif
+#ifdef XRT_DP_D3D12_HAS_PRESENT_ORIGIN
+	ldp->base.set_present_origin = leia_dp_d3d12_set_present_origin; // multi-screen M6 (slot 24)
 #endif
 	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;
@@ -2988,6 +2981,43 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	if (!leia_dp_d3d12_init_blit(ldp)) {
 		U_LOG_W("Leia D3D12 DP: blit init failed — 2D mode will be unavailable");
 	}
+}
+
+/*
+ *
+ * Factory function — matches xrt_dp_factory_d3d12_fn_t signature.
+ *
+ */
+
+extern "C" xrt_result_t
+leia_dp_factory_d3d12(void *d3d12_device,
+                      void *d3d12_command_queue,
+                      void *window_handle,
+                      struct xrt_display_processor_d3d12 **out_xdp)
+{
+	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
+	// before the first SR call, or a missing/mismatched SR platform faults at
+	// the call site. The bind logs its own outcome once.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia D3D12 DP: SR platform client DLLs not usable — not creating the display processor");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
+	// so we pass 0,0 here.
+	struct leiasr_d3d12 *weaver = NULL;
+	xrt_result_t ret = leiasr_d3d12_create(5.0, d3d12_device, d3d12_command_queue, window_handle, 0, 0, &weaver);
+	if (ret != XRT_SUCCESS || weaver == NULL) {
+		U_LOG_W("Failed to create SR D3D12 weaver");
+		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct leia_display_processor_d3d12_impl *ldp =
+	    (struct leia_display_processor_d3d12_impl *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		leiasr_d3d12_destroy(&weaver);
+		return XRT_ERROR_ALLOCATION;
+	}
+	leia_dp_d3d12_init(ldp, weaver, d3d12_device, d3d12_command_queue, window_handle);
 
 	*out_xdp = &ldp->base;
 
@@ -2995,3 +3025,72 @@ leia_dp_factory_d3d12(void *d3d12_device,
 
 	return XRT_SUCCESS;
 }
+
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN
+/*
+ * Multi-screen M6: one D3D12 DP per screen a spanning window covers — the
+ * D3D12 twin of leia_dp_factory_d3d11_for_screen. The screen's SR display id
+ * comes from the binding when the runtime carries one, else from this
+ * plug-in's own per-monitor claim. Ids are not stable across display-config
+ * events, so they are resolved here, at create, never cached beyond the DP's
+ * life.
+ *
+ * Canvas confinement needs nothing new on this arm: process_atlas already
+ * hands the weaver viewport + scissor = the canvas and sets both on the
+ * command list (leiasr_d3d12_weave), which is exactly the segment contract.
+ */
+extern "C" xrt_result_t
+leia_dp_factory_d3d12_for_screen(struct xrt_plugin_instance *inst,
+                                 void *d3d12_device,
+                                 void *d3d12_command_queue,
+                                 void *window_handle,
+                                 const struct xrt_screen_binding *binding,
+                                 struct xrt_display_processor_d3d12 **out_xdp)
+{
+	(void)inst;
+	if (binding == nullptr || out_xdp == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia D3D12 per-screen DP: SR platform client DLLs not usable — not creating");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	uint64_t display_id = 0;
+	if (binding->struct_size > offsetof(struct xrt_screen_binding, display_id)) {
+		display_id = binding->display_id;
+	}
+	if (display_id == 0) {
+		struct leia_win_claim_binding claim = {};
+		if (leia_win_claims_lookup(binding->monitor_id, &claim)) {
+			display_id = claim.sr_display_id;
+		}
+	}
+	U_LOG_W(
+	    "Leia D3D12 per-screen DP: monitor 0x%016llx ('%s', %dx%d @ %d,%d, serial '%s') -> SR display "
+	    "0x%016llx, window %p",
+	    (unsigned long long)binding->monitor_id, binding->device_name, (int)binding->desktop_width,
+	    (int)binding->desktop_height, (int)binding->desktop_left, (int)binding->desktop_top, binding->serial,
+	    (unsigned long long)display_id, window_handle);
+
+	struct leiasr_d3d12 *weaver = NULL;
+	xrt_result_t ret =
+	    leiasr_d3d12_create_for_screen(5.0, d3d12_device, d3d12_command_queue, window_handle, display_id, &weaver);
+	if (ret != XRT_SUCCESS || weaver == NULL) {
+		U_LOG_W("Failed to create the SR D3D12 per-screen weaver");
+		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct leia_display_processor_d3d12_impl *ldp =
+	    (struct leia_display_processor_d3d12_impl *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		leiasr_d3d12_destroy(&weaver);
+		return XRT_ERROR_ALLOCATION;
+	}
+	leia_dp_d3d12_init(ldp, weaver, d3d12_device, d3d12_command_queue, window_handle);
+
+	*out_xdp = &ldp->base;
+	U_LOG_W("Created Leia SR D3D12 per-screen display processor (multi-screen M6)");
+	return XRT_SUCCESS;
+}
+#endif
