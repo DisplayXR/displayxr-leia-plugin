@@ -45,6 +45,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
 
@@ -177,6 +178,16 @@ leia_mac_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	return true;
 }
 
+//! EDID id equality across byte orders: CoreGraphics reports the ids as
+//! big-endian integers (0x4C2D for "SAM"), the runtime's descriptor carries the
+//! raw EDID bytes, which on a little-endian read is 0x2D4C — leia_edid_table.h
+//! lists both spellings for that reason.
+static bool
+edid_id_eq(uint16_t a, uint16_t b)
+{
+	return a == b || a == (uint16_t)((b >> 8) | (b << 8));
+}
+
 //! Does descriptor @p d sit where the panel is (origin in points or pixels)?
 static bool
 descriptor_is_panel_rect(const struct xrt_display_descriptor *d, const struct leia_mac_display_info *info)
@@ -220,8 +231,9 @@ leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		c->monitor_id = d->monitor_id;
 		// VERIFIED only for the monitor SR is actually driving (single-panel
 		// SR line on macOS: the one whose EDID pair is the panel we found).
-		const bool is_sr_panel = sr_ok && d->edid_manufacturer == info.edid_vendor &&
-		                         d->edid_product == info.edid_product;
+		const bool is_sr_panel = sr_ok && info.cg_display_id != 0 &&
+		                         edid_id_eq(d->edid_manufacturer, info.edid_vendor) &&
+		                         edid_id_eq(d->edid_product, info.edid_product);
 		c->confidence = is_sr_panel ? XRT_DISPLAY_CLAIM_VERIFIED : XRT_DISPLAY_CLAIM_EDID;
 		c->supported_apis = XRT_DP_API_BIT_METAL;
 	}
@@ -275,8 +287,8 @@ leia_mac_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
 		return false;
 	}
 	// Only the monitor SR drives: same EDID pair, or (no EDID) the panel's rect.
-	const bool same_edid = info.cg_display_id != 0 && display->edid_manufacturer == info.edid_vendor &&
-	                       display->edid_product == info.edid_product;
+	const bool same_edid = info.cg_display_id != 0 && edid_id_eq(display->edid_manufacturer, info.edid_vendor) &&
+	                       edid_id_eq(display->edid_product, info.edid_product);
 	if (!same_edid && !descriptor_is_panel_rect(display, &info)) {
 		return false;
 	}
@@ -291,6 +303,59 @@ leia_mac_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
  * Vtable.
  *
  */
+
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN
+/*!
+ * One windowless DP per screen (multi-screen on macOS). Binds ONLY when the
+ * binding's display is the Leia panel SR drives — matched by the CoreGraphics
+ * display UUID the runtime puts in device_name, else by the panel's
+ * CGDisplayBounds (points) — and declines otherwise, so the screen's other
+ * claimant (sim-display) serves it.
+ */
+static xrt_result_t
+leia_mac_plugin_create_dp_metal_for_screen(struct xrt_plugin_instance *inst,
+                                           void *metal_device,
+                                           void *command_queue,
+                                           void *window_handle,
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_metal **out_xdp)
+{
+	(void)inst;
+	(void)window_handle; // NULL today; the segment DP is windowless by contract
+	if (binding == NULL || out_xdp == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	struct leia_mac_display_info info;
+	if (!leia_mac_sr_probe() || !leia_mac_get_display_info(&info) || !info.valid || info.cg_display_id == 0) {
+		U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen declined — no SR panel identified");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	const uint32_t sz = binding->struct_size;
+#define LEIA_HAS(field) (sz >= offsetof(struct xrt_screen_binding, field) + sizeof(binding->field))
+	bool uuid_match = false, rect_match = false;
+	char name[sizeof(binding->device_name) + 1] = {0};
+	if (LEIA_HAS(device_name)) {
+		memcpy(name, binding->device_name, sizeof(binding->device_name));
+		uuid_match = info.uuid[0] != '\0' && strcasecmp(name, info.uuid) == 0;
+	}
+	if (LEIA_HAS(desktop_height)) {
+		rect_match = binding->desktop_left == info.screen_left_pt && binding->desktop_top == info.screen_top_pt &&
+		             binding->desktop_width == info.screen_width_pt &&
+		             binding->desktop_height == info.screen_height_pt;
+	}
+#undef LEIA_HAS
+	if (!uuid_match && !rect_match) {
+		U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen declined — screen '%s' (%d,%d %ux%u pt) is not "
+		        "the Leia panel (display %u, '%s')",
+		        name, binding->desktop_left, binding->desktop_top, binding->desktop_width, binding->desktop_height,
+		        info.cg_display_id, info.uuid);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen: screen '%s' is the Leia panel (display %u, matched by %s)",
+	        name, info.cg_display_id, uuid_match ? "UUID" : "desktop rect");
+	return leia_mac_dp_factory_metal_for_screen(metal_device, command_queue, out_xdp);
+}
+#endif
 
 #ifndef DXR_PLUGIN_GIT_DESC
 #define DXR_PLUGIN_GIT_DESC "unknown"
@@ -323,6 +388,10 @@ static struct xrt_plugin_iface g_leia_mac_iface = {
 
 #ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR
     .get_display_info_for_monitor = leia_mac_plugin_get_display_info_for_monitor,
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN
+    /* One windowless DP per screen (multi-screen on macOS), Leia panel only. */
+    .create_dp_metal_for_screen = leia_mac_plugin_create_dp_metal_for_screen,
 #endif
 };
 

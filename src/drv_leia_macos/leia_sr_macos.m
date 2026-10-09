@@ -162,6 +162,15 @@ fill_cg_info(struct leia_mac_display_info *info)
 	info->screen_height_pt = (uint32_t)b.size.height;
 	info->edid_vendor = (uint16_t)CGDisplayVendorNumber(did);
 	info->edid_product = (uint16_t)CGDisplayModelNumber(did);
+	CFUUIDRef u = CGDisplayCreateUUIDFromDisplayID(did);
+	if (u != NULL) {
+		CFStringRef us = CFUUIDCreateString(NULL, u);
+		if (us != NULL) {
+			CFStringGetCString(us, info->uuid, sizeof(info->uuid), kCFStringEncodingUTF8);
+			CFRelease(us);
+		}
+		CFRelease(u);
+	}
 
 	uint32_t mw = 0, mh = 0;
 	double hz = 0.0;

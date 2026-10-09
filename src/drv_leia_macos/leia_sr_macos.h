@@ -61,6 +61,9 @@ struct leia_mac_display_info
 	float backing_scale;
 	uint16_t edid_vendor;     //!< CGDisplayVendorNumber (EDID manufacturer id)
 	uint16_t edid_product;    //!< CGDisplayModelNumber  (EDID product id)
+	//! CGDisplayCreateUUIDFromDisplayID as a string — what the runtime's macOS
+	//! monitor enumeration puts in xrt_screen_binding::device_name.
+	char uuid[40];
 };
 
 /*!

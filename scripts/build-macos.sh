@@ -35,7 +35,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build-macos"
 PARENT="$(cd "$ROOT/.." && pwd)"
-RUNTIME_DIR="${DXR_RUNTIME_SOURCE_DIR:-$PARENT/displayxr-runtime}"
+# DEV OVERRIDE (remove once runtime #1872/#1873 merge and a tag carries them):
+# the macOS arm's per-screen slots (create_dp_metal_for_screen,
+# xrt_display_processor_metal::set_present_origin) and macOS monitor
+# enumeration exist only on runtime branch feat/macos-metal-segments. Unless
+# DXR_RUNTIME_SOURCE_DIR names a checkout, that ref is exported READ-ONLY
+# (git archive, no worktree, no checkout change) from ../displayxr-runtime into
+# build-macos/_runtime-src. DXR_RUNTIME_DEV_REF="" uses ../displayxr-runtime as is.
+DXR_RUNTIME_DEV_REF="${DXR_RUNTIME_DEV_REF-feat/macos-metal-segments}"
+if [ -n "${DXR_RUNTIME_SOURCE_DIR:-}" ]; then
+    RUNTIME_DIR="$DXR_RUNTIME_SOURCE_DIR"
+elif [ -n "$DXR_RUNTIME_DEV_REF" ]; then
+    RUNTIME_DIR="$BUILD_DIR/_runtime-src"
+else
+    RUNTIME_DIR="$PARENT/displayxr-runtime"
+fi
 LEIASR_MACOS_DIR="${LEIASR_MACOS_DIR:-$PARENT/LeiaSR-macos}"
 
 RUN_TEST=1
@@ -50,6 +64,17 @@ for arg in "$@"; do
     esac
 done
 
+if [ -z "${DXR_RUNTIME_SOURCE_DIR:-}" ] && [ -n "$DXR_RUNTIME_DEV_REF" ]; then
+    RT_REPO="$PARENT/displayxr-runtime"
+    git -C "$RT_REPO" fetch -q origin "$DXR_RUNTIME_DEV_REF"
+    RT_SHA="$(git -C "$RT_REPO" rev-parse FETCH_HEAD)"
+    if [ "$(cat "$RUNTIME_DIR/.dxr-runtime-sha" 2>/dev/null)" != "$RT_SHA" ]; then
+        echo "==> Exporting runtime $DXR_RUNTIME_DEV_REF @ ${RT_SHA:0:9} -> $RUNTIME_DIR (dev override)"
+        rm -rf "$RUNTIME_DIR" && mkdir -p "$RUNTIME_DIR"
+        git -C "$RT_REPO" archive "$RT_SHA" | tar -x -C "$RUNTIME_DIR"
+        echo "$RT_SHA" >"$RUNTIME_DIR/.dxr-runtime-sha"
+    fi
+fi
 [ -f "$RUNTIME_DIR/CMakeLists.txt" ] || { echo "error: runtime checkout not found at $RUNTIME_DIR" >&2; exit 1; }
 
 SR_ARGS=()

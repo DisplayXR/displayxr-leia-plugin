@@ -22,9 +22,14 @@
  * that origin changes (window moves; first frame). Never latched off: an SR
  * runtime without IWeaverPresentOrigin1 answers FEATURE_NOT_SUPPORTED and the
  * next move retries, so a runtime swap is picked up live. Each distinct result
- * code is logged once. A content origin outside the panel means the window is
- * not on the panel: the call is skipped (logged once per off-panel episode)
- * rather than sending negative / out-of-range coordinates.
+ * code is logged once. A window whose content rect does not touch the panel
+ * skips the call (logged once per off-panel episode); a window that STRADDLES
+ * the panel sends its origin even when negative (origin + canvas offset is the
+ * segment's top-left on the panel). Multi-screen: segment DPs made by
+ * create_dp_metal_for_screen get the origin from the runtime
+ * (set_present_origin) and forward it; once that slot is called, this polling
+ * stands down. The runtime does not call it on the session's primary DP, so
+ * there the polling is the live path.
  *
  * Colour: macOS colour-matches every window from its layer's colour space to
  * the display profile, which mixes subpixels across views on a lenticular
@@ -116,6 +121,13 @@ struct leia_dp_mac
 	uint32_t window_did;    //!< screen the window was last seen on (0 = never)
 	uint64_t last_tag_check_ns;
 
+	//! Created by create_dp_metal_for_screen: windowless, one display, and NOT
+	//! the first writer to the target this frame (load, never clear; every
+	//! write confined to the canvas).
+	bool screen_bound;
+	//! The runtime drives set_present_origin: the DP-side polling stands down.
+	bool runtime_origin;
+
 	//! Present-origin state: last origin SENT (any result), so the call is
 	//! repeated only when the window moves; result codes already logged.
 	bool origin_sent;
@@ -180,7 +192,7 @@ find_metal_layer(NSView *view)
 //! The view's top-left in CoreGraphics global points (origin = top-left of the
 //! primary display, y down) — the space CGDisplayBounds is in.
 static bool
-view_origin_cg_points(NSView *view, CGFloat *out_x, CGFloat *out_y)
+view_origin_cg_points(NSView *view, CGFloat *out_x, CGFloat *out_y, CGFloat *out_w, CGFloat *out_h)
 {
 	NSWindow *win = view.window;
 	NSArray<NSScreen *> *screens = [NSScreen screens];
@@ -192,6 +204,8 @@ view_origin_cg_points(NSView *view, CGFloat *out_x, CGFloat *out_y)
 	const CGFloat primary_h = screens[0].frame.size.height;   // screens[0] = the menu-bar screen
 	*out_x = in_screen.origin.x;
 	*out_y = primary_h - (in_screen.origin.y + in_screen.size.height);
+	*out_w = in_screen.size.width;
+	*out_h = in_screen.size.height;
 	return true;
 }
 
@@ -213,28 +227,31 @@ first_time_result(struct leia_dp_mac *ldp, SrResult res)
 static void
 update_present_origin(struct leia_dp_mac *ldp)
 {
-	if (ldp->view == nil || ldp->weaver == NULL) {
-		return;
+	if (ldp->runtime_origin || ldp->view == nil || ldp->weaver == NULL) {
+		return; // the runtime's set_present_origin is authoritative once it calls
 	}
 	struct leia_mac_display_info info;
 	if (!leia_mac_get_display_info(&info) || info.cg_display_id == 0) {
 		return;
 	}
-	CGFloat vx = 0, vy = 0;
-	if (!view_origin_cg_points(ldp->view, &vx, &vy)) {
+	CGFloat vx = 0, vy = 0, vw = 0, vh = 0;
+	if (!view_origin_cg_points(ldp->view, &vx, &vy, &vw, &vh)) {
 		return;
 	}
 	const CGRect b = CGDisplayBounds(info.cg_display_id);
 	const CGFloat rx = vx - b.origin.x;
 	const CGFloat ry = vy - b.origin.y;
 
-	// Content origin outside the panel = the window is not on the panel: a
-	// present origin would be negative / beyond the panel. Skip, log once per
-	// episode, and send again as soon as it is back on the panel.
-	if (rx < 0.0 || ry < 0.0 || rx >= b.size.width || ry >= b.size.height) {
+	// The content rect does not touch the panel = nothing of the window is
+	// woven there: skip, log once per episode, send again once it is back.
+	// A window that STRADDLES the panel keeps its (possibly negative) origin:
+	// the weave adds the canvas offset, and origin + canvas offset is the
+	// segment's top-left on the panel (the runtime's multi-screen contract,
+	// which computes e.g. -800,300 for a window hanging off the panel's left).
+	if (rx + vw <= 0.0 || ry + vh <= 0.0 || rx >= b.size.width || ry >= b.size.height) {
 		if (!ldp->origin_off_panel) {
 			ldp->origin_off_panel = true;
-			U_LOG_W("leia_mac_dp: window content origin (%.0f, %.0f) pt is outside the Leia panel "
+			U_LOG_W("leia_mac_dp: window content (%.0f, %.0f) pt does not reach the Leia panel "
 			        "(display %u, bounds %.0f,%.0f %.0fx%.0f pt) — not calling srWeaverSetPresentOrigin "
 			        "until it is on the panel",
 			        vx, vy, info.cg_display_id, b.origin.x, b.origin.y, b.size.width, b.size.height);
@@ -399,15 +416,34 @@ encode_clear_and_blit(struct leia_dp_mac *ldp,
                       uint32_t rows,
                       MTLViewport vp)
 {
+	// A screen-bound (segment) DP is never the first writer this frame: load
+	// the target, and confine the draw to the canvas (viewport AND scissor).
+	const bool load = ldp->screen_bound;
+	if (load && src == nil) {
+		return; // nothing to clear on a segment
+	}
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 	pass.colorAttachments[0].texture = target;
-	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].loadAction = load ? MTLLoadActionLoad : MTLLoadActionClear;
 	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
 	if (src != nil && ensure_blit_pipeline(ldp, target.pixelFormat)) {
 		const float scale[2] = {1.0f / (float)(cols ? cols : 1), 1.0f / (float)(rows ? rows : 1)};
 		[enc setViewport:vp];
+		if (load) {
+			const int64_t x0 = vp.originX < 0 ? 0 : (int64_t)vp.originX;
+			const int64_t y0 = vp.originY < 0 ? 0 : (int64_t)vp.originY;
+			int64_t x1 = (int64_t)(vp.originX + vp.width), y1 = (int64_t)(vp.originY + vp.height);
+			x1 = x1 > (int64_t)target.width ? (int64_t)target.width : x1;
+			y1 = y1 > (int64_t)target.height ? (int64_t)target.height : y1;
+			if (x1 <= x0 || y1 <= y0) {
+				[enc endEncoding];
+				return;
+			}
+			[enc setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0),
+			                                     (NSUInteger)(y1 - y0)}];
+		}
 		[enc setRenderPipelineState:ldp->blit_pipeline];
 		[enc setFragmentTexture:src atIndex:0];
 		[enc setFragmentSamplerState:ldp->sampler atIndex:0];
@@ -599,6 +635,39 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 	}
 }
 
+#ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN
+//! Runtime-computed phase origin (multi-screen on macOS): backing px of the
+//! content view's top-left relative to THIS display's CGDisplayBounds origin —
+//! exactly srWeaverSetPresentOrigin's units. Forwarded as is (only when it
+//! changes); from the first call on, update_present_origin stands down.
+static void
+leia_dp_mac_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (!ldp->runtime_origin) {
+		ldp->runtime_origin = true;
+		U_LOG_W("leia_mac_dp: the runtime drives set_present_origin (first: %d, %d) — DP-side origin "
+		        "polling off",
+		        panel_x, panel_y);
+	}
+	if (ldp->weaver == NULL ||
+	    (ldp->origin_sent && panel_x == ldp->last_origin_x && panel_y == ldp->last_origin_y)) {
+		return;
+	}
+	const SrResult res = srWeaverSetPresentOrigin(ldp->weaver, panel_x, panel_y);
+	ldp->origin_sent = true;
+	ldp->last_origin_x = panel_x;
+	ldp->last_origin_y = panel_y;
+	if (first_time_result(ldp, res)) {
+		U_LOG_W("leia_mac_dp: srWeaverSetPresentOrigin(%d, %d) panel px (runtime) -> %s", panel_x, panel_y,
+		        leia_mac_sr_result_str(res));
+	} else {
+		U_LOG_I("leia_mac_dp: present origin (%d, %d) panel px (runtime) -> %s", panel_x, panel_y,
+		        leia_mac_sr_result_str(res));
+	}
+}
+#endif
+
 static bool
 leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp, struct xrt_eye_positions *out)
 {
@@ -748,11 +817,12 @@ leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
  *
  */
 
-xrt_result_t
-leia_mac_dp_factory_metal(void *metal_device,
-                          void *command_queue,
-                          void *window_handle,
-                          struct xrt_display_processor_metal **out_xdp)
+static xrt_result_t
+leia_dp_mac_create(void *metal_device,
+                   void *command_queue,
+                   void *window_handle,
+                   bool screen_bound,
+                   struct xrt_display_processor_metal **out_xdp)
 {
 	if (out_xdp == NULL || metal_device == NULL || command_queue == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -763,6 +833,7 @@ leia_mac_dp_factory_metal(void *metal_device,
 	if (ldp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
+	ldp->screen_bound = screen_bound;
 	ldp->device = [(__bridge id<MTLDevice>)metal_device retain];
 	ldp->queue = [(__bridge id<MTLCommandQueue>)command_queue retain];
 
@@ -837,6 +908,9 @@ leia_mac_dp_factory_metal(void *metal_device,
 	ldp->base.get_display_dimensions = leia_dp_mac_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_mac_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_mac_destroy;
+#ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN
+	ldp->base.set_present_origin = leia_dp_mac_set_present_origin;
+#endif
 	// Left NULL, as on the Linux arm's first cut: get_window_metrics (the
 	// Metal compositor computes it from the view), is_alpha_native (a weave is
 	// opaque), colour capability / encoding (ENCODED default), background,
@@ -844,9 +918,10 @@ leia_mac_dp_factory_metal(void *metal_device,
 
 	struct leia_mac_display_info info = {0};
 	(void)leia_mac_get_display_info(&info);
-	U_LOG_W("leia_mac_dp: created SR Metal weaver (window %p, view %p, panel display %u, %ux%u px)",
-	        (void *)ldp->window, (void *)ldp->view, info.cg_display_id, info.pixel_width, info.pixel_height);
-	if (ldp->window == nil) {
+	U_LOG_W("leia_mac_dp: created SR Metal weaver (%s; window %p, view %p, panel display %u, %ux%u px)",
+	        screen_bound ? "SCREEN-BOUND segment DP, windowless" : "session DP", (void *)ldp->window,
+	        (void *)ldp->view, info.cg_display_id, info.pixel_width, info.pixel_height);
+	if (ldp->window == nil && !screen_bound) {
 		U_LOG_W("leia_mac_dp: no window handed to the DP (hosted app) — SR weaves windowless: the "
 		        "phase assumes the target sits at the panel origin");
 	}
@@ -858,4 +933,23 @@ fail:
 	ldp->base.destroy = leia_dp_mac_destroy;
 	leia_dp_mac_destroy(&ldp->base);
 	return XRT_ERROR_DEVICE_CREATION_FAILED;
+}
+
+xrt_result_t
+leia_mac_dp_factory_metal(void *metal_device,
+                          void *command_queue,
+                          void *window_handle,
+                          struct xrt_display_processor_metal **out_xdp)
+{
+	return leia_dp_mac_create(metal_device, command_queue, window_handle, false, out_xdp);
+}
+
+xrt_result_t
+leia_mac_dp_factory_metal_for_screen(void *metal_device,
+                                     void *command_queue,
+                                     struct xrt_display_processor_metal **out_xdp)
+{
+	// Windowless (srCreateWeaverMetal window = NULL); the phase arrives
+	// through set_present_origin.
+	return leia_dp_mac_create(metal_device, command_queue, NULL, true, out_xdp);
 }
