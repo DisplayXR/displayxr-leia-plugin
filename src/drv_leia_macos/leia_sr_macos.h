@@ -8,17 +8,26 @@
  *
  * Two kinds of SR instance exist on this arm, and why matters:
  *
- *  - ONE short-lived PROBE instance (leia_mac_sr_probe): CLIENT mode,
- *    srInitialize, srCreateDisplay, read the geometry, destroy. It answers
- *    probe() and get_display_info() and is cached for the process.
+ *  - ONE process-wide ENUMERATION instance (CLIENT mode, kept alive): it
+ *    answers which monitors are SR displays (srEnumerateDisplays), reads the
+ *    active display's geometry, and carries an SrSystemMonitor whose
+ *    SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED marks everything below stale.
+ *    The next query re-enumerates; CGDirectDisplayIDs (SR's platformHandle)
+ *    are never kept across that event.
  *  - ONE instance PER DISPLAY PROCESSOR (leia_display_processor_macos.m),
  *    created only once the compositor hands over its MTLDevice + queue. On the
  *    macOS SR line the weaver (and the eye-tracker callback) MUST exist before
  *    srInitialize: srInitialize -> startAllSenses() is what starts the
  *    weaver's PredictingWeaverTracker, so a weaver created on an
- *    already-initialised instance never receives eye positions. A shared
- *    pre-initialised context (the Linux arm's shape) therefore cannot host the
- *    weaver here.
+ *    already-initialised instance never receives eye positions.
+ *
+ * Panel identity: srEnumerateDisplays when the SR runtime has it (FPC verified
+ * or EDID only, platformHandle = CGDirectDisplayID). An SR runtime that
+ * predates it (SR_ERROR_FUNCTION_UNSUPPORTED) falls back to the old path:
+ * srCreateDisplay on the active display, matched to a CGDisplay through the
+ * frozen EDID table. srEnumerateDisplays returning 0 = no SR panel attached:
+ * the plug-in declines (srDisplayIsValid alone is NOT evidence — the SR
+ * runtime reports the active display valid with no panel connected).
  *
  * @ingroup drv_leia
  */
@@ -64,6 +73,25 @@ struct leia_mac_display_info
 	//! CGDisplayCreateUUIDFromDisplayID as a string — what the runtime's macOS
 	//! monitor enumeration puts in xrt_screen_binding::device_name.
 	char uuid[40];
+
+	//! srEnumerateDisplays identity (0 / empty / false on the legacy path).
+	uint64_t sr_display_id;   //!< SrDisplayDescriptor::displayId (0 = the active display)
+	char fpc_serial[32];      //!< SR device serial when FPC verified
+	bool fpc_verified;        //!< SR_DISPLAY_CONFIDENCE_FPC_VERIFIED
+	bool from_enumeration;    //!< identity came from srEnumerateDisplays (not the EDID table)
+};
+
+//! Most SR displays tracked (the macOS line binds 1 today).
+#define LEIA_MAC_MAX_SR_DISPLAYS 4
+
+//! What the SR runtime can do for a per-screen weaver (srGetRuntimeCapabilities).
+struct leia_mac_sr_caps
+{
+	bool external_routing;      //!< SrWeaverRoutingCapabilities::externalRouting
+	bool display_binding;       //!< SrDisplayBindingCapabilities::displayBinding
+	uint32_t max_bound_displays;
+	bool lens_per_device;       //!< SrLensBindingCapabilities::lensPerDevice
+	bool eye_tracker_per_device; //!< SrEyeTrackerBindingCapabilities::eyeTrackerPerDevice
 };
 
 /*!
@@ -74,9 +102,25 @@ struct leia_mac_display_info
 bool
 leia_mac_sr_probe(void);
 
-//! Copy of the cached probe result (false if the probe never succeeded).
+//! The active SR panel (false when there is none). Re-enumerates first if a
+//! topology change arrived since the last enumeration.
 bool
 leia_mac_get_display_info(struct leia_mac_display_info *out);
+
+/*!
+ * Every SR display srEnumerateDisplays reports, CoreGraphics side resolved
+ * (cg_display_id, bounds in points, UUID). Index 0 is the active panel (the
+ * one leia_mac_get_display_info describes). Only the active panel carries the
+ * SR geometry (recommended view size, nominal viewer); the others carry the
+ * descriptor's. Returns the count (0 = no SR panel). Legacy SR runtimes
+ * report the one EDID-table panel.
+ */
+uint32_t
+leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max);
+
+//! Capability snapshot of the enumeration instance (false if no SR runtime).
+bool
+leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);
 
 /*!
  * Find the SR panel among the online displays: an EDID (vendor, product) pair

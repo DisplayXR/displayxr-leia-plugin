@@ -30,12 +30,19 @@ leia_mac_dp_factory_metal(void *metal_device,
 
 /*!
  * Windowless DP for ONE display (create_dp_metal_for_screen). The caller has
- * already checked the display is the Leia panel. Loads the target (never
- * clears) and confines every write to the canvas; phase via set_present_origin.
+ * already resolved @p display (an srEnumerateDisplays entry). The weaver is
+ * bound to it (SrDisplayBindingInfo, when the SR runtime honours binding and
+ * the display is FPC verified) with SR_WEAVER_ROUTING_EXTERNAL; lens and eye
+ * tracker are bound per device only when the capabilities say so. Loads the
+ * target (never clears) and confines every write to the canvas; phase via
+ * set_present_origin.
  */
+struct leia_mac_display_info;
+
 xrt_result_t
 leia_mac_dp_factory_metal_for_screen(void *metal_device,
                                      void *command_queue,
+                                     const struct leia_mac_display_info *display,
                                      struct xrt_display_processor_metal **out_xdp);
 
 #ifdef __cplusplus

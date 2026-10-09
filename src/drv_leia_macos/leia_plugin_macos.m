@@ -11,17 +11,19 @@
  * `DisplayProcessors/` root) and resolves exactly one symbol,
  * `xrtPluginNegotiate` (`-exported_symbol`, ADR-019).
  *
- * Probe policy: bind when the SR runtime answers and reports a valid SR
- * display (leia_mac_sr_probe — one short-lived CLIENT instance). No SR runtime,
- * no SRService, or no panel = decline, so a Mac without Leia hardware falls
- * through to sim_display. `DXR_LEIA_FORCE_PROBE=1` binds regardless (bring-up).
+ * Probe policy: bind when the SR runtime's srEnumerateDisplays reports at
+ * least one SR display (leia_sr_macos.m: one long-lived CLIENT instance that
+ * re-enumerates on SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED). No SR runtime, or
+ * srEnumerateDisplays = 0 (panel unplugged) = decline, so sim-display wins.
+ * An SR runtime without the call falls back to the active display + the
+ * frozen EDID table. `DXR_LEIA_FORCE_PROBE=1` binds regardless (bring-up).
  *
- * Panel selection: the SR display is the panel; it is matched to a
- * CGDirectDisplayID by EDID (vendor, product) against the frozen Leia table,
- * then by NSScreen name, then by native resolution (leia_mac_find_panel_display).
- * probe_displays claims the runtime monitor descriptor with the same EDID pair
- * (VERIFIED when SR also answered), else falls back to the descriptor sitting
- * where the panel is.
+ * Panel selection: each SR display's platformHandle (CGDirectDisplayID) is
+ * resolved to CGDisplayBounds + its CoreGraphics UUID at enumeration time
+ * (never cached across a topology change). probe_displays claims the runtime
+ * monitor with that CGDisplay rect: VERIFIED when FPC verified, EDID when
+ * EDID only. create_dp_metal_for_screen binds a screen whose UUID (or rect)
+ * is an SR display, and declines every other.
  *
  * @ingroup drv_leia
  */
@@ -49,8 +51,6 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
 
-//! probe() bound this plug-in. probe_displays then guarantees it a monitor.
-static bool g_probe_bound;
 
 
 /*
@@ -98,8 +98,10 @@ leia_mac_plugin_probe(struct xrt_plugin_instance **out_inst)
 	const bool forced = debug_get_bool_option_leia_force_probe();
 	const bool sr_ok = leia_mac_sr_probe();
 	if (!sr_ok && !forced) {
-		U_LOG_W("leia_mac_plugin: probe declined — no SR runtime / SRService / SR display "
-		        "(set SR_RUNTIME_PATH for a dev SR tree; DXR_LEIA_FORCE_PROBE=1 force-binds)");
+		// leia_sr_macos.m logged the reason (no SR runtime, or
+		// srEnumerateDisplays = 0 / no panel located on a legacy SR runtime).
+		U_LOG_W("leia_mac_plugin: probe declined — no SR display (see the leia_mac line above); "
+		        "DXR_LEIA_FORCE_PROBE=1 force-binds");
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
 
@@ -111,7 +113,6 @@ leia_mac_plugin_probe(struct xrt_plugin_instance **out_inst)
 		                              info.pixel_height);
 	}
 	U_LOG_W("leia_mac_plugin: %s", sr_ok ? "SR display found — binding" : "probe FORCED (DXR_LEIA_FORCE_PROBE=1)");
-	g_probe_bound = true;
 	return XRT_SUCCESS;
 }
 
@@ -203,6 +204,28 @@ descriptor_is_panel_rect(const struct xrt_display_descriptor *d, const struct le
 	return (origin_pt || origin_px) && (size_pt || size_px);
 }
 
+//! Index of the SR display (from leia_mac_get_sr_displays) that monitor
+//! descriptor @p d is, joined through SR's platformHandle (CGDirectDisplayID)
+//! -> CGDisplayBounds, the rect the runtime's macOS enumerator reports, with
+//! the EDID product as a cross-check. -1 = not an SR display.
+static int
+sr_display_for_descriptor(const struct xrt_display_descriptor *d, const struct leia_mac_display_info *sr, uint32_t n)
+{
+	if (d->struct_size < offsetof(struct xrt_display_descriptor, screen_top) + sizeof(d->screen_top)) {
+		return -1;
+	}
+	for (uint32_t j = 0; j < n; j++) {
+		if (!descriptor_is_panel_rect(d, &sr[j])) {
+			continue;
+		}
+		if (d->edid_product != 0 && sr[j].edid_product != 0 && !edid_id_eq(d->edid_product, sr[j].edid_product)) {
+			continue;
+		}
+		return (int)j;
+	}
+	return -1;
+}
+
 static uint32_t
 leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
                                const struct xrt_display_descriptor *displays,
@@ -214,56 +237,44 @@ leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	if (displays == NULL || display_count == 0 || out_claims == NULL || max_claims == 0) {
 		return 0;
 	}
-	struct leia_mac_display_info info = {0};
-	const bool sr_ok = leia_mac_get_display_info(&info) && info.valid;
+	// The SR displays as SR enumerates them now (re-enumerated after a
+	// topology change), joined to the runtime's monitors by CGDisplay.
+	// No SR display = no claim: sim-display (or another vendor) keeps them.
+	struct leia_mac_display_info sr[LEIA_MAC_MAX_SR_DISPLAYS];
+	const uint32_t n_sr = leia_mac_get_sr_displays(sr, LEIA_MAC_MAX_SR_DISPLAYS);
 
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
-		const struct xrt_display_descriptor *d = &displays[i];
-		if (d->struct_size < offsetof(struct xrt_display_descriptor, edid_product) + sizeof(d->edid_product)) {
-			continue;
-		}
-		if (!leia_mac_edid_is_leia_panel(d->edid_manufacturer, d->edid_product)) {
+		const int j = sr_display_for_descriptor(&displays[i], sr, n_sr);
+		if (j < 0) {
 			continue;
 		}
 		struct xrt_display_claim *c = &out_claims[n++];
 		memset(c, 0, sizeof(*c));
-		c->monitor_id = d->monitor_id;
-		// VERIFIED only for the monitor SR is actually driving (single-panel
-		// SR line on macOS: the one whose EDID pair is the panel we found).
-		const bool is_sr_panel = sr_ok && info.cg_display_id != 0 &&
-		                         edid_id_eq(d->edid_manufacturer, info.edid_vendor) &&
-		                         edid_id_eq(d->edid_product, info.edid_product);
-		c->confidence = is_sr_panel ? XRT_DISPLAY_CLAIM_VERIFIED : XRT_DISPLAY_CLAIM_EDID;
+		c->monitor_id = displays[i].monitor_id;
+		// Linux-arm meaning: VERIFIED = the SR service vouches for THIS panel
+		// (FPC verified; on a legacy SR runtime, its one active display that
+		// the EDID table located), EDID = recognised by EDID only.
+		const bool verified = sr[j].from_enumeration ? sr[j].fpc_verified : true;
+		c->confidence = verified ? XRT_DISPLAY_CLAIM_VERIFIED : XRT_DISPLAY_CLAIM_EDID;
 		c->supported_apis = XRT_DP_API_BIT_METAL;
-	}
-
-	// probe() bound us but no descriptor carried a known EDID pair (an
-	// enumerator that could not read EDID, or DXR_LEIA_FORCE_PROBE): claim the
-	// descriptor where the panel sits, so the bound plug-in owns a monitor.
-	if (n == 0 && g_probe_bound) {
-		for (uint32_t i = 0; i < display_count; i++) {
-			if (descriptor_is_panel_rect(&displays[i], &info)) {
-				memset(&out_claims[0], 0, sizeof(out_claims[0]));
-				out_claims[0].monitor_id = displays[i].monitor_id;
-				out_claims[0].confidence = XRT_DISPLAY_CLAIM_EDID;
-				out_claims[0].supported_apis = XRT_DP_API_BIT_METAL;
-				n = 1;
-				break;
-			}
-		}
+		snprintf(c->serial, sizeof(c->serial), "%s", sr[j].fpc_serial);
 	}
 
 	static uint32_t last_n = UINT32_MAX;
-	if (n != last_n) {
+	static uint32_t last_sr = UINT32_MAX;
+	if (n != last_n || n_sr != last_sr) {
 		last_n = n;
+		last_sr = n_sr;
 		for (uint32_t i = 0; i < n; i++) {
-			U_LOG_I("leia_mac_plugin: claim monitor 0x%016llx confidence=%s",
+			U_LOG_W("leia_mac_plugin: claim monitor 0x%016llx confidence=%s serial='%s'",
 			        (unsigned long long)out_claims[i].monitor_id,
-			        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID");
+			        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID",
+			        out_claims[i].serial);
 		}
 		if (n == 0) {
-			U_LOG_I("leia_mac_plugin: probe_displays — no Leia panel among %u monitor(s)", display_count);
+			U_LOG_W("leia_mac_plugin: probe_displays — no claim among %u monitor(s) (%u SR display(s))",
+			        display_count, n_sr);
 		}
 	}
 	return n;
@@ -286,10 +297,10 @@ leia_mac_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
 	if (!leia_mac_get_display_info(&info) || !info.valid) {
 		return false;
 	}
-	// Only the monitor SR drives: same EDID pair, or (no EDID) the panel's rect.
-	const bool same_edid = info.cg_display_id != 0 && edid_id_eq(display->edid_manufacturer, info.edid_vendor) &&
-	                       edid_id_eq(display->edid_product, info.edid_product);
-	if (!same_edid && !descriptor_is_panel_rect(display, &info)) {
+	// Only the ACTIVE SR panel (the one the SR geometry describes), joined by
+	// its CGDisplay rect. Another SR display (macOS binds one today) or a
+	// non-SR monitor gets the runtime's EDID defaults.
+	if (sr_display_for_descriptor(display, &info, 1) != 0) {
 		return false;
 	}
 	fill_display_info(&info, out_info);
@@ -307,10 +318,12 @@ leia_mac_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
 #ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN
 /*!
  * One windowless DP per screen (multi-screen on macOS). Binds ONLY when the
- * binding's display is the Leia panel SR drives — matched by the CoreGraphics
- * display UUID the runtime puts in device_name, else by the panel's
- * CGDisplayBounds (points) — and declines otherwise, so the screen's other
- * claimant (sim-display) serves it.
+ * binding's display is an SR display srEnumerateDisplays reports — joined by
+ * the CoreGraphics UUID the runtime puts in device_name (SR's platformHandle
+ * -> CGDisplayCreateUUIDFromDisplayID), else by its CGDisplayBounds (points)
+ * — and declines otherwise, so the screen's other claimant (sim-display)
+ * serves it. The DP's weaver is bound to that display (SrDisplayBindingInfo)
+ * with EXTERNAL routing; see leia_display_processor_macos.m.
  */
 static xrt_result_t
 leia_mac_plugin_create_dp_metal_for_screen(struct xrt_plugin_instance *inst,
@@ -325,35 +338,43 @@ leia_mac_plugin_create_dp_metal_for_screen(struct xrt_plugin_instance *inst,
 	if (binding == NULL || out_xdp == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
-	struct leia_mac_display_info info;
-	if (!leia_mac_sr_probe() || !leia_mac_get_display_info(&info) || !info.valid || info.cg_display_id == 0) {
-		U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen declined — no SR panel identified");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
+	struct leia_mac_display_info sr[LEIA_MAC_MAX_SR_DISPLAYS];
+	const uint32_t n_sr = leia_mac_get_sr_displays(sr, LEIA_MAC_MAX_SR_DISPLAYS);
+
 	const uint32_t sz = binding->struct_size;
 #define LEIA_HAS(field) (sz >= offsetof(struct xrt_screen_binding, field) + sizeof(binding->field))
-	bool uuid_match = false, rect_match = false;
 	char name[sizeof(binding->device_name) + 1] = {0};
 	if (LEIA_HAS(device_name)) {
 		memcpy(name, binding->device_name, sizeof(binding->device_name));
-		uuid_match = info.uuid[0] != '\0' && strcasecmp(name, info.uuid) == 0;
 	}
-	if (LEIA_HAS(desktop_height)) {
-		rect_match = binding->desktop_left == info.screen_left_pt && binding->desktop_top == info.screen_top_pt &&
-		             binding->desktop_width == info.screen_width_pt &&
-		             binding->desktop_height == info.screen_height_pt;
+	int match = -1;
+	const char *how = "";
+	for (uint32_t j = 0; j < n_sr && match < 0; j++) {
+		if (sr[j].cg_display_id == 0) {
+			continue;
+		}
+		if (name[0] != '\0' && sr[j].uuid[0] != '\0' && strcasecmp(name, sr[j].uuid) == 0) {
+			match = (int)j;
+			how = "UUID";
+		} else if (LEIA_HAS(desktop_height) && binding->desktop_left == sr[j].screen_left_pt &&
+		           binding->desktop_top == sr[j].screen_top_pt && binding->desktop_width == sr[j].screen_width_pt &&
+		           binding->desktop_height == sr[j].screen_height_pt) {
+			match = (int)j;
+			how = "desktop rect";
+		}
 	}
 #undef LEIA_HAS
-	if (!uuid_match && !rect_match) {
-		U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen declined — screen '%s' (%d,%d %ux%u pt) is not "
-		        "the Leia panel (display %u, '%s')",
+	if (match < 0) {
+		U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen declined — screen '%s' (%d,%d %ux%u pt) is not an "
+		        "SR display (%u enumerated)",
 		        name, binding->desktop_left, binding->desktop_top, binding->desktop_width, binding->desktop_height,
-		        info.cg_display_id, info.uuid);
+		        n_sr);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
-	U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen: screen '%s' is the Leia panel (display %u, matched by %s)",
-	        name, info.cg_display_id, uuid_match ? "UUID" : "desktop rect");
-	return leia_mac_dp_factory_metal_for_screen(metal_device, command_queue, out_xdp);
+	U_LOG_W("leia_mac_plugin: create_dp_metal_for_screen: screen '%s' is SR display 0x%016llx (%s, matched by %s)",
+	        name, (unsigned long long)sr[match].sr_display_id, sr[match].fpc_verified ? "FPC verified" : "EDID only",
+	        how);
+	return leia_mac_dp_factory_metal_for_screen(metal_device, command_queue, &sr[match], out_xdp);
 }
 #endif
 

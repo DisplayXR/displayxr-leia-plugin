@@ -126,6 +126,13 @@ struct leia_dp_mac
 	//! the first writer to the target this frame (load, never clear; every
 	//! write confined to the canvas).
 	bool screen_bound;
+	//! The SR display a screen-bound DP was made for (srEnumerateDisplays
+	//! entry, resolved at creation and owned here — never the process-wide
+	//! "active panel" cache, which a topology change rewrites).
+	struct leia_mac_display_info screen;
+	//! Weaver created with SR_WEAVER_ROUTING_EXTERNAL: it never votes the
+	//! lens, so this DP owns it (lens_owner.external_weavers = 1).
+	bool external_routing;
 	//! The runtime has called set_present_origin at least once (logging only).
 	bool runtime_origin;
 	//! Frame (ldp->frames numbering) the runtime's set_present_origin was last
@@ -804,9 +811,14 @@ leia_dp_mac_get_hardware_3d_state(struct xrt_display_processor_metal *xdp, bool 
 static bool
 leia_dp_mac_get_display_dimensions(struct xrt_display_processor_metal *xdp, float *out_w_m, float *out_h_m)
 {
-	(void)xdp;
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
 	struct leia_mac_display_info info;
-	if (!leia_mac_get_display_info(&info) || !info.valid) {
+	if (ldp->screen_bound) {
+		info = ldp->screen;
+	} else if (!leia_mac_get_display_info(&info)) {
+		return false;
+	}
+	if (!info.valid || info.width_m <= 0.0f) {
 		return false;
 	}
 	*out_w_m = info.width_m;
@@ -821,17 +833,23 @@ leia_dp_mac_get_display_pixel_info(struct xrt_display_processor_metal *xdp,
                                    int32_t *out_left,
                                    int32_t *out_top)
 {
-	(void)xdp;
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
 	struct leia_mac_display_info info;
-	if (!leia_mac_get_display_info(&info) || !info.valid) {
+	if (ldp->screen_bound) {
+		info = ldp->screen;
+	} else if (!leia_mac_get_display_info(&info)) {
+		return false;
+	}
+	if (!info.valid) {
 		return false;
 	}
 	*out_px_w = info.pixel_width;
 	*out_px_h = info.pixel_height;
-	// The Metal compositor's window metrics are screen-relative (its
-	// display_screen_left/top are 0), so the panel origin is 0,0 here too.
-	*out_left = 0;
-	*out_top = 0;
+	// Session DP: the Metal compositor's window metrics are screen-relative
+	// (its display_screen_left/top are 0), so 0,0. Segment DP: the binding's
+	// desktop origin (top-down points), per the for_screen contract.
+	*out_left = ldp->screen_bound ? info.screen_left_pt : 0;
+	*out_top = ldp->screen_bound ? info.screen_top_pt : 0;
 	return true;
 }
 
@@ -839,6 +857,10 @@ static void
 leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
 {
 	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (ldp->external_routing && ldp->lens != NULL && ldp->lens_owner.last_sent == LEIA_LENS_REQ_3D) {
+		// No weaver will ever release a lens an EXTERNAL weaver's owner raised.
+		(void)srLensDisable(ldp->lens);
+	}
 	if (ldp->weaver != NULL) {
 		srDestroyWeaver(ldp->weaver);
 	}
@@ -872,9 +894,10 @@ static xrt_result_t
 leia_dp_mac_create(void *metal_device,
                    void *command_queue,
                    void *window_handle,
-                   bool screen_bound,
+                   const struct leia_mac_display_info *screen,
                    struct xrt_display_processor_metal **out_xdp)
 {
+	const bool screen_bound = screen != NULL;
 	if (out_xdp == NULL || metal_device == NULL || command_queue == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
@@ -885,6 +908,11 @@ leia_dp_mac_create(void *metal_device,
 		return XRT_ERROR_ALLOCATION;
 	}
 	ldp->screen_bound = screen_bound;
+	if (screen_bound) {
+		ldp->screen = *screen;
+	}
+	struct leia_mac_sr_caps sr_caps = {0};
+	(void)leia_mac_get_sr_caps(&sr_caps);
 	ldp->device = [(__bridge id<MTLDevice>)metal_device retain];
 	ldp->queue = [(__bridge id<MTLCommandQueue>)command_queue retain];
 
@@ -919,7 +947,26 @@ leia_dp_mac_create(void *metal_device,
 		goto fail;
 	}
 
-	SrEyeTrackerCreateInfo eci = SrEyeTrackerCreateInfo(.enablePrediction = SR_FALSE);
+	// Per-screen DP: bind to that SR display. The weaver only when the SR
+	// runtime honours binding and the display is FPC verified (an EDID-only
+	// one has no calibration and fails with DEVICE_NOT_AVAILABLE); lens and
+	// eye tracker only when their per-device capability says a non-active
+	// display can be named (macOS today: no — they stay on the active one).
+	SrDisplayBindingInfo bind = SrDisplayBindingInfo(.displayId = screen_bound ? ldp->screen.sr_display_id : 0);
+	const bool bind_weaver = screen_bound && sr_caps.display_binding && ldp->screen.fpc_verified &&
+	                         ldp->screen.sr_display_id != 0;
+	const bool bind_tracker = bind_weaver && sr_caps.eye_tracker_per_device;
+	const bool bind_lens = bind_weaver && sr_caps.lens_per_device;
+	SrWeaverRoutingInfo routing = SrWeaverRoutingInfo(.mode = SR_WEAVER_ROUTING_EXTERNAL,
+	                                                  .pNext = bind_weaver ? &bind : NULL);
+	ldp->external_routing = screen_bound && sr_caps.external_routing;
+	if (screen_bound && !sr_caps.external_routing) {
+		U_LOG_W("leia_mac_dp: SR runtime lacks external weaver routing — the windowless segment weaver is "
+		        "SDK-routed (phase from set_present_origin only if the runtime honours it)");
+	}
+
+	SrEyeTrackerCreateInfo eci = SrEyeTrackerCreateInfo(.enablePrediction = SR_FALSE,
+	                                                    .pNext = bind_tracker ? &bind : NULL);
 	res = srCreateEyeTracker(ldp->inst, &eci, &ldp->tracker);
 	if (SR_SUCCEEDED(res)) {
 		srEyeTrackerAddCallback(ldp->tracker, leia_dp_mac_on_eye_pair, ldp);
@@ -931,6 +978,11 @@ leia_dp_mac_create(void *metal_device,
 
 	SrWeaverCreateInfoMetal wci = SrWeaverCreateInfoMetal(.device = metal_device, .commandQueue = command_queue,
 	                                                      .window = (__bridge void *)ldp->window);
+	if (ldp->external_routing) {
+		wci.pNext = &routing; // routing -> (binding)
+	} else if (bind_weaver) {
+		wci.pNext = &bind;
+	}
 	res = srCreateWeaverMetal(ldp->inst, &wci, &ldp->weaver);
 	if (SR_FAILED(res)) {
 		U_LOG_E("leia_mac_dp: srCreateWeaverMetal failed: %s", leia_mac_sr_result_str(res));
@@ -944,11 +996,22 @@ leia_dp_mac_create(void *metal_device,
 		goto fail;
 	}
 
-	SrLensCreateInfo lci = SrLensCreateInfo();
+	SrLensCreateInfo lci = SrLensCreateInfo(.pNext = bind_lens ? &bind : NULL);
 	res = srCreateLens(ldp->inst, &lci, &ldp->lens);
 	if (SR_FAILED(res)) {
 		U_LOG_W("leia_mac_dp: srCreateLens failed (%s) — no 2D/3D switching", leia_mac_sr_result_str(res));
 		ldp->lens = NULL;
+	}
+	if (ldp->external_routing) {
+		// An EXTERNAL weaver never votes the lens: a 3D request must be sent.
+		ldp->lens_owner.external_weavers = 1;
+	}
+	if (screen_bound) {
+		U_LOG_W("leia_mac_dp: segment weaver for SR display 0x%016llx (%s): routing %s, weaver %s, eye tracker "
+		        "%s, lens %s",
+		        (unsigned long long)ldp->screen.sr_display_id, ldp->screen.fpc_verified ? "FPC verified" : "EDID only",
+		        ldp->external_routing ? "EXTERNAL" : "SDK", bind_weaver ? "BOUND" : "active display",
+		        bind_tracker ? "BOUND" : "active display", bind_lens ? "BOUND" : "active display");
 	}
 
 	ldp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_metal);
@@ -995,15 +1058,19 @@ leia_mac_dp_factory_metal(void *metal_device,
                           void *window_handle,
                           struct xrt_display_processor_metal **out_xdp)
 {
-	return leia_dp_mac_create(metal_device, command_queue, window_handle, false, out_xdp);
+	return leia_dp_mac_create(metal_device, command_queue, window_handle, NULL, out_xdp);
 }
 
 xrt_result_t
 leia_mac_dp_factory_metal_for_screen(void *metal_device,
                                      void *command_queue,
+                                     const struct leia_mac_display_info *display,
                                      struct xrt_display_processor_metal **out_xdp)
 {
+	if (display == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Windowless (srCreateWeaverMetal window = NULL); the phase arrives
 	// through set_present_origin.
-	return leia_dp_mac_create(metal_device, command_queue, NULL, true, out_xdp);
+	return leia_dp_mac_create(metal_device, command_queue, NULL, display, out_xdp);
 }
