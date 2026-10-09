@@ -18,6 +18,11 @@
  *          frozen EDID table knows the panel" — today's behaviour, kept
  *          byte-identical so nothing changes on a box whose SR runtime
  *          predates the API.
+ *   3. SR's own monitor list (srEnumerateMonitors, slot 108 on Windows,
+ *      LeiaSR 1.38.0+2192 headers), when the installed SR runtime has it:
+ *      every OS monitor with the SR display it belongs to. SR joins its
+ *      displays to monitors by HMONITOR itself, so a monitor it lists is
+ *      bound without any EDID/origin guesswork (see leia_win_compute_claims).
  *
  * Kept free of SDK and Win32 headers so a host unit test drives it with
  * fixtures (tests/test_display_claims_win.c, run by the Linux CI job).
@@ -71,6 +76,35 @@ struct leia_win_sr_display
 	uint64_t hmonitor;    //!< HMONITOR at enumeration time (SR's `platformHandle`), 0 = none
 };
 
+//! Upper bound on OS monitors one SR monitor enumeration is read into.
+#define LEIA_WIN_SR_MAX_MONITORS 16
+
+/*!
+ * One OS monitor as SR's monitor enumeration reports it (SrMonitorDescriptor,
+ * SR_TYPE 31), reduced to what claiming needs. Plain C, like
+ * @ref leia_win_sr_display.
+ */
+struct leia_win_sr_monitor
+{
+	//! The SR display this monitor is (SrDisplayDescriptor displayId), 0 =
+	//! SR says it is not an SR display.
+	uint64_t sr_display_id;
+	uint64_t hmonitor;    //!< HMONITOR (SR's `platformHandle`), the join key
+	char device_name[32]; //!< GDI device name (SR's `connector`), may be empty
+
+	//! Desktop rect in device px, desktop coordinates.
+	int32_t x, y;
+	int32_t width, height;
+	uint32_t native_w, native_h; //!< preferred mode, 0 = unknown
+	bool is_primary;
+
+	//! Raw little-endian EDID words (bytes 8-9 / 10-11) — the same encoding
+	//! as xrt_display_descriptor's edid_manufacturer / edid_product. 0 =
+	//! unknown.
+	uint16_t edid_manufacturer, edid_product;
+	uint32_t edid_serial; //!< EDID bytes 12-15; 0 = none
+};
+
 /*!
  * Pack a 3-letter EDID PNP vendor id ("ACR") into the little-endian
  * manufacturer word the frozen table uses (ACR -> 29188).
@@ -97,6 +131,19 @@ struct leia_win_claim_inputs
 	bool legacy_table_verified;
 
 	uint32_t supported_apis; //!< XRT_DP_API_BIT_* for every claim
+
+	//! SR's own monitor list (srEnumerateMonitors); @ref sr_monitor_count < 0
+	//! = unavailable (compiled out, SR runtime predates it, no instance) ->
+	//! every monitor takes the EDID/origin heuristic, exactly as before.
+	const struct leia_win_sr_monitor *sr_monitors;
+	int32_t sr_monitor_count;
+
+	//! Resolve a runtime descriptor's desktop origin to its HMONITOR in this
+	//! process (the runtime derived the origin from that HMONITOR's rect, in
+	//! the same process and DPI context). 0 = none. NULL = compare the origin
+	//! with SR's desktop rect instead. Injected so the test runs without
+	//! Win32 (@ref leia_win_monitor_at is the real one).
+	uint64_t (*monitor_at)(int32_t left, int32_t top);
 };
 
 /*! What a claim is bound to — the plug-in-private monitor table (M5/M6 bind
@@ -107,6 +154,14 @@ struct leia_win_claim_binding
 	uint64_t sr_display_id; //!< 0 = none known (older SR, or SR does not list it)
 	uint64_t hmonitor;      //!< SR's HMONITOR for the matched display, 0 = none
 	char device_name[32];   //!< GDI device name of the matched SR display, may be empty
+
+	//! True when SR's own monitor join bound this claim (no heuristic).
+	bool sr_joined;
+	//! The matched SR display's calibrated size and native mode, captured at
+	//! claim time so get_display_info_for_monitor needs no re-enumeration.
+	//! 0 = SR did not say (or nothing matched).
+	uint32_t width_mm, height_mm;
+	uint32_t native_w, native_h;
 };
 
 /*!
@@ -116,6 +171,26 @@ struct leia_win_claim_binding
  * @p out_claims.
  *
  * Matching rules:
+ *  - SR's own join first (@ref leia_win_claim_inputs::sr_monitor_count >= 0).
+ *    A runtime monitor is looked up in SR's monitor list by HMONITOR
+ *    (@ref leia_win_claim_inputs::monitor_at on the descriptor's origin), or,
+ *    with no resolver / no HMONITOR, by desktop origin == SR's monitor rect
+ *    origin. A row whose EDID ids contradict the descriptor's (both known,
+ *    different) is treated as absent (topology changed between the two
+ *    enumerations). When the row is found:
+ *      - its SR display id is in SR's display list -> bound to that SR
+ *        display, period: no EDID/origin matching, never AMBIGUOUS (two
+ *        identical panels are told apart by SR itself). Confidence as below;
+ *      - its SR display id is 0 -> SR says this monitor is not an SR display:
+ *        no binding; claimed at EDID confidence only on a frozen-table hit
+ *        (the "table knows it, SR does not list it" case below);
+ *      - its SR display id is not in SR's display list (the two lists are
+ *        cached separately) -> treated as absent.
+ *    Joined SR displays are taken before the heuristic runs, so it can never
+ *    hand one to a second monitor.
+ *  - Monitors absent from SR's list, or every monitor when the list is
+ *    unavailable, take the heuristic below — unchanged, so with the list
+ *    unavailable the result is byte-identical to before.
  *  - Runtime monitor -> SR display (new API): same (manufacturer, product)
  *    AND, when SR marks its location desktop-global, the same desktop origin;
  *    else (manufacturer, product) when that pair is unique in SR's list. Two
@@ -177,6 +252,28 @@ leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out);
  */
 int32_t
 leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap);
+
+/*!
+ * SR's monitor list (srEnumerateMonitors, Windows slot 108, LeiaSR
+ * 1.38.0+2192): every active OS monitor and the SR display it is. Same
+ * process-wide probe instance and short-TTL cache as
+ * @ref leia_win_sr_enumerate_displays.
+ *
+ * @return the number of monitors (<= @p cap written to @p out), or -1 when
+ *         unavailable: compiled out, the installed SR runtime predates it
+ *         (SR_ERROR_FUNCTION_UNSUPPORTED), or no instance could be created.
+ */
+int32_t
+leia_win_sr_enumerate_monitors(struct leia_win_sr_monitor *out, uint32_t cap);
+
+/*!
+ * The HMONITOR whose desktop rect contains (@p left, @p top) in this
+ * process's coordinate space (MonitorFromPoint, no default), as a uint64_t;
+ * 0 when none or not on Windows. The real
+ * @ref leia_win_claim_inputs::monitor_at.
+ */
+uint64_t
+leia_win_monitor_at(int32_t left, int32_t top);
 
 //! Destroy the probe instance, if one exists. Plug-in destroy.
 void
