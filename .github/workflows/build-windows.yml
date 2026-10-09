@@ -93,8 +93,11 @@ jobs:
       # 1895 = final RC @ c0384431e: no new functions -- 104 slot declarations,
       # 95 live (an exact ordered copy of 1874's) + 9 reserved NULL (Metal, GL/VK
       # compose inputs). Repinned so releases name the SR build David distributes.
-      SR_V2_TAG: sr-sdk-v2-1.38.0.2141
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+2141.68f7307e8d-win64-Release
+      # 2192 = + LeiaSR #485 (ST-5481): DECLARATION grep 99 -> 100, APPENDS ONLY
+      # (EnumerateMonitors, Windows slot 108, tag 31 -- used by probe_displays
+      # under DXR_LEIA_HAS_SR_MONITOR_ENUM).
+      SR_V2_TAG: sr-sdk-v2-1.38.0.2192
+      SR_V2_DIR: LeiaSR-SDK-1.38.0+2192.242007fdc9-win64-Release
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.

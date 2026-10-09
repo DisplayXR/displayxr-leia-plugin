@@ -104,8 +104,11 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: used by the d3d11 DP under DXR_LEIA_HAS_SR_COMPOSE_STRENGTH (XR_DXR_weave v15).
 :: 1895 = final RC @ c0384431e: no new functions -- 104 slot declarations, 95 live (an
 :: exact ordered copy of 1874's) + 9 reserved NULL (Metal, GL/VK compose inputs).
-set SR_V2_TAG=sr-sdk-v2-1.38.0.2141
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+2141.68f7307e8d-win64-Release
+:: 2192 = RC @ 242007fdc (+ LeiaSR #485, ST-5481): DECLARATION grep 99 -> 100, 2141's 99 an
+:: exact ordered prefix, APPENDS ONLY -- pfnEnumerateMonitors (Windows slot 108, tag 31), used by
+:: probe_displays under DXR_LEIA_HAS_SR_MONITOR_ENUM (SR's own monitor <-> SR display join).
+set SR_V2_TAG=sr-sdk-v2-1.38.0.2192
+set SR_V2_DIR=LeiaSR-SDK-1.38.0+2192.242007fdc9-win64-Release
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
