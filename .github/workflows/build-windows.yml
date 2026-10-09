@@ -108,7 +108,7 @@ jobs:
       # from the PRIVATE LeiaInc/media_sdk repo into the gitignored
       # NeurD-SDK-<ref>/include -- never committed. Pin a media_sdk release tag.
       # KEEP IN SYNC with scripts/build-windows.bat (check_sr_pins.py asserts).
-      NEURD_SDK_REF: v0.4.6
+      NEURD_SDK_REF: v0.4.9-DEV
       NEURD_SDK_REPO: LeiaInc/media_sdk
       GH_TOKEN: ${{ github.token }}
       # SourceForge serves a bot-check page to CI runners, so vcpkg's pthreads

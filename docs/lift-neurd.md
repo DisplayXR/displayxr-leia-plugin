@@ -534,15 +534,15 @@ exactly like the SR SDK:
 | | |
 |---|---|
 | Pins | `NEURD_SDK_REF` + `NEURD_SDK_REPO` in `scripts/build-windows.bat` **and** `.github/workflows/build-windows.yml` (`jobs.Build.env`), kept equal by `scripts/check_sr_pins.py` (lint.yml). |
-| Current pin | `v0.4.6` — the newest media_sdk release tag; its headers are byte-identical to `dev@25a713d93` (the tip this module was written against). Move it to a newer **release tag** when the module needs a newer NeurD API. |
+| Current pin | `v0.4.9-DEV` — the first media_sdk tag carrying `NeurD_convert_stream_dx_ex` and per-stream props (media_sdk#561, `dev@fd9590f`). Move it to the `v0.4.9` release tag once it exists; headers are identical across a version's `-DEV`/`-QA`/release tags. |
 | Auth | `gh` with read access to `LeiaInc/media_sdk` (`gh auth login`, or `GH_TOKEN`). CI uses `secrets.LEIALOFT_GITHUB_TOKEN`, the SR SDK token — that token must be granted read on `media_sdk`. |
 | Failure | Soft. The .bat prints a WARN and builds without lift; CI emits a `::warning::` annotation (`continue-on-error`) and ships without lift. CMake prints `NeurD headers NOT found ... lift compiled OUT`. |
 | Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |
 
 The 0.4.9 features (per-stream props / depth export / off-axis camera) compile only when the
-fetched `NeurD.h` declares them, detected per feature. Until a media_sdk release tag carries
-them (#561), build locally against headers from the PR branches with
-`NEURD_SDK_ROOT` (never commit them); the pinned `v0.4.6` build compiles them out.
+fetched `NeurD.h` declares them, detected per feature, so a build against an older pin (or an
+older `NEURD_SDK_ROOT` drop) compiles them out. At run time each one also needs the loaded
+NeurD to be 0.4.9 or newer; with an older NeurD the module falls back to the plain convert.
 
 `NeurD_version.h` is generated the way media_sdk's CMake does it, from
 `sdk/NeurD_version.h.in` and the top-level `project(mediasdk VERSION x.y.z)` at the same
