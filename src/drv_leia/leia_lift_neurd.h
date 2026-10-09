@@ -58,7 +58,7 @@ struct leia_lift_neurd_caps
 	uint64_t typical_latency_ns;
 	char backend[32]; //!< e.g. "neurd-directml"; "" when unavailable.
 	//! LEIA_LIFT_AUX_DEPTH when SBS / NVIEW streams can return the depth of
-	//! the same inference (NeurD >= 0.4.9 with get_stream_depth_dx,
+	//! the same inference (NeurD >= 0.4.9 convert_stream_dx_ex want_depth,
 	//! DirectML).
 	uint32_t aux_outputs;
 	//! LEIA_LIFT_DEPTH_UNITS_* (leia_lift_depth.h) of that depth: METRIC
@@ -209,7 +209,7 @@ leia_lift_neurd_convert(struct leia_lift_neurd *lift,
  * The depth NeurD retained for the conversion leia_lift_neurd_convert just
  * returned on stream @p id (created with LEIA_LIFT_AUX_DEPTH). Non-blocking:
  * the depth was bridged during that convert. False = none (not requested,
- * NeurD < 0.4.9 / not DirectML, or the last convert retained nothing).
+ * NeurD < 0.4.9 / not DirectML, or the last convert returned no depth).
  */
 bool
 leia_lift_neurd_get_depth(struct leia_lift_neurd *lift, uint64_t id, struct leia_lift_neurd_depth *out);
