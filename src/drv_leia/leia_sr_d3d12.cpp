@@ -11,6 +11,7 @@
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
 #include "leia_sr_liveness.h"
+#include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -22,6 +23,9 @@
 #ifdef DXR_LEIA_HAS_SR_V2
 #include <sr/sr_dx12.h>
 #include <sr/sr_weaver.h>
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+#include <sr/sr_display.h> // SrDisplayBindingInfo (multi-screen M6)
+#endif
 #endif
 
 #include <d3d12.h>
@@ -148,6 +152,36 @@ struct leiasr_d3d12
 	//! runtime#939: set by lens_worker_join on the way to a destroy/reconnect so a
 	//! worker sitting in its 2D dwell applies at once instead of finishing the wait.
 	std::atomic<bool> lens_quit{false};
+
+	// --- Multi-screen M6: per-screen weaver (create_dp_d3d12_for_screen) ---
+	// The D3D12 twin of the D3D11 arm's fields of the same names; see
+	// leia_sr_d3d11.cpp for the full rationale of each.
+	//! Created for ONE screen: plan EXTERNAL routing + display binding.
+	//! The unbound DP (every pre-M6 caller) keeps SDK routing, byte-identical.
+	bool screen_bound = false;
+	//! The SR display to bind (0 = unknown ⟹ routing only).
+	uint64_t bind_display_id = 0;
+	//! What the create ended up with (for logs and the per-frame paths).
+	bool external_routed = false;
+	bool display_bound = false;
+	bool binding_refused = false;
+	//! The weaver reads its phase from the present origin + viewport only
+	//! (EXTERNAL without a window). Applied before every weave.
+	bool needs_present_origin = false;
+	std::atomic<int32_t> present_origin_x{0};
+	std::atomic<int32_t> present_origin_y{0};
+	//! The runtime's active (tracked) display id, 0 = unknown.
+	uint64_t active_display_id = 0;
+	//! The bound display is not the tracked one: the nominal viewer is pinned,
+	//! re-applied before every weave.
+	bool viewer_pinned = false;
+	//! lens_v2 is bound to bind_display_id (SR D3): disabled before destroy.
+	bool lens_bound = false;
+	//! This segment has a tracker of its own (the active display, or SR D4).
+	bool segment_tracked = true;
+	float pin_left_mm[3] = {0.0f, 0.0f, 0.0f};
+	float pin_right_mm[3] = {0.0f, 0.0f, 0.0f};
+	bool pin_eyes_logged = false;
 };
 
 namespace {
@@ -274,11 +308,35 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 		return false;
 	}
 
+	// Multi-screen M6: what the runtime can do, and what this DP will ask for.
+	// An unbound DP gets an empty plan (SDK routing, no binding) — today's
+	// single-screen behaviour, byte-identical. Same plan as the D3D11 arm.
+	struct leia_win_sr_multi_caps mcaps = {};
+	leia_sr_v2_query_multi_caps(sr.instance_v2, &mcaps);
+	struct leia_win_sr_weaver_plan plan =
+	    leia_win_sr_plan_weaver(&mcaps, sr.screen_bound, hwnd != nullptr, sr.bind_display_id);
+	if (sr.screen_bound) {
+		U_LOG_W(
+		    "SR D3D12 per-screen weaver: display 0x%016llx, window %p, caps{known=%d external=%d snap=%d "
+		    "binding=%d maxBound=%u} -> plan{external=%d keep_drag_snap=%d bind=%d}",
+		    (unsigned long long)sr.bind_display_id, hwnd, (int)mcaps.known, (int)mcaps.external_routing,
+		    (int)mcaps.keep_drag_snap, (int)mcaps.display_binding, mcaps.max_bound_displays,
+		    (int)plan.routing_external, (int)plan.keep_drag_snap, (int)plan.bind_display);
+	}
+
 	leia_sr_v2_display_info info{};
-	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, 0, &info)) {
+	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, plan.bind_display ? plan.display_id : 0, &info)) {
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
 		return false;
+	}
+	// The runtime's ACTIVE display — the one its tracker follows — so a weaver
+	// bound to any other display knows it must pin a viewer.
+	if (plan.bind_display) {
+		leia_sr_v2_display_info active{};
+		if (leia_sr_v2_query_display(sr.instance_v2, nullptr, max_time, 0, &active)) {
+			sr.active_display_id = active.display_id;
+		}
 	}
 
 	sr.display_width_m = info.width_m;
@@ -301,7 +359,55 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	ci.d3d12Device = sr.device;
 	ci.window = (SrNativeWindowHandle)hwnd;
 
-	const SrResult wr = srCreateWeaverDX12(sr.instance_v2, &ci, &sr.weaver_v2);
+	SrResult wr = SR_ERROR_RUNTIME_FAILURE;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	// Multi-screen M6: chain routing + binding per the plan; on a refusal
+	// drop the binding first, then routing (leia_win_sr_plan_weaver_fallback),
+	// so a runtime that refuses an id still yields a weaver.
+	for (;;) {
+		SrDisplayBindingInfo binding{};
+		binding.sType = SR_TYPE_DISPLAY_BINDING_INFO;
+		binding.pNext = nullptr;
+		binding.displayId = plan.display_id;
+		SrWeaverRoutingInfo routing{};
+		routing.sType = SR_TYPE_WEAVER_ROUTING_INFO;
+		routing.pNext = nullptr;
+		routing.mode = SR_WEAVER_ROUTING_EXTERNAL;
+		routing.flags = plan.keep_drag_snap ? SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT : 0;
+		const void *head = nullptr;
+		if (plan.bind_display) {
+			binding.pNext = head;
+			head = &binding;
+		}
+		if (plan.routing_external) {
+			routing.pNext = head;
+			head = &routing;
+		}
+		ci.pNext = head;
+		wr = srCreateWeaverDX12(sr.instance_v2, &ci, &sr.weaver_v2);
+		if (SR_SUCCEEDED(wr) && sr.weaver_v2 != nullptr) {
+			break;
+		}
+		if (!plan.bind_display && !plan.routing_external) {
+			break; // the plain create failed: a real fault, reported below
+		}
+		U_LOG_W("srCreateWeaverDX12 refused plan{external=%d bind=%d id=0x%016llx}: %s (%d) — falling back",
+		        (int)plan.routing_external, (int)plan.bind_display, (unsigned long long)plan.display_id,
+		        leia_sr_v2_result_str(wr), (int)wr);
+		if (plan.bind_display) {
+			sr.binding_refused = true;
+		}
+		sr.weaver_v2 = nullptr;
+		if (!leia_win_sr_plan_weaver_fallback(&plan)) {
+			break;
+		}
+	}
+#else
+	wr = srCreateWeaverDX12(sr.instance_v2, &ci, &sr.weaver_v2);
+#endif
+	sr.external_routed = plan.routing_external;
+	sr.display_bound = plan.bind_display;
+	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
@@ -315,7 +421,19 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 		return false;
 	}
 
-	if (!leia_sr_v2_initialize(sr.instance_v2)) {
+	/*
+	 * Multi-screen M6 (same decision as the D3D11 arm): a weaver bound to a
+	 * display that is NOT the runtime's active one, with no tracker of its own
+	 * (SR D4 absent), pins the nominal viewer and so never initialises its
+	 * instance — a running "no face" feed would drive it back to 2D.
+	 */
+	const bool segment_tracked =
+	    leia_win_sr_plan_segment_tracked(&mcaps, sr.display_bound ? sr.bind_display_id : 0, sr.active_display_id);
+	const bool pin_viewer =
+	    !segment_tracked &&
+	    leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0, sr.active_display_id);
+	sr.segment_tracked = segment_tracked;
+	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		srDestroyWeaver(sr.weaver_v2);
 		sr.weaver_v2 = nullptr;
 		srDestroyInstance(sr.instance_v2);
@@ -330,9 +448,62 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	// returns a hardcoded false). It needs the same submit hook Vulkan has —
 	// D3D12 hands submission to the application too — and that hook does not
 	// exist. Calling enable here would return SR_SUCCESS and do nothing.
-	leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
+	//
+	// The lens (multi-screen M6, as on D3D11): an unbound DP and a screen-bound
+	// DP on the active display take the plain (active-display) lens. A DP
+	// bound to another display must NOT — that handle would switch the active
+	// panel; with SR D3 it binds a lens to ITS display, else leaves it alone.
+	const bool non_active =
+	    sr.display_bound && sr.active_display_id != 0 && sr.bind_display_id != sr.active_display_id;
+	const bool bind_lens = non_active && leia_win_sr_plan_bind_lens(&mcaps, &plan);
+	if (!non_active) {
+		leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
+	} else if (bind_lens) {
+		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
+		sr.lens_bound = sr.lens_v2 != nullptr;
+	}
+	if (non_active && segment_tracked) {
+		U_LOG_W(
+		    "SR D3D12 per-screen weaver: display 0x%016llx is not the active 0x%016llx but the runtime "
+		    "reports a tracker per device (D4) — tracked by its own camera, no simulated viewer, lens %s",
+		    (unsigned long long)sr.bind_display_id, (unsigned long long)sr.active_display_id,
+		    sr.lens_bound ? "BOUND to this display" : "left to the active panel");
+	}
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	if (pin_viewer) {
+		// The SDK's own no-face viewer (0, 100, 600) mm, split by a 63 mm IPD
+		// — the same pair the D3D11 arm pins.
+		sr.pin_left_mm[0] = -31.5f;
+		sr.pin_left_mm[1] = 100.0f;
+		sr.pin_left_mm[2] = 600.0f;
+		sr.pin_right_mm[0] = 31.5f;
+		sr.pin_right_mm[1] = 100.0f;
+		sr.pin_right_mm[2] = 600.0f;
+		SrSimulatedViewer viewer{};
+		viewer.sType = SR_TYPE_SIMULATED_VIEWER;
+		viewer.pNext = nullptr;
+		viewer.leftEye.x = sr.pin_left_mm[0];
+		viewer.leftEye.y = sr.pin_left_mm[1];
+		viewer.leftEye.z = sr.pin_left_mm[2];
+		viewer.rightEye.x = sr.pin_right_mm[0];
+		viewer.rightEye.y = sr.pin_right_mm[1];
+		viewer.rightEye.z = sr.pin_right_mm[2];
+		const SrResult vr = srWeaverSetSimulatedViewer(sr.weaver_v2, &viewer);
+		sr.viewer_pinned = SR_SUCCEEDED(vr);
+		U_LOG_W(
+		    "SR D3D12 per-screen weaver: display 0x%016llx is not the active 0x%016llx — simulated "
+		    "nominal viewer %s, lens %s",
+		    (unsigned long long)sr.bind_display_id, (unsigned long long)sr.active_display_id,
+		    sr.viewer_pinned ? "PINNED" : "REFUSED (will fall back to 2D)",
+		    sr.lens_bound ? "BOUND to this display (D3)"
+		                  : (bind_lens ? "bind REFUSED — left to the active panel"
+		                               : "left to the active panel (runtime predates D3)"));
+	}
+#endif
 
-	U_LOG_W("SR D3D12 weaver created via the v2 C API");
+	U_LOG_W("SR D3D12 weaver created via the v2 C API%s%s%s", sr.external_routed ? " (EXTERNAL routing" : "",
+	        sr.external_routed ? (sr.display_bound ? ", display bound)" : ")") : "",
+	        sr.needs_present_origin ? " [windowless: phase from the present origin]" : "");
 	return true;
 }
 #endif // DXR_LEIA_HAS_SR_V2
@@ -765,7 +936,45 @@ w_weave(leiasr_d3d12 *sr)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+		// Multi-screen M6: a windowless EXTERNAL weaver phases from the
+		// present origin + the viewport and nothing else; the runtime feeds
+		// the origin every frame it weaves, so apply it right before the
+		// weave that uses it. Cheap.
+		if (sr->needs_present_origin) {
+			srWeaverSetPresentOrigin(sr->weaver_v2, sr->present_origin_x.load(std::memory_order_relaxed),
+			                         sr->present_origin_y.load(std::memory_order_relaxed));
+		}
+		if (sr->viewer_pinned) {
+			// Per weave, not once (see the D3D11 arm's field comment).
+			SrSimulatedViewer viewer{};
+			viewer.sType = SR_TYPE_SIMULATED_VIEWER;
+			viewer.pNext = nullptr;
+			viewer.leftEye.x = sr->pin_left_mm[0];
+			viewer.leftEye.y = sr->pin_left_mm[1];
+			viewer.leftEye.z = sr->pin_left_mm[2];
+			viewer.rightEye.x = sr->pin_right_mm[0];
+			viewer.rightEye.y = sr->pin_right_mm[1];
+			viewer.rightEye.z = sr->pin_right_mm[2];
+			srWeaverSetSimulatedViewer(sr->weaver_v2, &viewer);
+		}
+#endif
 		srWeaverWeave(sr->weaver_v2);
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+		if (sr->viewer_pinned && !sr->pin_eyes_logged) {
+			// One-shot evidence that the pin took: a collapsed pair (L == R)
+			// means the weaver wove 2D, whatever srWeaverWeave returned.
+			sr->pin_eyes_logged = true;
+			SrPoint3f l{}, r{};
+			const SrResult er = srWeaverGetPredictedEyePositions(sr->weaver_v2, &l, &r);
+			U_LOG_W(
+			    "SR D3D12 per-screen weaver 0x%016llx: first weave with the pinned viewer — predicted eyes "
+			    "L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) (%s)",
+			    (unsigned long long)sr->bind_display_id, l.x, l.y, l.z, r.x, r.y, r.z,
+			    SR_SUCCEEDED(er) ? (fabsf(l.x - r.x) > 1.0f ? "PAIR — weaving" : "COLLAPSED — 2D fallback")
+			                     : leia_sr_v2_result_str(er));
+		}
+#endif
 		return;
 	}
 #endif
@@ -847,14 +1056,21 @@ v2_instance_of(const struct leiasr_d3d12 *sr)
 
 extern "C" {
 
-xrt_result_t
-leiasr_d3d12_create(double max_time,
-                    void *d3d12_device,
-                    void *d3d12_command_queue,
-                    void *hwnd,
-                    uint32_t view_width,
-                    uint32_t view_height,
-                    struct leiasr_d3d12 **out)
+/*!
+ * The one create both entry points share. @p screen_bound / @p display_id are
+ * the multi-screen M6 plan inputs (create_v2 reads them); an unbound create is
+ * exactly the pre-M6 one.
+ */
+static xrt_result_t
+leiasr_d3d12_create_impl(double max_time,
+                         void *d3d12_device,
+                         void *d3d12_command_queue,
+                         void *hwnd,
+                         uint32_t view_width,
+                         uint32_t view_height,
+                         bool screen_bound,
+                         uint64_t display_id,
+                         struct leiasr_d3d12 **out)
 {
 	if (d3d12_device == nullptr) {
 		U_LOG_E("D3D12 device is null");
@@ -866,6 +1082,8 @@ leiasr_d3d12_create(double max_time,
 	sr->command_queue = static_cast<ID3D12CommandQueue *>(d3d12_command_queue);
 	sr->view_width = view_width;
 	sr->view_height = view_height;
+	sr->screen_bound = screen_bound;
+	sr->bind_display_id = display_id;
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leia_sr_api_selected() == LEIA_SR_API_V2) {
@@ -983,6 +1201,46 @@ leiasr_d3d12_create(double max_time,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+leiasr_d3d12_create(double max_time,
+                    void *d3d12_device,
+                    void *d3d12_command_queue,
+                    void *hwnd,
+                    uint32_t view_width,
+                    uint32_t view_height,
+                    struct leiasr_d3d12 **out)
+{
+	return leiasr_d3d12_create_impl(max_time, d3d12_device, d3d12_command_queue, hwnd, view_width, view_height,
+	                                false, 0, out);
+}
+
+xrt_result_t
+leiasr_d3d12_create_for_screen(double max_time,
+                               void *d3d12_device,
+                               void *d3d12_command_queue,
+                               void *hwnd,
+                               uint64_t display_id,
+                               struct leiasr_d3d12 **out)
+{
+	const xrt_result_t ret =
+	    leiasr_d3d12_create_impl(max_time, d3d12_device, d3d12_command_queue, hwnd, 0, 0, true, display_id, out);
+	if (ret == XRT_SUCCESS) {
+		U_LOG_I("Created D3D12 SR per-screen weaver for display 0x%016llx, HWND %p",
+		        (unsigned long long)display_id, hwnd);
+	}
+	return ret;
+}
+
+void
+leiasr_d3d12_set_present_origin(struct leiasr_d3d12 *leiasr, int32_t panel_x, int32_t panel_y)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+	leiasr->present_origin_x.store(panel_x, std::memory_order_relaxed);
+	leiasr->present_origin_y.store(panel_y, std::memory_order_relaxed);
+}
+
 void
 leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 {
@@ -1006,8 +1264,15 @@ leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 		// is a double-free) this must be called, and there is no hazard in
 		// calling it. Full rationale in leia_sr_d3d11.cpp.
 		if (sr->lens_v2 != nullptr) {
+			// SR D3: a bound lens's request is context-owned and survives
+			// srDestroyLens; a segment DP going away must hand its panel
+			// back to 2D explicitly (as on D3D11).
+			if (sr->lens_bound) {
+				(void)srLensDisable(sr->lens_v2);
+			}
 			srDestroyLens(sr->lens_v2);
 			sr->lens_v2 = nullptr;
+			sr->lens_bound = false;
 		}
 		srDestroyWeaver(sr->weaver_v2);
 		sr->weaver_v2 = nullptr;
