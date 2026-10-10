@@ -153,6 +153,33 @@ test_simulated_viewer_pin(void)
 	CHECK(!leia_win_sr_plan_pin_simulated_viewer(0, AL_ID));
 }
 
+static void
+test_window_handle_on_the_untracked_screen(void)
+{
+	/*
+	 * ADR-047 Amendment 2, shared by the D3D11 and Vulkan per-screen DPs: the
+	 * window's majority moved to the DS1, so the DS1's DP holds the HWND and
+	 * the AL (the active, tracked panel) weaves windowless.
+	 */
+	// The DS1 DP with the window: EXTERNAL + drag snap, bound, phases from
+	// the window — and still pins its viewer (its display has no tracker).
+	struct leia_win_sr_weaver_plan ds1 = leia_win_sr_plan_weaver(&k_caps_2056, true, true, DS1_ID);
+	CHECK(ds1.routing_external && ds1.keep_drag_snap);
+	CHECK(ds1.bind_display && ds1.display_id == DS1_ID);
+	CHECK(!leia_win_sr_plan_needs_present_origin(&ds1, true));
+	CHECK(!leia_win_sr_plan_segment_tracked(&k_caps_2056, DS1_ID, AL_ID));
+	CHECK(leia_win_sr_plan_pin_simulated_viewer(DS1_ID, AL_ID));
+
+	// The AL's windowless replacement: EXTERNAL, no snap, phase from the
+	// present origin, tracked by the active display's camera — no pin.
+	struct leia_win_sr_weaver_plan al = leia_win_sr_plan_weaver(&k_caps_2056, true, false, AL_ID);
+	CHECK(al.routing_external && !al.keep_drag_snap);
+	CHECK(al.bind_display && al.display_id == AL_ID);
+	CHECK(leia_win_sr_plan_needs_present_origin(&al, false));
+	CHECK(leia_win_sr_plan_segment_tracked(&k_caps_2056, AL_ID, AL_ID));
+	CHECK(!leia_win_sr_plan_pin_simulated_viewer(AL_ID, AL_ID));
+}
+
 int
 main(void)
 {
@@ -165,6 +192,7 @@ main(void)
 	test_bound_lens();
 	test_segment_tracked();
 	test_simulated_viewer_pin();
+	test_window_handle_on_the_untracked_screen();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_multi_win: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
