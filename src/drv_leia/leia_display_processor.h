@@ -20,6 +20,8 @@ extern "C" {
 #endif
 
 struct leiasr;
+struct xrt_plugin_instance;
+struct xrt_screen_binding;
 
 /*!
  * Factory function for creating a Leia SR Vulkan display processor.
@@ -37,6 +39,31 @@ leia_dp_factory_vk(void *vk_bundle,
                    void *window_handle,
                    int32_t target_format,
                    struct xrt_display_processor **out_xdp);
+
+/*!
+ * Multi-screen M6 (Windows): create a Leia SR Vulkan display processor for ONE
+ * screen a spanning window covers (`xrt_plugin_iface::create_dp_vk_for_screen`).
+ *
+ * The screen's SR display id comes from the binding when the runtime carries
+ * one, else from this plug-in's own per-monitor claim (probe_displays joined
+ * srEnumerateDisplays). @p window_handle is the session's HWND for the screen
+ * holding the majority of the window (its weaver keeps the SDK's drag
+ * phase-snap, EXTERNAL + KEEP_DRAG_SNAP) and NULL for every other screen
+ * (windowless EXTERNAL, phase from set_present_origin). The DP confines its
+ * output — viewport and scissor — to the canvas it is given, and never assumes
+ * it is the first writer to the target.
+ *
+ * SR v2 only (leiasr_create_for_screen): on a v1 weaver it fails, and the
+ * runtime shows that screen's segment flat 2D.
+ */
+xrt_result_t
+leia_dp_factory_vk_for_screen(struct xrt_plugin_instance *inst,
+                              void *vk_bundle,
+                              void *vk_cmd_pool,
+                              void *window_handle,
+                              int32_t target_format,
+                              const struct xrt_screen_binding *binding,
+                              struct xrt_display_processor **out_xdp);
 
 /*!
  * Create an @ref xrt_display_processor that wraps a Leia SR SDK

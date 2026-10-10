@@ -660,6 +660,21 @@ static struct xrt_plugin_iface g_leia_iface = {
     .get_platform_state = leia_plugin_get_platform_state,
 #endif
 
+#if defined(XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN)
+    /*
+     * Multi-screen M6 (Vulkan): one VK DP per screen a spanning window covers,
+     * for the in-process Vulkan compositor off the #918 split (under the split
+     * the runtime weaves with D3D11 DPs on the scanout adapter and uses the
+     * D3D11 slot below). SR v2 only — a v1 weaver fails the create and the
+     * runtime shows that segment flat 2D.
+     */
+#if defined(XRT_HAVE_LEIA_SR_VULKAN)
+    .create_dp_vk_for_screen = leia_dp_factory_vk_for_screen,
+#else
+    .create_dp_vk_for_screen = NULL,
+#endif
+#endif
+
 #if defined(XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN)
     /* Multi-screen M6: one D3D11 DP per screen a spanning window covers. */
 #if defined(XRT_HAVE_LEIA_SR_D3D11)

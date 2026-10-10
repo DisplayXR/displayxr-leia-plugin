@@ -38,6 +38,52 @@ leiasr_create(double maxTime,
               struct leiasr **out);
 
 /*!
+ * Multi-screen M6 (Windows, Vulkan): create a leiasr instance whose weaver is
+ * bound to ONE screen (create_dp_vk_for_screen) — the Vulkan twin of
+ * leiasr_d3d11_create_for_screen.
+ *
+ * SR v2 only: the routing / display-binding / present-origin / simulated-viewer
+ * surface exists only on the v2 C API, so a process on the v1 weaver (the
+ * bundled 1.36 stamp-aware or legacy weaver DLLs) gets no per-screen DP and
+ * the runtime shows that segment flat 2D. The plan (leia_sr_multi_win.h):
+ * EXTERNAL routing (+ KEEP_DRAG_SNAP with a real HWND) and SrDisplayBindingInfo
+ * when the runtime supports them; a windowless weaver phases from
+ * @ref leiasr_set_present_origin + the viewport; a weaver bound to a display
+ * that has no tracker of its own pins the nominal viewer; the lens is bound to
+ * the display when the runtime binds lenses per device (SR D3), else left to
+ * the active panel.
+ *
+ * @param windowHandle The session's HWND for the screen holding the majority
+ *                     of the window, NULL for every other screen's DP.
+ * @param display_id   The SR display to bind (0 = unknown: routing only).
+ */
+xrt_result_t
+leiasr_create_for_screen(double maxTime,
+                         VkDevice device,
+                         VkPhysicalDevice physicalDevice,
+                         VkQueue graphicsQueue,
+                         VkCommandPool commandPool,
+                         void *windowHandle,
+                         uint64_t display_id,
+                         struct leiasr **out);
+
+/*!
+ * Multi-screen M6: the window's origin relative to this weaver's panel, in that
+ * panel's device px (the runtime's set_present_origin). Applied before every
+ * weave, and only by a windowless EXTERNAL weaver — one with a window derives
+ * its phase from the window. Thread-safe.
+ */
+void
+leiasr_set_present_origin(struct leiasr *leiasr, int32_t panel_x, int32_t panel_y);
+
+/*!
+ * Was this instance created for one screen (@ref leiasr_create_for_screen)?
+ * Such a weaver confines its output to the canvas it is given.
+ */
+bool
+leiasr_is_screen_bound(struct leiasr *leiasr);
+
+/*!
  * Destroy a leiasr instance.
  * Frees all resources.
  *
