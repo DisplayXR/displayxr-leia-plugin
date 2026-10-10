@@ -249,6 +249,8 @@ leia_win_compute_claims(const struct xrt_display_descriptor *displays,
 				if (s->fpc_verified) {
 					c->confidence = (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
 					snprintf(c->serial, sizeof(c->serial), "%s", s->serial);
+					b.fpc_verified = true;
+					snprintf(b.serial, sizeof(b.serial), "%s", s->serial);
 				}
 				b.sr_display_id = s->display_id;
 				b.hmonitor = s->hmonitor;
@@ -293,6 +295,14 @@ static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct leia_win_claim_binding g_bindings[LEIA_WIN_MAX_BINDINGS];
 static uint32_t g_binding_count;
+static uint64_t g_binding_generation;
+
+static bool
+binding_same(const struct leia_win_claim_binding *a, const struct leia_win_claim_binding *b)
+{
+	return a->monitor_id == b->monitor_id && a->sr_display_id == b->sr_display_id &&
+	       a->fpc_verified == b->fpc_verified && strcmp(a->serial, b->serial) == 0;
+}
 
 void
 leia_win_claims_store(const struct leia_win_claim_binding *bindings, uint32_t count)
@@ -300,6 +310,14 @@ leia_win_claims_store(const struct leia_win_claim_binding *bindings, uint32_t co
 	BIND_LOCK();
 	if (count > LEIA_WIN_MAX_BINDINGS) {
 		count = LEIA_WIN_MAX_BINDINGS;
+	}
+	const uint32_t new_count = bindings != NULL ? count : 0;
+	bool changed = new_count != g_binding_count;
+	for (uint32_t i = 0; !changed && i < new_count; i++) {
+		changed = !binding_same(&g_bindings[i], &bindings[i]);
+	}
+	if (changed) {
+		g_binding_generation++;
 	}
 	if (bindings != NULL && count > 0) {
 		memcpy(g_bindings, bindings, count * sizeof(bindings[0]));
@@ -324,6 +342,15 @@ leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out)
 	}
 	BIND_UNLOCK();
 	return found;
+}
+
+uint64_t
+leia_win_claims_generation(void)
+{
+	BIND_LOCK();
+	const uint64_t g = g_binding_generation;
+	BIND_UNLOCK();
+	return g;
 }
 
 

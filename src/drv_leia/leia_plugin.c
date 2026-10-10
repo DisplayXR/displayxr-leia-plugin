@@ -61,6 +61,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 
 
 /*
@@ -512,6 +513,45 @@ leia_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
 #endif
 
 
+#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
+/*
+ * ADR-051 D2 dashboard cell for one claimed screen. PASSIVE by construction:
+ * it only reads what probe_displays() and the platform-state machine already
+ * published (claim table + lock-free cached state) — no SR handle, no SR SDK
+ * call, no probe. Tracker / lens / calibration are not known without a
+ * handle, so they stay UNKNOWN / UNSUPPORTED / false.
+ */
+static xrt_result_t
+leia_plugin_get_screen_status(struct xrt_plugin_instance *inst,
+                              uint64_t monitor_id,
+                              struct xrt_plugin_screen_status *out)
+{
+	(void)inst;
+	if (out == NULL || out->struct_size < offsetof(struct xrt_plugin_screen_status, warning_count)) {
+		return XRT_ERROR_PROBER_NOT_SUPPORTED;
+	}
+	struct leia_win_claim_binding claim;
+	memset(&claim, 0, sizeof(claim));
+	if (!leia_win_claims_lookup(monitor_id, &claim)) {
+		return XRT_ERROR_PROBER_NOT_SUPPORTED; /* not a screen this plug-in claimed */
+	}
+	const enum leia_platform_state st = leia_platform_state_get();
+	out->version = XRT_PLUGIN_SCREEN_STATUS_VERSION;
+	/* Moves on a claim-set change (re-probe that saw a different topology /
+	 * identity) or a platform-state transition — never by polling hardware. */
+	out->change_counter = (leia_win_claims_generation() << 4) | ((uint64_t)st & 0xF);
+	out->ready = st == LEIA_PLATFORM_READY;
+	out->verified = claim.fpc_verified;
+	out->calibrated = false;
+	out->tracker = XRT_PLUGIN_TRACKER_STATE_UNSUPPORTED;
+	out->lens = XRT_PLUGIN_LENS_STATE_UNKNOWN;
+	memset(out->model, 0, sizeof(out->model)); /* SR exposes no model name passively */
+	snprintf(out->serial, sizeof(out->serial), "%s", claim.fpc_verified ? claim.serial : "");
+	return XRT_SUCCESS;
+}
+#endif
+
+
 /*
  *
  * Vtable.
@@ -652,6 +692,11 @@ static struct xrt_plugin_iface g_leia_iface = {
     .stereo_camera_wait_frame = leia_stereo_camera_wait_frame,
     .stereo_camera_release_frame = leia_stereo_camera_release_frame,
     .stereo_camera_close = leia_stereo_camera_close,
+#endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS
+    /* ADR-051 D2: passive per-screen dashboard cell (claim table + cached state). */
+    .get_screen_status = leia_plugin_get_screen_status,
 #endif
 };
 
