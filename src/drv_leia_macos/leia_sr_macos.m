@@ -430,8 +430,39 @@ read_active_geometry_locked(uint64_t display_id, struct leia_mac_display_info *i
 		}
 		info->pixel_width = (uint32_t)px_w;
 		info->pixel_height = (uint32_t)px_h;
-		info->rec_view_width = rec_w > 0 ? (uint32_t)rec_w : (uint32_t)px_w / 2;
+		/*
+		 * srDisplayGetRecommendedTextureSize returns the size of BOTH views
+		 * side by side — sr_display.h: "The size covers both views side by
+		 * side: each view is *pWidth / 2 by *pHeight" (LeiaSR #429,
+		 * ST-5814; the C99 API is new in SR 1.38.0 and unshipped, so it was
+		 * changed rather than versioned). So the per-view width is
+		 * width / 2: THE rule. Reading it as one view gave a 1.0 x 0.5 view
+		 * scale (3840x1080 "views" on a 3840x2160 panel): anamorphic tiles
+		 * at twice the panel's horizontal view resolution, which the
+		 * weaver's per-subpixel sampling aliases into colour fringes.
+		 *
+		 * Guard for a pre-#429 runtime, which returned ONE view: if the
+		 * answer has the panel's aspect (rather than twice it), it is
+		 * already per-view — keep it, and say so once.
+		 */
+		bool pre429_per_view = false;
+		if (rec_w > 0 && rec_h > 0) {
+			const double rec_aspect = (double)rec_w / (double)rec_h;
+			const double px_aspect = (double)px_w / (double)px_h;
+			pre429_per_view = rec_aspect < 1.5 * px_aspect;
+		}
+		info->rec_view_width =
+		    rec_w > 0 ? (uint32_t)(pre429_per_view ? rec_w : rec_w / 2) : (uint32_t)px_w / 2;
 		info->rec_view_height = rec_h > 0 ? (uint32_t)rec_h : (uint32_t)px_h / 2;
+		static bool guard_logged = false;
+		if (pre429_per_view && !guard_logged) {
+			guard_logged = true;
+			U_LOG_W("leia_mac: srDisplayGetRecommendedTextureSize %dx%d has the panel's aspect (%dx%d) — a "
+			        "pre-LeiaSR#429 runtime answering ONE view; using it as per-view (logged once)",
+			        rec_w, rec_h, px_w, px_h);
+		}
+		U_LOG_I("leia_mac: srDisplayGetRecommendedTextureSize %dx%d -> per-view %ux%u (panel %dx%d)", rec_w,
+		        rec_h, info->rec_view_width, info->rec_view_height, px_w, px_h);
 		info->nominal_x_m = nx / 1000.0f;
 		info->nominal_y_m = ny / 1000.0f;
 		info->nominal_z_m = nz / 1000.0f;
