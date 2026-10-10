@@ -74,6 +74,9 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_mac_keep_color_matching, "DXR_LEIA_MAC_KEEP_COLOR_MATCHING", false)
+//! Period of the throttled "weaver eyes" INFO line (ms). Verification scripts
+//! lower it to collect enough samples in a short run; never per frame.
+DEBUG_GET_ONCE_NUM_OPTION(leia_mac_eye_log_ms, "DXR_LEIA_MAC_EYE_LOG_MS", 5000)
 
 #define LEIA_MAC_HALF_IPD_MM 31.5f
 #define LEIA_MAC_EYE_FRESH_NS (250ll * 1000 * 1000)
@@ -642,9 +645,9 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 	maybe_capture_woven(ldp, cmd, target);
 	if (!ldp->weave_logged) {
 		ldp->weave_logged = true;
-		U_LOG_W("leia_mac_dp: first SR weave: atlas %ux%u (2x1 of %ux%u, fmt %u) -> target %ux%u (fmt %lu), "
+		U_LOG_W("leia_mac_dp: first SR weave%s: atlas %ux%u (2x1 of %ux%u, fmt %u) -> target %ux%u (fmt %lu), "
 		        "canvas (%d,%d %ux%u)",
-		        in_w, in_h, view_width, view_height, format, target_width, target_height,
+		        ldp->screen_bound ? " (SEGMENT DP)" : "", in_w, in_h, view_width, view_height, format, target_width, target_height,
 		        (unsigned long)target.pixelFormat, cx, cy, cw, ch);
 	}
 }
@@ -763,10 +766,16 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 
 	// Throttled diagnostic (INFO, every ~5 s): what the weaver itself will weave for.
 	const uint64_t now = os_monotonic_get_ns();
-	if (now - ldp->last_eye_log_ns > 5ull * 1000 * 1000 * 1000) {
+	int64_t period_ms = debug_get_num_option_leia_mac_eye_log_ms();
+	period_ms = period_ms < 100 ? 100 : period_ms; // floor: never per-frame
+	if (now - ldp->last_eye_log_ns > (uint64_t)period_ms * 1000 * 1000) {
 		ldp->last_eye_log_ns = now;
-		U_LOG_I("leia_mac_dp: weaver eyes L(%.1f %.1f %.1f) R(%.1f %.1f %.1f) mm rc=%s fresh_raw=%d",
-		        l.x, l.y, l.z, r.x, r.y, r.z, leia_mac_sr_result_str(res), (int)out->is_tracking);
+		char tag[48] = "";
+		if (ldp->screen_bound) {
+			snprintf(tag, sizeof(tag), " [segment 0x%016llx]", (unsigned long long)ldp->screen.sr_display_id);
+		}
+		U_LOG_I("leia_mac_dp:%s weaver eyes L(%.1f %.1f %.1f) R(%.1f %.1f %.1f) mm rc=%s fresh_raw=%d", tag, l.x,
+		        l.y, l.z, r.x, r.y, r.z, leia_mac_sr_result_str(res), (int)out->is_tracking);
 	}
 	return true;
 }
