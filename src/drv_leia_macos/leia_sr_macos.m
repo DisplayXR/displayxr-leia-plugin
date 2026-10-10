@@ -12,11 +12,14 @@
 #include "leia_sr_macos.h"
 #include "leia_edid_table.h"
 
+#include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+
+#include <IOKit/graphics/IOGraphicsTypes.h> // kDisplayModeNativeFlag
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -39,6 +42,7 @@ static bool g_enumerated = false; //!< the cache below holds a result (possibly 
 static struct leia_mac_display_info g_disp[LEIA_MAC_MAX_SR_DISPLAYS];
 static uint32_t g_disp_count = 0;
 static int g_last_logged_count = -1;
+static uint32_t g_sr_reported = 0; //!< srEnumerateDisplays' raw count (before the guard)
 
 //! How long the probe waits for SRService to report a valid display.
 #define LEIA_MAC_PROBE_DISPLAY_WAIT_NS (3ull * 1000ull * 1000ull * 1000ull)
@@ -155,6 +159,103 @@ leia_mac_find_panel_display(uint32_t want_px_w, uint32_t want_px_h)
 		}
 	}
 	return 0;
+}
+
+DEBUG_GET_ONCE_BOOL_OPTION(leia_allow_builtin, "DXR_LEIA_ALLOW_BUILTIN", false)
+
+//! The display's NATIVE mode in pixels (the mode IOKit flags native), else the
+//! largest pixel mode; false if CG lists none. The CURRENT mode is not the
+//! test: a real panel in a scaled "more space" HiDPI mode has a current pixel
+//! size that is not its native one.
+static bool
+native_display_px(CGDirectDisplayID did, uint32_t *out_w, uint32_t *out_h)
+{
+	const void *keys[] = {kCGDisplayShowDuplicateLowResolutionModes};
+	const void *vals[] = {kCFBooleanTrue};
+	CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+	                                          &kCFTypeDictionaryValueCallBacks);
+	CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, opts);
+	if (opts != NULL) {
+		CFRelease(opts);
+	}
+	if (modes == NULL) {
+		return false;
+	}
+	uint32_t best_w = 0, best_h = 0;
+	for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+		CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+		const uint32_t w = (uint32_t)CGDisplayModeGetPixelWidth(m);
+		const uint32_t h = (uint32_t)CGDisplayModeGetPixelHeight(m);
+		if ((CGDisplayModeGetIOFlags(m) & kDisplayModeNativeFlag) != 0) {
+			best_w = w;
+			best_h = h;
+			break;
+		}
+		if ((uint64_t)w * h > (uint64_t)best_w * best_h) {
+			best_w = w;
+			best_h = h;
+		}
+	}
+	CFRelease(modes);
+	*out_w = best_w;
+	*out_h = best_h;
+	return best_w != 0 && best_h != 0;
+}
+
+//! Is @p v (either byte order) a manufacturer id anywhere in the Leia EDID table?
+static bool
+edid_vendor_in_table(uint16_t v)
+{
+	const uint16_t sw = (uint16_t)((v >> 8) | (v << 8));
+	for (size_t i = 0; i < sizeof(leia_edid_table) / sizeof(leia_edid_table[0]); i++) {
+		if (leia_edid_table[i][0] == v || leia_edid_table[i][0] == sw) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * Defensive guard on an srEnumerateDisplays entry whose platformHandle is
+ * @p did: NULL = plausible, else why it cannot be the SR panel. Exists because
+ * an SR runtime has been seen to report an ABSENT, FPC-verified DS1 with the
+ * MacBook's built-in display as its platformHandle (EDID APP/0xA04E, native
+ * 3024x1964 vs SR's 3840x2160) — the plug-in then claimed the built-in display
+ * VERIFIED and went active. Root cause is SR-side; these checks keep a wrong
+ * join from binding.
+ *   1. a built-in display (CGDisplayIsBuiltin) — DXR_LEIA_ALLOW_BUILTIN=1 for
+ *      a real built-in Leia panel;
+ *   2. the monitor's NATIVE mode is not the resolution SR reports;
+ *   3. the monitor's EDID (vendor, product) is not a Leia panel and its vendor
+ *      makes no Leia panel at all (leia_edid_table.h).
+ */
+static const char *
+sr_display_reject_reason(const struct leia_mac_display_info *info, CGDirectDisplayID did, char *buf, size_t cap)
+{
+	if (did == 0) {
+		return NULL; // nothing to cross-check (SR's Quartz source had no monitor)
+	}
+	if (CGDisplayIsBuiltin(did) && !debug_get_bool_option_leia_allow_builtin()) {
+		snprintf(buf, cap, "its monitor (CGDirectDisplayID %u) is the BUILT-IN display "
+		         "(set DXR_LEIA_ALLOW_BUILTIN=1 for a built-in Leia panel)", did);
+		return buf;
+	}
+	uint32_t nw = 0, nh = 0;
+	if (info->pixel_width != 0 && info->pixel_height != 0 && native_display_px(did, &nw, &nh) &&
+	    (nw != info->pixel_width || nh != info->pixel_height)) {
+		snprintf(buf, cap, "its monitor (CGDirectDisplayID %u) is natively %ux%u px but SR reports %ux%u", did, nw,
+		         nh, info->pixel_width, info->pixel_height);
+		return buf;
+	}
+	const uint16_t v = (uint16_t)CGDisplayVendorNumber(did);
+	const uint16_t p = (uint16_t)CGDisplayModelNumber(did);
+	if (!leia_mac_edid_is_leia_panel(v, p) && !leia_mac_edid_is_leia_panel((uint16_t)((v >> 8) | (v << 8)), p) &&
+	    !edid_vendor_in_table(v)) {
+		snprintf(buf, cap, "its monitor (CGDirectDisplayID %u, EDID 0x%04x/0x%04x) is not a Leia panel and that "
+		         "vendor makes none (leia_edid_table.h)", did, v, p);
+		return buf;
+	}
+	return NULL;
 }
 
 //! Fill the CG side of @p info for display @p did (0 = none). Caller holds g_lock.
@@ -376,6 +477,7 @@ enumerate_locked(void)
 	atomic_store(&g_topology_dirty, false);
 	memset(g_disp, 0, sizeof(g_disp));
 	g_disp_count = 0;
+	g_sr_reported = 0;
 	g_enumerated = false;
 	if (!ensure_instance_locked()) {
 		atomic_store(&g_topology_dirty, true); // retry on the next query
@@ -406,6 +508,7 @@ enumerate_locked(void)
 		descs[i] = SrDisplayDescriptor();
 	}
 	count = count > LEIA_MAC_MAX_SR_DISPLAYS ? LEIA_MAC_MAX_SR_DISPLAYS : count;
+	g_sr_reported = count;
 	if (count > 0) {
 		res = srEnumerateDisplays(g_inst, &count, descs);
 		if (SR_FAILED(res)) {
@@ -441,10 +544,34 @@ enumerate_locked(void)
 		// platformHandle = CGDirectDisplayID (0 when SR's Quartz source has
 		// none: fall back to the EDID table for the active panel).
 		CGDirectDisplayID did = (CGDirectDisplayID)d->platformHandle;
-		if (did == 0 && k == 0) {
+		if (did == 0 && g_disp_count == 0) {
 			did = leia_mac_find_panel_display(info->pixel_width, info->pixel_height);
 		}
-		if (k == 0 && !read_active_geometry_locked(d->displayId, info)) {
+		// The active candidate's SR geometry first: srDisplayGetPhysicalResolution
+		// is the resolution SR weaves for, which the guard checks against the
+		// monitor's native mode (a descriptor's nativeWidth comes from the very
+		// monitor it names, so it cannot disagree with it).
+		const bool is_active = g_disp_count == 0;
+		const bool have_geometry = is_active && read_active_geometry_locked(d->displayId, info);
+		char why_buf[192];
+		const char *why = sr_display_reject_reason(info, did, why_buf, sizeof(why_buf));
+		if (why != NULL) {
+			// Logged once per (display, reason); re-enumeration repeats it silently.
+			static char last_logged[256];
+			char key[256];
+			snprintf(key, sizeof(key), "%016llx:%s", (unsigned long long)d->displayId, why);
+			if (strcmp(key, last_logged) != 0) {
+				snprintf(last_logged, sizeof(last_logged), "%s", key);
+				U_LOG_W("leia_mac: IGNORING SR display id 0x%016llx (%s serial '%s', product '%.*s', %ux%u px): "
+				        "%s — treated as not attached",
+				        (unsigned long long)d->displayId, info->fpc_verified ? "FPC-verified" : "EDID-only",
+				        info->fpc_serial, (int)sizeof(d->productCode), d->productCode, info->pixel_width,
+				        info->pixel_height, why);
+			}
+			memset(info, 0, sizeof(*info));
+			continue;
+		}
+		if (is_active && !have_geometry) {
 			// Descriptor geometry only; recommended size = half the panel.
 			info->rec_view_width = info->pixel_width / 2;
 			info->rec_view_height = info->pixel_height / 2;
@@ -457,7 +584,7 @@ enumerate_locked(void)
 		        info->fpc_serial, (int)sizeof(d->productCode), d->productCode, (int)sizeof(d->edidVendor),
 		        d->edidVendor, d->edidProduct, did, info->uuid, info->screen_left_pt, info->screen_top_pt,
 		        info->screen_width_pt, info->screen_height_pt, (double)info->backing_scale, info->pixel_width,
-		        info->pixel_height, (double)info->width_m, (double)info->height_m, k == 0 ? " (active)" : "");
+		        info->pixel_height, (double)info->width_m, (double)info->height_m, is_active ? " (active)" : "");
 		g_disp_count++;
 	}
 
@@ -465,7 +592,13 @@ log:
 	if ((int)g_disp_count != g_last_logged_count) {
 		g_last_logged_count = (int)g_disp_count;
 		if (g_disp_count == 0) {
-			U_LOG_W("leia_mac: no SR display attached (srEnumerateDisplays = 0) — the plug-in declines");
+			if (g_sr_reported == 0) {
+				U_LOG_W("leia_mac: no SR display attached (srEnumerateDisplays = 0) — the plug-in declines");
+			} else {
+				U_LOG_W("leia_mac: no usable SR display (%u reported, all rejected above) — the plug-in "
+				        "declines",
+				        g_sr_reported);
+			}
 		} else {
 			U_LOG_W("leia_mac: %u SR display(s); active panel = CGDirectDisplayID %u", g_disp_count,
 			        g_disp[0].cg_display_id);
