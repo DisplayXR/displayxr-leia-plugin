@@ -43,8 +43,15 @@
  * falling back to the window's screen only when the panel's CGDirectDisplayID
  * is unknown. The window's screen is re-checked every 250 ms (a screen change
  * is logged and re-tags); the tag is re-applied when the presenting layer or
- * the target display changes. DXR_LEIA_MAC_KEEP_COLOR_MATCHING=1 skips it
- * (A/B), as SR_METAL_KEEP_COLOR_MATCHING=1 does on the SR side.
+ * the target display changes, AND whenever the layer's or the window's colour
+ * space no longer equals the panel's — something in the app (a VkSurface /
+ * swapchain on the same layer, AppKit on a backing change, an app that sets
+ * its own colour space) can reset it after the one-shot tag, and a reset tag
+ * is exactly the colour fringe the tag exists to prevent. Each reset is
+ * logged (throttled) with what the colour space was reset to.
+ * DXR_LEIA_MAC_COLORSPACE_TRACE=1 logs the presenting layer, the view's layer
+ * and both colour spaces about once a second. DXR_LEIA_MAC_KEEP_COLOR_MATCHING=1
+ * skips the tag (A/B), as SR_METAL_KEEP_COLOR_MATCHING=1 does on the SR side.
  *
  * @ingroup drv_leia
  */
@@ -70,10 +77,12 @@
 #include <unistd.h>
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_mac_keep_color_matching, "DXR_LEIA_MAC_KEEP_COLOR_MATCHING", false)
+DEBUG_GET_ONCE_BOOL_OPTION(leia_mac_colorspace_trace, "DXR_LEIA_MAC_COLORSPACE_TRACE", false)
 //! Period of the throttled "weaver eyes" INFO line (ms). Verification scripts
 //! lower it to collect enough samples in a short run; never per frame.
 DEBUG_GET_ONCE_NUM_OPTION(leia_mac_eye_log_ms, "DXR_LEIA_MAC_EYE_LOG_MS", 5000)
@@ -81,6 +90,10 @@ DEBUG_GET_ONCE_NUM_OPTION(leia_mac_eye_log_ms, "DXR_LEIA_MAC_EYE_LOG_MS", 5000)
 #define LEIA_MAC_HALF_IPD_MM 31.5f
 #define LEIA_MAC_EYE_FRESH_NS (250ll * 1000 * 1000)
 #define LEIA_MAC_TAG_CHECK_NS (250ull * 1000 * 1000)
+//! After a tag is issued (async, on the main queue), don't judge the layer's
+//! colour space until it has had time to land.
+#define LEIA_MAC_TAG_SETTLE_NS (500ull * 1000 * 1000)
+#define LEIA_MAC_TAG_TRACE_NS (1000ull * 1000 * 1000)
 #define LEIA_MAC_MAX_LOGGED_RESULTS 8
 
 static NSString *const k_blit_msl =
@@ -124,6 +137,11 @@ struct leia_dp_mac
 	uint32_t tagged_did;    //!< display whose colour space the layer carries
 	uint32_t window_did;    //!< screen the window was last seen on (0 = never)
 	uint64_t last_tag_check_ns;
+	uint64_t last_tag_issued_ns; //!< when the last tag was dispatched (settle window)
+	uint64_t last_tag_trace_ns;
+	uint64_t retags;             //!< times the tag was found reset and re-applied
+	CGColorSpaceRef panel_cs;    //!< cached CGDisplayCopyColorSpace(panel_cs_did); owned
+	uint32_t panel_cs_did;
 
 	//! Created by create_dp_metal_for_screen: windowless, one display, and NOT
 	//! the first writer to the target this frame (load, never clear; every
@@ -310,6 +328,49 @@ screen_display_id(NSScreen *screen)
 	return screen != nil ? [[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue] : 0;
 }
 
+//! Same colour space? CFEqual first; an equivalent space created another way
+//! (a copy, an NSColorSpace round trip) compares by its ICC profile.
+static bool
+colorspace_same(CGColorSpaceRef a, CGColorSpaceRef b)
+{
+	if (a == b) {
+		return true;
+	}
+	if (a == NULL || b == NULL) {
+		return false;
+	}
+	if (CFEqual(a, b)) {
+		return true;
+	}
+	CFDataRef ia = CGColorSpaceCopyICCData(a);
+	CFDataRef ib = CGColorSpaceCopyICCData(b);
+	const bool same = ia != NULL && ib != NULL && CFEqual(ia, ib);
+	if (ia != NULL) {
+		CFRelease(ia);
+	}
+	if (ib != NULL) {
+		CFRelease(ib);
+	}
+	return same;
+}
+
+//! A short printable name for a colour space (its name, else "unnamed"/"none").
+static void
+colorspace_name(CGColorSpaceRef cs, char *out, size_t out_size)
+{
+	if (cs == NULL) {
+		snprintf(out, out_size, "none");
+		return;
+	}
+	CFStringRef name = CGColorSpaceCopyName(cs);
+	if (name == NULL || !CFStringGetCString(name, out, (CFIndex)out_size, kCFStringEncodingUTF8)) {
+		snprintf(out, out_size, "unnamed(%p)", (void *)cs);
+	}
+	if (name != NULL) {
+		CFRelease(name);
+	}
+}
+
 //! Tag the presenting layer (and window) with the Leia panel's colour space so
 //! WindowServer applies no colour matching to the woven frame. See header.
 static void
@@ -344,16 +405,71 @@ update_colorspace_tag(struct leia_dp_mac *ldp)
 
 	// The weave targets the panel: its colour space, wherever the window is.
 	const uint32_t did = panel_did != 0 ? panel_did : win_did;
-	if (did == 0 || ((void *)layer == ldp->tagged_layer && did == ldp->tagged_did)) {
+	if (did == 0) {
 		return;
 	}
-	CGColorSpaceRef cs = CGDisplayCopyColorSpace(did);
-	if (cs == NULL) {
+	if (ldp->panel_cs == NULL || ldp->panel_cs_did != did) {
+		if (ldp->panel_cs != NULL) {
+			CGColorSpaceRelease(ldp->panel_cs);
+		}
+		ldp->panel_cs = CGDisplayCopyColorSpace(did);
+		ldp->panel_cs_did = did;
+	}
+	if (ldp->panel_cs == NULL) {
 		return;
 	}
+
+	// What the layer / window carry NOW (cheap property reads; a reset by the
+	// app or AppKit after the one-shot tag shows up here).
+	CGColorSpaceRef layer_cs = layer.colorspace;
+	CGColorSpaceRef win_cs = win.colorSpace != nil ? win.colorSpace.CGColorSpace : NULL;
+	const bool layer_ok = colorspace_same(layer_cs, ldp->panel_cs);
+	const bool win_ok = colorspace_same(win_cs, ldp->panel_cs);
+
+	if (debug_get_bool_option_leia_mac_colorspace_trace() &&
+	    (ldp->last_tag_trace_ns == 0 || now - ldp->last_tag_trace_ns >= LEIA_MAC_TAG_TRACE_NS)) {
+		ldp->last_tag_trace_ns = now;
+		char ln[96], wn[96], pn[96];
+		colorspace_name(layer_cs, ln, sizeof(ln));
+		colorspace_name(win_cs, wn, sizeof(wn));
+		colorspace_name(ldp->panel_cs, pn, sizeof(pn));
+		U_LOG_W("leia_mac_dp: [cs-trace] presenting layer %p (%s, view.layer sublayers %lu, EDR %d, fmt %lu, "
+		        "opaque %d) layer cs=%s%s window cs=%s%s panel(display %u) cs=%s; window on display %u, "
+		        "retags %llu",
+		        (void *)layer, (CALayer *)layer == ldp->view.layer ? "= view.layer" : "a sublayer of view.layer",
+		        (unsigned long)ldp->view.layer.sublayers.count, (int)layer.wantsExtendedDynamicRangeContent,
+		        (unsigned long)layer.pixelFormat, (int)layer.opaque, ln, layer_ok ? " [ok]" : " [MISMATCH]", wn,
+		        win_ok ? " [ok]" : " [MISMATCH]", did, pn, win_did, (unsigned long long)ldp->retags);
+	}
+
+	const bool same_target = (void *)layer == ldp->tagged_layer && did == ldp->tagged_did;
+	if (same_target && layer_ok && win_ok) {
+		return;
+	}
+	// A tag is in flight on the main queue: let it land before judging it.
+	if (same_target && ldp->last_tag_issued_ns != 0 && now - ldp->last_tag_issued_ns < LEIA_MAC_TAG_SETTLE_NS) {
+		return;
+	}
+
+	if (same_target) {
+		// Same layer, same panel, but the colour space moved: someone reset it.
+		ldp->retags++;
+		if (ldp->retags <= 3 || (ldp->retags & (ldp->retags - 1)) == 0) {
+			char ln[96], wn[96];
+			colorspace_name(layer_cs, ln, sizeof(ln));
+			colorspace_name(win_cs, wn, sizeof(wn));
+			U_LOG_W("leia_mac_dp: colour-space tag was RESET (layer cs=%s%s, window cs=%s%s) — re-applying "
+			        "the panel's (display %u); reset #%llu (logged at 1, 2, 3, then powers of two)",
+			        ln, layer_ok ? "" : " != panel", wn, win_ok ? "" : " != panel", did,
+			        (unsigned long long)ldp->retags);
+		}
+	}
+
 	ldp->tagged_layer = (void *)layer;
 	ldp->tagged_did = did;
+	ldp->last_tag_issued_ns = now;
 
+	CGColorSpaceRef cs = CGColorSpaceRetain(ldp->panel_cs);
 	[layer retain];
 	[win retain];
 	dispatch_async(dispatch_get_main_queue(), ^{
@@ -365,10 +481,12 @@ update_colorspace_tag(struct leia_dp_mac *ldp)
 		[layer release];
 		[win release];
 	});
-	U_LOG_W("leia_mac_dp: tagged the presenting CAMetalLayer (%s) + NSWindow with the colour space of "
-	        "display %u%s — WindowServer applies no colour matching to the woven frame",
-	        (CALayer *)layer == ldp->view.layer ? "the view's layer" : "a runtime-added sublayer", did,
-	        did == panel_did ? " (the Leia panel)" : " (window's screen; Leia panel display unknown)");
+	if (!same_target) {
+		U_LOG_W("leia_mac_dp: tagged the presenting CAMetalLayer (%s) + NSWindow with the colour space of "
+		        "display %u%s — WindowServer applies no colour matching to the woven frame",
+		        (CALayer *)layer == ldp->view.layer ? "the view's layer" : "a runtime-added sublayer", did,
+		        did == panel_did ? " (the Leia panel)" : " (window's screen; Leia panel display unknown)");
+	}
 }
 
 
@@ -881,6 +999,13 @@ leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
 	}
 	if (ldp->inst != NULL) {
 		srDestroyInstance(ldp->inst);
+	}
+	if (ldp->panel_cs != NULL) {
+		CGColorSpaceRelease(ldp->panel_cs);
+	}
+	if (ldp->retags > 0) {
+		U_LOG_W("leia_mac_dp: colour-space tag was reset and re-applied %llu time(s) this session",
+		        (unsigned long long)ldp->retags);
 	}
 	[ldp->blit_pipeline release];
 	[ldp->sampler release];
