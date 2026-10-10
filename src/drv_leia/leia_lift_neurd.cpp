@@ -1939,10 +1939,17 @@ ensure_depth_bridge(lift_stream *s, uint32_t w, uint32_t h)
  * views) into the depth bridge on NeurD's context (drained with the output by
  * the caller). @p zero_h_offaxis = h at zero disparity of an off-axis convert
  * (its screen fixed it), or < 0 for the legacy renderer (derived from the
- * convergence NeurD reports it used). Called with g.mtx held.
+ * convergence NeurD reports it used). @p oa = that off-axis convert's screen,
+ * NULL for the legacy renderer (no relief mapping then). Called with g.mtx
+ * held.
  */
 void
-capture_depth_locked(lift_stream *s, uint32_t w, uint32_t h, float zero_h_offaxis, void *tex_v,
+capture_depth_locked(lift_stream *s,
+                     uint32_t w,
+                     uint32_t h,
+                     float zero_h_offaxis,
+                     const struct NeurD_screen_desc *oa,
+                     void *tex_v,
                      const struct NeurD_depth_info &info)
 {
 	s->metric_scale = (info.units == NEURD_DEPTH_UNITS_METRIC_METERS) ? info.inverse_depth_scale : 0.0f;
@@ -2006,6 +2013,12 @@ capture_depth_locked(lift_stream *s, uint32_t w, uint32_t h, float zero_h_offaxi
 	o.convergence_depth = m.convergence_depth;
 	o.same_inference = 1; // _ex: the depth the views of THIS convert were synthesised from
 	o.vendor_frame_id = info.frame_id;
+	// ADR-046 Amendment 1: where the views put each texel — the off-axis
+	// renderer's screen, exactly; the legacy renderer has no display mapping.
+	if (oa != nullptr && leia_lift_oa_relief(m.units, info.inverse_depth_scale, oa->convergence_depth_m,
+	                                         oa->depth_scale_m, &o.relief_scale, &o.relief_offset)) {
+		o.relief_valid = 1;
+	}
 	s->depth_valid = true; // published once the caller's drain succeeds (cleared
 	                       // again on failure)
 }
@@ -2862,7 +2875,8 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		bool have_info = false;
 #ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
 		if (s->retain && ex_depth != nullptr) {
-			capture_depth_locked(s, w, h, use_oa ? oa_zero_h : -1.0f, ex_depth, ex_info);
+			capture_depth_locked(s, w, h, use_oa ? oa_zero_h : -1.0f, use_oa ? &oa_screen : nullptr, ex_depth,
+			                     ex_info);
 			have_info = true;
 		} else if (s->retain) {
 			LIFT_WARN_ONCE("Leia lift: want_depth convert returned no depth — no depth for that frame");

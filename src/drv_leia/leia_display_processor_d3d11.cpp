@@ -3345,6 +3345,12 @@ leia_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
 	full.convergence_depth = d.convergence_depth;
 	full.same_inference = d.same_inference;
 	full.vendor_frame_id = d.vendor_frame_id;
+#ifdef XRT_DP_LIFT_HAS_DEPTH_RELIEF
+	// ADR-046 Amendment 1: the runtime's depth cursor places on this.
+	full.relief_valid = d.relief_valid;
+	full.relief_scale = d.relief_scale;
+	full.relief_offset = d.relief_offset;
+#endif
 	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
 	return true;
 }

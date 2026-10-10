@@ -284,6 +284,27 @@ test_oa_metric_depth(void)
 	CHECK(NEAR(s.depth_scale_m, 0.08f));
 }
 
+static void
+test_oa_relief(void)
+{
+	// C = 30 mm in front, D = 80 mm thick: the nearest texel (h = 1) at +30 mm,
+	// the farthest (h -> 0) at -50 mm, zero disparity at h0 = 1 - C / D.
+	float k = 0.0f, o = 0.0f;
+	CHECK(leia_lift_oa_relief(LEIA_LIFT_DEPTH_UNITS_RELATIVE, 0.0f, 0.03f, 0.08f, &k, &o));
+	// Relative: 1 / depth = h.
+	CHECK(NEAR(k * 1.0f + o, 0.03f));
+	CHECK(NEAR(k * 0.0f + o, -0.05f));
+	CHECK(NEAR(k * (1.0f - 0.03f / 0.08f) + o, 0.0f));
+	// Metric: depth d metres has h = S / (255 d); same z through 1 / d.
+	const float S = 120.0f, d = 1.5f;
+	CHECK(leia_lift_oa_relief(LEIA_LIFT_DEPTH_UNITS_METRIC, S, 0.03f, 0.08f, &k, &o));
+	const float h = leia_lift_h_from_metric_depth(S, d);
+	CHECK(NEAR(k * (1.0f / d) + o, 0.03f - (1.0f - h) * 0.08f));
+	// No mapping without a relief, or a metric model without its scale.
+	CHECK(!leia_lift_oa_relief(LEIA_LIFT_DEPTH_UNITS_RELATIVE, 0.0f, 0.03f, 0.0f, &k, &o));
+	CHECK(!leia_lift_oa_relief(LEIA_LIFT_DEPTH_UNITS_METRIC, 0.0f, 0.03f, 0.08f, &k, &o));
+}
+
 int
 main(void)
 {
@@ -293,6 +314,7 @@ main(void)
 	test_oa_eyes();
 	test_oa_relative_depth();
 	test_oa_metric_depth();
+	test_oa_relief();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_lift_depth: %d failure(s)\n", g_failures);
 		return 1;

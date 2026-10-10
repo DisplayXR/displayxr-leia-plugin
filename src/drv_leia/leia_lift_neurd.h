@@ -149,6 +149,10 @@ struct leia_lift_neurd_depth
 	float convergence_depth;
 	uint32_t same_inference;
 	uint64_t vendor_frame_id;
+	//! Off-axis conversions only: z in front of the screen (metres) =
+	//! relief_scale / depth + relief_offset (leia_lift_oa_relief).
+	uint32_t relief_valid;
+	float relief_scale, relief_offset;
 };
 
 struct leia_lift_neurd;

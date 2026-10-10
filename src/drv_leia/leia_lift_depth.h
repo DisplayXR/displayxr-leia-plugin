@@ -217,6 +217,29 @@ leia_lift_oa_build(const struct leia_lift_oa_in *in,
                    uint32_t *out_n,
                    float *out_zero_h);
 
+/*!
+ * The relief mapping of an OFF-AXIS conversion, for the runtime's depth-aware
+ * cursor (xrt_dp_lift_depth::relief_*, ADR-046 Amendment 1): where the woven
+ * views present a depth-map texel, in metres in front of the screen,
+ *   z = *out_scale * (1 / depth) + *out_offset,
+ * with depth decoded as leia_lift_depth_meta_from_info describes it.
+ *
+ * The off-axis renderer puts h at z = C - (1 - h) D (C = convergence_depth_m,
+ * D = depth_scale_m), and h = 1 / depth for the relative model (the map holds
+ * h * 255, decoded INVERSE with scale 1/255) or S / (255 depth) for the metric
+ * one (the map holds metres). So scale = D (relative) or D S / 255 (metric),
+ * offset = C - D.
+ *
+ * @return false for D <= 0 or a metric S <= 0 (no mapping is reported).
+ */
+bool
+leia_lift_oa_relief(uint32_t units,
+                    float inverse_depth_scale,
+                    float convergence_depth_m,
+                    float depth_scale_m,
+                    float *out_scale,
+                    float *out_offset);
+
 #ifdef __cplusplus
 }
 #endif

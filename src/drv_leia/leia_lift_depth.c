@@ -47,6 +47,29 @@ leia_lift_depth_from_h(uint32_t units, float inverse_depth_scale, float h)
 	return 1.0f / h;
 }
 
+bool
+leia_lift_oa_relief(uint32_t units,
+                    float inverse_depth_scale,
+                    float convergence_depth_m,
+                    float depth_scale_m,
+                    float *out_scale,
+                    float *out_offset)
+{
+	if (!ld_finite(depth_scale_m) || depth_scale_m <= 0.0f || !ld_finite(convergence_depth_m)) {
+		return false;
+	}
+	float scale = depth_scale_m;
+	if (units == LEIA_LIFT_DEPTH_UNITS_METRIC) {
+		if (!ld_finite(inverse_depth_scale) || !(inverse_depth_scale > 0.0f)) {
+			return false;
+		}
+		scale = depth_scale_m * inverse_depth_scale / 255.0f;
+	}
+	*out_scale = scale;
+	*out_offset = convergence_depth_m - depth_scale_m;
+	return true;
+}
+
 float
 leia_lift_h_from_metric_depth(float inverse_depth_scale, float depth_m)
 {
