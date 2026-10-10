@@ -14,6 +14,21 @@ applications) or direct hardware control. This page documents the concrete Leia 
 | Windows (SR SDK) | `SwitchableLensHint::enable()` / `SwitchableLensHint::disable()` — preference-based, aggregated across applications. |
 | Android (CNSDK) | `leia_core_set_backlight(core, true)` / `leia_core_set_backlight(core, false)` — direct backlight control. |
 | Linux (srSDK) | `srLensEnable` / `srLensDisable` on the process-wide SR context's lens handle — preference-based, and **owned** after the first call (see below). |
+| macOS (srSDK, `drv_leia_macos`) | `srLensEnable` / `srLensDisable` on the DP's lens handle (`leia_dp_mac_request_display_mode`), under the **same ownership rules as Linux** (`leia_lens_owner_linux.h`): a 3D request before any 2D request sends nothing (the weaver raises the lens itself), and the first 2D request takes ownership. An EXTERNAL (screen-bound) weaver never votes the lens, so its 3D request is always sent. |
+
+## Smooth 2D↔3D transitions are app-side, on every platform
+
+Neither this plug-in nor the runtime eases a mode switch. The lens call happens on the frame
+the runtime applies the mode, and from that frame the DP weaves (2×1 atlas) or flat-blits (1×1
+atlas). No arm has a weaver fade, a lens-settle hold or a cross-fade: not Windows, Android,
+Linux or macOS. The soft transition users see on Windows comes from the **app**. It ramps the
+view rig's `ipdFactor` to 0 *before* requesting 2D, and requests 3D *before* ramping the
+disparity back up, so the lens always switches on flat content. Apps do this with
+`dxr::ModeSwitch` from
+[displayxr-common](https://github.com/DisplayXR/displayxr-common) (`common/mode_switch.h`;
+README *Smooth 2D↔3D transitions*). An app that requests modes directly snaps on every arm,
+and changing this plug-in would not fix that. Diagnose a "harsh 2D/3D switch" in the app
+first: displayxr-runtime's app linter flags it as INV-2.9.
 
 On Windows the SR SDK's `SwitchableLensHint` is a **preference**, not a hard set: the platform
 may aggregate hints from multiple applications or defer the switch, which is why the OpenXR API
