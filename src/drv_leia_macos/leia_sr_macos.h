@@ -51,7 +51,7 @@ struct leia_mac_display_info
 	float height_m;
 	uint32_t pixel_width;     //!< native panel pixels (srDisplayGetPhysicalResolution)
 	uint32_t pixel_height;
-	uint32_t rec_view_width;  //!< srDisplayGetRecommendedTextureSize (per view)
+	uint32_t rec_view_width;  //!< per view (srDisplayGetRecommendedTextureSize, halved when it reports side-by-side)
 	uint32_t rec_view_height;
 	float nominal_x_m;        //!< srDisplayGetDefaultViewingPosition, mm -> m
 	float nominal_y_m;

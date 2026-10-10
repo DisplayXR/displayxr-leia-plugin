@@ -430,8 +430,28 @@ read_active_geometry_locked(uint64_t display_id, struct leia_mac_display_info *i
 		}
 		info->pixel_width = (uint32_t)px_w;
 		info->pixel_height = (uint32_t)px_h;
-		info->rec_view_width = rec_w > 0 ? (uint32_t)rec_w : (uint32_t)px_w / 2;
+		/*
+		 * srDisplayGetRecommendedTextureSize: since LeiaSR #429 (ST-5814,
+		 * 2026-10-09) it returns the SIDE-BY-SIDE size of both views (each
+		 * view is width/2 x height); earlier runtimes returned ONE view.
+		 * Taking an SBS size as the per-view size gave a 1.0 x 0.5 view
+		 * scale (3840x1080 "views" on a 3840x2160 panel): anamorphic tiles
+		 * twice the panel's horizontal view resolution, which the weaver's
+		 * per-subpixel sampling aliases into colour fringes on fine detail.
+		 * Tell the two apart by aspect: a per-view size keeps the panel's
+		 * aspect, an SBS size is twice as wide for its height.
+		 */
+		bool rec_is_sbs = false;
+		if (rec_w > 0 && rec_h > 0) {
+			const double rec_aspect = (double)rec_w / (double)rec_h;
+			const double px_aspect = (double)px_w / (double)px_h;
+			rec_is_sbs = rec_aspect > 1.5 * px_aspect;
+		}
+		info->rec_view_width = rec_w > 0 ? (uint32_t)(rec_is_sbs ? rec_w / 2 : rec_w) : (uint32_t)px_w / 2;
 		info->rec_view_height = rec_h > 0 ? (uint32_t)rec_h : (uint32_t)px_h / 2;
+		U_LOG_W("leia_mac: srDisplayGetRecommendedTextureSize %dx%d = %s -> per-view %ux%u (panel %dx%d)",
+		        rec_w, rec_h, rec_is_sbs ? "side-by-side (both views)" : "one view", info->rec_view_width,
+		        info->rec_view_height, px_w, px_h);
 		info->nominal_x_m = nx / 1000.0f;
 		info->nominal_y_m = ny / 1000.0f;
 		info->nominal_z_m = nz / 1000.0f;
