@@ -440,6 +440,19 @@ update_colorspace_tag(struct leia_dp_mac *ldp)
 		        (unsigned long)ldp->view.layer.sublayers.count, (int)layer.wantsExtendedDynamicRangeContent,
 		        (unsigned long)layer.pixelFormat, (int)layer.opaque, ln, layer_ok ? " [ok]" : " [MISMATCH]", wn,
 		        win_ok ? " [ok]" : " [MISMATCH]", did, pn, win_did, (unsigned long long)ldp->retags);
+		// 1:1 check: a contentsScale != the window's backing scale (or a
+		// drawable != bounds x contentsScale) makes WindowServer RESAMPLE the
+		// woven frame, which shows as colour bands.
+		const CGSize ds = layer.drawableSize;
+		const CGRect lb = layer.bounds;
+		const CGFloat ws = win.backingScaleFactor;
+		const bool one_to_one = layer.contentsScale == ws && ds.width == lb.size.width * layer.contentsScale &&
+		                        ds.height == lb.size.height * layer.contentsScale;
+		U_LOG_W("leia_mac_dp: [cs-trace] layer contentsScale %.2f window backing %.2f, bounds %.0fx%.0f pt, "
+		        "drawable %.0fx%.0f px, filters mag=%s min=%s -> %s",
+		        layer.contentsScale, ws, lb.size.width, lb.size.height, ds.width, ds.height,
+		        layer.magnificationFilter.UTF8String, layer.minificationFilter.UTF8String,
+		        one_to_one ? "1:1 [ok]" : "NOT 1:1 [RESAMPLED by WindowServer]");
 	}
 
 	const bool same_target = (void *)layer == ldp->tagged_layer && did == ldp->tagged_did;
