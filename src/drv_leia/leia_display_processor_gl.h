@@ -33,6 +33,24 @@ xrt_result_t
 leia_dp_factory_gl(void *window_handle,
                     struct xrt_display_processor_gl **out_xdp);
 
+struct xrt_plugin_instance;
+struct xrt_screen_binding;
+
+/*!
+ * Multi-screen M6 (GL): the per-screen factory
+ * (`xrt_plugin_iface::create_dp_gl_for_screen`). The binding is resolved to an
+ * SR display id (the runtime's, or this plug-in's own per-monitor claim), the
+ * weaver is bound to it with EXTERNAL routing, and — with @p window_handle
+ * NULL — phases from set_present_origin. The weave stays inside the canvas
+ * (viewport + scissor). Compiled only against a runtime header announcing
+ * XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN.
+ */
+xrt_result_t
+leia_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
+                              void *window_handle,
+                              const struct xrt_screen_binding *binding,
+                              struct xrt_display_processor_gl **out_xdp);
+
 #ifdef __cplusplus
 }
 #endif
