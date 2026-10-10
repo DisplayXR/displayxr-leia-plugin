@@ -49,6 +49,31 @@ leiasr_gl_create(double max_time,
                   struct leiasr_gl **out);
 
 /*!
+ * Multi-screen M6: create the GL weaver for ONE screen (create_dp_gl_for_screen),
+ * the GL twin of leiasr_d3d11_create_for_screen. Binds the weaver to SR display
+ * @p display_id (0 = unknown: EXTERNAL routing on the active display) with
+ * EXTERNAL routing, keeps the SDK's drag phase-snap (KEEP_DRAG_SNAP) when
+ * @p hwnd is the session's real window, takes its phase from
+ * @ref leiasr_gl_set_present_origin when @p hwnd is NULL, and pins a simulated
+ * viewer when the bound display is not the runtime's active one and has no
+ * tracker of its own. v2 API only. The compositor's GL context must be current.
+ *
+ * @ingroup drv_leia
+ */
+xrt_result_t
+leiasr_gl_create_for_screen(double max_time, void *hwnd, uint64_t display_id, struct leiasr_gl **out);
+
+/*!
+ * Multi-screen M6: the window's client-area origin on this weaver's screen
+ * (device px, top-left). Applied before every weave on a windowless EXTERNAL
+ * weaver; ignored by a weaver with the real window (it phases from it).
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_gl_set_present_origin(struct leiasr_gl *leiasr, int32_t panel_x, int32_t panel_y);
+
+/*!
  * Destroy a GL SR weaver instance.
  *
  * @param leiasr_ptr Pointer to instance pointer (can be NULL).

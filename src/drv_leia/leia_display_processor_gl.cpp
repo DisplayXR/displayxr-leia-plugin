@@ -20,6 +20,8 @@
 #include "leia_display_processor_gl.h"
 #include "leia_sr_gl.h"
 #include "leia_platform_state.h"
+#include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
+#include "xrt/xrt_plugin.h"          // xrt_screen_binding
 
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
@@ -33,6 +35,7 @@
 #include "leia_bg_capture_win.h"
 #include <d3d11_4.h>
 
+#include <cstddef> // offsetof
 #include <cstdlib>
 #include <cstring>
 
@@ -1145,20 +1148,20 @@ alpha_gate_run_post_weave_gl(struct leia_display_processor_gl_impl *ldp,
 	                  0, 0, (GLsizei)target_width, (GLsizei)target_height,
 	                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-	// Canvas sub-rect (default = full target → identity). NOTE: GL viewport /
-	// scissor are bottom-left origin; the full-canvas (handle-app) case is
-	// identity and correct. The sub-rect (texture-app) mapping mirrors D3D11's
-	// top-left convention and is unverified on GL (no GL texture app yet).
+	// Canvas sub-rect (default = full target → identity). The canvas is
+	// top-left origin like every backend's; GL viewport / scissor / texture
+	// space are bottom-left, so the rect flips. The runtime hands a sub-rect
+	// canvas only to a multi-screen M6 segment (runtime comp_gl_segments).
 	int32_t  vp_x = 0, vp_y = 0;
 	uint32_t vp_w = target_width, vp_h = target_height;
 	float cu_ox = 0.0f, cu_oy = 0.0f, cu_ex = 1.0f, cu_ey = 1.0f;
 	if (canvas_width > 0 && canvas_height > 0 && target_width > 0 && target_height > 0) {
 		vp_x = canvas_offset_x;
-		vp_y = canvas_offset_y;
+		vp_y = (int32_t)target_height - canvas_offset_y - (int32_t)canvas_height;
 		vp_w = canvas_width;
 		vp_h = canvas_height;
-		cu_ox = (float)canvas_offset_x / (float)target_width;
-		cu_oy = (float)canvas_offset_y / (float)target_height;
+		cu_ox = (float)vp_x / (float)target_width;
+		cu_oy = (float)vp_y / (float)target_height;
 		cu_ex = (float)canvas_width  / (float)target_width;
 		cu_ey = (float)canvas_height / (float)target_height;
 	}
@@ -1246,6 +1249,18 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	// centering below.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
 
+	// Multi-screen M6: a non-empty canvas is THIS DP's segment of the window
+	// framebuffer (top-left origin); the runtime has set viewport + scissor to
+	// it and the DP must keep its output there (create_dp_gl_for_screen
+	// contract — the session's own DP weaves the primary segment the same
+	// way). Every other in-process caller passes an empty canvas: the whole
+	// target, as before.
+	const bool canvas_sub = canvas_width > 0 && canvas_height > 0;
+	const GLint out_x = canvas_sub ? canvas_offset_x : 0;
+	const GLint out_y = canvas_sub ? (GLint)target_height - canvas_offset_y - (GLint)canvas_height : 0;
+	const GLsizei out_w = canvas_sub ? (GLsizei)canvas_width : (GLsizei)target_width;
+	const GLsizei out_h = canvas_sub ? (GLsizei)canvas_height : (GLsizei)target_height;
+
 	// P-c display hot-plug (same contract as the D3D11/D3D12 DPs): ~1 Hz cheap
 	// platform-state poll — the EDID enumeration re-runs only on a monitor
 	// topology change — and, while the panel is gone (NO_DISPLAY; the runtime
@@ -1277,9 +1292,10 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->read_fbo);
 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 		                       GL_TEXTURE_2D, atlas_texture, 0);
-		// Blit content region (single view) to full draw framebuffer
+		// Blit content region (single view) to the draw framebuffer — the
+		// whole target, or this DP's segment of it (M6).
 		glBlitFramebuffer(0, 0, (GLint)view_width, (GLint)view_height,
-		                  0, 0, (GLint)target_width, (GLint)target_height,
+		                  out_x, out_y, out_x + out_w, out_y + out_h,
 		                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
 		// Restore read framebuffer
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -1325,8 +1341,14 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	leiasr_gl_set_input_texture(ldp->leiasr, weaver_input, view_width, view_height, format);
 
 	// Restore target viewport — SR weaver reads glViewport at weave() time,
-	// but set_input_texture may have reset it to input dimensions.
-	glViewport(0, 0, target_width, target_height);
+	// but set_input_texture may have reset it to input dimensions. Under M6
+	// the viewport (and scissor) is this DP's segment: an EXTERNAL weaver's
+	// phase is present origin + viewport.
+	glViewport(out_x, out_y, out_w, out_h);
+	if (canvas_sub) {
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(out_x, out_y, out_w, out_h);
+	}
 
 	// Perform weaving to the currently bound framebuffer
 	leiasr_gl_weave(ldp->leiasr);
@@ -2045,6 +2067,20 @@ leia_dp_gl_get_background_preview(struct xrt_display_processor_gl *xdp,
 }
 #endif
 
+#ifdef XRT_DP_GL_HAS_PRESENT_ORIGIN
+/*!
+ * Multi-screen M6: the window's client-area origin on this DP's screen. A
+ * windowless per-screen weaver phases from it (+ the viewport); a weaver with
+ * the real window ignores it.
+ */
+static void
+leia_dp_gl_set_present_origin(struct xrt_display_processor_gl *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	leiasr_gl_set_present_origin(ldp->leiasr, panel_x, panel_y);
+}
+#endif
+
 static void
 leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 {
@@ -2072,6 +2108,9 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 #endif
 #if defined(XRT_DP_GL_HAS_BACKGROUND_PREVIEW) && defined(LEIA_BG_CAPTURE_HAS_PREVIEW)
 	ldp->base.get_background_preview = leia_dp_gl_get_background_preview; // #224 rear depth budget (slot 21)
+#endif
+#ifdef XRT_DP_GL_HAS_PRESENT_ORIGIN
+	ldp->base.set_present_origin = leia_dp_gl_set_present_origin; // multi-screen M6 (slot 22)
 #endif
 }
 
@@ -2194,3 +2233,73 @@ leia_dp_factory_gl(void *window_handle,
 
 	return XRT_SUCCESS;
 }
+#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN
+/*
+ * Multi-screen M6 (GL): one DP per screen a spanning window covers — the GL
+ * twin of leia_dp_factory_d3d11_for_screen. The screen's SR display id comes
+ * from the binding when the runtime carries one, else from this plug-in's own
+ * per-monitor claim (probe_displays joined srEnumerateDisplays and kept the
+ * monitor -> displayId map). Ids are not stable across display-config events,
+ * so they are resolved here, at create, never cached beyond the DP's life.
+ * The compositor's GL context is current (the GL factory contract).
+ */
+extern "C" xrt_result_t
+leia_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
+                              void *window_handle,
+                              const struct xrt_screen_binding *binding,
+                              struct xrt_display_processor_gl **out_xdp)
+{
+	(void)inst;
+	if (binding == nullptr || out_xdp == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		U_LOG_W("Leia GL per-screen DP: SR platform client DLLs not usable — not creating");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	if (!leia_gl_ensure_glad_loaded()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	uint64_t display_id = 0;
+	if (binding->struct_size > offsetof(struct xrt_screen_binding, display_id)) {
+		display_id = binding->display_id;
+	}
+	if (display_id == 0) {
+		struct leia_win_claim_binding claim = {};
+		if (leia_win_claims_lookup(binding->monitor_id, &claim)) {
+			display_id = claim.sr_display_id;
+		}
+	}
+	U_LOG_W("Leia GL per-screen DP: monitor 0x%016llx ('%s', %dx%d @ %d,%d, serial '%s') -> SR display "
+	        "0x%016llx, window %p",
+	        (unsigned long long)binding->monitor_id, binding->device_name, (int)binding->desktop_width,
+	        (int)binding->desktop_height, (int)binding->desktop_left, (int)binding->desktop_top, binding->serial,
+	        (unsigned long long)display_id, window_handle);
+
+	struct leiasr_gl *weaver = NULL;
+	xrt_result_t ret = leiasr_gl_create_for_screen(5.0, window_handle, display_id, &weaver);
+	if (ret != XRT_SUCCESS || weaver == NULL) {
+		U_LOG_W("Failed to create the SR GL per-screen weaver");
+		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct leia_display_processor_gl_impl *ldp =
+	    (struct leia_display_processor_gl_impl *)calloc(1, sizeof(*ldp));
+	if (ldp == NULL) {
+		leiasr_gl_destroy(&weaver);
+		return XRT_ERROR_ALLOCATION;
+	}
+	leia_dp_gl_init_vtable(ldp);
+	ldp->leiasr = weaver;
+	ldp->view_count = 2;
+	ldp->hwnd = (HWND)window_handle; // NULL for a windowless segment: no WGC compose-under (falls back)
+	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
+	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
+	leiasr_gl_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
+
+	*out_xdp = &ldp->base;
+	U_LOG_W("Created Leia SR GL per-screen display processor (multi-screen M6)");
+	return XRT_SUCCESS;
+}
+#endif

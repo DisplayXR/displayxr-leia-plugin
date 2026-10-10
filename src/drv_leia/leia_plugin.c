@@ -698,6 +698,15 @@ static struct xrt_plugin_iface g_leia_iface = {
     /* ADR-051 D2: passive per-screen dashboard cell (claim table + cached state). */
     .get_screen_status = leia_plugin_get_screen_status,
 #endif
+
+#if defined(XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN)
+    /* Multi-screen M6 (GL): one GL DP per screen a spanning window covers. */
+#if defined(XRT_HAVE_LEIA_SR_GL)
+    .create_dp_gl_for_screen = leia_dp_factory_gl_for_screen,
+#else
+    .create_dp_gl_for_screen = NULL,
+#endif
+#endif
 };
 
 
