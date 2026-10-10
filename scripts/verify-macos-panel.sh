@@ -20,12 +20,16 @@
 #                  z in 300..1200 mm). FAIL = nobody was tracked: needs a face.
 #   5. straddle  — window across the panel's left edge with its MAJORITY on the
 #                  PANEL: two segments, the Leia session DP weaves the panel's.
-#   6. per-screen — window across the panel's left edge with its MAJORITY (and
-#                  content origin) on the BUILT-IN display, so the panel is NOT
-#                  the primary screen: the Leia segment DP must come from
-#                  create_dp_metal_for_screen (bound to the SR display, EXTERNAL
-#                  routing) and weave its segment; tracked eyes from that DP when
-#                  it logs any.
+#   6. per-screen — the Leia create_dp_metal_for_screen path. The session's
+#                  primary DP is always the ACTIVE plug-in's, so window
+#                  placement alone never routes the panel through it; the run
+#                  makes sim-display active (XRT_PREFERRED_PLUGIN_ID=sim-display)
+#                  and pins the panel to leia-sr (DXR_SCREEN_PLUGIN=<panel
+#                  UUID>=leia-sr), with the window straddling the panel's left
+#                  edge. Asserts: the runtime made the Leia segment DP via
+#                  create_dp_metal_for_screen; its weaver is EXTERNAL-routed with
+#                  weaver, eye tracker and lens BOUND; it is a SCREEN-BOUND
+#                  windowless DP; it wove its segment; its eyes are tracked.
 # Every app it starts is killed by PID; it touches no other process.
 #
 # Environment:
@@ -87,12 +91,17 @@ if [ -z "${PANEL_X:-}" ]; then
 fi
 PANEL_X="${PANEL_X:-1512}"
 PANEL_Y="${PANEL_Y:-0}"
+# The panel's CoreGraphics UUID (what DXR_SCREEN_PLUGIN matches), same line.
+PANEL_UUID="${PANEL_UUID:-$(grep -m1 "SR display \[0\]" "$OUT/claims.log" 2>/dev/null |
+    sed -n "s/.*CGDirectDisplayID [0-9]* '\([0-9A-Fa-f-]*\)'.*/\1/p")}"
 
-run_app() { # $1 = name, $2 = DXR_TEST_WINDOW_RECT
+run_app() { # $1 = name, $2 = DXR_TEST_WINDOW_RECT, $3.. = extra VAR=value for the app
     [ "$PARSE_ONLY" = "1" ] && return 0
     local log="$OUT/$1.log"
+    local rect="$2"
+    shift 2
     rm -f "${TMPDIR%/}"/displayxr_segments.* /tmp/dxr_leia_woven.png /tmp/dxr_leia_woven_trigger
-    (cd "$TEXTURES_DIR" && DXR_TEST_WINDOW_RECT="$2" exec nice -n 19 "$APP") >"$log" 2>&1 &
+    (cd "$TEXTURES_DIR" && exec env DXR_TEST_WINDOW_RECT="$rect" "$@" nice -n 19 "$APP") >"$log" 2>&1 &
     local pid=$!
     sleep "$RUN_SECONDS"
     touch "${TMPDIR%/}/displayxr_segments_trigger" /tmp/dxr_leia_woven_trigger
@@ -114,7 +123,7 @@ tracked_eye_samples() {
 }
 eye_samples() { grep "weaver eyes" "$1" 2>/dev/null | grep -c -- "${2:-weaver eyes}"; }
 
-echo "panel top-left: ($PANEL_X, $PANEL_Y) pt   logs: $OUT$([ "$PARSE_ONLY" = 1 ] && echo '   (parse-only)')"
+echo "panel top-left: ($PANEL_X, $PANEL_Y) pt  UUID ${PANEL_UUID:-?}   logs: $OUT$([ "$PARSE_ONLY" = 1 ] && echo '   (parse-only)')"
 
 # 1. claims
 if sed -n '/Per-display DP claims/,$p' "$OUT/claims.log" 2>/dev/null | grep -q "plug-in='leia-sr'  confidence=VERIFIED"; then
@@ -154,32 +163,40 @@ grep -q "\-> 2 segment(s)" "$L" && pass "straddle: two segments" || fail "stradd
 grep -q "first SR weave" "$L" && pass "straddle: the Leia session DP weaves the panel segment" \
     || fail "straddle: no Leia weave"
 
-# 6. per-screen: majority + content origin on the built-in, so the panel is a
-#    NON-primary segment served by create_dp_metal_for_screen.
-run_app perscreen "$((PANEL_X - 600)),$((PANEL_Y + 150)),800,500"
+# 6. per-screen: the Leia create_dp_metal_for_screen path. sim-display is the
+#    active plug-in (so ITS DP is the session's primary), the panel is pinned to
+#    leia-sr, and the window straddles the panel's left edge.
+if [ "$PARSE_ONLY" = "0" ] && [ -z "$PANEL_UUID" ]; then
+    fail "per-screen: panel UUID not found in $OUT/claims.log (set PANEL_UUID)"
+else
+    run_app perscreen "$((PANEL_X - 400)),$((PANEL_Y + 150)),800,500" \
+        XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN="$PANEL_UUID=leia-sr"
+fi
 L="$OUT/perscreen.log"
 if [ -f "$L" ]; then
-    grep -q "\-> 2 segment(s)" "$L" && pass "per-screen: two segments" || fail "per-screen: not split (see $L)"
+    grep -q "active plug-in: id=sim-display" "$L" || echo "NOTE: per-screen: sim-display is not the active plug-in in $L"
     grep -q "plug-in 'leia-sr') via create_dp_metal_for_screen" "$L" \
         && pass "per-screen: runtime created the Leia segment DP via create_dp_metal_for_screen" \
-        || fail "per-screen: no Leia segment DP from create_dp_metal_for_screen"
-    if grep -q "segment weaver for SR display .*routing EXTERNAL, weaver BOUND" "$L"; then
-        pass "per-screen: segment weaver bound to the SR display, EXTERNAL routing"
+        || fail "per-screen: no Leia segment DP from create_dp_metal_for_screen (see $L)"
+    if grep -q "segment weaver for SR display .*routing EXTERNAL, weaver BOUND, eye tracker BOUND, lens BOUND" "$L"; then
+        pass "per-screen: EXTERNAL routing; weaver, eye tracker and lens BOUND to the SR display"
     else
-        fail "per-screen: segment weaver not bound + EXTERNAL ($(grep -m1 'segment weaver for SR display' "$L" | sed 's/.*leia_mac_dp: //'))"
+        fail "per-screen: segment weaver not EXTERNAL + fully bound ($(grep -m1 'segment weaver for SR display' "$L" | sed 's/.*leia_mac_dp: //'))"
     fi
-    grep -q "first SR weave (SEGMENT DP)" "$L" && pass "per-screen: the Leia segment DP weaves its segment" \
+    grep -q "created SR Metal weaver (SCREEN-BOUND segment DP, windowless" "$L" \
+        && pass "per-screen: SCREEN-BOUND windowless segment DP" \
+        || fail "per-screen: no SCREEN-BOUND segment DP"
+    grep -q "first SR weave (SEGMENT DP)" "$L" && pass "per-screen: the Leia segment DP wove its segment" \
         || fail "per-screen: the Leia segment DP never wove"
     s_all="$(eye_samples "$L" "\[segment ")"
     s_trk="$(tracked_eye_samples "$L" "\[segment ")"
-    if [ "$s_all" -eq 0 ]; then
-        echo "NOTE: per-screen: the segment DP logged no eyes (the runtime may not query a non-primary DP's eyes)"
-    elif [ "$s_trk" -gt 0 ]; then
-        pass "per-screen: $s_trk of $s_all eye samples from the segment DP tracked"
+    if [ "$s_trk" -gt 0 ]; then
+        pass "per-screen: $s_trk of $s_all segment-DP eye samples tracked"
     else
         fail "per-screen: 0 of $s_all segment-DP eye samples tracked — needs a face in front of the panel"
     fi
-    grep -E "create_dp_metal_for_screen|segment weaver|segments: window" "$L" | head -5 | sed 's/^/    /'
+    grep -E "by DXR_SCREEN_PLUGIN|create_dp_metal_for_screen:|segment weaver|segments: window" "$L" | sort -u | head -5 |
+        sed 's/^ *[A-Z]* \[[a-z_]*\] /    /'
 else
     fail "per-screen: no log at $L (parse-only with no prior per-screen run)"
 fi
