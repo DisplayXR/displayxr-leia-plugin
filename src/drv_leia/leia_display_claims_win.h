@@ -162,6 +162,11 @@ struct leia_win_claim_binding
 	//! 0 = SR did not say (or nothing matched).
 	uint32_t width_mm, height_mm;
 	uint32_t native_w, native_h;
+
+	//! SR lists the matched display FPC_VERIFIED (the claim is VERIFIED with
+	//! @ref serial) — read back by get_screen_status, never re-queried.
+	bool fpc_verified;
+	char serial[64]; //!< FPC serial when @ref fpc_verified, else empty
 };
 
 /*!
@@ -230,6 +235,15 @@ leia_win_claims_store(const struct leia_win_claim_binding *bindings, uint32_t co
 //! Look up a claimed monitor's binding; false when it was not claimed.
 bool
 leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out);
+
+/*!
+ * Moves whenever leia_win_claims_store() stored a claim set that differs from
+ * the previous one (monitor, SR display, FPC verification or serial) — a
+ * topology / identity event, never a poll. Feeds get_screen_status's
+ * change_counter.
+ */
+uint64_t
+leia_win_claims_generation(void);
 
 
 /*
