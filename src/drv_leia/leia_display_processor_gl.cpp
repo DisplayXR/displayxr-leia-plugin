@@ -1345,13 +1345,19 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	// the viewport (and scissor) is this DP's segment: an EXTERNAL weaver's
 	// phase is present origin + viewport.
 	glViewport(out_x, out_y, out_w, out_h);
-	if (canvas_sub) {
-		glEnable(GL_SCISSOR_TEST);
-		glScissor(out_x, out_y, out_w, out_h);
-	}
+	// The SR GL weaver mirrors GL_SCISSOR_BOX into its own state and converts
+	// it a second time, so with GL_SCISSOR_TEST on a segment is not woven at all
+	// (LeiaSR runtime 1.38.0+2303, verified on hardware by the SR session
+	// 2026-10-10; fix pending on their side). The viewport alone confines the
+	// weave to the segment, so weave with the scissor test OFF and restore it.
+	const GLboolean scissor_was_on = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_SCISSOR_TEST);
 
 	// Perform weaving to the currently bound framebuffer
 	leiasr_gl_weave(ldp->leiasr);
+	if (scissor_was_on) {
+		glEnable(GL_SCISSOR_TEST);
+	}
 
 	if (compose_active) {
 		alpha_gate_run_post_weave_gl(ldp, atlas_texture, tile_columns, tile_rows, target_width,
