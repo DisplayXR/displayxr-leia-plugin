@@ -344,6 +344,27 @@ leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out)
 	return found;
 }
 
+bool
+leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *out)
+{
+	if (serial == NULL || serial[0] == '\0') {
+		return false;
+	}
+	bool found = false;
+	BIND_LOCK();
+	for (uint32_t i = 0; i < g_binding_count; i++) {
+		if (g_bindings[i].fpc_verified && strcmp(g_bindings[i].serial, serial) == 0) {
+			if (out != NULL) {
+				*out = g_bindings[i];
+			}
+			found = true;
+			break;
+		}
+	}
+	BIND_UNLOCK();
+	return found;
+}
+
 uint64_t
 leia_win_claims_generation(void)
 {
