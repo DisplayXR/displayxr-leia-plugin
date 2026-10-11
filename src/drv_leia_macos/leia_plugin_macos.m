@@ -42,6 +42,7 @@
 
 #include "leia_interface.h"
 #include "leia_sr_macos.h"
+#include "leia_sr_readiness.h"
 #include "leia_display_processor_macos.h"
 
 #include <stddef.h>
@@ -240,8 +241,17 @@ leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	// The SR displays as SR enumerates them now (re-enumerated after a
 	// topology change), joined to the runtime's monitors by CGDisplay.
 	// No SR display = no claim: sim-display (or another vendor) keeps them.
+	// A display SR lists but has not authenticated (EDID_ONLY) is claimed
+	// PRESENT_NOT_READY where the runtime knows that level: it keeps the
+	// fallback's weave off the panel, and the runtime shows it flat 2D with no
+	// display processor (no weaver, lens untouched) until it is verified.
 	struct leia_mac_display_info sr[LEIA_MAC_MAX_SR_DISPLAYS];
-	const uint32_t n_sr = leia_mac_get_sr_displays(sr, LEIA_MAC_MAX_SR_DISPLAYS);
+	const uint32_t n_sr = leia_mac_get_sr_displays_present(sr, LEIA_MAC_MAX_SR_DISPLAYS);
+#ifdef XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY
+	const bool runtime_has_not_ready = true;
+#else
+	const bool runtime_has_not_ready = false;
+#endif
 
 	uint32_t n = 0;
 	for (uint32_t i = 0; i < display_count && n < max_claims; i++) {
@@ -249,9 +259,22 @@ leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		if (j < 0) {
 			continue;
 		}
+		const struct leia_sr_readiness_entry re = {sr[j].sr_display_id, sr[j].from_enumeration, sr[j].fpc_verified};
+		const enum leia_sr_claim_kind kind =
+		    leia_sr_claim_kind(&re, leia_mac_sr_accept_edid_only(), runtime_has_not_ready);
+		if (kind == LEIA_SR_CLAIM_NONE) {
+			continue;
+		}
 		struct xrt_display_claim *c = &out_claims[n++];
 		memset(c, 0, sizeof(*c));
 		c->monitor_id = displays[i].monitor_id;
+#ifdef XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY
+		if (kind == LEIA_SR_CLAIM_PRESENT_NOT_READY) {
+			c->confidence = XRT_DISPLAY_CLAIM_PRESENT_NOT_READY;
+			c->supported_apis = 0; // no DP for it (create_dp_metal_for_screen declines it too)
+			continue;
+		}
+#endif
 		// Linux-arm meaning: VERIFIED = the SR service vouches for THIS panel
 		// (FPC verified; on a legacy SR runtime, its one active display that
 		// the EDID table located), EDID = recognised by EDID only.
@@ -269,7 +292,9 @@ leia_mac_plugin_probe_displays(struct xrt_plugin_instance *inst,
 		for (uint32_t i = 0; i < n; i++) {
 			U_LOG_W("leia_mac_plugin: claim monitor 0x%016llx confidence=%s serial='%s'",
 			        (unsigned long long)out_claims[i].monitor_id,
-			        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED" : "EDID",
+			        out_claims[i].confidence == XRT_DISPLAY_CLAIM_VERIFIED ? "VERIFIED"
+			        : out_claims[i].confidence == XRT_DISPLAY_CLAIM_EDID   ? "EDID"
+			                                                               : "PRESENT_NOT_READY (flat 2D)",
 			        out_claims[i].serial);
 		}
 		if (n == 0) {

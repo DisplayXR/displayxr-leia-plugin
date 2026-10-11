@@ -44,6 +44,12 @@ static _Atomic(leia_mac_topology_fn) g_topology_listener = NULL;
 
 DEBUG_GET_ONCE_BOOL_OPTION(leia_accept_edid_only, "DXR_LEIA_ACCEPT_EDID_ONLY", false)
 
+bool
+leia_mac_sr_accept_edid_only(void)
+{
+	return debug_get_bool_option_leia_accept_edid_only();
+}
+
 /*
  * Readiness (leia_sr_readiness.h): an EDID_ONLY display is present but not
  * ready until the SR service has authenticated its FPC. While one is listed, a
@@ -803,6 +809,25 @@ leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max)
 	for (uint32_t i = 0; i < g_disp_count && n < max; i++) {
 		if (!info_ready(&g_disp[i])) {
 			continue; // EDID_ONLY: present, not ready — never claimed or bound
+		}
+		if (out != NULL) {
+			out[n] = g_disp[i];
+		}
+		n++;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return n;
+}
+
+uint32_t
+leia_mac_get_sr_displays_present(struct leia_mac_display_info *out, uint32_t max)
+{
+	pthread_mutex_lock(&g_lock);
+	refresh_if_needed_locked();
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < g_disp_count && n < max; i++) {
+		if (!g_disp[i].valid) {
+			continue;
 		}
 		if (out != NULL) {
 			out[n] = g_disp[i];

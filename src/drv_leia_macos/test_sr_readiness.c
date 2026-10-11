@@ -58,6 +58,14 @@ main(void)
 	CHECK(leia_sr_newly_ready(NULL, 0, &edid_only, 1, true));
 	CHECK(!leia_sr_newly_ready(&edid_only, 1, &verified, 1, true));
 
+	// The claim: verified -> READY; EDID_ONLY -> PRESENT_NOT_READY (flat 2D)
+	// where the runtime knows the level, nothing on an older runtime.
+	CHECK(leia_sr_claim_kind(&verified, false, true) == LEIA_SR_CLAIM_READY);
+	CHECK(leia_sr_claim_kind(&edid_only, false, true) == LEIA_SR_CLAIM_PRESENT_NOT_READY);
+	CHECK(leia_sr_claim_kind(&edid_only, false, false) == LEIA_SR_CLAIM_NONE);
+	CHECK(leia_sr_claim_kind(&edid_only, true, true) == LEIA_SR_CLAIM_READY);
+	CHECK(leia_sr_claim_kind(&legacy, false, false) == LEIA_SR_CLAIM_READY);
+
 	if (g_fail != 0) {
 		fprintf(stderr, "%d failure(s)\n", g_fail);
 		return 1;

@@ -120,6 +120,15 @@ leia_mac_get_display_info(struct leia_mac_display_info *out);
 uint32_t
 leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max);
 
+//! DXR_LEIA_ACCEPT_EDID_ONLY=1: bind EDID_ONLY displays as ready (bring-up).
+bool
+leia_mac_sr_accept_edid_only(void);
+
+//! Like leia_mac_get_sr_displays, but every PRESENT display, ready or not
+//! (EDID_ONLY included; check fpc_verified / from_enumeration). For claims only.
+uint32_t
+leia_mac_get_sr_displays_present(struct leia_mac_display_info *out, uint32_t max);
+
 //! Capability snapshot of the enumeration instance (false if no SR runtime).
 bool
 leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);

@@ -49,6 +49,29 @@ leia_sr_display_ready(const struct leia_sr_readiness_entry *e, bool accept_edid_
 	return e != 0 && (!e->from_enumeration || e->fpc_verified || accept_edid_only);
 }
 
+//! What the plug-in claims for a listed SR display.
+enum leia_sr_claim_kind
+{
+	LEIA_SR_CLAIM_READY = 0,             //!< VERIFIED (or EDID on a legacy runtime): weave it.
+	LEIA_SR_CLAIM_PRESENT_NOT_READY = 1, //!< ours, not authenticated: the runtime shows it flat 2D.
+	LEIA_SR_CLAIM_NONE = 2,              //!< nothing (a runtime without the not-ready level).
+};
+
+/*!
+ * The claim for @p e: READY when it is ready; otherwise PRESENT_NOT_READY
+ * when the runtime understands that level (@p runtime_has_not_ready, i.e.
+ * XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY), else NONE — an older runtime would
+ * read a low claim as "weave it", and the panel would get a fallback weave.
+ */
+static inline enum leia_sr_claim_kind
+leia_sr_claim_kind(const struct leia_sr_readiness_entry *e, bool accept_edid_only, bool runtime_has_not_ready)
+{
+	if (leia_sr_display_ready(e, accept_edid_only)) {
+		return LEIA_SR_CLAIM_READY;
+	}
+	return runtime_has_not_ready ? LEIA_SR_CLAIM_PRESENT_NOT_READY : LEIA_SR_CLAIM_NONE;
+}
+
 //! How many listed displays are present but not ready (EDID_ONLY, awaiting
 //! authentication).
 uint32_t
