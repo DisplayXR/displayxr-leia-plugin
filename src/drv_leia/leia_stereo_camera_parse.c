@@ -163,6 +163,242 @@ leia_scam_parse_serials(const uint8_t *block, size_t size, char (*out)[LEIA_SCAM
 
 /*
  *
+ * One camera per SR device.
+ *
+ */
+
+bool
+leia_scam_section_name(const char *base, const char *serial, char *out, size_t out_size)
+{
+	if (out == NULL || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (base == NULL || base[0] == '\0') {
+		return false;
+	}
+	if (serial != NULL) {
+		for (const char *p = serial; *p != '\0'; p++) {
+			const unsigned char ch = (unsigned char)*p;
+			if (ch < 0x21 || ch > 0x7E || ch == '\\') {
+				return false;
+			}
+		}
+	}
+	int n = (serial == NULL || serial[0] == '\0') ? snprintf(out, out_size, "%s", base)
+	                                              : snprintf(out, out_size, "%s_%s", base, serial);
+	if (n < 0 || (size_t)n >= out_size) {
+		out[0] = '\0';
+		return false;
+	}
+	return true;
+}
+
+static uint32_t
+rd_u32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+uint32_t
+leia_scam_parse_tracker_stats(const uint8_t *block,
+                              size_t size,
+                              bool (*pid_alive)(uint32_t pid),
+                              struct leia_scam_tracker *out,
+                              uint32_t cap)
+{
+	if (block == NULL || out == NULL) {
+		return 0;
+	}
+	uint32_t n = 0;
+	for (uint32_t r = 0; r < LEIA_SCAM_STATS_ROWS && n < cap; r++) {
+		const size_t off = (size_t)r * LEIA_SCAM_STATS_ROW_SIZE;
+		if (off + LEIA_SCAM_STATS_ROW_SIZE > size) {
+			break;
+		}
+		const uint8_t *row = block + off;
+		size_t len = 0;
+		bool printable = true;
+		for (; len < LEIA_SCAM_SERIAL_LEN && row[len] != '\0'; len++) {
+			if (row[len] < 0x21 || row[len] > 0x7E) {
+				printable = false;
+			}
+		}
+		if (len == 0 || len == LEIA_SCAM_SERIAL_LEN || !printable) {
+			continue; // free row, unterminated, or garbage
+		}
+		const uint32_t pid = rd_u32(row + LEIA_SCAM_STATS_PID_OFFSET);
+		const uint32_t state = rd_u32(row + LEIA_SCAM_STATS_STATE_OFFSET);
+		if (pid == 0 || state > 1 || (pid_alive != NULL && !pid_alive(pid))) {
+			continue; // stale or out of contract
+		}
+		bool dup = false;
+		for (uint32_t i = 0; i < n && !dup; i++) {
+			dup = strlen(out[i].serial) == len && memcmp(out[i].serial, row, len) == 0;
+		}
+		if (dup) {
+			continue;
+		}
+		memcpy(out[n].serial, row, len);
+		out[n].serial[len] = '\0';
+		out[n].pid = pid;
+		out[n].streaming = state == 1;
+		n++;
+	}
+	return n;
+}
+
+static int
+cmp_slot_serial(const void *a, const void *b)
+{
+	return strcmp(((const struct leia_scam_camera_slot *)a)->serial,
+	              ((const struct leia_scam_camera_slot *)b)->serial);
+}
+
+uint32_t
+leia_scam_build_camera_list(const char *primary_serial,
+                            const struct leia_scam_tracker *trackers,
+                            int32_t tracker_count,
+                            bool (*has_section)(const char *serial),
+                            struct leia_scam_camera_slot *out,
+                            uint32_t cap)
+{
+	if (out == NULL) {
+		return 0;
+	}
+	if (cap > LEIA_SCAM_MAX_CAMERAS) {
+		cap = LEIA_SCAM_MAX_CAMERAS;
+	}
+	uint32_t n = 0;
+	const bool have_primary = primary_serial != NULL && primary_serial[0] != '\0';
+	if (have_primary && n < cap) {
+		snprintf(out[n].serial, sizeof(out[n].serial), "%s", primary_serial);
+		out[n].primary = true;
+		n++;
+	}
+	if (tracker_count <= 0 || trackers == NULL) {
+		return n;
+	}
+	// The others, sorted; collected past cap first so the cut keeps the
+	// lowest serials rather than whichever rows SR happened to fill first.
+	struct leia_scam_camera_slot others[LEIA_SCAM_STATS_ROWS];
+	uint32_t m = 0;
+	for (int32_t i = 0; i < tracker_count && m < LEIA_SCAM_STATS_ROWS; i++) {
+		const char *s = trackers[i].serial;
+		if (s[0] == '\0' || (have_primary && strcmp(s, primary_serial) == 0)) {
+			continue;
+		}
+		if (has_section != NULL && !has_section(s)) {
+			continue; // a live tracker that does not publish its camera
+		}
+		bool dup = false;
+		for (uint32_t j = 0; j < m && !dup; j++) {
+			dup = strcmp(others[j].serial, s) == 0;
+		}
+		if (dup) {
+			continue;
+		}
+		snprintf(others[m].serial, sizeof(others[m].serial), "%s", s);
+		others[m].primary = false;
+		m++;
+	}
+	qsort(others, m, sizeof(others[0]), cmp_slot_serial);
+	for (uint32_t j = 0; j < m && n < cap; j++) {
+		out[n++] = others[j];
+	}
+	return n;
+}
+
+uint32_t
+leia_scam_merge_stable(struct leia_scam_camera_slot *reg,
+                       uint32_t reg_count,
+                       uint32_t cap,
+                       const struct leia_scam_camera_slot *cur,
+                       uint32_t cur_count,
+                       bool *present)
+{
+	if (reg == NULL) {
+		return 0;
+	}
+	if (cap > LEIA_SCAM_MAX_CAMERAS) {
+		cap = LEIA_SCAM_MAX_CAMERAS;
+	}
+	if (reg_count > cap) {
+		reg_count = cap;
+	}
+	bool here[LEIA_SCAM_MAX_CAMERAS] = {false};
+	for (uint32_t i = 0; i < reg_count; i++) {
+		reg[i].primary = false;
+	}
+	for (uint32_t j = 0; cur != NULL && j < cur_count; j++) {
+		uint32_t i = 0;
+		while (i < reg_count && strcmp(reg[i].serial, cur[j].serial) != 0) {
+			i++;
+		}
+		if (i == reg_count) {
+			if (reg_count >= cap) {
+				continue; // full: a later device waits for a new plug-in instance
+			}
+			snprintf(reg[i].serial, sizeof(reg[i].serial), "%s", cur[j].serial);
+			reg_count++;
+		}
+		reg[i].primary = cur[j].primary;
+		here[i] = true;
+	}
+	if (present != NULL) {
+		for (uint32_t i = 0; i < reg_count; i++) {
+			present[i] = here[i];
+		}
+	}
+	return reg_count;
+}
+
+void
+leia_scam_display_names(const struct leia_scam_camera_slot *cams,
+                        const char *const *screen_names,
+                        uint32_t count,
+                        char (*out)[LEIA_SCAM_NAME_MAX])
+{
+	if (cams == NULL || out == NULL) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const char *screen = screen_names != NULL ? screen_names[i] : NULL;
+		if (screen != NULL && screen[0] != '\0') {
+			snprintf(out[i], LEIA_SCAM_NAME_MAX, "Leia SR camera - %s", screen);
+		} else {
+			snprintf(out[i], LEIA_SCAM_NAME_MAX, "Leia SR camera %s", cams[i].serial);
+		}
+	}
+	// Disambiguate: decide on the ORIGINAL names, then rewrite.
+	bool shared[LEIA_SCAM_MAX_CAMERAS * 2] = {false};
+	const uint32_t lim = count < LEIA_SCAM_MAX_CAMERAS * 2 ? count : LEIA_SCAM_MAX_CAMERAS * 2;
+	for (uint32_t i = 0; i < lim; i++) {
+		for (uint32_t j = i + 1; j < lim; j++) {
+			if (strcmp(out[i], out[j]) == 0) {
+				shared[i] = shared[j] = true;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < lim; i++) {
+		if (!shared[i]) {
+			continue;
+		}
+		char base[LEIA_SCAM_NAME_MAX];
+		snprintf(base, sizeof(base), "%s", out[i]);
+		// Keep the serial whole: trim the screen part if the result would not fit.
+		const size_t tail = strlen(cams[i].serial) + 3; // " (" + serial + ")"
+		size_t keep = strlen(base);
+		if (keep + tail >= LEIA_SCAM_NAME_MAX) {
+			keep = LEIA_SCAM_NAME_MAX - 1 - tail;
+		}
+		snprintf(out[i], LEIA_SCAM_NAME_MAX, "%.*s (%s)", (int)keep, base, cams[i].serial);
+	}
+}
+
+
+/*
+ *
  * YAML subset.
  *
  */

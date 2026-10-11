@@ -137,6 +137,222 @@ test_serials(void)
 }
 
 static void
+test_section_names(void)
+{
+	char n[128];
+	// Legacy (primary-only) names: no serial.
+	CHECK(leia_scam_section_name("Global\\SREyetrackerRawCamera", NULL, n, sizeof(n)));
+	CHECK(strcmp(n, "Global\\SREyetrackerRawCamera") == 0);
+	CHECK(leia_scam_section_name("Global\\SREyetrackerRawCamera", "", n, sizeof(n)));
+	CHECK(strcmp(n, "Global\\SREyetrackerRawCamera") == 0);
+	// Per-device: base + "_" + serial, for every object of the family.
+	CHECK(leia_scam_section_name("Global\\SREyetrackerRawCamera", "SRX12345678", n, sizeof(n)));
+	CHECK(strcmp(n, "Global\\SREyetrackerRawCamera_SRX12345678") == 0);
+	CHECK(leia_scam_section_name("Global\\SREyetrackerRawCameraMutex", "SRX12345678", n, sizeof(n)));
+	CHECK(strcmp(n, "Global\\SREyetrackerRawCameraMutex_SRX12345678") == 0);
+	// A serial that could name another object is refused, never truncated.
+	CHECK(!leia_scam_section_name("Global\\X", "a\\b", n, sizeof(n)) && n[0] == '\0');
+	CHECK(!leia_scam_section_name("Global\\X", "a b", n, sizeof(n)) && n[0] == '\0');
+	CHECK(!leia_scam_section_name("Global\\X", "abc\x01", n, sizeof(n)));
+	CHECK(!leia_scam_section_name("Global\\SREyetrackerRawCamera", "SRX12345678", n, 20) && n[0] == '\0');
+	CHECK(!leia_scam_section_name(NULL, "S", n, sizeof(n)));
+	CHECK(!leia_scam_section_name("", "S", n, sizeof(n)));
+}
+
+static void
+put_row(uint8_t *blk, uint32_t row, const char *serial, uint32_t pid, uint32_t state)
+{
+	uint8_t *r = blk + (size_t)row * LEIA_SCAM_STATS_ROW_SIZE;
+	memset(r, 0, LEIA_SCAM_STATS_ROW_SIZE);
+	memcpy(r, serial, strlen(serial));
+	for (int i = 0; i < 4; i++) {
+		r[LEIA_SCAM_STATS_PID_OFFSET + i] = (uint8_t)(pid >> (8 * i));
+		r[LEIA_SCAM_STATS_STATE_OFFSET + i] = (uint8_t)(state >> (8 * i));
+	}
+}
+
+static bool
+pid_alive_not_666(uint32_t pid)
+{
+	return pid != 666;
+}
+
+static void
+test_tracker_stats(void)
+{
+	// SR_TrackerStatsRow: 232 bytes, serial at 0, pid at 32, state at 48.
+	_Static_assert(LEIA_SCAM_STATS_MEMORY_SIZE == 8 * 232, "SR_TrackerStatsRow table size");
+	uint8_t blk[LEIA_SCAM_STATS_MEMORY_SIZE];
+	memset(blk, 0, sizeof(blk));
+	put_row(blk, 0, "PRIMARY-0001", 100, 1);
+	put_row(blk, 2, "CHILD-0002", 200, 0); // paused: still a live tracker
+	put_row(blk, 3, "STALE-0003", 666, 1); // its pid is gone
+	put_row(blk, 4, "ZERO-PID", 0, 1);
+	put_row(blk, 5, "BADSTATE", 300, 7);
+	put_row(blk, 6, "CHILD-0002", 201, 1); // repeat of a serial: first row wins
+	put_row(blk, 7, "has space", 400, 1);
+	struct leia_scam_tracker t[8];
+	uint32_t n = leia_scam_parse_tracker_stats(blk, sizeof(blk), pid_alive_not_666, t, 8);
+	CHECK(n == 2);
+	CHECK(strcmp(t[0].serial, "PRIMARY-0001") == 0 && t[0].pid == 100 && t[0].streaming);
+	CHECK(strcmp(t[1].serial, "CHILD-0002") == 0 && t[1].pid == 200 && !t[1].streaming);
+	// No liveness probe: the stale row counts.
+	CHECK(leia_scam_parse_tracker_stats(blk, sizeof(blk), NULL, t, 8) == 3);
+	// cap, and a short mapping (rows past it are not read).
+	CHECK(leia_scam_parse_tracker_stats(blk, sizeof(blk), NULL, t, 1) == 1);
+	CHECK(leia_scam_parse_tracker_stats(blk, LEIA_SCAM_STATS_ROW_SIZE * 2, NULL, t, 8) == 1);
+	// A 32-byte serial with no NUL is out of contract.
+	memset(blk, 0, sizeof(blk));
+	memset(blk, 'A', 32);
+	blk[LEIA_SCAM_STATS_PID_OFFSET] = 1;
+	CHECK(leia_scam_parse_tracker_stats(blk, sizeof(blk), NULL, t, 8) == 0);
+}
+
+static bool
+has_section_only_ccc(const char *serial)
+{
+	return strcmp(serial, "CCC-4") == 0;
+}
+
+static bool
+has_no_section(const char *serial)
+{
+	(void)serial;
+	return false;
+}
+
+static void
+test_camera_list(void)
+{
+	struct leia_scam_camera_slot s[LEIA_SCAM_MAX_CAMERAS];
+	struct leia_scam_tracker t[6];
+	memset(t, 0, sizeof(t));
+
+	// Today's SR (no Stats2 table): exactly the primary.
+	CHECK(leia_scam_build_camera_list("SRX1", NULL, -1, NULL, s, 4) == 1);
+	CHECK(strcmp(s[0].serial, "SRX1") == 0 && s[0].primary);
+	CHECK(leia_scam_build_camera_list("", NULL, -1, NULL, s, 4) == 0);
+	CHECK(leia_scam_build_camera_list(NULL, t, -1, NULL, s, 4) == 0);
+
+	// Stats2: primary first, then the others by serial, the primary not repeated.
+	snprintf(t[0].serial, sizeof(t[0].serial), "ZZZ-3");
+	snprintf(t[1].serial, sizeof(t[1].serial), "SRX1");
+	snprintf(t[2].serial, sizeof(t[2].serial), "BBB-2");
+	snprintf(t[3].serial, sizeof(t[3].serial), "BBB-2");
+	CHECK(leia_scam_build_camera_list("SRX1", t, 4, NULL, s, 4) == 3);
+	CHECK(strcmp(s[0].serial, "SRX1") == 0 && s[0].primary);
+	CHECK(strcmp(s[1].serial, "BBB-2") == 0 && !s[1].primary);
+	CHECK(strcmp(s[2].serial, "ZZZ-3") == 0 && !s[2].primary);
+
+	// The primary has the legacy sections, so it is listed without a Stats2 row.
+	CHECK(leia_scam_build_camera_list("SRX1", t, 1, NULL, s, 4) == 2);
+	CHECK(strcmp(s[0].serial, "SRX1") == 0 && strcmp(s[1].serial, "ZZZ-3") == 0);
+	// An empty table: the primary alone.
+	CHECK(leia_scam_build_camera_list("SRX1", t, 0, NULL, s, 4) == 1);
+	// No primary known: the live trackers, by serial.
+	CHECK(leia_scam_build_camera_list("", t, 3, NULL, s, 4) == 3);
+	CHECK(strcmp(s[0].serial, "BBB-2") == 0 && !s[0].primary);
+
+	// Cap: the primary survives, the lowest serials fill the rest.
+	snprintf(t[4].serial, sizeof(t[4].serial), "AAA-0");
+	snprintf(t[5].serial, sizeof(t[5].serial), "CCC-4");
+	CHECK(leia_scam_build_camera_list("SRX1", t, 6, NULL, s, 3) == 3);
+	CHECK(strcmp(s[0].serial, "SRX1") == 0 && strcmp(s[1].serial, "AAA-0") == 0 &&
+	      strcmp(s[2].serial, "BBB-2") == 0);
+	CHECK(leia_scam_build_camera_list("SRX1", t, 6, NULL, s, 99) == LEIA_SCAM_MAX_CAMERAS);
+
+	// A live tracker whose own section does not exist (an SR whose children do
+	// not publish yet) is not advertised; the primary never needs one.
+	CHECK(leia_scam_build_camera_list("SRX1", t, 6, has_section_only_ccc, s, 4) == 2);
+	CHECK(strcmp(s[0].serial, "SRX1") == 0 && s[0].primary && strcmp(s[1].serial, "CCC-4") == 0);
+	CHECK(leia_scam_build_camera_list("SRX1", t, 6, has_no_section, s, 4) == 1);
+}
+
+static void
+test_merge_stable(void)
+{
+	struct leia_scam_camera_slot reg[LEIA_SCAM_MAX_CAMERAS];
+	memset(reg, 0, sizeof(reg));
+	struct leia_scam_camera_slot cur[LEIA_SCAM_MAX_CAMERAS];
+	bool here[LEIA_SCAM_MAX_CAMERAS];
+	memset(cur, 0, sizeof(cur));
+
+	// First enumerate: the registry takes the list as is.
+	snprintf(cur[0].serial, sizeof(cur[0].serial), "SRX1");
+	cur[0].primary = true;
+	snprintf(cur[1].serial, sizeof(cur[1].serial), "BBB-2");
+	uint32_t n = leia_scam_merge_stable(reg, 0, 4, cur, 2, here);
+	CHECK(n == 2 && strcmp(reg[0].serial, "SRX1") == 0 && reg[0].primary && here[0] && here[1]);
+
+	// The primary moves to BBB-2 and a new device appears: indices hold, the
+	// new one is appended, the primary flag follows.
+	snprintf(cur[0].serial, sizeof(cur[0].serial), "BBB-2");
+	cur[0].primary = true;
+	snprintf(cur[1].serial, sizeof(cur[1].serial), "AAA-0");
+	cur[1].primary = false;
+	snprintf(cur[2].serial, sizeof(cur[2].serial), "SRX1");
+	cur[2].primary = false;
+	n = leia_scam_merge_stable(reg, n, 4, cur, 3, here);
+	CHECK(n == 3);
+	CHECK(strcmp(reg[0].serial, "SRX1") == 0 && !reg[0].primary);
+	CHECK(strcmp(reg[1].serial, "BBB-2") == 0 && reg[1].primary);
+	CHECK(strcmp(reg[2].serial, "AAA-0") == 0 && !reg[2].primary);
+
+	// A device goes away: it keeps its index, reported not present.
+	n = leia_scam_merge_stable(reg, n, 4, cur, 1, here);
+	CHECK(n == 3 && here[1] && !here[0] && !here[2]);
+	CHECK(strcmp(reg[0].serial, "SRX1") == 0 && !reg[0].primary);
+
+	// Full registry: a further device is not given an index.
+	snprintf(cur[0].serial, sizeof(cur[0].serial), "D4");
+	snprintf(cur[1].serial, sizeof(cur[1].serial), "E5");
+	n = leia_scam_merge_stable(reg, n, 4, cur, 2, here);
+	CHECK(n == 4 && strcmp(reg[3].serial, "D4") == 0 && here[3]);
+}
+
+static void
+test_display_names(void)
+{
+	struct leia_scam_camera_slot c[4];
+	memset(c, 0, sizeof(c));
+	snprintf(c[0].serial, sizeof(c[0].serial), "SRX1");
+	snprintf(c[1].serial, sizeof(c[1].serial), "BBB-2");
+	snprintf(c[2].serial, sizeof(c[2].serial), "ZZZ-3");
+	snprintf(c[3].serial, sizeof(c[3].serial), "Q4");
+	char out[4][LEIA_SCAM_NAME_MAX];
+
+	// A screen name when known, else the serial.
+	const char *screens[4] = {"Acer SpatialLabs View", "", NULL, "Odyssey 3D"};
+	leia_scam_display_names(c, screens, 4, out);
+	CHECK(strcmp(out[0], "Leia SR camera - Acer SpatialLabs View") == 0);
+	CHECK(strcmp(out[1], "Leia SR camera BBB-2") == 0);
+	CHECK(strcmp(out[2], "Leia SR camera ZZZ-3") == 0);
+	CHECK(strcmp(out[3], "Leia SR camera - Odyssey 3D") == 0);
+
+	// Two panels of one model: both get their serial, the third is untouched.
+	const char *same[3] = {"Odyssey 3D", "Odyssey 3D", "Other"};
+	leia_scam_display_names(c, same, 3, out);
+	CHECK(strcmp(out[0], "Leia SR camera - Odyssey 3D (SRX1)") == 0);
+	CHECK(strcmp(out[1], "Leia SR camera - Odyssey 3D (BBB-2)") == 0);
+	CHECK(strcmp(out[2], "Leia SR camera - Other") == 0);
+
+	// No screens table: serial names, distinct by construction.
+	leia_scam_display_names(c, NULL, 2, out);
+	CHECK(strcmp(out[0], "Leia SR camera SRX1") == 0 && strcmp(out[1], "Leia SR camera BBB-2") == 0);
+
+	// A screen name too long to fit keeps the serial whole when disambiguated.
+	char longname[300];
+	memset(longname, 'x', sizeof(longname) - 1);
+	longname[sizeof(longname) - 1] = '\0';
+	const char *lng[2] = {longname, longname};
+	leia_scam_display_names(c, lng, 2, out);
+	CHECK(strlen(out[0]) == LEIA_SCAM_NAME_MAX - 1 && strlen(out[1]) == LEIA_SCAM_NAME_MAX - 1);
+	CHECK(strcmp(out[0] + strlen(out[0]) - 7, " (SRX1)") == 0);
+	CHECK(strcmp(out[1] + strlen(out[1]) - 8, " (BBB-2)") == 0);
+	CHECK(strcmp(out[0], out[1]) != 0);
+}
+
+static void
 test_calibration(void)
 {
 	struct leia_scam_calibration c;
@@ -337,6 +553,11 @@ main(void)
 {
 	test_header_and_jpeg();
 	test_serials();
+	test_section_names();
+	test_tracker_stats();
+	test_camera_list();
+	test_merge_stable();
+	test_display_names();
 	test_calibration();
 	test_swap_halves();
 	test_rate_and_pairs();

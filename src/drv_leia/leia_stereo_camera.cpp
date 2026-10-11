@@ -14,6 +14,38 @@
  * `Global\SREyetrackerRawCameraEvent`. When its camera stops it zeroes the
  * block. There is no sequence number and no timestamp.
  *
+ * ## One camera per SR device
+ *
+ * SR runs one tracker process per device (the primary and a child per extra
+ * calibrated device, SR ST-5481 D4). Each writes its camera to the same three
+ * objects with "_<serial>" appended (`Global\SREyetrackerRawCamera_<serial>`,
+ * ...`Mutex_<serial>`, ...`Event_<serial>`); the PRIMARY also keeps the bare
+ * names above, a child never writes them. The live trackers are listed in
+ * `Global\SREyetrackerStats2` (one row per tracker: FPC serial + pid + paused /
+ * streaming). So enumerate advertises:
+ *
+ *  - the primary (`Global\sharedDeviceSerialMemory[0]`) at index 0, always —
+ *    it is today's single camera and has the legacy sections to fall back on;
+ *  - every other device with a LIVE tracker row whose own "_<serial>" section
+ *    exists, sorted by serial. Anything else is not advertised: a paused
+ *    tracker keeps its (zeroed) section, so a missing one means an SR whose
+ *    children do not publish their camera — a camera that could never
+ *    deliver. Indices are then kept stable for the instance's life (append-
+ *    only registry; a device that goes away keeps its index and just waits).
+ *
+ * With no Stats2 table (an SR that predates per-device trackers) the list is
+ * the primary alone, read from the legacy names: byte-for-byte today's
+ * behaviour. A camera reads its suffixed section when it exists; the primary
+ * falls back to the legacy section when it does not, and re-checks every
+ * second that it is still the primary (the legacy names follow the primary)
+ * and whether its suffixed section has appeared. The mapping, the section
+ * names and the display names are pure functions in
+ * leia_stereo_camera_parse.c, unit-tested on the host.
+ *
+ * Identity: device_identity "leia-sr:<serial>"; display_name names the screen
+ * when the claims table (probe_displays) or SR's display enumeration maps the
+ * serial to one, else the serial — always distinct per camera.
+ *
  * ## Rules this file follows (ADR-043 §6, spec §6)
  *
  *  - **Never take the device.** We open the three named objects READ-ONLY
@@ -33,18 +65,22 @@
  *  - **Hold the writer's mutex only for a memcpy** of the JPEG (~100-300 KB,
  *    tens of microseconds); decode OUTSIDE it, so the tracker never waits on
  *    our decoder.
- *  - **Calibration of the ACTIVE device.** The serial is the FIRST entry of
- *    `Global\sharedDeviceSerialMemory` — SRService writes the primary device
- *    first, and the SR eyetracker keys its own calibration the same way
- *    (PredictingEyeTracker: `readDeviceSerialsFromSharedMemory()[0]`). Only
- *    `%ProgramData%\Simulated Reality\Devices\<serial>\` is read; never "the
+ *  - **Calibration per device.** Each camera's serial names its folder: only
+ *    `%ProgramData%\Simulated Reality\Devices\<serial>\` is read (the primary's
+ *    serial is the FIRST entry of `Global\sharedDeviceSerialMemory` — SRService
+ *    writes the primary device first, and the SR eyetracker keys its own
+ *    calibration the same way); never "the
  *    first folder on the machine" (one field box carried eleven). Missing or
  *    unreadable => no CALIBRATED bit and a WARN naming the serial; never a
  *    fallback to another folder. The lens serial API (`srLensGetSerialNumber`)
  *    is deliberately NOT used: on the SRService side it force-enables and
  *    reconnects the display's controller board.
- *  - **Keep-alive.** Frames exist only while the tracker runs. While a camera
- *    is open we hold an SR v2 instance with an eye tracker initialised (the
+ *  - **Keep-alive.** Frames exist only while the tracker runs (a tracker
+ *    pauses 2 s after its last client leaves, zeroing its section). While a
+ *    camera is open we hold, PER DEVICE, an SR v2 instance with an eye tracker
+ *    BOUND to that device's display (SrDisplayBindingInfo, the display id from
+ *    the claims table / SR's enumeration; the primary falls back to an unbound
+ *    tracker, today's behaviour) initialised (the
  *    same weaver-less pattern leia_sr_predict_trace.cpp uses, which the SR SDK
  *    owner confirmed legal as a second instance per process). No v2 runtime
  *    => no keep-alive: frames then flow only while some app weaves (WARN once).
@@ -68,10 +104,14 @@
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
 
 #include "leia_stereo_camera_parse.h"
+#include "leia_display_claims_win.h"
 
 #ifdef DXR_LEIA_HAS_SR_V2
 #include "leia_sr_v2_common.h"
 #include <sr/sr_eye_tracker.h>
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+#include <sr/sr_display.h> // SrDisplayBindingInfo: a keep-alive tracker per device
+#endif
 #endif
 
 #include "os/os_time.h"
@@ -88,6 +128,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -95,10 +136,18 @@
 
 namespace {
 
+//! Bases: the legacy (primary-only) name, or + "_<serial>" per device.
 constexpr const char *k_cam_mutex = "Global\\SREyetrackerRawCameraMutex";
 constexpr const char *k_cam_memory = "Global\\SREyetrackerRawCamera";
 constexpr const char *k_serial_mutex = "Global\\sharedDeviceSerialMutex";
 constexpr const char *k_serial_memory = "Global\\sharedDeviceSerialMemory";
+//! SR eyetrackerstats.h (v2): one row per live tracker process.
+constexpr const char *k_stats_mutex = "Global\\SREyetrackerStats2Mutex";
+constexpr const char *k_stats_memory = "Global\\SREyetrackerStats2";
+//! Object-name buffer: base + '_' + a 32-byte serial.
+constexpr size_t k_name_max = 128;
+//! How often a camera reading the LEGACY section re-checks it is still the primary.
+constexpr int64_t k_legacy_recheck_ns = 1000ll * 1000 * 1000;
 
 //! Poll period on the high-resolution timer (~4x the tracker's ~60 Hz).
 constexpr DWORD k_poll_ms = 4;
@@ -133,10 +182,17 @@ env_is(const char *name, char c)
 
 struct resolved_camera
 {
-	bool present = false;
 	bool calibrated = false;
 	bool swap = false;
+	//! The SR device: names its sections, its identity and (by default) its calibration folder.
 	char serial[LEIA_SCAM_SERIAL_LEN + 1] = {0};
+	//! The primary device: the legacy unsuffixed sections are its fallback.
+	bool primary = false;
+	//! SR display id for the keep-alive's SrDisplayBindingInfo; 0 = unknown.
+	uint64_t display_id = 0;
+	char display_name[LEIA_SCAM_NAME_MAX] = {0};
+	//! The screen part of the name ("" = unknown), kept for a device that went away.
+	char display_screen[LEIA_SCAM_NAME_MAX] = {0};
 	uint32_t eye_w = k_default_eye_w, eye_h = k_default_eye_h;
 	leia_scam_eye_calibration cal = {};
 	//! platformDeviceHint: the OS camera the tracker holds, "" if not unambiguous.
@@ -144,9 +200,41 @@ struct resolved_camera
 };
 
 std::mutex g_resolve_mutex;
-resolved_camera g_cam;
-//! Source rate measured on an open in this process; what enumerate advertises.
-std::atomic<float> g_measured_rate{0.0f};
+//! The last enumerate's cameras, in index order. Under g_resolve_mutex.
+resolved_camera g_cams[LEIA_SCAM_MAX_CAMERAS];
+uint32_t g_cam_count = 0;
+
+//! Source rate measured on an open in this process, per device; what enumerate advertises.
+std::mutex g_rate_mutex;
+std::vector<std::pair<std::string, float>> g_rates;
+
+float
+rate_get(const char *serial)
+{
+	std::lock_guard<std::mutex> lk(g_rate_mutex);
+	for (const auto &r : g_rates) {
+		if (r.first == serial) {
+			return r.second;
+		}
+	}
+	return 0.0f;
+}
+
+//! @return the previous rate (0 = none).
+float
+rate_set(const char *serial, float rate)
+{
+	std::lock_guard<std::mutex> lk(g_rate_mutex);
+	for (auto &r : g_rates) {
+		if (r.first == serial) {
+			float prev = r.second;
+			r.second = rate;
+			return prev;
+		}
+	}
+	g_rates.emplace_back(serial, rate);
+	return 0.0f;
+}
 
 //! Read the primary (first) device serial. Empty string = none.
 void
@@ -200,12 +288,111 @@ read_text_file(const std::string &path, std::string &out)
 	return !out.empty();
 }
 
-//! Per-eye size from a frame already in the block, if any.
-void
-peek_eye_size(uint32_t *eye_w, uint32_t *eye_h)
+/*!
+ * Is @p pid a running process? A tracker runs as LocalSystem, so a caller
+ * without the right may be refused even the limited query: ACCESS_DENIED means
+ * the process exists. Only "no such process" (ERROR_INVALID_PARAMETER) or an
+ * exit code makes the row stale.
+ */
+bool
+pid_alive(uint32_t pid)
 {
-	HANDLE mtx = OpenMutexA(SYNCHRONIZE, FALSE, k_cam_mutex);
-	HANDLE map = OpenFileMappingA(FILE_MAP_READ, FALSE, k_cam_memory);
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (h == nullptr) {
+		return GetLastError() != ERROR_INVALID_PARAMETER;
+	}
+	DWORD code = 0;
+	bool alive = GetExitCodeProcess(h, &code) == 0 || code == STILL_ACTIVE;
+	CloseHandle(h);
+	return alive;
+}
+
+/*!
+ * The live trackers from Global\SREyetrackerStats2. @return -1 when the table
+ * does not exist (an SR that predates per-device trackers), else the count.
+ */
+int32_t
+read_trackers(leia_scam_tracker *out, uint32_t cap)
+{
+	HANDLE map = OpenFileMappingA(FILE_MAP_READ, FALSE, k_stats_memory);
+	if (map == nullptr) {
+		return -1;
+	}
+	int32_t n = 0;
+	HANDLE mtx = OpenMutexA(SYNCHRONIZE, FALSE, k_stats_mutex);
+	const uint8_t *view = static_cast<const uint8_t *>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
+	if (view != nullptr) {
+		MEMORY_BASIC_INFORMATION mbi = {};
+		SIZE_T region = VirtualQuery(view, &mbi, sizeof(mbi)) != 0 ? mbi.RegionSize : 0;
+		size_t len = region < LEIA_SCAM_STATS_MEMORY_SIZE ? (size_t)region : LEIA_SCAM_STATS_MEMORY_SIZE;
+		// SR's rule: nobody waits for it longer than 200 ms.
+		bool locked = mtx != nullptr && WaitForSingleObject(mtx, 200) != WAIT_TIMEOUT;
+		std::vector<uint8_t> copy(view, view + len);
+		if (locked) {
+			ReleaseMutex(mtx);
+		}
+		UnmapViewOfFile(view);
+		// pid liveness outside the writer's mutex.
+		n = (int32_t)leia_scam_parse_tracker_stats(copy.data(), copy.size(), pid_alive, out, cap);
+	}
+	if (mtx != nullptr) {
+		CloseHandle(mtx);
+	}
+	CloseHandle(map);
+	return n;
+}
+
+//! Open one device's raw-camera mutex + section (@p serial "" = the legacy names).
+bool
+open_named_pair(const char *serial, DWORD mutex_access, HANDLE *out_mtx, HANDLE *out_map)
+{
+	*out_mtx = nullptr;
+	*out_map = nullptr;
+	char mtx_name[k_name_max], mem_name[k_name_max];
+	if (!leia_scam_section_name(k_cam_mutex, serial, mtx_name, sizeof(mtx_name)) ||
+	    !leia_scam_section_name(k_cam_memory, serial, mem_name, sizeof(mem_name))) {
+		return false;
+	}
+	*out_map = OpenFileMappingA(FILE_MAP_READ, FALSE, mem_name);
+	if (*out_map == nullptr) {
+		return false;
+	}
+	*out_mtx = OpenMutexA(mutex_access, FALSE, mtx_name);
+	if (*out_mtx == nullptr && mutex_access != SYNCHRONIZE) {
+		*out_mtx = OpenMutexA(SYNCHRONIZE, FALSE, mtx_name);
+	}
+	if (*out_mtx == nullptr) {
+		CloseHandle(*out_map);
+		*out_map = nullptr;
+		return false;
+	}
+	return true;
+}
+
+//! Does the device's own "_<serial>" section exist?
+bool
+suffixed_section_exists(const char *serial)
+{
+	char mem_name[k_name_max];
+	if (serial[0] == '\0' || !leia_scam_section_name(k_cam_memory, serial, mem_name, sizeof(mem_name))) {
+		return false;
+	}
+	HANDLE map = OpenFileMappingA(FILE_MAP_READ, FALSE, mem_name);
+	if (map == nullptr) {
+		return false;
+	}
+	CloseHandle(map);
+	return true;
+}
+
+//! Per-eye size from a frame already in the device's block, if any.
+void
+peek_eye_size(const char *serial, bool primary, uint32_t *eye_w, uint32_t *eye_h)
+{
+	HANDLE mtx = nullptr, map = nullptr;
+	if (!open_named_pair(serial, SYNCHRONIZE, &mtx, &map) && primary) {
+		open_named_pair("", SYNCHRONIZE, &mtx, &map);
+	}
 	if (map != nullptr) {
 		const uint8_t *view = static_cast<const uint8_t *>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
 		if (view != nullptr) {
@@ -359,52 +546,115 @@ resolve_platform_hint(char out[LEIA_SCAM_HINT_MAX])
 	std::snprintf(out, LEIA_SCAM_HINT_MAX, "%s", pick);
 }
 
-void
-resolve_locked()
+/*!
+ * The OS's friendly name of the monitor driven by GDI source @p device_name
+ * ("\\.\DISPLAY2"): DisplayConfig's monitorFriendlyDeviceName, which is the
+ * EDID's monitor name. "" when it cannot be found.
+ */
+std::string
+monitor_friendly_name(const char *device_name)
 {
-	resolved_camera c;
-	if (env_is("DXR_LEIA_STEREO_CAMERA", '0')) {
-		g_cam = c;
-		return;
+	if (device_name == nullptr || device_name[0] == '\0') {
+		return std::string();
 	}
-	const char *serial_override = std::getenv("DXR_LEIA_STEREO_CAMERA_SERIAL");
-	if (serial_override != nullptr && serial_override[0] != '\0') {
-		std::snprintf(c.serial, sizeof(c.serial), "%s", serial_override);
-		U_LOG_W("leia stereo camera: calibration serial OVERRIDDEN by DXR_LEIA_STEREO_CAMERA_SERIAL=%s",
-		        c.serial);
-	} else {
-		read_primary_serial(c.serial);
+	UINT32 npaths = 0, nmodes = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &npaths, &nmodes) != ERROR_SUCCESS || npaths == 0) {
+		return std::string();
 	}
-	if (c.serial[0] == '\0') {
-		U_LOG_W(
-		    "leia stereo camera: no SR device serial in %s — no camera advertised (is SRService running "
-		    "with a device attached?)",
-		    k_serial_memory);
-		g_cam = c;
-		return;
+	std::vector<DISPLAYCONFIG_PATH_INFO> paths(npaths);
+	std::vector<DISPLAYCONFIG_MODE_INFO> modes(nmodes);
+	if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &npaths, paths.data(), &nmodes, modes.data(), nullptr) !=
+	    ERROR_SUCCESS) {
+		return std::string();
 	}
-	c.present = true;
-	peek_eye_size(&c.eye_w, &c.eye_h);
-	try {
-		resolve_platform_hint(c.platform_hint);
-	} catch (...) {
-		c.platform_hint[0] = '\0';
+	for (UINT32 i = 0; i < npaths; i++) {
+		DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {};
+		src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+		src.header.size = sizeof(src);
+		src.header.adapterId = paths[i].sourceInfo.adapterId;
+		src.header.id = paths[i].sourceInfo.id;
+		if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS ||
+		    narrow(src.viewGdiDeviceName) != device_name) {
+			continue;
+		}
+		DISPLAYCONFIG_TARGET_DEVICE_NAME tgt = {};
+		tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+		tgt.header.size = sizeof(tgt);
+		tgt.header.adapterId = paths[i].targetInfo.adapterId;
+		tgt.header.id = paths[i].targetInfo.id;
+		if (DisplayConfigGetDeviceInfo(&tgt.header) == ERROR_SUCCESS) {
+			std::string name = narrow(tgt.monitorFriendlyDeviceName);
+			// A laptop's own panel usually carries no EDID monitor name.
+			const auto tech = tgt.outputTechnology;
+			if (name.empty() && (tech == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL ||
+			                     tech == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED ||
+			                     tech == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED)) {
+				name = "Built-in display";
+			}
+			return name;
+		}
 	}
+	return std::string();
+}
 
+/*!
+ * Which screen a device's camera belongs to: the claims table first (what
+ * probe_displays stored — no SR call), then SR's own display enumeration
+ * (cached, shared with probe_displays). Fills the SR display id the
+ * keep-alive binds to and the screen's name ("" = unknown).
+ */
+void
+resolve_screen(const char *serial, uint64_t *out_display_id, std::string *out_screen)
+{
+	*out_display_id = 0;
+	out_screen->clear();
+	char device_name[32] = {0};
+	std::string product;
+	leia_win_claim_binding claim = {};
+	if (leia_win_claims_find_serial(serial, &claim)) {
+		*out_display_id = claim.sr_display_id;
+		std::snprintf(device_name, sizeof(device_name), "%s", claim.device_name);
+	}
+	if (*out_display_id == 0 || device_name[0] == '\0') {
+		leia_win_sr_display d[LEIA_WIN_SR_MAX_DISPLAYS];
+		int32_t n = leia_win_sr_enumerate_displays(d, LEIA_WIN_SR_MAX_DISPLAYS);
+		for (int32_t i = 0; i < n && i < (int32_t)LEIA_WIN_SR_MAX_DISPLAYS; i++) {
+			if (d[i].fpc_verified && std::strcmp(d[i].serial, serial) == 0) {
+				if (*out_display_id == 0) {
+					*out_display_id = d[i].display_id;
+				}
+				if (device_name[0] == '\0') {
+					std::snprintf(device_name, sizeof(device_name), "%s", d[i].device_name);
+				}
+				product = d[i].product_code;
+				break;
+			}
+		}
+	}
+	*out_screen = monitor_friendly_name(device_name);
+	if (out_screen->empty() && !product.empty()) {
+		*out_screen = product; // the panel's SR product code, when the OS has no name
+	}
+}
+
+//! Calibration of one device, by its serial's folder (never another's).
+void
+resolve_calibration(resolved_camera &c, const char *calib_serial)
+{
 	const char *pd = std::getenv("ProgramData");
 	std::string dir =
-	    std::string(pd != nullptr ? pd : "C:\\ProgramData") + "\\Simulated Reality\\Devices\\" + c.serial;
+	    std::string(pd != nullptr ? pd : "C:\\ProgramData") + "\\Simulated Reality\\Devices\\" + calib_serial;
 	std::string intr, extr;
 	char why[160] = {0};
 	leia_scam_calibration raw = {};
 	if (!read_text_file(dir + "\\intrinsics.yml", intr) || !read_text_file(dir + "\\extrinsics.yml", extr)) {
 		U_LOG_W(
-		    "leia stereo camera: no calibration for the ACTIVE device %s (%s\\{intrinsics,extrinsics}.yml "
+		    "leia stereo camera: no calibration for device %s (%s\\{intrinsics,extrinsics}.yml "
 		    "unreadable) — RAW only; NOT falling back to another device's folder",
-		    c.serial, dir.c_str());
+		    calib_serial, dir.c_str());
 	} else if (!leia_scam_parse_calibration(intr.c_str(), intr.size(), extr.c_str(), extr.size(), &raw, why,
 	                                        sizeof(why))) {
-		U_LOG_W("leia stereo camera: calibration of device %s rejected (%s) — RAW only", c.serial, why);
+		U_LOG_W("leia stereo camera: calibration of device %s rejected (%s) — RAW only", calib_serial, why);
 	} else {
 		c.swap = leia_scam_decide_swap(&raw, std::getenv("DXR_LEIA_STEREO_CAMERA_SWAP"));
 		leia_scam_calibration_for_runtime(&raw, c.swap, &c.cal);
@@ -412,22 +662,129 @@ resolve_locked()
 		U_LOG_W(
 		    "leia stereo camera: device %s calibrated from %s — baseline %.2f mm (T = %.2f %.2f %.2f), "
 		    "left-eye fx %.2f, %s halves (camera %s = SBS left)",
-		    c.serial, dir.c_str(), std::sqrt(raw.T[0] * raw.T[0] + raw.T[1] * raw.T[1] + raw.T[2] * raw.T[2]),
-		    raw.T[0], raw.T[1], raw.T[2], c.cal.k[0][0], c.swap ? "SWAPPED" : "native", c.swap ? "2" : "1");
+		    calib_serial, dir.c_str(),
+		    std::sqrt(raw.T[0] * raw.T[0] + raw.T[1] * raw.T[1] + raw.T[2] * raw.T[2]), raw.T[0], raw.T[1],
+		    raw.T[2], c.cal.k[0][0], c.swap ? "SWAPPED" : "native", c.swap ? "2" : "1");
 	}
-	g_cam = c;
+}
+
+//! One line per CHANGE of the advertised set, never per enumerate. Under g_resolve_mutex.
+std::string g_logged_set;
+//! Append-only serial -> index registry (stable indices for the instance's life).
+leia_scam_camera_slot g_registry[LEIA_SCAM_MAX_CAMERAS];
+
+void
+resolve_locked()
+{
+	if (env_is("DXR_LEIA_STEREO_CAMERA", '0')) {
+		g_cam_count = 0;
+		return;
+	}
+	char primary[LEIA_SCAM_SERIAL_LEN + 1];
+	read_primary_serial(primary);
+	leia_scam_tracker trackers[LEIA_SCAM_STATS_ROWS];
+	const int32_t ntr = read_trackers(trackers, LEIA_SCAM_STATS_ROWS);
+	leia_scam_camera_slot cur[LEIA_SCAM_MAX_CAMERAS];
+	const uint32_t ncur = leia_scam_build_camera_list(primary, trackers, ntr, suffixed_section_exists, cur,
+	                                                  LEIA_SCAM_MAX_CAMERAS);
+	bool present[LEIA_SCAM_MAX_CAMERAS] = {false};
+	const uint32_t n =
+	    leia_scam_merge_stable(g_registry, g_cam_count, LEIA_SCAM_MAX_CAMERAS, cur, ncur, present);
+	if (n == 0) {
+		if (g_logged_set != "-") {
+			g_logged_set = "-";
+			U_LOG_W(
+			    "leia stereo camera: no SR device serial in %s and no live tracker in %s — no camera "
+			    "advertised (is SRService running with a device attached?)",
+			    k_serial_memory, k_stats_memory);
+		}
+		return;
+	}
+
+	// Debug override of the PRIMARY's calibration folder (not its sections or identity).
+	const char *serial_override = std::getenv("DXR_LEIA_STEREO_CAMERA_SERIAL");
+	const bool overridden = serial_override != nullptr && serial_override[0] != '\0';
+
+	std::string screens[LEIA_SCAM_MAX_CAMERAS];
+	const char *screen_ptrs[LEIA_SCAM_MAX_CAMERAS];
+	resolved_camera cams[LEIA_SCAM_MAX_CAMERAS];
+	for (uint32_t i = 0; i < n; i++) {
+		resolved_camera &c = cams[i];
+		if (!present[i] && i < g_cam_count) {
+			// Gone since an earlier enumerate: keep its index and last answer
+			// (its stream waits); never hand the index to another device.
+			c = g_cams[i];
+			c.primary = false;
+			screens[i] = c.display_screen;
+			screen_ptrs[i] = screens[i].c_str();
+			continue;
+		}
+		std::snprintf(c.serial, sizeof(c.serial), "%s", g_registry[i].serial);
+		c.primary = g_registry[i].primary;
+		peek_eye_size(c.serial, c.primary, &c.eye_w, &c.eye_h);
+		try {
+			resolve_screen(c.serial, &c.display_id, &screens[i]);
+		} catch (...) {
+			c.display_id = 0;
+			screens[i].clear();
+		}
+		std::snprintf(c.display_screen, sizeof(c.display_screen), "%s", screens[i].c_str());
+		screen_ptrs[i] = screens[i].c_str();
+		if (c.primary && overridden) {
+			U_LOG_W("leia stereo camera: calibration serial OVERRIDDEN by DXR_LEIA_STEREO_CAMERA_SERIAL=%s",
+			        serial_override);
+		}
+		resolve_calibration(c, c.primary && overridden ? serial_override : c.serial);
+	}
+	char names[LEIA_SCAM_MAX_CAMERAS][LEIA_SCAM_NAME_MAX];
+	leia_scam_display_names(g_registry, screen_ptrs, n, names);
+
+	// The platform hint names ONE OS camera; it can only be attributed when
+	// exactly one device is advertised (several SR cameras make the pick
+	// ambiguous anyway, and it then names none).
+	char hint[LEIA_SCAM_HINT_MAX] = {0};
+	if (n == 1) {
+		try {
+			resolve_platform_hint(hint);
+		} catch (...) {
+			hint[0] = '\0';
+		}
+	}
+
+	std::string set;
+	for (uint32_t i = 0; i < n; i++) {
+		std::snprintf(cams[i].display_name, sizeof(cams[i].display_name), "%s", names[i]);
+		std::snprintf(cams[i].platform_hint, sizeof(cams[i].platform_hint), "%s", hint);
+		g_cams[i] = cams[i];
+		char line[512];
+		std::snprintf(line, sizeof(line), "[%u] \"%s\" leia-sr:%s%s%s display=0x%016llx %ux%u%s; ", i,
+		              cams[i].display_name, cams[i].serial, cams[i].primary ? " (primary)" : "",
+		              present[i] ? "" : " (GONE)", (unsigned long long)cams[i].display_id, cams[i].eye_w,
+		              cams[i].eye_h, cams[i].calibrated ? " calibrated" : " RAW");
+		set += line;
+	}
+	g_cam_count = n;
+	if (set != g_logged_set) {
+		g_logged_set = set;
+		U_LOG_W("leia stereo camera: %u camera(s) (%s): %s", n,
+		        ntr < 0 ? "no Stats2 table: primary only, legacy sections" : "per-device trackers",
+		        set.c_str());
+	}
 }
 
 
 /*
  *
- * Keep-alive: an SR v2 eye tracker on our own instance while any camera is open.
+ * Keep-alive: per DEVICE, an SR v2 eye tracker on our own instance, bound to
+ * that device's display, while any camera of that device is open.
  *
  */
 
 struct keepalive
 {
-	std::mutex m;
+	std::string serial;
+	uint64_t display_id = 0;
+	bool primary = false;
 	int refs = 0;
 #ifdef DXR_LEIA_HAS_SR_V2
 	SrInstance instance = nullptr;
@@ -438,10 +795,12 @@ struct keepalive
 	leia_scam_pair_count count = {};
 	uint64_t predict_failures = 0;
 #endif
-	bool warned_unavailable = false;
 };
 
-keepalive g_ka;
+//! Guards the list and every entry's refs / SR handles (acquire/release are rare).
+std::mutex g_ka_mutex;
+std::vector<std::unique_ptr<keepalive>> g_kas;
+bool g_ka_warned_unavailable = false;
 
 #ifdef DXR_LEIA_HAS_SR_V2
 /*!
@@ -456,6 +815,7 @@ keepalive_poll(keepalive *ka)
 	const int64_t t0 = os_monotonic_get_ns();
 	int64_t next_log = t0 + k_ka_log_ns;
 	bool warned_first = false, warned_silent = false;
+	const char *sn = ka->serial.c_str();
 	while (!ka->quit.load(std::memory_order_relaxed)) {
 		SrEyePair pair{};
 		SrResult r = SR_ERROR_VALIDATION_FAILURE;
@@ -468,8 +828,8 @@ keepalive_poll(keepalive *ka)
 			if (!warned_first && ka->count.with_eyes > 0) {
 				warned_first = true;
 				U_LOG_W(
-				    "leia stereo camera: keep-alive tracker delivering eye pairs (first after %.1f s)",
-				    (double)(os_monotonic_get_ns() - t0) * 1e-9);
+				    "leia stereo camera %s: keep-alive tracker delivering eye pairs (first after %.1f s)",
+				    sn, (double)(os_monotonic_get_ns() - t0) * 1e-9);
 			}
 		} else {
 			ka->predict_failures++;
@@ -478,121 +838,194 @@ keepalive_poll(keepalive *ka)
 		if (!warned_silent && ka->count.with_eyes == 0 && now - t0 > k_ka_silent_warn_ns) {
 			warned_silent = true;
 			U_LOG_W(
-			    "leia stereo camera: keep-alive: no eye pair after 5 s (%llu predicts, %llu tracker "
+			    "leia stereo camera %s: keep-alive: no eye pair after 5 s (%llu predicts, %llu tracker "
 			    "frames, %llu failed) — no face in view, or the tracker is not running for this instance",
-			    (unsigned long long)ka->count.polls, (unsigned long long)ka->count.new_frames,
+			    sn, (unsigned long long)ka->count.polls, (unsigned long long)ka->count.new_frames,
 			    (unsigned long long)ka->predict_failures);
 		}
 		if (now >= next_log) {
 			next_log = now + k_ka_log_ns;
 			U_LOG_I(
-			    "leia stereo camera: keep-alive eye pairs so far: %llu with eyes / %llu tracker frames "
+			    "leia stereo camera %s: keep-alive eye pairs so far: %llu with eyes / %llu tracker frames "
 			    "(%llu predicts)",
-			    (unsigned long long)ka->count.with_eyes, (unsigned long long)ka->count.new_frames,
+			    sn, (unsigned long long)ka->count.with_eyes, (unsigned long long)ka->count.new_frames,
 			    (unsigned long long)ka->count.polls);
 		}
 		Sleep((DWORD)(k_ka_poll_ns / 1000000));
 	}
 }
-#endif
 
 void
-keepalive_acquire()
+keepalive_teardown_locked(keepalive *ka)
 {
-	std::lock_guard<std::mutex> lk(g_ka.m);
-	if (g_ka.refs++ > 0) {
-		return;
+	if (ka->poller.joinable()) {
+		ka->quit = true;
+		ka->poller.join();
 	}
-	if (env_is("DXR_LEIA_STEREO_CAMERA_KEEPALIVE", '0')) {
-		U_LOG_W(
-		    "leia stereo camera: keep-alive disabled (DXR_LEIA_STEREO_CAMERA_KEEPALIVE=0) — frames only "
-		    "while an app weaves");
-		return;
+	if (ka->tracker != nullptr) {
+		srDestroyEyeTracker(ka->tracker);
+		ka->tracker = nullptr;
 	}
-#ifdef DXR_LEIA_HAS_SR_V2
+	if (ka->instance != nullptr) {
+		srDestroyInstance(ka->instance);
+		ka->instance = nullptr;
+	}
+}
+
+/*!
+ * Own instance + an eye tracker bound to @p bind_display_id (0 = unbound: the
+ * active display's, today's behaviour). @return false with everything released.
+ */
+bool
+keepalive_try_start_locked(keepalive *ka, uint64_t bind_display_id)
+{
 	try {
-		if (!leia_sr_v2_create_instance(3.0, &g_ka.instance) || g_ka.instance == nullptr) {
-			g_ka.instance = nullptr;
+		if (!leia_sr_v2_create_instance(3.0, &ka->instance) || ka->instance == nullptr) {
+			ka->instance = nullptr;
 			throw 1;
 		}
 		SrEyeTrackerCreateInfo tci{};
 		tci.sType = SR_TYPE_EYE_TRACKER_CREATE_INFO;
 		tci.pNext = nullptr;
 		tci.enablePrediction = SR_TRUE;
-		SrResult r = srCreateEyeTracker(g_ka.instance, &tci, &g_ka.tracker);
-		if (!SR_SUCCEEDED(r) || g_ka.tracker == nullptr) {
-			U_LOG_W("leia stereo camera: keep-alive srCreateEyeTracker failed (%s)",
-			        leia_sr_v2_result_str(r));
-			g_ka.tracker = nullptr;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+		// SR D4: a tracker bound to a display tracks THAT device's camera, which
+		// is what keeps that device's tracker process capturing.
+		SrDisplayBindingInfo binding{};
+		binding.sType = SR_TYPE_DISPLAY_BINDING_INFO;
+		binding.pNext = nullptr;
+		binding.displayId = bind_display_id;
+		if (bind_display_id != 0) {
+			tci.pNext = &binding;
+		}
+#else
+		(void)bind_display_id;
+#endif
+		SrResult r = srCreateEyeTracker(ka->instance, &tci, &ka->tracker);
+		if (!SR_SUCCEEDED(r) || ka->tracker == nullptr) {
+			U_LOG_W("leia stereo camera %s: keep-alive srCreateEyeTracker (display 0x%016llx) failed (%s)",
+			        ka->serial.c_str(), (unsigned long long)bind_display_id, leia_sr_v2_result_str(r));
+			ka->tracker = nullptr;
 			throw 2;
 		}
 		// Senses before srInitialize (sr_eye_tracker.h); this starts tracking.
 		// No callback: it would only echo our own predicts (see the file comment).
-		if (!leia_sr_v2_initialize(g_ka.instance)) {
+		if (!leia_sr_v2_initialize(ka->instance)) {
 			throw 4;
 		}
-		g_ka.count = {};
-		g_ka.predict_failures = 0;
-		g_ka.quit = false;
-		g_ka.poller = std::thread(keepalive_poll, &g_ka);
+		ka->count = {};
+		ka->predict_failures = 0;
+		ka->quit = false;
+		ka->poller = std::thread(keepalive_poll, ka);
 		U_LOG_W(
-		    "leia stereo camera: keep-alive UP (own SR v2 instance + eye tracker, predicting at ~%d Hz) — the "
-		    "tracker stays on while the camera is open",
+		    "leia stereo camera %s: keep-alive UP (own SR v2 instance + eye tracker %s, predicting at ~%d "
+		    "Hz) — the device's tracker stays on while its camera is open",
+		    ka->serial.c_str(), bind_display_id != 0 ? "BOUND to its display" : "unbound (active display)",
 		    (int)(1000000000ll / k_ka_poll_ns));
-		return;
+		return true;
 	} catch (...) {
-		if (g_ka.tracker != nullptr) {
-			srDestroyEyeTracker(g_ka.tracker);
-			g_ka.tracker = nullptr;
+		keepalive_teardown_locked(ka);
+		return false;
+	}
+}
+#endif
+
+/*!
+ * Hold device @p serial's tracker up. One keep-alive per device, shared by
+ * every open camera of it. Never fails the open: without a keep-alive the
+ * frames flow only while something else holds that device's tracker.
+ */
+keepalive *
+keepalive_acquire(const char *serial, uint64_t display_id, bool primary)
+{
+	std::lock_guard<std::mutex> lk(g_ka_mutex);
+	for (auto &k : g_kas) {
+		if (k->serial == serial) {
+			k->refs++;
+			return k.get();
 		}
-		if (g_ka.instance != nullptr) {
-			srDestroyInstance(g_ka.instance);
-			g_ka.instance = nullptr;
-		}
-		U_LOG_W("leia stereo camera: keep-alive could not start — frames only while an app weaves");
-		return;
+	}
+	g_kas.push_back(std::make_unique<keepalive>());
+	keepalive *ka = g_kas.back().get();
+	ka->serial = serial;
+	ka->display_id = display_id;
+	ka->primary = primary;
+	ka->refs = 1;
+	if (env_is("DXR_LEIA_STEREO_CAMERA_KEEPALIVE", '0')) {
+		U_LOG_W(
+		    "leia stereo camera %s: keep-alive disabled (DXR_LEIA_STEREO_CAMERA_KEEPALIVE=0) — frames only "
+		    "while something else holds the device's tracker",
+		    serial);
+		return ka;
+	}
+#ifdef DXR_LEIA_HAS_SR_V2
+	bool up = false;
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+	if (display_id != 0) {
+		up = keepalive_try_start_locked(ka, display_id);
+	}
+#endif
+	if (!up && primary) {
+		// The primary's tracker is what an unbound tracker holds (today's path).
+		up = keepalive_try_start_locked(ka, 0);
+	}
+	if (!up) {
+		const char *why = primary ? "no SR v2 instance / tracker"
+		                  : display_id == 0
+		                      ? "no SR display id for this serial (claims / SR enumeration); an unbound "
+		                        "tracker would hold the PRIMARY's"
+		                      : "the bound tracker was refused (or this SDK cannot bind one)";
+		U_LOG_W(
+		    "leia stereo camera %s: keep-alive could not start (%s) — frames only while something else "
+		    "holds the device's tracker",
+		    serial, why);
 	}
 #else
-	if (!g_ka.warned_unavailable) {
-		g_ka.warned_unavailable = true;
+	(void)display_id;
+	(void)primary;
+	if (!g_ka_warned_unavailable) {
+		g_ka_warned_unavailable = true;
 		U_LOG_W(
 		    "leia stereo camera: built without the SR v2 SDK — no tracker keep-alive; frames only while "
 		    "an app weaves");
 	}
 #endif
+	return ka;
 }
 
 void
-keepalive_release()
+keepalive_release(keepalive *ka)
 {
-	std::lock_guard<std::mutex> lk(g_ka.m);
-	if (g_ka.refs <= 0 || --g_ka.refs > 0) {
+	if (ka == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(g_ka_mutex);
+	if (--ka->refs > 0) {
 		return;
 	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	try {
-		if (g_ka.poller.joinable()) {
-			g_ka.quit = true;
-			g_ka.poller.join();
-		}
-		if (g_ka.tracker != nullptr) {
-			srDestroyEyeTracker(g_ka.tracker);
-			g_ka.tracker = nullptr;
-		}
-		if (g_ka.instance != nullptr) {
-			srDestroyInstance(g_ka.instance);
-			g_ka.instance = nullptr;
+		const bool was_up = ka->instance != nullptr;
+		keepalive_teardown_locked(ka);
+		if (was_up) {
 			U_LOG_W(
-			    "leia stereo camera: keep-alive released after %llu eye pairs (%llu tracker frames, %llu "
+			    "leia stereo camera %s: keep-alive released after %llu eye pairs (%llu tracker frames, %llu "
 			    "predicts, %llu failed)",
-			    (unsigned long long)g_ka.count.with_eyes, (unsigned long long)g_ka.count.new_frames,
-			    (unsigned long long)g_ka.count.polls, (unsigned long long)g_ka.predict_failures);
+			    ka->serial.c_str(), (unsigned long long)ka->count.with_eyes,
+			    (unsigned long long)ka->count.new_frames, (unsigned long long)ka->count.polls,
+			    (unsigned long long)ka->predict_failures);
 		}
 	} catch (...) {
-		g_ka.tracker = nullptr;
-		g_ka.instance = nullptr;
+		ka->tracker = nullptr;
+		ka->instance = nullptr;
 	}
 #endif
+	for (auto it = g_kas.begin(); it != g_kas.end(); ++it) {
+		if (it->get() == ka) {
+			g_kas.erase(it);
+			break;
+		}
+	}
 }
 
 } // namespace
@@ -611,6 +1044,14 @@ struct xrt_plugin_stereo_camera
 	const uint8_t *view = nullptr;
 	SIZE_T view_size = 0;
 	int64_t next_open_try_ns = 0;
+
+	//! The device this camera streams (copied from the enumerate at open).
+	char serial[LEIA_SCAM_SERIAL_LEN + 1] = {0};
+	bool primary = false;
+	//! Reading the LEGACY (unsuffixed) section, which follows the primary.
+	bool legacy = false;
+	int64_t next_legacy_check_ns = 0;
+	keepalive *ka = nullptr;
 
 	bool swap = false;
 	uint32_t eye_w = 0, eye_h = 0;
@@ -650,9 +1091,13 @@ cam_close_channel(xrt_plugin_stereo_camera *c)
 		c->mutex = nullptr;
 	}
 	c->view_size = 0;
+	c->legacy = false;
 }
 
-//! Open the tracker's named objects READ-ONLY (never the event).
+/*!
+ * Open the device's named objects READ-ONLY (never the event): its own
+ * "_<serial>" section, else — the primary only — the legacy unsuffixed one.
+ */
 static bool
 cam_open_channel(xrt_plugin_stereo_camera *c, int64_t now)
 {
@@ -665,14 +1110,14 @@ cam_open_channel(xrt_plugin_stereo_camera *c, int64_t now)
 	c->next_open_try_ns = now + k_reopen_ns;
 	// SYNCHRONIZE is all a wait + ReleaseMutex needs; ask for MODIFY_STATE too
 	// where the ACL grants it. Never the event (see the file comment).
-	c->mutex = OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, k_cam_mutex);
-	if (c->mutex == nullptr) {
-		c->mutex = OpenMutexA(SYNCHRONIZE, FALSE, k_cam_mutex);
-	}
-	c->mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, k_cam_memory);
-	if (c->mutex == nullptr || c->mapping == nullptr) {
-		cam_close_channel(c); // the tracker has not created them yet
-		return false;
+	const DWORD access = SYNCHRONIZE | MUTEX_MODIFY_STATE;
+	bool legacy = false;
+	if (!open_named_pair(c->serial, access, &c->mutex, &c->mapping)) {
+		if (!c->primary || !open_named_pair("", access, &c->mutex, &c->mapping)) {
+			cam_close_channel(c); // the tracker has not created them yet
+			return false;
+		}
+		legacy = true;
 	}
 	c->view = static_cast<const uint8_t *>(MapViewOfFile(c->mapping, FILE_MAP_READ, 0, 0, 0));
 	MEMORY_BASIC_INFORMATION mbi = {};
@@ -681,11 +1126,47 @@ cam_open_channel(xrt_plugin_stereo_camera *c, int64_t now)
 		return false;
 	}
 	c->view_size = mbi.RegionSize;
+	c->legacy = legacy;
+	c->next_legacy_check_ns = now + k_legacy_recheck_ns;
+	char name[k_name_max];
+	leia_scam_section_name(k_cam_memory, legacy ? "" : c->serial, name, sizeof(name));
 	U_LOG_W(
-	    "leia stereo camera: reading %s (%llu bytes, read-only; polling, never waiting on the auto-reset "
-	    "event)",
-	    k_cam_memory, (unsigned long long)c->view_size);
+	    "leia stereo camera %s: reading %s (%llu bytes, read-only%s; polling, never waiting on the "
+	    "auto-reset event)",
+	    c->serial, name, (unsigned long long)c->view_size,
+	    legacy ? "; LEGACY primary-only section, no per-device one yet" : "");
 	return true;
+}
+
+/*!
+ * The legacy section follows the primary. Once a second, while reading it:
+ * drop it if this device is no longer the primary (it would carry another
+ * device's camera), and move to the device's own section once it exists.
+ */
+static void
+cam_recheck_legacy(xrt_plugin_stereo_camera *c, int64_t now)
+{
+	if (!c->legacy || c->view == nullptr || now < c->next_legacy_check_ns) {
+		return;
+	}
+	c->next_legacy_check_ns = now + k_legacy_recheck_ns;
+	char primary[LEIA_SCAM_SERIAL_LEN + 1];
+	read_primary_serial(primary);
+	if (primary[0] != '\0' && std::strcmp(primary, c->serial) != 0) {
+		U_LOG_W(
+		    "leia stereo camera %s: no longer the primary device (now %s) — leaving the legacy section, "
+		    "waiting for its own",
+		    c->serial, primary);
+		c->primary = false;
+		cam_close_channel(c);
+		c->next_open_try_ns = 0;
+		return;
+	}
+	if (suffixed_section_exists(c->serial)) {
+		U_LOG_W("leia stereo camera %s: per-device section appeared — switching to it", c->serial);
+		cam_close_channel(c);
+		c->next_open_try_ns = 0;
+	}
 }
 
 enum poll_result
@@ -795,36 +1276,44 @@ leia_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 	try {
 		std::lock_guard<std::mutex> lk(g_resolve_mutex);
 		resolve_locked();
-		if (!g_cam.present) {
-			return 0;
+		if (out == nullptr) {
+			return g_cam_count;
 		}
-		if (capacity >= 1 && out != nullptr) {
-			uint32_t sz = out->struct_size;
+		// The runtime's stride: every entry is written only up to the
+		// struct_size the runtime set on out[0] (ADR-020: never past it).
+		const uint32_t sz = out[0].struct_size;
+		if (sz == 0) {
+			return g_cam_count;
+		}
+		const uint32_t n = g_cam_count < capacity ? g_cam_count : capacity;
+		for (uint32_t i = 0; i < n; i++) {
+			const resolved_camera &rc = g_cams[i];
 			xrt_plugin_stereo_camera_info info;
 			std::memset(&info, 0, sizeof(info));
 			info.struct_size = (uint32_t)sizeof(info);
-			std::snprintf(info.display_name, sizeof(info.display_name), "Leia SR tracking camera");
-			std::snprintf(info.device_identity, sizeof(info.device_identity), "leia-sr:%s", g_cam.serial);
+			std::snprintf(info.display_name, sizeof(info.display_name), "%s", rc.display_name);
+			std::snprintf(info.device_identity, sizeof(info.device_identity), "leia-sr:%s", rc.serial);
 			// The OS camera the tracker holds (USB "vvvv:pppp"), so a capture
 			// stack can hide the busy duplicate; "" unless unambiguous.
 			std::snprintf(info.platform_device_hint, sizeof(info.platform_device_hint), "%s",
-			              g_cam.platform_hint);
+			              rc.platform_hint);
 			info.flags = XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING |
 			             XRT_PLUGIN_STEREO_CAMERA_USER_FACING | XRT_PLUGIN_STEREO_CAMERA_MONOCHROME;
-			if (g_cam.calibrated) {
+			if (rc.calibrated) {
 				info.flags |= XRT_PLUGIN_STEREO_CAMERA_CALIBRATED;
 			}
-			info.eye_width = g_cam.eye_w;
-			info.eye_height = g_cam.eye_h;
+			info.eye_width = rc.eye_w;
+			info.eye_height = rc.eye_h;
 			// Measured on an earlier open, else 0 = unknown: never a guess (the
 			// first field run advertised a hard-coded 30 Hz for a ~60 Hz camera).
-			info.max_frame_rate = g_measured_rate.load();
+			info.max_frame_rate = rate_get(rc.serial);
 			info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
-			std::memcpy(out, &info,
-			            sz < sizeof(info) ? sz : sizeof(info)); // ADR-020: never past struct_size
-			out->struct_size = sz;
+			auto *dst = reinterpret_cast<xrt_plugin_stereo_camera_info *>(reinterpret_cast<uint8_t *>(out) +
+			                                                               (size_t)i * sz);
+			std::memcpy(dst, &info, sz < sizeof(info) ? sz : sizeof(info));
+			dst->struct_size = sz;
 		}
-		return 1;
+		return g_cam_count;
 	} catch (...) {
 		return 0;
 	}
@@ -838,31 +1327,32 @@ leia_stereo_camera_get_calibration(struct xrt_plugin_instance *inst,
 	(void)inst;
 	try {
 		std::lock_guard<std::mutex> lk(g_resolve_mutex);
-		if (index != 0 || out == nullptr || !g_cam.present || !g_cam.calibrated) {
+		if (index >= g_cam_count || out == nullptr || !g_cams[index].calibrated) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 		}
+		const resolved_camera &rc = g_cams[index];
 		uint32_t sz = out->struct_size;
 		xrt_plugin_stereo_camera_calibration c;
 		std::memset(&c, 0, sizeof(c));
 		c.struct_size = (uint32_t)sizeof(c);
 		// The SR tracker calibrates at its native per-eye size (the frames').
-		c.image_width = g_cam.eye_w;
-		c.image_height = g_cam.eye_h;
+		c.image_width = rc.eye_w;
+		c.image_height = rc.eye_h;
 		for (int e = 0; e < 2; e++) {
 			for (int k = 0; k < 4; k++) {
-				c.k[e][k] = g_cam.cal.k[e][k];
+				c.k[e][k] = rc.cal.k[e][k];
 			}
 			for (int k = 0; k < 8; k++) {
-				c.distortion[e][k] = g_cam.cal.d[e][k];
+				c.distortion[e][k] = rc.cal.d[e][k];
 			}
 		}
-		c.distortion_model = g_cam.cal.model == 2 ? XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN8
-		                                          : XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN5;
+		c.distortion_model = rc.cal.model == 2 ? XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN8
+		                                       : XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN5;
 		for (int i = 0; i < 3; i++) {
 			for (int j = 0; j < 3; j++) {
-				c.rotation_right_from_left[i][j] = g_cam.cal.R[i][j];
+				c.rotation_right_from_left[i][j] = rc.cal.R[i][j];
 			}
-			c.translation_right_from_left_mm[i] = g_cam.cal.T[i];
+			c.translation_right_from_left_mm[i] = rc.cal.T[i];
 		}
 		std::memcpy(out, &c, sz < sizeof(c) ? sz : sizeof(c));
 		out->struct_size = sz;
@@ -876,20 +1366,25 @@ extern "C" xrt_result_t
 leia_stereo_camera_open(struct xrt_plugin_instance *inst, uint32_t index, struct xrt_plugin_stereo_camera **out_cam)
 {
 	(void)inst;
-	if (index != 0 || out_cam == nullptr) {
+	if (out_cam == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	try {
 		xrt_plugin_stereo_camera *c = new xrt_plugin_stereo_camera();
+		uint64_t display_id = 0;
 		{
 			std::lock_guard<std::mutex> lk(g_resolve_mutex);
-			if (!g_cam.present) {
+			if (index >= g_cam_count) {
 				delete c;
 				return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 			}
-			c->swap = g_cam.calibrated && g_cam.swap;
-			c->eye_w = g_cam.eye_w;
-			c->eye_h = g_cam.eye_h;
+			const resolved_camera &rc = g_cams[index];
+			std::snprintf(c->serial, sizeof(c->serial), "%s", rc.serial);
+			c->primary = rc.primary;
+			c->swap = rc.calibrated && rc.swap;
+			c->eye_w = rc.eye_w;
+			c->eye_h = rc.eye_h;
+			display_id = rc.display_id;
 		}
 		c->jpeg.reserve(512 * 1024);
 		c->timer = CreateWaitableTimerExW(nullptr, nullptr, k_timer_high_res, TIMER_ALL_ACCESS);
@@ -898,7 +1393,7 @@ leia_stereo_camera_open(struct xrt_plugin_instance *inst, uint32_t index, struct
 			    "leia stereo camera: no high-resolution timer (pre-1803 Windows?) — polling on Sleep, "
 			    "~64 Hz at best for a ~60 Hz source");
 		}
-		keepalive_acquire();
+		c->ka = keepalive_acquire(c->serial, display_id, c->primary);
 		cam_open_channel(c, os_monotonic_get_ns());
 		*out_cam = c;
 		return XRT_SUCCESS;
@@ -919,6 +1414,7 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 		const int64_t deadline = os_monotonic_get_ns() + (timeout_ns > 0 ? timeout_ns : 0);
 		for (;;) {
 			int64_t now = os_monotonic_get_ns();
+			cam_recheck_legacy(c, now);
 			if (cam_open_channel(c, now)) {
 				leia_scam_header hdr;
 				poll_result p = cam_poll(c, &hdr);
@@ -929,13 +1425,13 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 						c->block_empty = false;
 						c->last_new_ns = arrival;
 						if (leia_scam_rate_push(&c->rate, arrival)) {
-							float prev = g_measured_rate.exchange(c->rate.rate);
+							float prev = rate_set(c->serial, c->rate.rate);
 							if (prev <= 0.0f) {
 								U_LOG_W(
-								    "leia stereo camera: measured source rate %.1f Hz "
+								    "leia stereo camera %s: measured source rate %.1f Hz "
 								    "over %u frames (advertised from the next "
 								    "enumerate)",
-								    c->rate.rate, LEIA_SCAM_RATE_WINDOW);
+								    c->serial, c->rate.rate, LEIA_SCAM_RATE_WINDOW);
 							}
 						}
 						std::memset(out, 0, sizeof(*out));
@@ -1003,13 +1499,14 @@ leia_stereo_camera_close(struct xrt_plugin_stereo_camera *c)
 		return;
 	}
 	try {
-		U_LOG_W("leia stereo camera: closed after %llu frames", (unsigned long long)c->seq);
+		U_LOG_W("leia stereo camera %s: closed after %llu frames", c->serial, (unsigned long long)c->seq);
 		cam_close_channel(c);
 		if (c->timer != nullptr) {
 			CloseHandle(c->timer);
 			c->timer = nullptr;
 		}
-		keepalive_release();
+		keepalive_release(c->ka);
+		c->ka = nullptr;
 		delete c;
 	} catch (...) {
 	}

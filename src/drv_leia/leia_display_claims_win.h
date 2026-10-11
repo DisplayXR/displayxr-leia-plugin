@@ -237,6 +237,16 @@ bool
 leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out);
 
 /*!
+ * Look up the claimed monitor whose SR display carries FPC serial @p serial
+ * (exact string match; only FPC-verified bindings carry one). The stereo
+ * camera provider names a device's camera after its screen and binds its
+ * keep-alive tracker to the display id this returns. False when no stored
+ * claim has that serial, or @p serial is empty.
+ */
+bool
+leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *out);
+
+/*!
  * Moves whenever leia_win_claims_store() stored a claim set that differs from
  * the previous one (monitor, SR display, FPC verification or serial) — a
  * topology / identity event, never a poll. Feeds get_screen_status's

@@ -13,11 +13,16 @@
  *
  * Knobs (read by the process that loads the plug-in — the runtime SERVICE):
  *   DXR_LEIA_STEREO_CAMERA=0             advertise no camera
- *   DXR_LEIA_STEREO_CAMERA_KEEPALIVE=0   do not hold the tracker up while open
+ *   DXR_LEIA_STEREO_CAMERA_KEEPALIVE=0   do not hold the trackers up while open
  *   DXR_LEIA_STEREO_CAMERA_SWAP=auto|0|1 which SBS half is the LEFT lens
  *                                        (auto = from the sign of T)
- *   DXR_LEIA_STEREO_CAMERA_SERIAL=<s>    calibration folder override (debug;
- *                                        default = the ACTIVE device's serial)
+ *   DXR_LEIA_STEREO_CAMERA_SERIAL=<s>    the PRIMARY camera's calibration
+ *                                        folder override (debug; default =
+ *                                        its serial; other cameras always
+ *                                        use their own)
+ *
+ * One camera per SR device (primary at index 0, then one per live per-device
+ * tracker that publishes its camera); see leia_stereo_camera.cpp.
  *
  * @ingroup drv_leia
  */

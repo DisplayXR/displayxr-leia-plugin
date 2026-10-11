@@ -504,6 +504,40 @@ test_store(void)
 	CHECK(!leia_win_claims_lookup(0xA, &out));
 }
 
+// The stereo camera's serial -> screen lookup: FPC-verified bindings only,
+// exact string match.
+static void
+test_find_serial(void)
+{
+	struct leia_win_claim_binding b[3];
+	memset(b, 0, sizeof(b));
+	b[0].monitor_id = 0xA;
+	b[0].sr_display_id = 0x11;
+	b[0].fpc_verified = true;
+	snprintf(b[0].serial, sizeof(b[0].serial), "SRX1");
+	snprintf(b[0].device_name, sizeof(b[0].device_name), "\\\\.\\DISPLAY1");
+	b[1].monitor_id = 0xB;
+	b[1].sr_display_id = 0x22;
+	b[1].fpc_verified = true;
+	snprintf(b[1].serial, sizeof(b[1].serial), "SRX10");
+	b[2].monitor_id = 0xC;
+	b[2].sr_display_id = 0x33;
+	b[2].fpc_verified = false; // stale serial text on an unverified binding never matches
+	snprintf(b[2].serial, sizeof(b[2].serial), "EDID-ONLY");
+	leia_win_claims_store(b, 3);
+	struct leia_win_claim_binding out;
+	CHECK(leia_win_claims_find_serial("SRX1", &out) && out.sr_display_id == 0x11 && out.monitor_id == 0xA);
+	CHECK(strcmp(out.device_name, "\\\\.\\DISPLAY1") == 0);
+	CHECK(leia_win_claims_find_serial("SRX10", &out) && out.sr_display_id == 0x22);
+	CHECK(!leia_win_claims_find_serial("SRX", &out));
+	CHECK(!leia_win_claims_find_serial("EDID-ONLY", &out));
+	CHECK(!leia_win_claims_find_serial("", &out));
+	CHECK(!leia_win_claims_find_serial(NULL, &out));
+	CHECK(leia_win_claims_find_serial("SRX1", NULL));
+	leia_win_claims_store(NULL, 0);
+	CHECK(!leia_win_claims_find_serial("SRX1", &out));
+}
+
 int
 main(void)
 {
@@ -519,6 +553,7 @@ main(void)
 	test_join_not_sr();
 	test_join_unavailable();
 	test_store();
+	test_find_serial();
 	if (g_failures != 0) {
 		fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

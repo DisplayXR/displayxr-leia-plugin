@@ -16,6 +16,9 @@
  *  - the device-serial list in `Global\sharedDeviceSerialMemory` (1 count
  *    byte, then 32-byte NUL-terminated serials, primary device FIRST — the
  *    same rule the SR eyetracker's PredictingEyeTracker uses);
+ *  - one camera per SR device: the per-device section names, the live
+ *    trackers in `Global\SREyetrackerStats2`, the serial -> camera index
+ *    mapping (kept stable) and the camera display names;
  *  - the small OpenCV FileStorage YAML subset of `intrinsics.yml`
  *    (M1 D1 M2 D2) and `extrinsics.yml` (R T), parsed without OpenCV;
  *  - eye order: which SBS half is the camera's LEFT lens, decided from the
@@ -103,6 +106,133 @@ leia_scam_fingerprint(const uint8_t *jpg, size_t size);
  */
 uint32_t
 leia_scam_parse_serials(const uint8_t *block, size_t size, char (*out)[LEIA_SCAM_SERIAL_LEN + 1], uint32_t cap);
+
+
+/*
+ *
+ * One camera per SR device (multi-device trackers, SR ST-5481 D4).
+ *
+ * Every SR eye tracker process (the primary and each per-device child) writes
+ * its camera to sections named after its device: the base name + "_<serial>"
+ * (Global\SREyetrackerRawCamera_<serial>, ...Mutex_<serial>, ...Event_<serial>).
+ * The PRIMARY also keeps the bare legacy names; a child never writes them.
+ * <serial> is the FPC serial — the Devices\<serial> calibration folder name
+ * and the SR display enumeration's serial, compared by plain string equality.
+ *
+ * The live trackers are listed in Global\SREyetrackerStats2 (SR's
+ * eyetrackerstats.h, SR_TrackerStatsRow): 8 rows x 232 bytes, serial[32] at
+ * offset 0 (empty = free row), u32 pid at 32 (a pid that is no longer a
+ * running process = stale row), u32 state at 48 (0 paused, 1 streaming).
+ *
+ */
+
+//! Most cameras the provider advertises (XRT_STEREO_CAMERA_MAX_CAMERAS).
+#define LEIA_SCAM_MAX_CAMERAS 4u
+
+#define LEIA_SCAM_STATS_ROW_SIZE 232u
+#define LEIA_SCAM_STATS_ROWS 8u
+#define LEIA_SCAM_STATS_MEMORY_SIZE (LEIA_SCAM_STATS_ROW_SIZE * LEIA_SCAM_STATS_ROWS)
+#define LEIA_SCAM_STATS_PID_OFFSET 32u
+#define LEIA_SCAM_STATS_STATE_OFFSET 48u
+
+/*!
+ * The per-device name of an SR named object: @p base when @p serial is NULL
+ * or empty (the legacy, primary-only name), else "<base>_<serial>".
+ * @return false (and "" in @p out) when the name does not fit or @p serial
+ *         holds a character that cannot be in a kernel object name ('\\',
+ *         control characters, non-ASCII) — never a name that could resolve to
+ *         another object.
+ */
+bool
+leia_scam_section_name(const char *base, const char *serial, char *out, size_t out_size);
+
+//! One live tracker from Global\SREyetrackerStats2.
+struct leia_scam_tracker
+{
+	char serial[LEIA_SCAM_SERIAL_LEN + 1];
+	uint32_t pid;
+	bool streaming; //!< row state 1; 0 = paused (no client holds it)
+};
+
+/*!
+ * Parse the Global\SREyetrackerStats2 table. Keeps rows with a printable,
+ * NUL-terminated, non-empty serial, a non-zero pid that @p pid_alive (may be
+ * NULL = trust every pid) says is running, and state 0 or 1; drops repeats of
+ * a serial (first row wins). @return the number written (<= @p cap).
+ */
+uint32_t
+leia_scam_parse_tracker_stats(const uint8_t *block,
+                              size_t size,
+                              bool (*pid_alive)(uint32_t pid),
+                              struct leia_scam_tracker *out,
+                              uint32_t cap);
+
+//! One advertised camera = one SR device.
+struct leia_scam_camera_slot
+{
+	char serial[LEIA_SCAM_SERIAL_LEN + 1];
+	//! The primary device: the legacy unsuffixed sections are its fallback.
+	bool primary;
+};
+
+/*!
+ * The serial -> camera mapping, i.e. what enumerate advertises, in index order.
+ *
+ *  - @p tracker_count < 0 (no Stats2 table: an SR that predates per-device
+ *    trackers): exactly the primary, when @p primary_serial is non-empty —
+ *    today's single camera, read from the legacy sections.
+ *  - Otherwise: the primary (when known; it always has the legacy sections)
+ *    plus every OTHER device that has a live tracker row AND whose own
+ *    "_<serial>" section exists (@p has_section; NULL = assume it does). A
+ *    paused tracker keeps its section (zeroed), so a device that has none is
+ *    on an SR whose children do not publish yet: NOT advertised, because a
+ *    camera that can never deliver is worse than none.
+ *
+ * Order: the primary first (index 0, as before), then the others by serial
+ * (strcmp), so indices only move when the device set or the primary changes.
+ * At most @p cap (and LEIA_SCAM_MAX_CAMERAS). @return the count.
+ */
+uint32_t
+leia_scam_build_camera_list(const char *primary_serial,
+                            const struct leia_scam_tracker *trackers,
+                            int32_t tracker_count,
+                            bool (*has_section)(const char *serial),
+                            struct leia_scam_camera_slot *out,
+                            uint32_t cap);
+
+/*!
+ * Keep indices stable for the plug-in instance's life (the runtime contract):
+ * merge the current list (@p cur, from @ref leia_scam_build_camera_list) into
+ * the append-only @p reg. A serial keeps the index it first got; a new one is
+ * appended (while @p cap allows); one that is gone stays, marked not primary
+ * and not present (its stream then just waits — the runtime shows WAITING).
+ * Every entry's @ref leia_scam_camera_slot::primary is refreshed from @p cur.
+ * @p present (may be NULL) receives, per registry index, whether the serial is
+ * in @p cur. @return the registry count.
+ */
+uint32_t
+leia_scam_merge_stable(struct leia_scam_camera_slot *reg,
+                       uint32_t reg_count,
+                       uint32_t cap,
+                       const struct leia_scam_camera_slot *cur,
+                       uint32_t cur_count,
+                       bool *present);
+
+//! Size of a display name (xrt_plugin_stereo_camera_info::display_name).
+#define LEIA_SCAM_NAME_MAX 128u
+
+/*!
+ * Display names for @p count cameras. "Leia SR camera - <screen>" when
+ * @p screen_names[i] is non-empty (the monitor's friendly name or the panel's
+ * model), else "Leia SR camera <serial>". The names are guaranteed distinct
+ * (the browser labels devices by them): any name two cameras share — two
+ * panels of the same model — gets " (<serial>)" appended on every holder.
+ */
+void
+leia_scam_display_names(const struct leia_scam_camera_slot *cams,
+                        const char *const *screen_names,
+                        uint32_t count,
+                        char (*out)[LEIA_SCAM_NAME_MAX]);
 
 
 /*
