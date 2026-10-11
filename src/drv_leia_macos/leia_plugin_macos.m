@@ -429,12 +429,27 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
                    struct xrt_plugin_iface **out_iface,
                    uint32_t *out_plugin_api_version)
 {
-	(void)host;
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 	if (runtime_api_version != XRT_PLUGIN_API_VERSION_CURRENT) {
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+#ifdef XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN
+	// Display hotplug (DisplayXR ADR-047 Amendment 7): an SR topology change
+	// asks the runtime to re-run its claim sweep, so a panel plugged in while
+	// an app runs is claimed (and this plug-in re-probed when it declined at
+	// instance create) within the sweep's debounce. A runtime predating the
+	// slot leaves it zero (carved from reserved[]); its OS-triggered sweep, if
+	// any, still re-probes us on its own follow-up schedule.
+	if (host != NULL &&
+	    host->struct_size >= offsetof(struct xrt_plugin_host_iface, request_display_rescan) +
+	                             sizeof(host->request_display_rescan) &&
+	    host->request_display_rescan != NULL) {
+		leia_mac_sr_set_topology_listener(host->request_display_rescan);
+	}
+#else
+	(void)host;
+#endif
 	*out_iface = &g_leia_mac_iface;
 	return XRT_SUCCESS;
 }

@@ -36,6 +36,10 @@ static struct leia_mac_sr_caps g_caps;
 
 //! Set by SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED (SR thread); cleared by a re-enumeration.
 static atomic_bool g_topology_dirty = true;
+
+//! The runtime's request_display_rescan (leia_mac_sr_set_topology_listener); NULL = none.
+typedef void (*leia_mac_topology_fn)(const char *reason);
+static _Atomic(leia_mac_topology_fn) g_topology_listener = NULL;
 static bool g_enumerated = false; //!< the cache below holds a result (possibly 0 displays)
 
 //! The SR displays, [0] = the active panel. Never trusted across a topology change.
@@ -315,6 +319,12 @@ on_system_event(const SrSystemEvent *event, void *user_data)
 		atomic_store(&g_topology_dirty, true);
 		U_LOG_W("leia_mac: SR display topology changed (%s) — re-enumerating on the next query",
 		        event->message != NULL ? event->message : "no detail");
+		// Tell the runtime: a panel that just came up must be claimed (and
+		// this plug-in re-probed if it declined) without an app restart.
+		leia_mac_topology_fn fn = atomic_load(&g_topology_listener);
+		if (fn != NULL) {
+			fn("leia-sr: SR display topology changed");
+		}
 	}
 }
 
@@ -680,6 +690,12 @@ leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max)
 	}
 	pthread_mutex_unlock(&g_lock);
 	return n;
+}
+
+void
+leia_mac_sr_set_topology_listener(void (*fn)(const char *reason))
+{
+	atomic_store(&g_topology_listener, fn);
 }
 
 bool

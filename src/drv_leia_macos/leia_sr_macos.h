@@ -123,6 +123,18 @@ bool
 leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);
 
 /*!
+ * Who to tell when SR raises SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED (an SR
+ * panel came up or went away): the runtime's
+ * `xrt_plugin_host_iface::request_display_rescan`, which re-runs the
+ * per-monitor claim sweep — and re-probes this plug-in when it declined at
+ * instance create (DisplayXR ADR-047 Amendment 7). Called from the SR event
+ * thread; the runtime only queues a debounced sweep and returns. NULL clears.
+ * The pointer lives in the runtime, so it outlives a declined probe.
+ */
+void
+leia_mac_sr_set_topology_listener(void (*fn)(const char *reason));
+
+/*!
  * Find the SR panel among the online displays: an EDID (vendor, product) pair
  * from the frozen Leia table first, then a localizedName match (the same
  * keywords LeiaSR's mtl_weaver_window uses), then the only display whose
