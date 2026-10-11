@@ -108,6 +108,17 @@ test_header_and_jpeg(void)
 	CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_EMPTY);
 	CHECK(h.compressed_size == 0 && h.width == 0 && h.height == 0);
 	CHECK(leia_scam_header_check_extent(head, LEIA_SCAM_HEADER_SIZE, &h) == LEIA_SCAM_HEADER_EMPTY);
+	// SR #548 e20fb4633: a frame whose body failed to commit has its size
+	// zeroed on release while format/height/width stay: still "no frame".
+	{
+		uint64_t z[4] = {0, 0, 480, 1280};
+		memcpy(head, z, sizeof(z));
+		CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_EMPTY);
+		CHECK(h.width == 1280 && h.height == 480 && h.compressed_size == 0);
+		z[0] = 7; // even a garbage format: size 0 wins, no BAD warning
+		memcpy(head, z, sizeof(z));
+		CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_EMPTY);
+	}
 	f[3] = 1280;
 	f[1] = 4064; // header + payload = exactly one 4 KiB page
 	memcpy(head, f, sizeof(f));
