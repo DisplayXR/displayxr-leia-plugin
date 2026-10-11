@@ -74,6 +74,18 @@ enum leia_scam_header_status
 leia_scam_header_check(const void *block, uint64_t region_size, struct leia_scam_header *out);
 
 /*!
+ * Same checks, but @p header is a 32-byte COPY of the header and
+ * @p readable_size is how many bytes of the block may be read (header
+ * included): for a SEC_RESERVE section, min(committed prefix, view capacity).
+ * OK guarantees header + compressed_size <= @p readable_size, so a reader that
+ * copies exactly that range never touches an uncommitted page.
+ */
+enum leia_scam_header_status
+leia_scam_header_check_extent(const uint8_t header[LEIA_SCAM_HEADER_SIZE],
+                              uint64_t readable_size,
+                              struct leia_scam_header *out);
+
+/*!
  * Width / height / component count from the first SOF marker of a JPEG.
  * @return false when @p jpg is not a JPEG or has no SOF before the scan.
  */
@@ -137,11 +149,12 @@ leia_scam_parse_serials(const uint8_t *block, size_t size, char (*out)[LEIA_SCAM
 
 /*!
  * The per-device name of an SR named object: @p base when @p serial is NULL
- * or empty (the legacy, primary-only name), else "<base>_<serial>".
- * @return false (and "" in @p out) when the name does not fit or @p serial
- *         holds a character that cannot be in a kernel object name ('\\',
- *         control characters, non-ASCII) — never a name that could resolve to
- *         another object.
+ * or empty (the legacy, primary-only name), else "<base>_<serial>". Only the
+ * Raw family (SREyetrackerRawCamera{,Mutex,Event}) has per-device names.
+ * @return false (and "" in @p out) when the name does not fit or @p serial is
+ *         not one SR writes a per-device set for (SR #548,
+ *         isValidCameraImagesSerial: 1-31 characters of [A-Za-z0-9._-]) —
+ *         never a name that could resolve to another object.
  */
 bool
 leia_scam_section_name(const char *base, const char *serial, char *out, size_t out_size);

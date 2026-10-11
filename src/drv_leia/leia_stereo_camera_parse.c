@@ -58,6 +58,19 @@ leia_scam_header_check(const void *block, uint64_t region_size, struct leia_scam
 	return LEIA_SCAM_HEADER_OK;
 }
 
+enum leia_scam_header_status
+leia_scam_header_check_extent(const uint8_t header[LEIA_SCAM_HEADER_SIZE],
+                              uint64_t readable_size,
+                              struct leia_scam_header *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (header == NULL || readable_size < LEIA_SCAM_HEADER_SIZE) {
+		return LEIA_SCAM_HEADER_BAD;
+	}
+	// The header copy carries the fields; the size bound is the readable extent.
+	return leia_scam_header_check(header, readable_size, out);
+}
+
 bool
 leia_scam_jpeg_dims(const uint8_t *jpg, size_t size, uint32_t *out_w, uint32_t *out_h, uint32_t *out_components)
 {
@@ -177,10 +190,14 @@ leia_scam_section_name(const char *base, const char *serial, char *out, size_t o
 	if (base == NULL || base[0] == '\0') {
 		return false;
 	}
-	if (serial != NULL) {
-		for (const char *p = serial; *p != '\0'; p++) {
-			const unsigned char ch = (unsigned char)*p;
-			if (ch < 0x21 || ch > 0x7E || ch == '\\') {
+	if (serial != NULL && serial[0] != '\0') {
+		// SR's isValidCameraImagesSerial: 1-31 of [A-Za-z0-9._-].
+		size_t len = 0;
+		for (const char *p = serial; *p != '\0'; p++, len++) {
+			const char ch = *p;
+			const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+			                ch == '.' || ch == '_' || ch == '-';
+			if (!ok || len >= LEIA_SCAM_SERIAL_LEN - 1) {
 				return false;
 			}
 		}

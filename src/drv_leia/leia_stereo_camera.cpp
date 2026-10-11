@@ -63,8 +63,18 @@
  *    MEASURED on an earlier open in this process, else 0 = unknown (never a
  *    guess); the runtime measures independently.
  *  - **Hold the writer's mutex only for a memcpy** of the JPEG (~100-300 KB,
- *    tens of microseconds); decode OUTSIDE it, so the tracker never waits on
- *    our decoder.
+ *    tens of microseconds), with a bounded wait (10 ms, as the tracker's own);
+ *    fingerprint, decode and any buffer growth happen OUTSIDE it, so the
+ *    tracker never waits on us.
+ *  - **SEC_RESERVE sections (SR #548).** A per-device section reserves its
+ *    full size but commits pages only as frames are written; touching an
+ *    uncommitted page faults. Reads stay inside the committed prefix of the
+ *    view, and within it only the header + its declared payload, the payload
+ *    size validated against both bounds.
+ *  - **Least access (SR #548).** FILE_MAP_READ on every section, SYNCHRONIZE
+ *    on every mutex, bare and suffixed alike; more is refused for signed-in
+ *    users. Only the Raw family exists per device: the Camera / InputCamera
+ *    families are bare and primary-only, and are never opened here.
  *  - **Calibration per device.** Each camera's serial names its folder: only
  *    `%ProgramData%\Simulated Reality\Devices\<serial>\` is read (the primary's
  *    serial is the FIRST entry of `Global\sharedDeviceSerialMemory` — SRService
@@ -157,8 +167,12 @@ constexpr DWORD k_timer_high_res = 0x00000002;
 constexpr int64_t k_ka_poll_ns = 33ll * 1000 * 1000;
 constexpr int64_t k_ka_log_ns = 30ll * 1000 * 1000 * 1000;
 constexpr int64_t k_ka_silent_warn_ns = 5ll * 1000 * 1000 * 1000;
-//! How long the writer's mutex may be waited for (it is held for a memcpy).
-constexpr DWORD k_mutex_wait_ms = 20;
+//! How long the writer's mutex may be waited for. Bounded like the tracker's
+//! own 10 ms wait (SR #548); both sides hold it for a memcpy only.
+constexpr DWORD k_mutex_wait_ms = 10;
+//! The JPEG copy buffer is sized OUTSIDE the mutex: start here, grow to the
+//! frame's declared size on the next poll when a frame is larger.
+constexpr size_t k_jpeg_initial_bytes = 1024 * 1024;
 //! No new frame for this long while the block is zeroed = tracker stopped.
 constexpr int64_t k_suspend_after_ns = 1000ll * 1000 * 1000;
 //! Re-try opening the named objects at most this often.
@@ -342,9 +356,51 @@ read_trackers(leia_scam_tracker *out, uint32_t cap)
 	return n;
 }
 
-//! Open one device's raw-camera mutex + section (@p serial "" = the legacy names).
+/*!
+ * Geometry of a mapped view of a raw-camera section. The per-device sections
+ * are SEC_RESERVE (SR #548): the whole kSharedCameraImagesBytes is reserved,
+ * but pages are committed only as frames are written, so touching a page past
+ * the committed prefix FAULTS. @p capacity = the whole view (every region of
+ * this allocation); the return value = the contiguous COMMITTED prefix from
+ * the base. A reader only ever reads [0, min(committed, capacity)), and within
+ * that only the header plus the header-declared payload. Committed pages of a
+ * section view are never decommitted, so a prefix measured once stays valid.
+ */
+size_t
+view_committed_prefix(const uint8_t *view, size_t *capacity)
+{
+	size_t committed = 0, total = 0;
+	bool in_prefix = true;
+	const uint8_t *p = view;
+	for (int guard = 0; guard < 4096; guard++) {
+		MEMORY_BASIC_INFORMATION mbi = {};
+		if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.AllocationBase != (PVOID)view ||
+		    mbi.State == MEM_FREE || mbi.RegionSize == 0) {
+			break;
+		}
+		total += mbi.RegionSize;
+		if (in_prefix && mbi.State == MEM_COMMIT) {
+			committed += mbi.RegionSize;
+		} else {
+			in_prefix = false;
+		}
+		p += mbi.RegionSize;
+	}
+	if (capacity != nullptr) {
+		*capacity = total;
+	}
+	return committed;
+}
+
+/*!
+ * Open one device's raw-camera mutex + section (@p serial "" = the legacy
+ * names) with the ONLY rights SR grants signed-in users (SR #548):
+ * FILE_MAP_READ on the section, SYNCHRONIZE on the mutex (enough to wait and
+ * to ReleaseMutex). Never the event: it is auto-reset, a wait would steal
+ * another reader's signal.
+ */
 bool
-open_named_pair(const char *serial, DWORD mutex_access, HANDLE *out_mtx, HANDLE *out_map)
+open_named_pair(const char *serial, HANDLE *out_mtx, HANDLE *out_map)
 {
 	*out_mtx = nullptr;
 	*out_map = nullptr;
@@ -357,10 +413,7 @@ open_named_pair(const char *serial, DWORD mutex_access, HANDLE *out_mtx, HANDLE 
 	if (*out_map == nullptr) {
 		return false;
 	}
-	*out_mtx = OpenMutexA(mutex_access, FALSE, mtx_name);
-	if (*out_mtx == nullptr && mutex_access != SYNCHRONIZE) {
-		*out_mtx = OpenMutexA(SYNCHRONIZE, FALSE, mtx_name);
-	}
+	*out_mtx = OpenMutexA(SYNCHRONIZE, FALSE, mtx_name);
 	if (*out_mtx == nullptr) {
 		CloseHandle(*out_map);
 		*out_map = nullptr;
@@ -390,22 +443,27 @@ void
 peek_eye_size(const char *serial, bool primary, uint32_t *eye_w, uint32_t *eye_h)
 {
 	HANDLE mtx = nullptr, map = nullptr;
-	if (!open_named_pair(serial, SYNCHRONIZE, &mtx, &map) && primary) {
-		open_named_pair("", SYNCHRONIZE, &mtx, &map);
+	if (!open_named_pair(serial, &mtx, &map) && primary) {
+		open_named_pair("", &mtx, &map);
 	}
 	if (map != nullptr) {
 		const uint8_t *view = static_cast<const uint8_t *>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0));
 		if (view != nullptr) {
-			MEMORY_BASIC_INFORMATION mbi = {};
-			SIZE_T region = VirtualQuery(view, &mbi, sizeof(mbi)) != 0 ? mbi.RegionSize : 0;
-			if (mtx == nullptr || WaitForSingleObject(mtx, 100) != WAIT_TIMEOUT) {
-				leia_scam_header h;
-				if (leia_scam_header_check(view, region, &h) == LEIA_SCAM_HEADER_OK) {
-					*eye_w = (uint32_t)(h.width / 2);
-					*eye_h = (uint32_t)h.height;
-				}
-				if (mtx != nullptr) {
+			size_t capacity = 0;
+			size_t readable = view_committed_prefix(view, &capacity);
+			readable = readable < capacity ? readable : capacity;
+			// Header only (32 bytes), and only once its page is committed.
+			if (readable >= LEIA_SCAM_HEADER_SIZE && mtx != nullptr) {
+				DWORD w = WaitForSingleObject(mtx, k_mutex_wait_ms);
+				if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+					uint8_t head[LEIA_SCAM_HEADER_SIZE];
+					std::memcpy(head, view, sizeof(head));
 					ReleaseMutex(mtx);
+					leia_scam_header h;
+					if (leia_scam_header_check_extent(head, readable, &h) == LEIA_SCAM_HEADER_OK) {
+						*eye_w = (uint32_t)(h.width / 2);
+						*eye_h = (uint32_t)h.height;
+					}
 				}
 			}
 			UnmapViewOfFile(view);
@@ -1042,7 +1100,7 @@ struct xrt_plugin_stereo_camera
 	HANDLE mutex = nullptr;
 	HANDLE mapping = nullptr;
 	const uint8_t *view = nullptr;
-	SIZE_T view_size = 0;
+	size_t view_capacity = 0; //!< the whole view; the per-device section is SEC_RESERVE
 	int64_t next_open_try_ns = 0;
 
 	//! The device this camera streams (copied from the enumerate at open).
@@ -1056,7 +1114,11 @@ struct xrt_plugin_stereo_camera
 	bool swap = false;
 	uint32_t eye_w = 0, eye_h = 0;
 
+	//! Copy buffer, sized only OUTSIDE the writer's mutex; jpeg_len = the frame in it.
 	std::vector<uint8_t> jpeg;
+	size_t jpeg_len = 0;
+	//! A frame larger than the buffer was seen: grow to this before the next poll.
+	size_t jpeg_need = 0;
 	std::vector<uint8_t> gray;
 	uint32_t gray_w = 0, gray_h = 0;
 
@@ -1090,7 +1152,7 @@ cam_close_channel(xrt_plugin_stereo_camera *c)
 		CloseHandle(c->mutex);
 		c->mutex = nullptr;
 	}
-	c->view_size = 0;
+	c->view_capacity = 0;
 	c->legacy = false;
 }
 
@@ -1108,24 +1170,27 @@ cam_open_channel(xrt_plugin_stereo_camera *c, int64_t now)
 		return false;
 	}
 	c->next_open_try_ns = now + k_reopen_ns;
-	// SYNCHRONIZE is all a wait + ReleaseMutex needs; ask for MODIFY_STATE too
-	// where the ACL grants it. Never the event (see the file comment).
-	const DWORD access = SYNCHRONIZE | MUTEX_MODIFY_STATE;
+	// FILE_MAP_READ + SYNCHRONIZE only, never the event (open_named_pair).
 	bool legacy = false;
-	if (!open_named_pair(c->serial, access, &c->mutex, &c->mapping)) {
-		if (!c->primary || !open_named_pair("", access, &c->mutex, &c->mapping)) {
+	if (!open_named_pair(c->serial, &c->mutex, &c->mapping)) {
+		if (!c->primary || !open_named_pair("", &c->mutex, &c->mapping)) {
 			cam_close_channel(c); // the tracker has not created them yet
 			return false;
 		}
 		legacy = true;
 	}
 	c->view = static_cast<const uint8_t *>(MapViewOfFile(c->mapping, FILE_MAP_READ, 0, 0, 0));
-	MEMORY_BASIC_INFORMATION mbi = {};
-	if (c->view == nullptr || VirtualQuery(c->view, &mbi, sizeof(mbi)) == 0) {
+	if (c->view == nullptr) {
 		cam_close_channel(c);
 		return false;
 	}
-	c->view_size = mbi.RegionSize;
+	size_t capacity = 0;
+	(void)view_committed_prefix(c->view, &capacity);
+	if (capacity < LEIA_SCAM_HEADER_SIZE) {
+		cam_close_channel(c);
+		return false;
+	}
+	c->view_capacity = capacity;
 	c->legacy = legacy;
 	c->next_legacy_check_ns = now + k_legacy_recheck_ns;
 	char name[k_name_max];
@@ -1133,7 +1198,7 @@ cam_open_channel(xrt_plugin_stereo_camera *c, int64_t now)
 	U_LOG_W(
 	    "leia stereo camera %s: reading %s (%llu bytes, read-only%s; polling, never waiting on the "
 	    "auto-reset event)",
-	    c->serial, name, (unsigned long long)c->view_size,
+	    c->serial, name, (unsigned long long)c->view_capacity,
 	    legacy ? "; LEGACY primary-only section, no per-device one yet" : "");
 	return true;
 }
@@ -1176,16 +1241,47 @@ enum poll_result
 	POLL_EMPTY,
 };
 
-//! Under the writer's mutex: copy the JPEG out iff it is a new frame.
+/*!
+ * Copy the newest frame out, then decide outside the mutex whether it is new.
+ * Under the writer's mutex (bounded wait): read the 32-byte header, and copy
+ * header-declared payload bytes into the pre-sized buffer — nothing else (no
+ * fingerprint, no decode, no allocation: SR #548). Reads stay inside the
+ * committed prefix and the view's capacity (the per-device section is
+ * SEC_RESERVE; an uncommitted page faults).
+ */
 static poll_result
 cam_poll(xrt_plugin_stereo_camera *c, leia_scam_header *hdr)
 {
+	if (c->jpeg_need > c->jpeg.size()) {
+		c->jpeg.resize(c->jpeg_need); // outside the mutex
+	}
+	size_t readable = view_committed_prefix(c->view, nullptr);
+	readable = readable < c->view_capacity ? readable : c->view_capacity;
+	if (readable < LEIA_SCAM_HEADER_SIZE) {
+		// SEC_RESERVE before the first frame: not even the header page exists.
+		std::memset(hdr, 0, sizeof(*hdr));
+		return POLL_EMPTY;
+	}
 	DWORD w = WaitForSingleObject(c->mutex, k_mutex_wait_ms);
 	if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
 		return POLL_NOTHING; // writer busy; next poll
 	}
+	uint8_t head[LEIA_SCAM_HEADER_SIZE];
+	std::memcpy(head, c->view, sizeof(head));
+	const leia_scam_header_status st = leia_scam_header_check_extent(head, readable, hdr);
+	bool copied = false;
+	if (st == LEIA_SCAM_HEADER_OK) {
+		if (hdr->compressed_size <= c->jpeg.size()) {
+			std::memcpy(c->jpeg.data(), c->view + LEIA_SCAM_HEADER_SIZE, (size_t)hdr->compressed_size);
+			copied = true;
+		} else {
+			c->jpeg_need = (size_t)hdr->compressed_size; // grow outside, copy next poll
+		}
+	}
+	ReleaseMutex(c->mutex);
+
 	poll_result res = POLL_NOTHING;
-	switch (leia_scam_header_check(c->view, c->view_size, hdr)) {
+	switch (st) {
 	case LEIA_SCAM_HEADER_EMPTY: res = POLL_EMPTY; break;
 	case LEIA_SCAM_HEADER_BAD:
 		if (!c->warned_bad_header) {
@@ -1198,17 +1294,18 @@ cam_poll(xrt_plugin_stereo_camera *c, leia_scam_header *hdr)
 		}
 		break;
 	case LEIA_SCAM_HEADER_OK: {
-		const uint8_t *jpg = c->view + LEIA_SCAM_HEADER_SIZE;
-		uint64_t fp = leia_scam_fingerprint(jpg, (size_t)hdr->compressed_size);
+		if (!copied) {
+			break;
+		}
+		uint64_t fp = leia_scam_fingerprint(c->jpeg.data(), (size_t)hdr->compressed_size);
 		if (fp != c->last_fp) {
 			c->last_fp = fp;
-			c->jpeg.assign(jpg, jpg + hdr->compressed_size);
+			c->jpeg_len = (size_t)hdr->compressed_size;
 			res = POLL_NEW;
 		}
 		break;
 	}
 	}
-	ReleaseMutex(c->mutex);
 	return res;
 }
 
@@ -1217,7 +1314,7 @@ static bool
 cam_decode(xrt_plugin_stereo_camera *c, const leia_scam_header &hdr)
 {
 	uint32_t jw = 0, jh = 0, comps = 0;
-	if (!leia_scam_jpeg_dims(c->jpeg.data(), c->jpeg.size(), &jw, &jh, &comps) || jw != hdr.width ||
+	if (!leia_scam_jpeg_dims(c->jpeg.data(), c->jpeg_len, &jw, &jh, &comps) || jw != hdr.width ||
 	    jh != hdr.height) {
 		if (!c->warned_decode) {
 			c->warned_decode = true;
@@ -1228,7 +1325,7 @@ cam_decode(xrt_plugin_stereo_camera *c, const leia_scam_header &hdr)
 		return false;
 	}
 	try {
-		cv::Mat buf(1, (int)c->jpeg.size(), CV_8UC1, c->jpeg.data());
+		cv::Mat buf(1, (int)c->jpeg_len, CV_8UC1, c->jpeg.data());
 		cv::Mat img = cv::imdecode(buf, cv::IMREAD_GRAYSCALE);
 		if (img.empty() || img.type() != CV_8UC1 || (uint32_t)img.cols != jw || (uint32_t)img.rows != jh) {
 			throw 0;
@@ -1243,7 +1340,7 @@ cam_decode(xrt_plugin_stereo_camera *c, const leia_scam_header &hdr)
 		if (!c->warned_decode) {
 			c->warned_decode = true;
 			U_LOG_W("leia stereo camera: JPEG decode failed (%llu bytes, %ux%u) — frame dropped",
-			        (unsigned long long)c->jpeg.size(), jw, jh);
+			        (unsigned long long)c->jpeg_len, jw, jh);
 		}
 		return false;
 	}
@@ -1386,7 +1483,7 @@ leia_stereo_camera_open(struct xrt_plugin_instance *inst, uint32_t index, struct
 			c->eye_h = rc.eye_h;
 			display_id = rc.display_id;
 		}
-		c->jpeg.reserve(512 * 1024);
+		c->jpeg.resize(k_jpeg_initial_bytes); // never sized under the writer's mutex
 		c->timer = CreateWaitableTimerExW(nullptr, nullptr, k_timer_high_res, TIMER_ALL_ACCESS);
 		if (c->timer == nullptr) {
 			U_LOG_W(
@@ -1448,7 +1545,7 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 							U_LOG_W(
 							    "leia stereo camera: first frame %ux%u GRAY8 (JPEG %llu "
 							    "bytes)%s",
-							    c->gray_w, c->gray_h, (unsigned long long)c->jpeg.size(),
+							    c->gray_w, c->gray_h, (unsigned long long)c->jpeg_len,
 							    c->swap ? ", halves swapped" : "");
 						}
 						return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;

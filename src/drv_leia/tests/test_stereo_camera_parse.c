@@ -99,6 +99,25 @@ test_header_and_jpeg(void)
 	memcpy(blk, f, sizeof(f));
 	CHECK(leia_scam_header_check(blk, sizeof(blk), &h) == LEIA_SCAM_HEADER_BAD);
 
+	// SEC_RESERVE (SR #548): the header COPY is judged against the readable
+	// extent (committed prefix, capped at the view capacity), never the mapping.
+	uint8_t head[LEIA_SCAM_HEADER_SIZE];
+	f[3] = 1280;
+	f[1] = 4064; // header + payload = exactly one 4 KiB page
+	memcpy(head, f, sizeof(f));
+	CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_OK);
+	CHECK(h.compressed_size == 4064);
+	CHECK(leia_scam_header_check_extent(head, 4095, &h) == LEIA_SCAM_HEADER_BAD); // one byte uncommitted
+	f[1] = 4065;
+	memcpy(head, f, sizeof(f));
+	CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_BAD);
+	CHECK(leia_scam_header_check_extent(head, 8192, &h) == LEIA_SCAM_HEADER_OK);
+	f[1] = (uint64_t)-1; // absurd size never wraps the bound
+	memcpy(head, f, sizeof(f));
+	CHECK(leia_scam_header_check_extent(head, 8192, &h) == LEIA_SCAM_HEADER_BAD);
+	CHECK(leia_scam_header_check_extent(head, 16, &h) == LEIA_SCAM_HEADER_BAD); // header page not readable
+	CHECK(leia_scam_header_check_extent(NULL, 8192, &h) == LEIA_SCAM_HEADER_BAD);
+
 	// SOI, APP0 (len 16), SOF0 1280x480 x1 component, SOS.
 	const uint8_t jpg[] = {0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J',  'F',  'I',  'F',  0x00, 0x01, 0x01,
 	                       0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01,
@@ -155,6 +174,13 @@ test_section_names(void)
 	CHECK(!leia_scam_section_name("Global\\X", "a b", n, sizeof(n)) && n[0] == '\0');
 	CHECK(!leia_scam_section_name("Global\\X", "abc\x01", n, sizeof(n)));
 	CHECK(!leia_scam_section_name("Global\\SREyetrackerRawCamera", "SRX12345678", n, 20) && n[0] == '\0');
+	// SR #548 isValidCameraImagesSerial: 1-31 of [A-Za-z0-9._-], nothing else.
+	CHECK(leia_scam_section_name("B", "Qa.Z_0-9", n, sizeof(n)) && strcmp(n, "B_Qa.Z_0-9") == 0);
+	CHECK(!leia_scam_section_name("B", "abc/def", n, sizeof(n)));
+	CHECK(!leia_scam_section_name("B", "abc:def", n, sizeof(n)));
+	CHECK(!leia_scam_section_name("B", "caf\xc3\xa9", n, sizeof(n)));
+	CHECK(leia_scam_section_name("B", "0123456789012345678901234567890", n, sizeof(n))); // 31
+	CHECK(!leia_scam_section_name("B", "01234567890123456789012345678901", n, sizeof(n))); // 32
 	CHECK(!leia_scam_section_name(NULL, "S", n, sizeof(n)));
 	CHECK(!leia_scam_section_name("", "S", n, sizeof(n)));
 }
