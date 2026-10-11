@@ -75,10 +75,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <new>
 #include <thread>
 #include <vector>
@@ -652,6 +654,13 @@ struct global
 	struct NeurD const *nd = nullptr;
 	enum NeurD_backend backend = NEURD_BACKEND_DIRECTML;
 	char backend_name[32] = {};
+	// Module info (runtime XRT_DP_LIFT_HAS_MODULE_INFO): why the last activation
+	// failed, and NeurD's own licence line. Written by the worker / the log
+	// callback, read by get_caps; info_mtx only (never held across a NeurD call).
+	std::mutex info_mtx;
+	uint32_t fail_kind = LEIA_LIFT_MODULE_UNKNOWN;
+	char fail_detail[96] = {};
+	char licence[64] = {};
 
 	ID3D11Device *nd_dev = nullptr; //!< NeurD-owned (never Released) unless nd_dev_owned.
 	bool nd_dev_owned = false;      //!< nd_dev is the plug-in's own device (NeurD < 0.4.3): Release it.
@@ -818,6 +827,19 @@ mark_file_failure(const char *path, HMODULE mapped)
 	g.next_reprobe_ms.store(now_ms() + kReprobeMs);
 }
 
+//! Record why activation failed, for the dashboard (call right before
+//! storing G_FAILED).
+void
+note_failure(uint32_t kind, const char *fmt, ...)
+{
+	std::lock_guard<std::mutex> lock(g.info_mtx);
+	g.fail_kind = kind;
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(g.fail_detail, sizeof(g.fail_detail), fmt, ap);
+	va_end(ap);
+}
+
 void
 neurd_log_cb(const char *msg, int size)
 {
@@ -827,6 +849,16 @@ neurd_log_cb(const char *msg, int size)
 	// Not NUL-terminated (NeurD contract). Trim a trailing newline.
 	while (size > 0 && (msg[size - 1] == '\n' || msg[size - 1] == '\r')) {
 		size--;
+	}
+	// NeurD says which licence it runs under ("License: Leia internal use only"
+	// for the internal build): keep it for the dashboard, verbatim.
+	{
+		const std::string line(msg, (size_t)size);
+		const size_t at = line.find("License:");
+		if (at != std::string::npos) {
+			std::lock_guard<std::mutex> lock(g.info_mtx);
+			snprintf(g.licence, sizeof(g.licence), "%s", line.c_str() + at);
+		}
 	}
 	// Until the module is READY these are one-off activation/init lines (licence, model paths,
 	// adapter) and the only place NeurD says WHY an init failed — surface them at the default
@@ -1039,16 +1071,22 @@ activation_worker()
 				        knob_src_str(g.k0.src_min_version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
 				        NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
 				mark_file_failure(path, nullptr);
+				note_failure(LEIA_LIFT_MODULE_TOO_OLD, "NeurD %u.%u.%u is older than the minimum %u.%u.%u",
+				             NEURD_GET_VERSION_MAJOR(file_ver), NEURD_GET_VERSION_MINOR(file_ver),
+				             NEURD_GET_VERSION_PATCH(file_ver), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				             NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
 			}
 			HMODULE lib = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 			if (lib == nullptr) {
+				const unsigned long err = (unsigned long)GetLastError();
 				U_LOG_W("Leia lift: NeurD.dll found at %s (%s) but LoadLibrary failed (err %lu) — lift "
 				        "unavailable; re-checked when the file changes",
-				        path, where, (unsigned long)GetLastError());
+				        path, where, err);
 				mark_file_failure(path, nullptr);
+				note_failure(LEIA_LIFT_MODULE_LOAD_FAILED, "NeurD.dll found but failed to load (error %lu)", err);
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1067,6 +1105,8 @@ activation_worker()
 				        "this process — restart the process to use the new NeurD",
 				        path);
 				mark_file_failure(path, nullptr);
+				note_failure(LEIA_LIFT_MODULE_LOAD_FAILED,
+				             "NeurD was updated; restart the DisplayXR service to use the new one");
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1078,6 +1118,7 @@ activation_worker()
 				U_LOG_W("Leia lift: NeurD.dll (%s) has no usable NeurD_load — lift unavailable", where);
 				// Deliberately no FreeLibrary: NeurD may have spun threads.
 				mark_file_failure(path, lib);
+				note_failure(LEIA_LIFT_MODULE_LOAD_FAILED, "NeurD.dll has no usable NeurD_load");
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1102,6 +1143,10 @@ activation_worker()
 				// Deliberately no FreeLibrary: NeurD may have spun threads. (A NeurD
 				// with a version resource is refused before the load, above.)
 				mark_file_failure(path, lib);
+				note_failure(LEIA_LIFT_MODULE_TOO_OLD, "NeurD %u.%u.%u is older than the minimum %u.%u.%u",
+				             NEURD_GET_VERSION_MAJOR(nd->version), NEURD_GET_VERSION_MINOR(nd->version),
+				             NEURD_GET_VERSION_PATCH(nd->version), NEURD_GET_VERSION_MAJOR(g.k0.min_version),
+				             NEURD_GET_VERSION_MINOR(g.k0.min_version), NEURD_GET_VERSION_PATCH(g.k0.min_version));
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1112,6 +1157,9 @@ activation_worker()
 				U_LOG_W("Leia lift: NeurD runtime too old/new for the D3D11 stream path (need 0.3.11+, "
 				        "major 0) — lift unavailable");
 				mark_file_failure(path, lib);
+				note_failure(LEIA_LIFT_MODULE_TOO_OLD, "NeurD %u.%u.%u lacks the D3D11 stream API (needs 0.3.11+)",
+				             NEURD_GET_VERSION_MAJOR(nd->version), NEURD_GET_VERSION_MINOR(nd->version),
+				             NEURD_GET_VERSION_PATCH(nd->version));
 				g.state.store(G_FAILED);
 				g.worker_running.store(false);
 				return;
@@ -1165,6 +1213,11 @@ activation_worker()
 		}
 		if (st != NEURD_SUCCESS) {
 			U_LOG_W("Leia lift: NeurD init failed: %s — lift unavailable", status_str(st));
+			if (st == NEURD_INVALID_LICENSE) {
+				note_failure(LEIA_LIFT_MODULE_UNLICENSED, "NeurD licence refused (INVALID_LICENSE)");
+			} else {
+				note_failure(LEIA_LIFT_MODULE_LOAD_FAILED, "NeurD init failed: %s", status_str(st));
+			}
 			g.state.store(G_FAILED);
 			g.worker_running.store(false);
 			return;
@@ -1214,6 +1267,9 @@ activation_worker()
 		                            nd->version < NEURD_convert_stream_dx_interactive_INTRODUCED_IN;
 		g.props_valid = false;
 		next = setup_nd_device_locked() ? (uint32_t)G_READY : (uint32_t)G_FAILED;
+		if (next == G_FAILED) {
+			note_failure(LEIA_LIFT_MODULE_LOAD_FAILED, "NeurD's D3D11 device could not be set up");
+		}
 		if (next == G_READY) {
 			U_LOG_W("Leia lift: NeurD READY — backend %s, interactive viewpoints %s", g.backend_name,
 			        g.interactive_unavailable ? "UNAVAILABLE (NeurD < 0.4.5)" : "available");
@@ -1783,7 +1839,58 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **plift)
 	delete l;
 }
 
-extern "C" bool
+extern "C" //! NeurD's installed version string (HKLM\SOFTWARE\LeiaInc\NeurD "Version",
+//! written by its installer, e.g. "0.4.9-v0.4.9-QA+190.20bf39e"); "" if none.
+static void
+neurd_registry_version(char *buf, size_t size)
+{
+	buf[0] = '\0';
+	DWORD cb = (DWORD)size;
+	if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\LeiaInc\\NeurD", "Version", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+	                 nullptr, buf, &cb) != ERROR_SUCCESS) {
+		buf[0] = '\0';
+	}
+}
+
+//! Which NeurD, and why it is (not) usable, from the activation state.
+static void
+fill_module_info(uint32_t s, struct leia_lift_neurd_caps *out)
+{
+	neurd_registry_version(out->module_version, sizeof(out->module_version));
+	std::lock_guard<std::mutex> lock(g.info_mtx);
+	switch (s) {
+	case G_READY:
+		out->module_status = LEIA_LIFT_MODULE_READY;
+		if (out->module_version[0] == '\0' && g.nd != nullptr) {
+			snprintf(out->module_version, sizeof(out->module_version), "%u.%u.%u",
+			         NEURD_GET_VERSION_MAJOR(g.nd->version), NEURD_GET_VERSION_MINOR(g.nd->version),
+			         NEURD_GET_VERSION_PATCH(g.nd->version));
+		}
+		snprintf(out->module_detail, sizeof(out->module_detail), "%s", g.licence[0] != '\0' ? g.licence : "loaded");
+		break;
+	case G_UNPROBED:
+	case G_LOADING:
+		out->module_status = LEIA_LIFT_MODULE_ACTIVATING;
+		snprintf(out->module_detail, sizeof(out->module_detail), "loading NeurD");
+		break;
+	case G_RETRY_WAIT:
+		out->module_status = LEIA_LIFT_MODULE_ACTIVATING;
+		snprintf(out->module_detail, sizeof(out->module_detail),
+		         "licence activation needs the network; retrying");
+		break;
+	case G_ABSENT:
+		out->module_status = LEIA_LIFT_MODULE_ABSENT;
+		snprintf(out->module_detail, sizeof(out->module_detail), "NeurD is not installed (NeurD.dll not found)");
+		break;
+	default: // G_FAILED
+		out->module_status = g.fail_kind != LEIA_LIFT_MODULE_UNKNOWN ? g.fail_kind : LEIA_LIFT_MODULE_LOAD_FAILED;
+		snprintf(out->module_detail, sizeof(out->module_detail), "%s",
+		         g.fail_detail[0] != '\0' ? g.fail_detail : "NeurD failed to load");
+		break;
+	}
+}
+
+bool
 leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps *out)
 {
 	if (out == nullptr) {
@@ -1791,12 +1898,17 @@ leia_lift_neurd_get_caps(struct leia_lift_neurd *l, struct leia_lift_neurd_caps 
 	}
 	memset(out, 0, sizeof(*out));
 	if (l == nullptr || !l->k.enabled) {
+		out->module_status = LEIA_LIFT_MODULE_DISABLED;
+		snprintf(out->module_detail, sizeof(out->module_detail),
+		         "2D->3D lift turned off (DXR_LEIA_LIFT / HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift)");
+		neurd_registry_version(out->module_version, sizeof(out->module_version));
 		return true; // modes 0 / UNAVAILABLE — a valid answer, not a failure.
 	}
 	kick(l->k, false);
 
 	uint32_t s = g.state.load();
 	out->state = public_state(s);
+	fill_module_info(s, out);
 	if (out->state == LEIA_LIFT_STATE_UNAVAILABLE) {
 		return true;
 	}

@@ -48,6 +48,17 @@ extern "C" {
 #define LEIA_LIFT_STATE_ACTIVATING 1u
 #define LEIA_LIFT_STATE_READY 2u
 
+//! Values identical to the runtime's XRT_DP_LIFT_MODULE_* (module info for the
+//! dashboard / `displayxr-cli info`: which NeurD was found and why it is not usable).
+#define LEIA_LIFT_MODULE_UNKNOWN 0u
+#define LEIA_LIFT_MODULE_READY 1u
+#define LEIA_LIFT_MODULE_ACTIVATING 2u
+#define LEIA_LIFT_MODULE_ABSENT 3u
+#define LEIA_LIFT_MODULE_TOO_OLD 4u
+#define LEIA_LIFT_MODULE_UNLICENSED 5u
+#define LEIA_LIFT_MODULE_LOAD_FAILED 6u
+#define LEIA_LIFT_MODULE_DISABLED 7u
+
 struct leia_lift_neurd_caps
 {
 	uint32_t modes;           //!< LEIA_LIFT_MODE_* bits; 0 when unavailable.
@@ -57,6 +68,9 @@ struct leia_lift_neurd_caps
 	uint32_t state;           //!< LEIA_LIFT_STATE_*.
 	uint64_t typical_latency_ns;
 	char backend[32]; //!< e.g. "neurd-directml"; "" when unavailable.
+	uint32_t module_status;  //!< LEIA_LIFT_MODULE_*.
+	char module_version[48]; //!< NeurD's installed version string; "" = none / unknown.
+	char module_detail[96];  //!< One line for a human; display only.
 };
 
 struct leia_lift_neurd_stream_desc
