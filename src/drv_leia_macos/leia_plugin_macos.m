@@ -100,7 +100,7 @@ leia_mac_plugin_probe(struct xrt_plugin_instance **out_inst)
 	if (!sr_ok && !forced) {
 		// leia_sr_macos.m logged the reason (no SR runtime, or
 		// srEnumerateDisplays = 0 / no panel located on a legacy SR runtime).
-		U_LOG_W("leia_mac_plugin: probe declined — no SR display (see the leia_mac line above); "
+		U_LOG_W("leia_mac_plugin: probe declined — no authenticated SR display (see the leia_mac line above); "
 		        "DXR_LEIA_FORCE_PROBE=1 force-binds");
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}

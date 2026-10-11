@@ -49,6 +49,8 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_plugin_macos.m
     leia_sr_macos.m
     leia_sr_macos.h
+    leia_sr_readiness.c
+    leia_sr_readiness.h
     leia_display_processor_macos.m
     leia_display_processor_macos.h
     # Shared, platform-portable head device from the Windows arm.
@@ -121,3 +123,12 @@ file(GENERATE
 install(TARGETS DisplayXR-LeiaSR
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 )
+
+# Host unit test: SR display readiness (EDID_ONLY = present, not ready) and the
+# EDID_ONLY -> FPC_VERIFIED edge (display hotplug, runtime ADR-047 Amendment 7).
+# Plain C; also registered by the Linux arm so CI runs it.
+add_executable(test_sr_readiness test_sr_readiness.c leia_sr_readiness.c)
+target_include_directories(test_sr_readiness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(COMMAND add_test)
+    add_test(NAME test_sr_readiness COMMAND test_sr_readiness)
+endif()

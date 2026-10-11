@@ -108,9 +108,11 @@ bool
 leia_mac_get_display_info(struct leia_mac_display_info *out);
 
 /*!
- * Every SR display srEnumerateDisplays reports, CoreGraphics side resolved
- * (cg_display_id, bounds in points, UUID). Index 0 is the active panel (the
- * one leia_mac_get_display_info describes). Only the active panel carries the
+ * Every READY SR display srEnumerateDisplays reports (FPC_VERIFIED; an
+ * EDID_ONLY one is present but not authenticated yet and is left out — see
+ * leia_sr_readiness.h), CoreGraphics side resolved (cg_display_id, bounds in
+ * points, UUID). Index 0 is the active panel (the one
+ * leia_mac_get_display_info describes). Only the active panel carries the
  * SR geometry (recommended view size, nominal viewer); the others carry the
  * descriptor's. Returns the count (0 = no SR panel). Legacy SR runtimes
  * report the one EDID-table panel.

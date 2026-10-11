@@ -10,6 +10,7 @@
  */
 
 #include "leia_sr_macos.h"
+#include "leia_sr_readiness.h"
 #include "leia_edid_table.h"
 
 #include "util/u_debug.h"
@@ -40,6 +41,23 @@ static atomic_bool g_topology_dirty = true;
 //! The runtime's request_display_rescan (leia_mac_sr_set_topology_listener); NULL = none.
 typedef void (*leia_mac_topology_fn)(const char *reason);
 static _Atomic(leia_mac_topology_fn) g_topology_listener = NULL;
+
+DEBUG_GET_ONCE_BOOL_OPTION(leia_accept_edid_only, "DXR_LEIA_ACCEPT_EDID_ONLY", false)
+
+/*
+ * Readiness (leia_sr_readiness.h): an EDID_ONLY display is present but not
+ * ready until the SR service has authenticated its FPC. While one is listed, a
+ * detached poll re-reads srEnumerateDisplays every 500 ms — open-ended, since
+ * the service retries a failed authentication with a backoff up to 30 s — and
+ * on the EDID_ONLY -> FPC_VERIFIED edge marks the cache stale and asks the
+ * runtime for a claim sweep, whether or not SR raises a topology event for it.
+ * All guarded by g_lock.
+ */
+#define LEIA_MAC_VERIFY_POLL_NS (500ull * 1000ull * 1000ull)
+static struct leia_sr_readiness_entry g_raw_ready[LEIA_MAC_MAX_SR_DISPLAYS]; //!< last raw enumeration
+static uint32_t g_raw_ready_count = 0;
+static bool g_verify_poll_running = false;
+static uint64_t g_verify_poll_since_ns = 0;
 static bool g_enumerated = false; //!< the cache below holds a result (possibly 0 displays)
 
 //! The SR displays, [0] = the active panel. Never trusted across a topology change.
@@ -558,6 +576,13 @@ enumerate_locked(void)
 		}
 	}
 
+	// Raw readiness of everything SR lists (the verification poll's baseline).
+	g_raw_ready_count = count;
+	for (uint32_t i = 0; i < count; i++) {
+		g_raw_ready[i] = (struct leia_sr_readiness_entry){
+		    descs[i].displayId, true, descs[i].confidence == SR_DISPLAY_CONFIDENCE_FPC_VERIFIED};
+	}
+
 	// Active panel first: the first FPC-verified display (its displayId is the
 	// one srCreateDisplay binds by default), else the first one listed.
 	uint32_t active = 0;
@@ -593,7 +618,9 @@ enumerate_locked(void)
 		// monitor's native mode (a descriptor's nativeWidth comes from the very
 		// monitor it names, so it cannot disagree with it).
 		const bool is_active = g_disp_count == 0;
-		const bool have_geometry = is_active && read_active_geometry_locked(d->displayId, info);
+		const struct leia_sr_readiness_entry re = {d->displayId, true, info->fpc_verified};
+		const bool ready = leia_sr_display_ready(&re, debug_get_bool_option_leia_accept_edid_only());
+		const bool have_geometry = is_active && ready && read_active_geometry_locked(d->displayId, info);
 		char why_buf[192];
 		const char *why = sr_display_reject_reason(info, did, why_buf, sizeof(why_buf));
 		if (why != NULL) {
@@ -647,12 +674,98 @@ log:
 	}
 }
 
+static bool
+info_ready(const struct leia_mac_display_info *info)
+{
+	const struct leia_sr_readiness_entry re = {info->sr_display_id, info->from_enumeration, info->fpc_verified};
+	return info->valid && leia_sr_display_ready(&re, debug_get_bool_option_leia_accept_edid_only());
+}
+
+static void *
+verify_poll_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		os_nanosleep((int64_t)LEIA_MAC_VERIFY_POLL_NS);
+		const bool accept = debug_get_bool_option_leia_accept_edid_only();
+		bool newly = false;
+		bool pending = false;
+		uint64_t waited_ms = 0;
+		pthread_mutex_lock(&g_lock);
+		if (g_inst != NULL) {
+			uint32_t count = 0;
+			struct leia_sr_readiness_entry cur[LEIA_MAC_MAX_SR_DISPLAYS];
+			if (SR_SUCCEEDED(srEnumerateDisplays(g_inst, &count, NULL))) {
+				SrDisplayDescriptor descs[LEIA_MAC_MAX_SR_DISPLAYS];
+				for (uint32_t i = 0; i < LEIA_MAC_MAX_SR_DISPLAYS; i++) {
+					descs[i] = SrDisplayDescriptor();
+				}
+				count = count > LEIA_MAC_MAX_SR_DISPLAYS ? LEIA_MAC_MAX_SR_DISPLAYS : count;
+				if (count > 0 && SR_FAILED(srEnumerateDisplays(g_inst, &count, descs))) {
+					count = 0;
+				}
+				for (uint32_t i = 0; i < count; i++) {
+					cur[i] = (struct leia_sr_readiness_entry){
+					    descs[i].displayId, true, descs[i].confidence == SR_DISPLAY_CONFIDENCE_FPC_VERIFIED};
+				}
+				newly = leia_sr_newly_ready(g_raw_ready, g_raw_ready_count, cur, count, accept);
+				memcpy(g_raw_ready, cur, count * sizeof(cur[0]));
+				g_raw_ready_count = count;
+				pending = leia_sr_pending_count(cur, count, accept) > 0;
+				if (newly) {
+					atomic_store(&g_topology_dirty, true); // the next query re-enumerates
+				}
+			}
+		}
+		waited_ms = (os_monotonic_get_ns() - g_verify_poll_since_ns) / (1000ull * 1000ull);
+		if (!pending) {
+			g_verify_poll_running = false;
+		}
+		pthread_mutex_unlock(&g_lock);
+
+		if (newly) {
+			U_LOG_W("leia_mac: SR panel AUTHENTICATED (EDID_ONLY -> FPC_VERIFIED) after %llu ms — asking the "
+			        "runtime for a claim sweep",
+			        (unsigned long long)waited_ms);
+			leia_mac_topology_fn fn = atomic_load(&g_topology_listener);
+			if (fn != NULL) {
+				fn("leia-sr: SR panel authenticated (EDID_ONLY -> FPC_VERIFIED)");
+			}
+		}
+		if (!pending) {
+			return NULL;
+		}
+	}
+}
+
+//! Start the verification poll if a listed display is not ready yet. Caller holds g_lock.
+static void
+maybe_start_verify_poll_locked(void)
+{
+	const bool accept = debug_get_bool_option_leia_accept_edid_only();
+	if (g_verify_poll_running || leia_sr_pending_count(g_raw_ready, g_raw_ready_count, accept) == 0) {
+		return;
+	}
+	pthread_t t;
+	if (pthread_create(&t, NULL, verify_poll_thread, NULL) != 0) {
+		U_LOG_W("leia_mac: could not start the FPC-verification poll — an authenticated panel is picked up "
+		        "only on the next topology event or runtime sweep");
+		return;
+	}
+	pthread_detach(t);
+	g_verify_poll_running = true;
+	g_verify_poll_since_ns = os_monotonic_get_ns();
+	U_LOG_W("leia_mac: SR panel present but NOT authenticated yet (EDID_ONLY) — not claimed, no weaver, no lens; "
+	        "polling srEnumerateDisplays every 500 ms until the SR service verifies its FPC");
+}
+
 //! Caller holds g_lock.
 static void
 refresh_if_needed_locked(void)
 {
 	if (!g_enumerated || atomic_load(&g_topology_dirty)) {
 		enumerate_locked();
+		maybe_start_verify_poll_locked();
 	}
 }
 
@@ -661,7 +774,9 @@ leia_mac_sr_probe(void)
 {
 	pthread_mutex_lock(&g_lock);
 	refresh_if_needed_locked();
-	const bool ok = g_disp_count > 0 && g_disp[0].valid;
+	// The active entry is the first FPC-verified one when there is one, so
+	// "not ready" here means no listed display is authenticated yet.
+	const bool ok = g_disp_count > 0 && info_ready(&g_disp[0]);
 	pthread_mutex_unlock(&g_lock);
 	return ok;
 }
@@ -671,7 +786,7 @@ leia_mac_get_display_info(struct leia_mac_display_info *out)
 {
 	pthread_mutex_lock(&g_lock);
 	refresh_if_needed_locked();
-	const bool ok = g_disp_count > 0 && g_disp[0].valid;
+	const bool ok = g_disp_count > 0 && info_ready(&g_disp[0]);
 	if (ok && out != NULL) {
 		*out = g_disp[0];
 	}
@@ -684,9 +799,15 @@ leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max)
 {
 	pthread_mutex_lock(&g_lock);
 	refresh_if_needed_locked();
-	uint32_t n = g_disp_count < max ? g_disp_count : max;
-	if (out != NULL) {
-		memcpy(out, g_disp, n * sizeof(out[0]));
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < g_disp_count && n < max; i++) {
+		if (!info_ready(&g_disp[i])) {
+			continue; // EDID_ONLY: present, not ready — never claimed or bound
+		}
+		if (out != NULL) {
+			out[n] = g_disp[i];
+		}
+		n++;
 	}
 	pthread_mutex_unlock(&g_lock);
 	return n;
