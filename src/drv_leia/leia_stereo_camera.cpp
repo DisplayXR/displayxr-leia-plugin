@@ -1543,9 +1543,9 @@ leia_stereo_camera_wait_frame(struct xrt_plugin_stereo_camera *c,
 						if (!c->logged_first) {
 							c->logged_first = true;
 							U_LOG_W(
-							    "leia stereo camera: first frame %ux%u GRAY8 (JPEG %llu "
+							    "leia stereo camera %s: first frame %ux%u GRAY8 (JPEG %llu "
 							    "bytes)%s",
-							    c->gray_w, c->gray_h, (unsigned long long)c->jpeg_len,
+							    c->serial, c->gray_w, c->gray_h, (unsigned long long)c->jpeg_len,
 							    c->swap ? ", halves swapped" : "");
 						}
 						return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
