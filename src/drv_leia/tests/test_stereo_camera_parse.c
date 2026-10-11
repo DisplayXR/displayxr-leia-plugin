@@ -102,6 +102,12 @@ test_header_and_jpeg(void)
 	// SEC_RESERVE (SR #548): the header COPY is judged against the readable
 	// extent (committed prefix, capped at the view capacity), never the mapping.
 	uint8_t head[LEIA_SCAM_HEADER_SIZE];
+	// SR #548: the header page is committed at creation, all ZERO until the
+	// first frame -> "no frame yet" (EMPTY: no copy, no decode, no warning).
+	memset(head, 0, sizeof(head));
+	CHECK(leia_scam_header_check_extent(head, 4096, &h) == LEIA_SCAM_HEADER_EMPTY);
+	CHECK(h.compressed_size == 0 && h.width == 0 && h.height == 0);
+	CHECK(leia_scam_header_check_extent(head, LEIA_SCAM_HEADER_SIZE, &h) == LEIA_SCAM_HEADER_EMPTY);
 	f[3] = 1280;
 	f[1] = 4064; // header + payload = exactly one 4 KiB page
 	memcpy(head, f, sizeof(f));
