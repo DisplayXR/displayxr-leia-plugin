@@ -446,6 +446,30 @@ does instead, the sign is reversed — set `DXR_LEIA_LIFT_CONV_GAIN=-0.4`; then 
 until c = 0 and c = 1 put the extremes on the glass. Auto-convergence (the default,
 c < 0) is unaffected.
 
+**Runtime auto-convergence (runtime #1858).** A runtime that carries it (runtime PR #1978,
+default `DXR_LIFT_AUTO_CONVERGENCE=runtime`) no longer sends AUTO for lifted SBS / N-view
+video: it measures the centre-weighted foreground mode of each stream's own depth (the aux
+depth of the same inference, which it requests from the plug-in for this even when the app
+did not), smooths it per stream, and sends it as an ordinary caller-set `convergence` =
+1 − h(subject), in the same normalised inverse-depth range NeurD's relative depth uses. So
+on the panel's off-axis path the runtime's value lands 1:1 on `h₀ = 1 − c` — no new field
+and nothing to calibrate there; on the legacy renderer it goes through the uncalibrated K map
+above. The plug-in's part:
+
+- caller-set ⇒ `AUTO_CONVERGENCE = FALSE` per stream (no saliency inference), as before;
+- NeurD's auto-convergence result is **not read back** for that convert (`auto_zero_h` is
+  cleared, so a stale anchor cannot leak into a later AUTO convert);
+- each stream logs its source once per change (a runtime that has not measured yet sends AUTO
+  for the first one or two converts, so a stream usually logs both):
+
+```
+Leia lift: stream 3 convergence = NeurD auto-convergence (caller AUTO)
+Leia lift: stream 3 convergence = caller-set (runtime auto-convergence policy or the app) — NeurD auto-convergence OFF
+```
+
+An older runtime keeps sending AUTO and the plug-in keeps today's behaviour. A/B on the
+panel: `DXR_LIFT_AUTO_CONVERGENCE=module` in the **service** environment restores AUTO.
+
 `xrt_dp_lift_stream_info.input_scale` in (0, 1] (1 = native) picks the smallest NeurD
 autoscaling bucket (720p / 1080p / 1440p / none) that covers `input_scale × input
 height`; outside that range the 720p default applies, and an explicitly set

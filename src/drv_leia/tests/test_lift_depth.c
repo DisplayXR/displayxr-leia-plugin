@@ -212,6 +212,13 @@ test_oa_relative_depth(void)
 	in.convergence = 1.0f;
 	CHECK(leia_lift_oa_build(&in, NULL, 0, &s, e, &n, &h0));
 	CHECK(NEAR(s.convergence_depth_m, 0.08f) && NEAR(h0, 0.0f));
+	// The runtime's auto-convergence (runtime #1858) sends 1 - h(subject):
+	// the subject's h lands on the glass, and a (stale) module estimate is
+	// ignored.
+	in.auto_zero_h = 0.25f;
+	in.convergence = 1.0f - 0.7f;
+	CHECK(leia_lift_oa_build(&in, NULL, 0, &s, e, &n, &h0));
+	CHECK(NEAR(h0, 0.7f) && NEAR(s.convergence_depth_m, 0.3f * 0.08f));
 
 	// strength scales the relief; 0 -> NeurD's minimum (it rejects <= 0).
 	in.convergence = 0.5f;
