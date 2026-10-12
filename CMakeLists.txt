@@ -200,7 +200,7 @@ endif()
 # plug-in ABI still v5; an older pin compiles the NeurD lift module OUT.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.36.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.39.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin so it can move independently of the Windows
 # installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
@@ -244,7 +244,7 @@ set(DXR_RUNTIME_GIT_TAG "v2.36.0" CACHE STRING
 # on displayxr-runtime (>= 2.27.1) (scripts/package_deb_leia.sh) — an older
 # runtime would weave a scaled X11 window into a double image. vk_bundle /
 # os_mutex / xrt_plugin.h are unchanged v2.27.0..v2.29.0.
-set(DXR_RUNTIME_GIT_TAG_LINUX "v2.36.0" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG_LINUX "v2.39.0" CACHE STRING
     "Runtime git ref for Linux builds. Must equal build-linux.yml's RUNTIME_REF (rule-5 CI check enforces).")
 
 # macOS carries its own pin for the same reason as _LINUX / _ANDROID: the Metal
