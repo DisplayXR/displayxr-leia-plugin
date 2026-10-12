@@ -460,7 +460,7 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
 #ifdef XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN
-	// Display hotplug (DisplayXR ADR-047 Amendment 7): an SR topology change
+	// Display hotplug (DisplayXR ADR-047 Amendment 8): an SR topology change
 	// asks the runtime to re-run its claim sweep, so a panel plugged in while
 	// an app runs is claimed (and this plug-in re-probed when it declined at
 	// instance create) within the sweep's debounce. A runtime predating the

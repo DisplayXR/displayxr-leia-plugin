@@ -138,7 +138,7 @@ leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);
  * panel came up or went away): the runtime's
  * `xrt_plugin_host_iface::request_display_rescan`, which re-runs the
  * per-monitor claim sweep — and re-probes this plug-in when it declined at
- * instance create (DisplayXR ADR-047 Amendment 7). Called from the SR event
+ * instance create (DisplayXR ADR-047 Amendment 8). Called from the SR event
  * thread; the runtime only queues a debounced sweep and returns. NULL clears.
  * The pointer lives in the runtime, so it outlives a declined probe.
  */

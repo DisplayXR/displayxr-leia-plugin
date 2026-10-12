@@ -125,7 +125,7 @@ install(TARGETS DisplayXR-LeiaSR
 )
 
 # Host unit test: SR display readiness (EDID_ONLY = present, not ready) and the
-# EDID_ONLY -> FPC_VERIFIED edge (display hotplug, runtime ADR-047 Amendment 7).
+# EDID_ONLY -> FPC_VERIFIED edge (display hotplug, runtime ADR-047 Amendment 8).
 # Plain C; also registered by the Linux arm so CI runs it.
 add_executable(test_sr_readiness test_sr_readiness.c leia_sr_readiness.c)
 target_include_directories(test_sr_readiness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
