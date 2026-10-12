@@ -108,9 +108,11 @@ bool
 leia_mac_get_display_info(struct leia_mac_display_info *out);
 
 /*!
- * Every SR display srEnumerateDisplays reports, CoreGraphics side resolved
- * (cg_display_id, bounds in points, UUID). Index 0 is the active panel (the
- * one leia_mac_get_display_info describes). Only the active panel carries the
+ * Every READY SR display srEnumerateDisplays reports (FPC_VERIFIED; an
+ * EDID_ONLY one is present but not authenticated yet and is left out — see
+ * leia_sr_readiness.h), CoreGraphics side resolved (cg_display_id, bounds in
+ * points, UUID). Index 0 is the active panel (the one
+ * leia_mac_get_display_info describes). Only the active panel carries the
  * SR geometry (recommended view size, nominal viewer); the others carry the
  * descriptor's. Returns the count (0 = no SR panel). Legacy SR runtimes
  * report the one EDID-table panel.
@@ -118,9 +120,30 @@ leia_mac_get_display_info(struct leia_mac_display_info *out);
 uint32_t
 leia_mac_get_sr_displays(struct leia_mac_display_info *out, uint32_t max);
 
+//! DXR_LEIA_ACCEPT_EDID_ONLY=1: bind EDID_ONLY displays as ready (bring-up).
+bool
+leia_mac_sr_accept_edid_only(void);
+
+//! Like leia_mac_get_sr_displays, but every PRESENT display, ready or not
+//! (EDID_ONLY included; check fpc_verified / from_enumeration). For claims only.
+uint32_t
+leia_mac_get_sr_displays_present(struct leia_mac_display_info *out, uint32_t max);
+
 //! Capability snapshot of the enumeration instance (false if no SR runtime).
 bool
 leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);
+
+/*!
+ * Who to tell when SR raises SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED (an SR
+ * panel came up or went away): the runtime's
+ * `xrt_plugin_host_iface::request_display_rescan`, which re-runs the
+ * per-monitor claim sweep — and re-probes this plug-in when it declined at
+ * instance create (DisplayXR ADR-047 Amendment 8). Called from the SR event
+ * thread; the runtime only queues a debounced sweep and returns. NULL clears.
+ * The pointer lives in the runtime, so it outlives a declined probe.
+ */
+void
+leia_mac_sr_set_topology_listener(void (*fn)(const char *reason));
 
 /*!
  * Find the SR panel among the online displays: an EDID (vendor, product) pair

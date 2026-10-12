@@ -363,6 +363,14 @@ target_include_directories(test_stereo_camera_parse PRIVATE ${CMAKE_CURRENT_SOUR
 target_link_libraries(test_stereo_camera_parse PRIVATE m)
 add_test(NAME test_stereo_camera_parse COMMAND test_stereo_camera_parse)
 
+# macOS-arm SR display readiness (leia_sr_readiness.c): platform-neutral C,
+# host-tested here because the macOS arm has no CI ctest lane.
+add_executable(test_sr_readiness
+    ../drv_leia_macos/test_sr_readiness.c
+    ../drv_leia_macos/leia_sr_readiness.c)
+target_include_directories(test_sr_readiness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_macos)
+add_test(NAME test_sr_readiness COMMAND test_sr_readiness)
+
 # Windows-arm claim matcher (leia_display_claims_win.c): platform-neutral C,
 # host-tested here because the Windows build has no ctest lane.
 add_executable(test_display_claims_win

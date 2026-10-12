@@ -127,6 +127,13 @@ struct leia_dp_mac
 	SrPoint3f last_good_l, last_good_r;
 	bool have_last_good;
 
+	//! Tracked-eyes edge logging (display hotplug: how long after a (re)claim
+	//! the tracker delivers a fresh, non-nominal pair again).
+	uint64_t created_ns;         //!< DP creation
+	uint64_t not_tracking_since_ns; //!< start of the current not-tracking episode (0 = tracking)
+	bool tracking;               //!< last reported edge state
+	bool ever_tracked;
+
 	//! Passthrough (2D) pipeline, built for one target pixel format.
 	id<MTLRenderPipelineState> blit_pipeline;
 	MTLPixelFormat blit_format;
@@ -895,6 +902,31 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 	const int64_t last = atomic_load(&ldp->last_pair_ns);
 	out->is_tracking = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < LEIA_MAC_EYE_FRESH_NS;
 
+	// Edge-only WARN (never per frame): tracked eyes = a fresh raw pair
+	// (fresh_raw=1) AND a non-nominal weaver sample. After a panel is plugged
+	// back in the tracker must re-acquire its camera, so this is the line that
+	// times "eyes resumed" (against the runtime's claim / regain line).
+	{
+		const uint64_t t = os_monotonic_get_ns();
+		const bool tracked = out->is_tracking && plausible;
+		if (tracked && !ldp->tracking) {
+			const uint64_t from = ldp->not_tracking_since_ns != 0 ? ldp->not_tracking_since_ns : ldp->created_ns;
+			U_LOG_W("leia_mac_dp:%s eye tracking ACQUIRED (fresh_raw=1, non-nominal) %llu ms after %s",
+			        ldp->screen_bound ? " [segment]" : "", (unsigned long long)((t - from) / 1000000ull),
+			        ldp->ever_tracked ? "it was lost" : "the DP was created");
+			ldp->tracking = true;
+			ldp->ever_tracked = true;
+			ldp->not_tracking_since_ns = 0;
+		} else if (!tracked && ldp->tracking) {
+			U_LOG_W("leia_mac_dp:%s eye tracking LOST (fresh_raw=%d, %s) — nominal / last-good eyes until it "
+			        "returns",
+			        ldp->screen_bound ? " [segment]" : "", (int)out->is_tracking,
+			        plausible ? "weaver sample ok" : "no weaver sample");
+			ldp->tracking = false;
+			ldp->not_tracking_since_ns = t;
+		}
+	}
+
 	// Throttled diagnostic (INFO, every ~5 s): what the weaver itself will weave for.
 	const uint64_t now = os_monotonic_get_ns();
 	int64_t period_ms = debug_get_num_option_leia_mac_eye_log_ms();
@@ -1051,6 +1083,9 @@ leia_dp_mac_create(void *metal_device,
 	(void)leia_mac_sr_probe(); // panel geometry + CGDirectDisplayID (cached)
 
 	struct leia_dp_mac *ldp = calloc(1, sizeof(*ldp));
+	if (ldp != NULL) {
+		ldp->created_ns = os_monotonic_get_ns();
+	}
 	if (ldp == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
