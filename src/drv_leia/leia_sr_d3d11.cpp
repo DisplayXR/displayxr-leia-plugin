@@ -14,6 +14,7 @@
 #include "leia_sr_predict_trace.h"
 #include "leia_sr_v2_common.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
+#include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -73,6 +74,11 @@ struct leiasr_d3d11
 	SrInstance instance_v2 = nullptr;
 	SrWeaver weaver_v2 = nullptr;
 	SrLens lens_v2 = nullptr;
+	//! Per-display user presence (SR event 20): the monitor on instance_v2,
+	//! and its published leia_sr_presence. The state lives HERE, not in the
+	//! monitor, so a frame-thread read never races the monitor's destroy.
+	struct leia_sr_presence_monitor *presence = nullptr;
+	std::atomic<int32_t> presence_state{0};
 #ifdef DXR_LEIA_HAS_SR_COMPOSE
 	// ST-5788 weaver 2D compose. The compose ORDER is sticky per weaver, so the
 	// probe is keyed to the weaver handle it ran on: a recreated weaver (#144
@@ -644,10 +650,21 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	                        leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0,
 	                                                              sr.active_display_id);
 	sr.segment_tracked = segment_tracked;
+	/*
+	 * Per-display user presence (SR event 20): HERE, between the weaver
+	 * create and srInitialize, because senses and their callbacks must exist
+	 * before initialize starts them. Only when this instance WILL initialise:
+	 * a pinned (untracked) segment has no camera of its own to report.
+	 */
+	if (!pin_viewer) {
+		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
+		                                               "D3D11", &sr.presence_state);
+	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		// The recorder's senses belong to this instance — take them down
 		// before it, never after.
 		leia_sr_predict_trace_destroy(&sr.trace);
+		leia_sr_presence_monitor_destroy(&sr.presence);
 		srDestroyWeaver(sr.weaver_v2);
 		sr.weaver_v2 = nullptr;
 		srDestroyInstance(sr.instance_v2);
@@ -1697,6 +1714,8 @@ destroy_sdk_objects(leiasr_d3d11 *sr)
 	// old file is closed with its trailer and the rebuilt weaver opens a new
 	// one, instead of one file silently spanning two different weavers.
 	leia_sr_predict_trace_destroy(&sr->trace);
+	// The presence monitor is a sense on instance_v2 too: before it.
+	leia_sr_presence_monitor_destroy(&sr->presence);
 	sr->trace_push_us = 0;
 	sr->trace_pushed = false;
 	sr->trace_now_valid = false;
@@ -2811,6 +2830,19 @@ leiasr_d3d11_check_window_valid(struct leiasr_d3d11 *leiasr, void *hwnd)
 	}
 
 	return true;
+}
+
+enum leia_sr_presence
+leiasr_d3d11_get_user_presence(struct leiasr_d3d11 *leiasr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr != nullptr) {
+		return leia_sr_presence_load(leiasr->presence_state);
+	}
+#else
+	(void)leiasr;
+#endif
+	return LEIA_SR_PRESENCE_UNKNOWN;
 }
 
 bool

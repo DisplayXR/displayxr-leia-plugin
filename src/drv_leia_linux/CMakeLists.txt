@@ -386,6 +386,12 @@ add_executable(test_sr_multi_win ../drv_leia/tests/test_sr_multi_win.c)
 target_include_directories(test_sr_multi_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_multi_win COMMAND test_sr_multi_win)
 
+# Windows-arm per-display user presence rules (leia_sr_presence.h, SR event
+# 20): header-only plain C, host-tested here for the same reason.
+add_executable(test_sr_presence ../drv_leia/tests/test_sr_presence.c)
+target_include_directories(test_sr_presence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+add_test(NAME test_sr_presence COMMAND test_sr_presence)
+
 # Windows-arm lift viewpoint mapping (leia_lift_viewpoint.c, runtime ADR-048):
 # platform-neutral C (no NeurD / SR / D3D), host-tested here for the same reason.
 add_executable(test_lift_viewpoint

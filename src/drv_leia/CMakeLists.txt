@@ -24,6 +24,13 @@ set(LEIA_SOURCES
     # second place that has to agree about when it exists.
     leia_sr_predict_trace.h
     leia_sr_predict_trace.cpp
+    # Per-display user presence (SR system event 20, LeiaSR q4 line). Same
+    # unconditional listing: the monitor TU is inside #ifdef
+    # DXR_LEIA_HAS_SR_V2, and the rules header is plain C, host-tested
+    # (tests/test_sr_presence.c, run by the Linux CI job).
+    leia_sr_presence.h
+    leia_sr_presence_win.h
+    leia_sr_presence_win.cpp
     leia_sr_liveness.h
     leia_sr_liveness.cpp
     # SR panel readiness + the process-wide geometry cache. Listed
@@ -238,6 +245,20 @@ if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_display.h
     endif()
     unset(_leia_sr_disp_h)
     unset(_leia_sr_weav_h)
+endif()
+# Per-display user presence (SR_EVENT_TYPE_DISPLAY_USER_PRESENCE = 20, LeiaSR
+# q4 line, 1.39.0+2344 on). NOT a compile gate: the plug-in carries the two
+# integer values itself (leia_sr_presence.h) and detects the feature at RUN
+# time through srGetRuntimeCapabilities, so it engages on a q4 SR runtime even
+# while the pinned SDK is 1.38. When the SDK header does declare it, this only
+# turns on static_asserts holding the local values to the SDK's.
+set(LEIA_SR_USER_PRESENCE_SDK FALSE)
+if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_system.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_system.h" _leia_sr_sys_h)
+    if(_leia_sr_sys_h MATCHES "SrDisplayUserPresenceCapabilities")
+        set(LEIA_SR_USER_PRESENCE_SDK TRUE)
+    endif()
+    unset(_leia_sr_sys_h)
 endif()
 if(LEIA_SR_LENS_BINDING_AVAILABLE)
     message(STATUS "SR lens per device (D3): ENABLED - a screen-bound D3D11 DP binds and drives its own lens")
@@ -538,6 +559,9 @@ if(LEIA_SR_V2_AVAILABLE)
     endif()
     if(LEIA_SR_MONITOR_ENUM_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_MONITOR_ENUM=1)
+    endif()
+    if(LEIA_SR_USER_PRESENCE_SDK)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_SDK_HAS_SR_USER_PRESENCE=1)
     endif()
 endif()
 
