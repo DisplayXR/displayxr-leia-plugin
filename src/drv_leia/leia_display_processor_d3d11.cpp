@@ -3160,6 +3160,16 @@ leia_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_
 	static_assert(sizeof(full.backend) <= sizeof(c.backend), "backend name buffers");
 	memcpy(full.backend, c.backend, sizeof(full.backend));
 	full.backend[sizeof(full.backend) - 1] = '\0';
+#ifdef XRT_DP_LIFT_HAS_MODULE_INFO
+	// Which NeurD, and why it is (not) usable: diagnostics for the dashboard.
+	full.module_status = c.module_status;
+	static_assert(sizeof(full.module_version) == sizeof(c.module_version), "module version buffers");
+	static_assert(sizeof(full.module_detail) == sizeof(c.module_detail), "module detail buffers");
+	memcpy(full.module_version, c.module_version, sizeof(full.module_version));
+	full.module_version[sizeof(full.module_version) - 1] = '\0';
+	memcpy(full.module_detail, c.module_detail, sizeof(full.module_detail));
+	full.module_detail[sizeof(full.module_detail) - 1] = '\0';
+#endif
 	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
 	return true;
 }
