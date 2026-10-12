@@ -534,7 +534,7 @@ exactly like the SR SDK:
 | | |
 |---|---|
 | Pins | `NEURD_SDK_REF` + `NEURD_SDK_REPO` in `scripts/build-windows.bat` **and** `.github/workflows/build-windows.yml` (`jobs.Build.env`), kept equal by `scripts/check_sr_pins.py` (lint.yml). |
-| Current pin | `v0.4.9-DEV` — the first media_sdk tag carrying `NeurD_convert_stream_dx_ex` and per-stream props (media_sdk#561, `dev@fd9590f`). Move it to the `v0.4.9` release tag once it exists; headers are identical across a version's `-DEV`/`-QA`/release tags. |
+| Current pin | `v0.4.9` — the first media_sdk release carrying `NeurD_convert_stream_dx_ex` and per-stream props (media_sdk#561; tag on `dev@20bf39e`, the commit that passed QA as `v0.4.9-QA`). Headers are identical across a version's `-DEV`/`-QA`/release tags. |
 | Auth | `gh` with read access to `LeiaInc/media_sdk` (`gh auth login`, or `GH_TOKEN`). CI uses `secrets.LEIALOFT_GITHUB_TOKEN`, the SR SDK token — that token must be granted read on `media_sdk`. |
 | Failure | Soft. The .bat prints a WARN and builds without lift; CI emits a `::warning::` annotation (`continue-on-error`) and ships without lift. CMake prints `NeurD headers NOT found ... lift compiled OUT`. |
 | Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |

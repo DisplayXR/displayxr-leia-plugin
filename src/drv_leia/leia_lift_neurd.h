@@ -68,11 +68,9 @@ struct leia_lift_neurd_caps
 	uint32_t state;           //!< LEIA_LIFT_STATE_*.
 	uint64_t typical_latency_ns;
 	char backend[32]; //!< e.g. "neurd-directml"; "" when unavailable.
-<<<<<<< HEAD
 	uint32_t module_status;  //!< LEIA_LIFT_MODULE_*.
 	char module_version[48]; //!< NeurD's installed version string; "" = none / unknown.
 	char module_detail[96];  //!< One line for a human; display only.
-=======
 	//! LEIA_LIFT_AUX_DEPTH when SBS / NVIEW streams can return the depth of
 	//! the same inference (NeurD >= 0.4.9 convert_stream_dx_ex want_depth,
 	//! DirectML).
@@ -80,7 +78,6 @@ struct leia_lift_neurd_caps
 	//! LEIA_LIFT_DEPTH_UNITS_* (leia_lift_depth.h) of that depth: METRIC
 	//! with the metric video model, RELATIVE otherwise.
 	uint32_t aux_depth_semantics;
->>>>>>> 37880f3 (feat(lift): metric depth export + NeurD off-axis camera (NeurD >= 0.4.9))
 };
 
 //! Auxiliary output bit (identical value to the runtime's
