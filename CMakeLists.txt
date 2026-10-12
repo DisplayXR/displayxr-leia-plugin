@@ -287,7 +287,11 @@ set(DXR_RUNTIME_GIT_TAG_MACOS "v2.31.0" CACHE STRING
 # reads the slot only when struct_size covers it). That is also why the runtime's
 # ABI-gated runtime-pin-bump.yml SKIPS this track -- an appended slot is
 # invisible to an ABI comparison, so the repin is human-driven.
-set(DXR_RUNTIME_GIT_TAG_ANDROID "v2.26.0" CACHE STRING
+# TEMPORARY (feat/android-weave-sync-slot): a displayxr-runtime BRANCH SHA
+# (feat/android-weave-sync-file) carrying VK DP slot set_weave_sync /
+# XRT_DP_VK_HAS_WEAVE_SYNC (XR_DXR_weave v20), so CI compiles the slot in.
+# MUST be repinned to the runtime v* tag that ships the slot before merge.
+set(DXR_RUNTIME_GIT_TAG_ANDROID "357183f8ea91c53d5d4bc0873aec9b0dea4ec1f6" CACHE STRING
     "Runtime git ref for Android builds (floor v2.7.2). Must equal build-android.yml's RUNTIME_REF_ANDROID (rule-5 CI check enforces).")
 
 if(DXR_RUNTIME_SOURCE_DIR)
