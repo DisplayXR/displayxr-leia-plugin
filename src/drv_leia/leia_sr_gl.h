@@ -12,6 +12,7 @@
 #include "xrt/xrt_results.h"
 #include "leia_types.h"
 #include "leia_sr_liveness.h" // enum leia_sr_backend_state — the poll below returns it
+#include "leia_sr_presence.h" // enum leia_sr_presence — per-display user presence (SR event 20)
 
 #ifdef __cplusplus
 extern "C" {
@@ -127,6 +128,17 @@ leiasr_gl_weave(struct leiasr_gl *leiasr);
  *
  * @ingroup drv_leia
  */
+/*!
+ * This weaver's own display's user presence (SR event 20, LeiaSR q4 line):
+ * UNKNOWN unless the SR runtime offers the per-display event and this
+ * display's camera has reported a face since the weaver came up.
+ * Lock-free; any thread.
+ *
+ * @ingroup drv_leia
+ */
+enum leia_sr_presence
+leiasr_gl_get_user_presence(struct leiasr_gl *leiasr);
+
 bool
 leiasr_gl_get_predicted_eye_positions(struct leiasr_gl *leiasr,
                                        float out_left_eye[3],

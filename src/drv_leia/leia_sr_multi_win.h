@@ -47,6 +47,10 @@ struct leia_win_sr_multi_caps
 	//! camera (EXTERNAL included); false while the service has no tracker
 	//! for it (gate off, old service).
 	bool eye_tracker_per_device;
+	//! SrDisplayUserPresenceCapabilities::displayUserPresenceEvent (LeiaSR q4
+	//! line): the runtime raises SR_EVENT_TYPE_DISPLAY_USER_PRESENCE per
+	//! display with its display= id (leia_sr_presence.h).
+	bool display_user_presence;
 };
 
 //! The chain to build on the weaver create-info.

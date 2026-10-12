@@ -8,6 +8,7 @@
 
 #include "leia_sr_v2_common.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 caps (plain C)
+#include "leia_sr_presence.h"  // per-display user presence values (plain C)
 
 #ifdef DXR_LEIA_HAS_SR_V2
 
@@ -25,8 +26,12 @@
 #ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING
 #include <sr/sr_eye_tracker.h> // SrEyeTrackerBindingCapabilities (SR D4)
 #endif
+#ifdef DXR_LEIA_SDK_HAS_SR_USER_PRESENCE
+#include <sr/sr_system.h> // SrDisplayUserPresenceCapabilities (static_assert only)
+#endif
 
 #include <atomic>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -469,6 +474,39 @@ leia_sr_v2_query_display(SrInstance instance,
 	return true;
 }
 
+#ifdef DXR_LEIA_HAS_SR_MULTI_WIN
+/*!
+ * SrDisplayUserPresenceCapabilities::displayUserPresenceEvent (SR event 20,
+ * struct tag 32, LeiaSR q4 line), in a query of its OWN: whatever an older
+ * runtime makes of a tag it does not know, it cannot cost the routing /
+ * binding answer of the caller. Our own layout {sType, pNext, SrBool32} because the
+ * pinned SDK predates the struct (leia_sr_presence.h); a runtime that does
+ * not know it leaves it untouched (0 = not supported).
+ */
+static bool
+query_user_presence_cap(SrInstance instance)
+{
+	struct
+	{
+		SrStructureType sType;
+		void *pNext;
+		SrBool32 displayUserPresenceEvent;
+	} presence_caps = {(SrStructureType)LEIA_SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES, nullptr, SR_FALSE};
+#ifdef DXR_LEIA_SDK_HAS_SR_USER_PRESENCE
+	static_assert(sizeof(presence_caps) == sizeof(SrDisplayUserPresenceCapabilities),
+	              "local SrDisplayUserPresenceCapabilities layout drifted from the SDK's");
+	static_assert(offsetof(SrDisplayUserPresenceCapabilities, displayUserPresenceEvent) ==
+	                  offsetof(decltype(presence_caps), displayUserPresenceEvent),
+	              "local SrDisplayUserPresenceCapabilities layout drifted from the SDK's");
+#endif
+	SrRuntimeCapabilities caps{};
+	caps.sType = SR_TYPE_RUNTIME_CAPABILITIES;
+	caps.pNext = &presence_caps;
+	const SrResult r = srGetRuntimeCapabilities(instance, &caps);
+	return SR_SUCCEEDED(r) && presence_caps.displayUserPresenceEvent == SR_TRUE;
+}
+#endif
+
 void
 leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *out)
 {
@@ -509,6 +547,7 @@ leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *
 	out->keep_drag_snap = (route_caps.supportedFlags & SR_WEAVER_ROUTING_KEEP_DRAG_SNAP_BIT) != 0;
 	out->display_binding = bind_caps.displayBinding != SR_FALSE;
 	out->max_bound_displays = bind_caps.maxBoundDisplays;
+	out->display_user_presence = query_user_presence_cap(instance);
 #ifdef DXR_LEIA_HAS_SR_LENS_BINDING
 	out->lens_per_device = lens_caps.lensPerDevice != SR_FALSE;
 #ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING

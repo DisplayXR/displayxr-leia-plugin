@@ -1472,7 +1472,11 @@ leia_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
 		const float dx = right[0] - left[0];
 		const float dy = right[1] - left[1];
 		const float dz = right[2] - left[2];
-		out_eye_pos->is_tracking = (dx * dx + dy * dy + dz * dz) > 1e-6f;
+		// Per-display user presence (SR event 20): this screen's OWN camera
+		// wins when it has answered; UNKNOWN keeps the heuristic, byte for
+		// byte (leia_sr_presence.h).
+		out_eye_pos->is_tracking =
+		    leia_sr_presence_apply(leiasr_gl_get_user_presence(ldp->leiasr), (dx * dx + dy * dy + dz * dz) > 1e-6f);
 	}
 	// In 2D mode, average L/R to a single midpoint eye.
 	if (ldp->view_count == 1 && out_eye_pos->count >= 2) {

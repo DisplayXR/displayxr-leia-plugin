@@ -12,6 +12,7 @@
 #include "leia_sr_v2_common.h"
 #include "leia_sr_liveness.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
+#include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -56,6 +57,11 @@ struct leiasr_d3d12
 	SrInstance instance_v2 = nullptr;
 	SrWeaver weaver_v2 = nullptr;
 	SrLens lens_v2 = nullptr;
+	//! Per-display user presence (SR event 20): the monitor on instance_v2,
+	//! and its published leia_sr_presence. The state lives HERE, not in the
+	//! monitor, so a frame-thread read never races the monitor's destroy.
+	struct leia_sr_presence_monitor *presence = nullptr;
+	std::atomic<int32_t> presence_state{0};
 #endif
 
 	// D3D12 resources (references, not owned)
@@ -433,7 +439,18 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	    !segment_tracked &&
 	    leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0, sr.active_display_id);
 	sr.segment_tracked = segment_tracked;
+	/*
+	 * Per-display user presence (SR event 20): HERE, between the weaver
+	 * create and srInitialize, because senses and their callbacks must exist
+	 * before initialize starts them. Only when this instance WILL initialise:
+	 * a pinned (untracked) segment has no camera of its own to report.
+	 */
+	if (!pin_viewer) {
+		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
+		                                               "D3D12", &sr.presence_state);
+	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
+		leia_sr_presence_monitor_destroy(&sr.presence);
 		srDestroyWeaver(sr.weaver_v2);
 		sr.weaver_v2 = nullptr;
 		srDestroyInstance(sr.instance_v2);
@@ -1274,6 +1291,8 @@ leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 			sr->lens_v2 = nullptr;
 			sr->lens_bound = false;
 		}
+		// A sense on instance_v2: before the instance.
+		leia_sr_presence_monitor_destroy(&sr->presence);
 		srDestroyWeaver(sr->weaver_v2);
 		sr->weaver_v2 = nullptr;
 
@@ -1611,6 +1630,19 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	// horizon inside srWeaverWeave, so this reports what THIS weave predicted
 	// against. One line, once per weaver.
 	w_log_target_acceptance(leiasr);
+}
+
+enum leia_sr_presence
+leiasr_d3d12_get_user_presence(struct leiasr_d3d12 *leiasr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr != nullptr) {
+		return leia_sr_presence_load(leiasr->presence_state);
+	}
+#else
+	(void)leiasr;
+#endif
+	return LEIA_SR_PRESENCE_UNKNOWN;
 }
 
 bool

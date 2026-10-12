@@ -20,6 +20,7 @@
 #include "leia_sr_v2_common.h"
 #include "leia_sr_liveness.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
+#include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
 
 #ifdef DXR_LEIA_HAS_SR_V2
 #include <sr/sr_vk.h>
@@ -71,6 +72,11 @@ struct leiasr
 	//! (unlike the other arms, `weaver` is non-null on BOTH paths).
 	SrInstance instance_v2 = nullptr;
 	SrLens lens_v2 = nullptr;
+	//! Per-display user presence (SR event 20): the monitor on instance_v2,
+	//! and its published leia_sr_presence. The state lives HERE, not in the
+	//! monitor, so a frame-thread read never races the monitor's destroy.
+	struct leia_sr_presence_monitor *presence = nullptr;
+	std::atomic<int32_t> presence_state{0};
 #endif
 
 	// Display dimensions in meters (for Kooima FOV calculation)
@@ -541,7 +547,18 @@ create_v2(double max_time,
 	    !segment_tracked &&
 	    leia_win_sr_plan_pin_simulated_viewer(sr.display_bound ? sr.bind_display_id : 0, sr.active_display_id);
 	sr.segment_tracked = segment_tracked;
+	/*
+	 * Per-display user presence (SR event 20): HERE, between the weaver
+	 * create and srInitialize, because senses and their callbacks must exist
+	 * before initialize starts them. Only when this instance WILL initialise:
+	 * a pinned (untracked) segment has no camera of its own to report.
+	 */
+	if (!pin_viewer) {
+		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
+		                                               "VK", &sr.presence_state);
+	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
+		leia_sr_presence_monitor_destroy(&sr.presence);
 		srDestroyWeaver(weaver);
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
@@ -1157,6 +1174,8 @@ leiasr_destroy(struct leiasr *leiasr)
 			leiasr->lens_v2 = nullptr;
 			leiasr->lens_bound = false;
 		}
+		// The presence monitor is a sense on instance_v2: before it.
+		leia_sr_presence_monitor_destroy(&leiasr->presence);
 		srDestroyInstance(leiasr->instance_v2);
 		leiasr->instance_v2 = nullptr;
 
@@ -1571,7 +1590,14 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	float dy = rightEye[1] - leftEye[1];
 	float dz = rightEye[2] - leftEye[2];
 	float dist_sq = dx * dx + dy * dy + dz * dz;
-	out_eye_pos->is_tracking = (dist_sq > 1e-6f);
+	// Per-display user presence (SR event 20) wins when this display's own
+	// camera has answered; otherwise the heuristic above, as always.
+	bool pair_tracking = (dist_sq > 1e-6f);
+#ifdef DXR_LEIA_HAS_SR_V2
+	out_eye_pos->is_tracking = leia_sr_presence_apply(leia_sr_presence_load(leiasr->presence_state), pair_tracking);
+#else
+	out_eye_pos->is_tracking = pair_tracking;
+#endif
 
 	return true;
 }
