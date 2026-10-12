@@ -220,13 +220,23 @@ leia_cnsdk_ensure_face_tracking_started(struct leia_cnsdk *cnsdk);
  * directly via @ref leia_cnsdk_weave and does the L/R split internally;
  * the DP doesn't have to manage per-view images or per-tile blits.
  *
+ * @p queue / @p queue_family: the runtime's weave queue, captured by the DP at
+ * FACTORY time (the in-process runtime swaps `vk_bundle::main_queue->queue`
+ * only around the factory call, and the interlacer is created lazily on the
+ * first weave — so the live value here would be the wrong queue). With a
+ * CNSDK core >= 0.10.76 every interlacer submit then lands on that queue
+ * (`leia_interlacer_vulkan_initialize_with_queue`); on an older core, or with
+ * VK_NULL_HANDLE, CNSDK keeps its legacy family-0/index-0 queue.
+ *
  * @return true if the interlacer exists and is ready to weave.
  */
 bool
 leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
                               VkDevice device,
                               VkPhysicalDevice physDev,
-                              VkFormat targetFmt);
+                              VkFormat targetFmt,
+                              VkQueue queue,
+                              uint32_t queue_family);
 
 /*!
  * Fetch the latest predicted primary face position from CNSDK.
