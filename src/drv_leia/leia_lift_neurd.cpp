@@ -1549,6 +1549,10 @@ struct lift_stream
 	//! Last logged camera path (0 legacy, 1 off-axis) | policy bits; ~0 =
 	//! none yet.
 	uint32_t cam_logged;
+	//! Last logged convergence source: 0 NeurD's own auto-convergence, 1
+	//! caller-set (the runtime's auto-convergence policy, or the app); -1 =
+	//! none yet.
+	int32_t conv_src_logged;
 
 	// Depth bridge (R32_FLOAT, NeurD's device -> caller's).
 	uint32_t depth_w, depth_h;
@@ -1940,11 +1944,13 @@ ensure_depth_bridge(lift_stream *s, uint32_t w, uint32_t h)
  * the caller). @p zero_h_offaxis = h at zero disparity of an off-axis convert
  * (its screen fixed it), or < 0 for the legacy renderer (derived from the
  * convergence NeurD reports it used). @p oa = that off-axis convert's screen,
- * NULL for the legacy renderer (no relief mapping then). Called with g.mtx
- * held.
+ * NULL for the legacy renderer (no relief mapping then). @p auto_conv = this
+ * convert ran NeurD's own auto-convergence (caller AUTO); otherwise its value
+ * is not read back. Called with g.mtx held.
  */
 void
 capture_depth_locked(lift_stream *s,
+                     bool auto_conv,
                      uint32_t w,
                      uint32_t h,
                      float zero_h_offaxis,
@@ -1953,7 +1959,10 @@ capture_depth_locked(lift_stream *s,
                      const struct NeurD_depth_info &info)
 {
 	s->metric_scale = (info.units == NEURD_DEPTH_UNITS_METRIC_METERS) ? info.inverse_depth_scale : 0.0f;
-	s->auto_zero_h = leia_lift_nd_legacy_zero_h(info.convergence);
+	// NeurD's own auto-convergence is only an anchor when it ran: with a
+	// caller-set convergence (the runtime's policy) it is off, and a stale
+	// value must not survive into a later AUTO convert.
+	s->auto_zero_h = auto_conv ? leia_lift_nd_legacy_zero_h(info.convergence) : 0.0f;
 	if (!s->aux_depth) {
 		return; // retained only for the metric off-axis scale
 	}
@@ -2295,6 +2304,7 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	s->k = sk;
 	s->vp_logged = ~0u;
 	s->cam_logged = ~0u;
+	s->conv_src_logged = -1;
 	s->aux_depth = (desc->aux_outputs & LEIA_LIFT_AUX_DEPTH) != 0 && desc->mode != LEIA_LIFT_MODE_DEPTH;
 	l->streams.push_back(s);
 	g.streams_live.fetch_add(1);
@@ -2528,6 +2538,13 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			rows = 1;
 		}
 		const bool auto_conv = !(dp.convergence >= 0.0f);
+		if (s->mode != LEIA_LIFT_MODE_DEPTH && s->conv_src_logged != (auto_conv ? 0 : 1)) {
+			s->conv_src_logged = auto_conv ? 0 : 1;
+			U_LOG_W("Leia lift: stream %llu convergence = %s", (unsigned long long)s->id,
+			        auto_conv ? "NeurD auto-convergence (caller AUTO)"
+			                  : "caller-set (runtime auto-convergence policy or the app) — NeurD "
+			                    "auto-convergence OFF");
+		}
 		// strength: 1 = NeurD's calibrated budget, 0 = flat; negative/NaN = default.
 		// The element's strength (1 = nominal) times the depth-gain calibration:
 		// NeurD's own gain 1 read as too weak on the panel (David, 2026-09-26:
@@ -2875,8 +2892,8 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		bool have_info = false;
 #ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
 		if (s->retain && ex_depth != nullptr) {
-			capture_depth_locked(s, w, h, use_oa ? oa_zero_h : -1.0f, use_oa ? &oa_screen : nullptr, ex_depth,
-			                     ex_info);
+			capture_depth_locked(s, auto_conv, w, h, use_oa ? oa_zero_h : -1.0f, use_oa ? &oa_screen : nullptr,
+			                     ex_depth, ex_info);
 			have_info = true;
 		} else if (s->retain) {
 			LIFT_WARN_ONCE("Leia lift: want_depth convert returned no depth — no depth for that frame");
