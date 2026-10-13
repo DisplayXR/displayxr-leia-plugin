@@ -125,7 +125,7 @@ jobs:
       # regression originally).
       # #734: runtime v2.0.0 (a8f6e74f) ships the XR_EXT_* → XR_DXR_*
       # extension rename this plug-in's headers now use (ABI unchanged, v4).
-      RUNTIME_REF: v2.44.1
+      RUNTIME_REF: v2.45.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -381,6 +381,46 @@ jobs:
           }
           Write-Host "PASS: no static LeiaSR_runtime.dll import (lazy v2 load intact)."
 
+      # The conversion provider (src/conv_leia, ADR-053): a SEPARATE DLL from the
+      # display processor. Exactly one export (xrtConversionPluginNegotiate), no
+      # SR SDK import (it must load on a box without LeiaSR) and no static
+      # import of the vendor conversion module (loaded by absolute path, or the
+      # DLL would fail to load without it). Built only with the NeurD headers —
+      # without them it is skipped with a warning, like the lift slots.
+      - name: Assert conversion provider exports + imports
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $dll = "_package/bin/plugins/DisplayXR-LeiaConversion.dll"
+          if (-not (Test-Path $dll)) {
+            if (Test-Path "NeurD-SDK-$env:NEURD_SDK_REF/include/NeurD.h") {
+              Write-Host "::error::$dll missing although the NeurD headers were fetched."
+              exit 1
+            }
+            Write-Host "::warning::NeurD headers not fetched -- DisplayXR-LeiaConversion.dll not built."
+            exit 0
+          }
+          $names = @(& dumpbin /exports $dll 2>&1 | ForEach-Object {
+            if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $Matches[1] }
+          })
+          if ($names.Count -ne 1 -or $names[0] -ne 'xrtConversionPluginNegotiate') {
+            Write-Host "::error::$dll exports [$($names -join ', ')] -- expected exactly xrtConversionPluginNegotiate."
+            exit 1
+          }
+          Write-Host "PASS: exactly one export, xrtConversionPluginNegotiate."
+          $imports = & dumpbin /imports $dll 2>&1 | Out-String
+          foreach ($bad in @('SimulatedReality', 'LeiaSR_runtime', 'DisplayXR-LeiaSR', 'NeurD.dll')) {
+            if ($imports -match [regex]::Escape($bad)) {
+              Write-Host "::error::$dll statically imports $bad -- the provider must load without it."
+              exit 1
+            }
+          }
+          Write-Host "PASS: no SR SDK, display-DLL or conversion-module import."
+
+      - name: Conversion provider tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ctest --test-dir build/src/conv_leia -C Release --output-on-failure
+
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target installer
@@ -392,6 +432,7 @@ jobs:
           name: DisplayXR-LeiaSR
           path: |
             _package/bin/plugins/DisplayXR-LeiaSR.dll
+            _package/bin/plugins/DisplayXR-LeiaConversion.dll
             _package/DisplayXRLeiaSRSetup-*.exe
           if-no-files-found: error
 
