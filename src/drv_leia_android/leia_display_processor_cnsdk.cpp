@@ -270,6 +270,17 @@ struct leia_dp_cnsdk
 	//! drop a possible DOUBLE signal. This one is ours, so a drop just replaces
 	//! it (#1394 machinery) and the runtime's semaphore is signalled exactly once.
 	VkSemaphore op_weave_sem;
+	//! DP-owned binary semaphore CNSDK waits as its imageAvailableSemaphore on
+	//! the opaque path, signalled by an empty in-relay submit that waits the
+	//! runtime's `sync_wait_sem` at ALL_COMMANDS. Indirect because CNSDK
+	//! (0.10.75) attaches that wait at COLOR_ATTACHMENT_OUTPUT only, so its
+	//! first pass's FRAGMENT shader — the one sampling the atlas — is not held
+	//! back by it (CNSDK#748). A binary-semaphore signal completes only after
+	//! all prior work of the signalling batch, and the in-relay's ALL_COMMANDS
+	//! wait makes that include the runtime's writes; so no stage of CNSDK's pass
+	//! can start before them. It also makes the runtime wait deterministic on a
+	//! drop: our own submit consumed it, and only this semaphore is retired.
+	VkSemaphore op_in_sem;
 	//! Fence on the LAST DP submit of a runtime-synced frame (the alpha gate, or
 	//! the out-relay). Replaces the gate's vkQueueWaitIdle as the reclaim guard:
 	//! the next process_atlas waits it (bounded) before it may reuse the gate's
@@ -357,17 +368,27 @@ tail_fence_get(leia_dp_cnsdk *impl)
  * (op_weave_sem → runtime signal), the self-signal on a dropped weave, and
  * every early return of an accepted set_weave_sync frame.
  *
- * `idle` = drain the queue afterwards (the pre-v20 drain_semaphore shape, kept
- * for paths where nothing downstream waits on the GPU). Otherwise, when this
- * batch signals a runtime semaphore it carries `tail_fence` instead.
+ * RELAY_IDLE = drain the queue afterwards (the pre-v20 drain_semaphore shape, kept
+ * for paths where nothing downstream waits on the GPU). RELAY_TAIL: when this
+ * batch signals a runtime semaphore it carries `tail_fence` instead. RELAY_FWD:
+ * a mid-chain hop (the opaque in-relay) — the next submit in the chain waits it
+ * on the GPU, so neither a fence nor a drain.
  *
  * Returns false on a failed submit: then NEITHER semaphore was touched (a
  * failed vkQueueSubmit has no effect), and the caller reports the frame
  * dropped so the runtime takes its documented fallback.
  */
-static bool
-sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, bool idle)
+enum relay_mode
 {
+	RELAY_TAIL, //!< Final batch of the frame: carries tail_fence when it signals.
+	RELAY_IDLE, //!< Drain the queue afterwards (pre-v20 drain_semaphore shape).
+	RELAY_FWD,  //!< Mid-chain hop (in-relay): no fence, no drain.
+};
+
+static bool
+sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, enum relay_mode mode)
+{
+	const bool idle = mode == RELAY_IDLE;
 	struct vk_bundle *vk = impl->vk;
 	if (wait == VK_NULL_HANDLE && signal == VK_NULL_HANDLE) {
 		return true;
@@ -388,7 +409,7 @@ sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, boo
 		si.pSignalSemaphores = &signal;
 	}
 	VkFence fence = VK_NULL_HANDLE;
-	if (!idle && signal != VK_NULL_HANDLE) {
+	if (mode == RELAY_TAIL && signal != VK_NULL_HANDLE) {
 		// Only one tail per frame: the previous one was reclaimed at the top of
 		// process_atlas, and nothing else arms it within a frame before this.
 		if (!impl->tail_fence_armed) {
@@ -402,7 +423,7 @@ sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, boo
 	}
 	if (fence != VK_NULL_HANDLE) {
 		impl->tail_fence_armed = true;
-	} else if (idle || signal != VK_NULL_HANDLE) {
+	} else if (idle || (mode == RELAY_TAIL && signal != VK_NULL_HANDLE)) {
 		// No fence to park on (idle requested, or fence create failed): fall back
 		// to the pre-v20 queue drain so reuse stays safe.
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
@@ -1469,32 +1490,31 @@ reset_weave_semaphores(leia_dp_cnsdk *impl)
 	impl->clean_weaves = 0;
 }
 
-// set_weave_sync (v20): lazily create the DP-owned out-relay semaphore (see
-// `op_weave_sem`). VK_NULL_HANDLE on failure — the caller then keeps the
-// runtime's signal for a plain relay after a CPU-synchronised weave.
+// set_weave_sync (v20): lazily create a DP-owned relay semaphore (`op_weave_sem`
+// or `op_in_sem`). VK_NULL_HANDLE on failure; callers degrade conservatively.
 static VkSemaphore
-op_weave_sem_get(leia_dp_cnsdk *impl)
+op_sem_get(leia_dp_cnsdk *impl, VkSemaphore *slot)
 {
 	struct vk_bundle *vk = impl->vk;
-	if (impl->op_weave_sem == VK_NULL_HANDLE && vk != nullptr) {
+	if (*slot == VK_NULL_HANDLE && vk != nullptr) {
 		VkSemaphoreCreateInfo sci = {};
 		sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		if (vk->vkCreateSemaphore(vk->device, &sci, nullptr, &impl->op_weave_sem) != VK_SUCCESS) {
-			impl->op_weave_sem = VK_NULL_HANDLE;
+		if (vk->vkCreateSemaphore(vk->device, &sci, nullptr, slot) != VK_SUCCESS) {
+			*slot = VK_NULL_HANDLE;
 		}
 	}
-	return impl->op_weave_sem;
+	return *slot;
 }
 
-// runtime#1394 for the out-relay semaphore: after a CNSDK drop we cannot know
-// whether it was signalled (failed submit: no; fence timeout: yes, late), so it
+// runtime#1394 for the relay semaphores: after a CNSDK drop we cannot know
+// whether op_weave_sem was signalled / op_in_sem consumed (failed submit: no; fence timeout: yes, late), so it
 // is retired — destroy deferred exactly like the compose pair — and the next
 // frame lazily creates a fresh, provably unsignalled one. No device idle.
 static void
-reset_op_weave_sem(leia_dp_cnsdk *impl)
+reset_op_sem(leia_dp_cnsdk *impl, VkSemaphore *slot)
 {
-	retire_semaphore(impl, impl->op_weave_sem);
-	impl->op_weave_sem = VK_NULL_HANDLE;
+	retire_semaphore(impl, *slot);
+	*slot = VK_NULL_HANDLE;
 	impl->clean_weaves = 0;
 }
 
@@ -2684,7 +2704,7 @@ struct WeaveSyncGuard
 		if (wait == VK_NULL_HANDLE && signal == VK_NULL_HANDLE) {
 			return;
 		}
-		if (!sync_relay_submit(impl, wait, signal, false)) {
+		if (!sync_relay_submit(impl, wait, signal, RELAY_TAIL)) {
 			impl->last_frame_dropped = true;
 		}
 	}
@@ -2887,23 +2907,34 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// provide them:
 	//
 	//  - WAIT: if the runtime's wait semaphore is still ours to honour (no
-	//    compose ran; a compose that ran consumed it, CPU-synchronised or not),
-	//    CNSDK's first pass waits it directly as its `imageAvailableSemaphore`.
-	//    That is the submit that reads the atlas (and the 2D over-layer), which
-	//    is exactly where the contract puts the wait.
+	//    compose ran; a compose that ran consumed it at ALL_COMMANDS,
+	//    CPU-synchronised or not), an empty in-relay submit waits it at
+	//    ALL_COMMANDS and signals `op_in_sem`, which CNSDK's first pass waits as
+	//    its `imageAvailableSemaphore` — never the runtime's directly: CNSDK
+	//    waits at COLOR_ATTACHMENT_OUTPUT only, which would let its fragment
+	//    shader sample the atlas before the runtime finished writing it.
 	//  - SIGNAL: if the runtime wants a signal and the weave is not already
 	//    chained into the compose pair, CNSDK signals the DP-owned out-relay
 	//    semaphore, and a DP submit after it (the gate, or the relay below)
 	//    signals the runtime's — see `op_weave_sem` for why never directly.
 	VkSemaphore weave_wait_sem = compose_done_sem;
-	bool weave_takes_rt_wait = false;
+	bool weave_uses_in_sem = false;
 	if (weave_wait_sem == VK_NULL_HANDLE && rt.wait != VK_NULL_HANDLE) {
-		weave_wait_sem = rt.wait;
-		weave_takes_rt_wait = true;
+		VkSemaphore in_sem = op_sem_get(impl, &impl->op_in_sem);
+		if (in_sem == VK_NULL_HANDLE || !sync_relay_submit(impl, rt.wait, in_sem, RELAY_FWD)) {
+			// Cannot order the weave after the runtime's writes on the GPU, and
+			// weaving unordered is a read-before-write. Skip the weave: the guard
+			// pays rt.wait / rt.signal, and the frame is reported dropped.
+			impl->last_frame_dropped = true;
+			return;
+		}
+		rt.wait = VK_NULL_HANDLE; // consumed, deterministically, by the in-relay
+		weave_wait_sem = in_sem;
+		weave_uses_in_sem = true;
 	}
 	bool weave_uses_op_sem = false;
 	if (weave_done_sem == VK_NULL_HANDLE && rt.signal != VK_NULL_HANDLE) {
-		weave_done_sem = op_weave_sem_get(impl);
+		weave_done_sem = op_sem_get(impl, &impl->op_weave_sem);
 		weave_uses_op_sem = weave_done_sem != VK_NULL_HANDLE;
 		// On a create failure weave_done_sem stays NULL: CNSDK signals nothing,
 		// the gate (if any) device-idles as pre-v20, and the guard signals the
@@ -2948,19 +2979,15 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	if (!wove) {
 		// Can't normally happen — the interlacer was checked ready above — but a
 		// binary semaphore that was signalled and never waited is unrecoverable
-		// next frame, so drain both rather than assume. (A runtime wait handed to
-		// the weave was NOT consumed — leia_cnsdk_weave returned before
-		// do_post_process — so it stays in `rt` for the guard.)
+		// next frame, so drain both rather than assume. (leia_cnsdk_weave
+		// returned before do_post_process, so the in-relay's signal is unconsumed
+		// too.)
 		drain_semaphore(impl, compose_done_sem);
+		if (weave_uses_in_sem) {
+			drain_semaphore(impl, impl->op_in_sem);
+		}
 		weave_done_sem = VK_NULL_HANDLE;
 		weave_uses_op_sem = false;
-	} else if (weave_takes_rt_wait) {
-		// Handed to CNSDK's first-pass submit. On a clean weave it is consumed;
-		// on a CNSDK#734 drop it is INDETERMINATE (a failed submit consumed
-		// nothing, a fence timeout consumed it) and the DP must NOT wait it again
-		// — a second wait with no pending signal can hang the queue. The drop
-		// report below is what tells the runtime to recreate it.
-		rt.wait = VK_NULL_HANDLE;
 	}
 
 	/*
@@ -2992,7 +3019,13 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 			reset_weave_semaphores(impl);
 		}
 		if (weave_uses_op_sem) {
-			reset_op_weave_sem(impl);
+			reset_op_sem(impl, &impl->op_weave_sem);
+		}
+		if (weave_uses_in_sem) {
+			// Consumed by a timed-out weave, still signalled after a failed one:
+			// unknowable, so retire it. The runtime's wait was already consumed
+			// by our in-relay, so nothing of the runtime's is left indeterminate.
+			reset_op_sem(impl, &impl->op_in_sem);
 		}
 		// set_weave_sync: the runtime's signal is still owed (it was never handed
 		// to CNSDK — see op_weave_sem), so the guard signals it on return with an
@@ -3038,9 +3071,9 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 			// (idle): off the happy path, and it restores the one-compose-in-
 			// flight invariant the gate would have kept.
 			if (weave_done_sem != VK_NULL_HANDLE || rt.signal != VK_NULL_HANDLE) {
-				if (!sync_relay_submit(impl, weave_done_sem, rt.signal, true)) {
+				if (!sync_relay_submit(impl, weave_done_sem, rt.signal, RELAY_IDLE)) {
 					if (weave_uses_op_sem) {
-						reset_op_weave_sem(impl);
+						reset_op_sem(impl, &impl->op_weave_sem);
 					}
 					impl->last_frame_dropped = impl->last_frame_dropped || rt.signal != VK_NULL_HANDLE;
 				}
@@ -3051,10 +3084,10 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 		// set_weave_sync out-relay (opaque app, the common case): wait the
 		// weave's completion on the GPU, signal the runtime. No CPU wait — the
 		// batch carries `tail_fence`, which the next process_atlas reclaims.
-		if (!sync_relay_submit(impl, weave_done_sem, rt.signal, false)) {
+		if (!sync_relay_submit(impl, weave_done_sem, rt.signal, RELAY_TAIL)) {
 			// Nothing touched: the op semaphore is still signalled-or-pending
 			// and the runtime's is unsignalled. Retire ours, report the drop.
-			reset_op_weave_sem(impl);
+			reset_op_sem(impl, &impl->op_weave_sem);
 			impl->last_frame_dropped = true;
 		}
 		rt.signal = VK_NULL_HANDLE;
@@ -3092,8 +3125,9 @@ weave_sync_enabled()
  * the NEXT process_atlas only; process_atlas_weave takes and honours it on every
  * path (WeaveSyncGuard). How each path chains it:
  *
- *   opaque:        rt wait → CNSDK pass 0 (imageAvailable) → op_weave_sem
- *                  → empty relay submit → rt signal   [tail_fence]
+ *   opaque:        rt wait → empty in-relay (ALL_COMMANDS) → op_in_sem
+ *                  → CNSDK pass 0 (imageAvailable) → op_weave_sem
+ *                  → empty out-relay → rt signal   [tail_fence]
  *   compose-under: rt wait → compose submit → cmp_done_sem → CNSDK
  *                  → cmp_weave_sem → alpha gate → rt signal   [tail_fence;
  *                  the gate's vkQueueWaitIdle is gone]
@@ -3131,7 +3165,7 @@ set_weave_sync_cnsdk(struct xrt_display_processor_vk *xdp,
 	// orphaned binary-semaphore signal would poison the runtime's next frame.
 	if (impl->sync_wait_sem != VK_NULL_HANDLE || impl->sync_signal_sem != VK_NULL_HANDLE) {
 		U_LOG_W("Leia CNSDK DP: set_weave_sync called twice without process_atlas — paying the stale pair");
-		sync_relay_submit(impl, impl->sync_wait_sem, impl->sync_signal_sem, true);
+		sync_relay_submit(impl, impl->sync_wait_sem, impl->sync_signal_sem, RELAY_IDLE);
 	}
 	impl->sync_wait_sem = (VkSemaphore)wait_sem;
 	impl->sync_signal_sem = (VkSemaphore)signal_sem;
@@ -3338,6 +3372,9 @@ destroy_impl(struct xrt_display_processor *xdp)
 	if (impl->vk != nullptr) {
 		if (impl->op_weave_sem != VK_NULL_HANDLE) {
 			impl->vk->vkDestroySemaphore(impl->vk->device, impl->op_weave_sem, nullptr);
+		}
+		if (impl->op_in_sem != VK_NULL_HANDLE) {
+			impl->vk->vkDestroySemaphore(impl->vk->device, impl->op_in_sem, nullptr);
 		}
 		if (impl->tail_fence != VK_NULL_HANDLE) {
 			impl->vk->vkDestroyFence(impl->vk->device, impl->tail_fence, nullptr);
