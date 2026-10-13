@@ -198,9 +198,13 @@ endif()
 # (XRT_DP_D3D11_HAS_LIFT, runtime#1781) and the lift-only factory
 # (XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY). Appended and struct_size-gated,
 # plug-in ABI still v5; an older pin compiles the NeurD lift module OUT.
+# v2.41.0 (from v2.39.0): the first runtime with the conversion-provider ABI
+# (xrt/xrt_conversion_plugin.h, XRT_CONVERSION_PLUGIN_API_VERSION 1, ADR-053) that
+# src/conv_leia (DisplayXR-LeiaConversion.dll) is built against; an older pin
+# leaves that DLL unbuilt. Display plug-in ABI unchanged (v5).
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.44.1" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.45.0" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin so it can move independently of the Windows
 # installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
@@ -351,6 +355,8 @@ if(WIN32)
     message(STATUS "Leia SR SDK at ${SR_PATH}")
 
     add_subdirectory(src/drv_leia)
+    # Conversion provider (ADR-053): a separate DLL, no SR SDK dependency.
+    add_subdirectory(src/conv_leia)
     add_subdirectory(installer)
 elseif(ANDROID)
     # --- CNSDK (Android / Leia CNSDK plug-in) --------------------------

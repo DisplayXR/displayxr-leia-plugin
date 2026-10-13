@@ -417,6 +417,16 @@ target_include_directories(test_lift_depth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.
 target_link_libraries(test_lift_depth PRIVATE m)
 add_test(NAME test_lift_depth COMMAND test_lift_depth)
 
+# Windows conversion provider's pure decisions (src/conv_leia/leia_conv_policy.c:
+# the readiness / version gate, licence class, extents): plain C, no runtime
+# header, host-tested here like the lift helpers above.
+add_executable(test_conv_leia_policy
+    ../conv_leia/tests/test_conv_leia_policy.c
+    ../conv_leia/leia_conv_policy.c)
+target_include_directories(test_conv_leia_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../conv_leia)
+target_link_libraries(test_conv_leia_policy PRIVATE m)
+add_test(NAME test_conv_leia_policy COMMAND test_conv_leia_policy)
+
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
