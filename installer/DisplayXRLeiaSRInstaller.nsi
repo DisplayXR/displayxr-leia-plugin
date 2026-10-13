@@ -20,6 +20,15 @@
 ;  - Files held by running processes (the service, in-process OpenXR apps)
 ;    are released through Windows Restart Manager (dxr-rm-close.exe), which
 ;    also restarts what it closed. See docs/installer.md.
+;
+; When built with the conversion provider (LEIA_CONV, runtime ADR-053) it also
+; ships DisplayXR-LeiaConversion.dll and registers
+; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion (ProbeOrder 50,
+; Supersedes dp-lift, Version written LAST). That DLL is mapped only by its
+; displayxr-conversion-host.exe, so its files get their OWN Restart Manager
+; session, held under the maintenance mutex
+; Global\DisplayXR-ConvMaintenance-leia-conversion: it closes the host, never
+; the service, and starts nothing. See docs/conversion-provider.md.
 
 ;--------------------------------
 ; Build-time definitions (passed from CMake):
@@ -64,13 +73,18 @@
 ; then File-include the pre-signed uninstaller in the real pass (see .onInit
 ; and the WriteUninstaller site). INNER is RequestExecutionLevel user so it
 ; never triggers UAC when run from makensis on a non-elevated build host.
+!ifdef LEIA_CONV
+	!define INNER_CONV_DEFINE "-DLEIA_CONV=1"
+!else
+	!define INNER_CONV_DEFINE ""
+!endif
 !ifndef INNER
 	!ifdef SIGN_CMD
 		!if "${SIGN_CMD}" != ""
 			!finalize '${SIGN_CMD} "%1"'
 			; Build the inner installer (passes every define it needs to
 			; compile; OUTPUT_DIR/SIGN_CMD are deliberately omitted).
-			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "-DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}" "${__FILE__}"' = 0
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "-DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}" ${INNER_CONV_DEFINE} "${__FILE__}"' = 0
 			; Run it: .onInit writes %TEMP%\Uninstall.exe then Quit (exit 2).
 			!system '"$%TEMP%\DisplayXRLeiaSR_inner.exe"' = 2
 			; Sign the emitted uninstaller, then File it in the real pass.
@@ -368,6 +382,143 @@ FunctionEnd
 !insertmacro RM_FUNCTIONS "un."
 
 ;--------------------------------
+; Conversion provider (runtime ADR-053; discovery spec §3.8 "close the host,
+; never the service"; docs/conversion-provider.md).
+;
+; DisplayXR-LeiaConversion.dll is satellite-hosted: only its
+; displayxr-conversion-host.exe maps it. The update sequence:
+;   1. create AND own Global\DisplayXR-ConvMaintenance-leia-conversion, held to
+;      the end (the service spawns no host for the provider while it is held);
+;   2. a Restart Manager session over the provider's files only — it lists the
+;      host, which exits 20 ("closed for update"; the provider's tasks report
+;      WARMING(updating), every app session and stream stays alive);
+;   3. replace the files, write the registry row with Version LAST;
+;   4. end the session WITHOUT restarting anything (the host never registers
+;      for restart; the service respawns it on demand);
+;   5. release the mutex.
+; The mutex is owned by the thread that created it, so take and release it from
+; the same section (NSIS runs sections and their Calls on one thread).
+
+!define CONV_ID "leia-conversion"
+!define CONV_DLL "DisplayXR-LeiaConversion.dll"
+!define CONV_KEY "Software\DisplayXR\ConversionProviders\${CONV_ID}"
+!define CONV_MUTEX "Global\DisplayXR-ConvMaintenance-${CONV_ID}"
+
+Var ConvMutex     ; owned maintenance mutex handle ("" = not held)
+Var ConvRmDir     ; the provider's own RM session state dir
+Var ConvRmRc      ; its closed.txt code (as $RmClosedRc)
+Var SvcRunning0   ; 1 = the service was running before ANY session touched it
+
+!macro CONV_FUNCTIONS PFX
+
+; Step 1: create and own the maintenance mutex. ERROR_ALREADY_EXISTS (183) means
+; another installer (e.g. the conversion module's own) holds it: wait for it.
+Function ${PFX}ConvMaintenanceTake
+	StrCpy $ConvMutex ""
+	System::Call 'kernel32::CreateMutexW(p 0, i 1, w "${CONV_MUTEX}") p.r0 ?e'
+	Pop $1
+	${If} $0 == 0
+		DetailPrint "Could not create the conversion maintenance mutex (error $1) - continuing without it."
+		Return
+	${EndIf}
+	${If} $1 == 183
+		DetailPrint "Another installer is updating the conversion provider; waiting..."
+		System::Call 'kernel32::WaitForSingleObject(p r0, i 120000) i.r2'
+		; 0 = acquired, 0x80 = abandoned by its owner (acquired too)
+		${If} $2 != 0
+		${AndIf} $2 != 128
+			DetailPrint "The conversion maintenance mutex is still held after 120 s - continuing without it."
+			System::Call 'kernel32::CloseHandle(p r0)'
+			Return
+		${EndIf}
+	${EndIf}
+	StrCpy $ConvMutex $0
+	DetailPrint "Holding ${CONV_MUTEX}."
+FunctionEnd
+
+; Step 5.
+Function ${PFX}ConvMaintenanceRelease
+	${If} $ConvMutex != ""
+		System::Call 'kernel32::ReleaseMutex(p $ConvMutex)'
+		System::Call 'kernel32::CloseHandle(p $ConvMutex)'
+		StrCpy $ConvMutex ""
+		DetailPrint "Released ${CONV_MUTEX}."
+	${EndIf}
+FunctionEnd
+
+; Step 2: Restart Manager over the provider's files ONLY. No taskkill fallback:
+; nothing here may stop the service — a file still held aborts the install
+; (AllowSkipFiles off) and the bundle reports it.
+Function ${PFX}ConvRmClose
+	StrCpy $ConvRmDir "$PLUGINSDIR\rmconv"
+	${IfNot} ${FileExists} "$RmHelper"
+		StrCpy $ConvRmRc "nohelper"
+		Return
+	${EndIf}
+	RMDir /r "$ConvRmDir"
+	CreateDirectory "$ConvRmDir"
+	DetailPrint "Releasing the conversion provider's files (Restart Manager)..."
+	ClearErrors
+	ExecShell "open" '"$RmHelper"' 'session "$ConvRmDir" "$INSTDIR\${CONV_DLL}"' SW_HIDE
+	${If} ${Errors}
+		StrCpy $ConvRmRc "noexec"
+		Return
+	${EndIf}
+	StrCpy $0 120000
+	StrCpy $1 "$ConvRmDir\closed.txt"
+	Call ${PFX}RmWaitFile
+	${If} ${Errors}
+		StrCpy $ConvRmRc "timeout"
+	${Else}
+		StrCpy $0 "$ConvRmDir\closed.txt"
+		Call ${PFX}RmReadCode
+		StrCpy $ConvRmRc $1
+	${EndIf}
+	Call ${PFX}ConvRmPrintLog
+	${If} $ConvRmRc == "0"
+		DetailPrint "Restart Manager closed the conversion host (it exits 'closed for update')."
+	${ElseIf} $ConvRmRc == "10"
+		DetailPrint "No process holds the conversion provider's files."
+	${Else}
+		DetailPrint "Restart Manager did not release the conversion provider's files ($ConvRmRc)."
+	${EndIf}
+FunctionEnd
+
+; Step 4: end the session; restart NOTHING.
+Function ${PFX}ConvRmEnd
+	${If} $ConvRmRc == "0"
+	${OrIf} $ConvRmRc == "1"
+	${OrIf} $ConvRmRc == "timeout"
+		FileOpen $2 "$ConvRmDir\go.txt" w
+		FileWrite $2 "end$\r$\n"
+		FileClose $2
+		StrCpy $0 60000
+		StrCpy $1 "$ConvRmDir\done.txt"
+		Call ${PFX}RmWaitFile
+		Call ${PFX}ConvRmPrintLog
+	${EndIf}
+	StrCpy $ConvRmRc "ended"
+FunctionEnd
+
+; The helper's log for the provider session (RmPrintLog reads $RmDir).
+Function ${PFX}ConvRmPrintLog
+	Push $RmDir
+	Push $RmLogLines
+	StrCpy $RmDir $ConvRmDir
+	StrCpy $RmLogLines 0
+	Call ${PFX}RmPrintLog
+	Pop $RmLogLines
+	Pop $RmDir
+FunctionEnd
+
+!macroend
+
+!ifdef LEIA_CONV
+	!insertmacro CONV_FUNCTIONS ""
+	!insertmacro CONV_FUNCTIONS "un."
+!endif
+
+;--------------------------------
 ; Interface Settings
 
 !define MUI_ABORTWARNING
@@ -429,7 +580,24 @@ Section "Leia SR Plug-in" SecPlugin
 	InitPluginsDir
 	File "/oname=$PLUGINSDIR\dxr-rm-close.exe" "${BIN_DIR}\tools\dxr-rm-close.exe"
 	StrCpy $RmHelper "$PLUGINSDIR\dxr-rm-close.exe"
+	nsExec::Exec '"$RmHelper" is-running ${SVC_EXE}'
+	Pop $0
+	StrCpy $SvcRunning0 0
+	${If} $0 == 0
+		StrCpy $SvcRunning0 1
+	${EndIf}
+!ifdef LEIA_CONV
+	; The conversion provider first, under its maintenance mutex: its session
+	; closes the conversion host only (see CONV_FUNCTIONS above).
+	Call ConvMaintenanceTake
+	Call ConvRmClose
+!endif
 	Call RmClose
+	; The display plug-in's RmFinish restores the service only if it was running
+	; before; count "before" from before EITHER session.
+	${If} $SvcRunning0 == 1
+		StrCpy $SvcWasRunning 1
+	${EndIf}
 
 	SetOutPath "$INSTDIR"
 
@@ -462,6 +630,13 @@ Section "Leia SR Plug-in" SecPlugin
 	; it to release the DLL before deleting it.
 	File "${BIN_DIR}\tools\dxr-rm-close.exe"
 
+!ifdef LEIA_CONV
+	; The conversion provider (ADR-053): a separate DLL, no SR SDK, no link to
+	; DisplayXR-LeiaSR.dll. It loads the NeurD conversion module (installed by
+	; NeurD's own installer) by absolute path when the runtime warms it.
+	File "${BIN_DIR}\plugins\${CONV_DLL}"
+!endif
+
 	; -----------------------------------------------------------------
 	; Register at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr per
 	; the contract in docs/specs/runtime/plugin-discovery.md.
@@ -487,6 +662,29 @@ Section "Leia SR Plug-in" SecPlugin
 		"UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
 	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" \
 		"ProbeOrder"      50
+
+!ifdef LEIA_CONV
+	; -----------------------------------------------------------------
+	; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion
+	; (runtime docs/specs/runtime/conversion-provider-discovery.md §3.1).
+	; ProbeOrder 50 = the vendor band. Supersedes = dp-lift hides the
+	; runtime's legacy adapter over this plug-in's own display-side lift
+	; slots, so the two are never listed twice (it never affects selection
+	; among other providers: an absent NeurD still falls through).
+	; Hosting is left to the runtime default (satellite). A Settings subkey
+	; the user created survives an update. Version is written LAST: it is
+	; the "row complete" marker the runtime re-describes on, so it is
+	; removed first and rewritten after everything else.
+	; -----------------------------------------------------------------
+	DeleteRegValue HKLM "${CONV_KEY}" "Version"
+	WriteRegStr   HKLM "${CONV_KEY}" "Binary"          "$INSTDIR\${CONV_DLL}"
+	WriteRegStr   HKLM "${CONV_KEY}" "DisplayName"     "Leia conversion (NeurD)"
+	WriteRegStr   HKLM "${CONV_KEY}" "Vendor"          "Leia Inc."
+	WriteRegStr   HKLM "${CONV_KEY}" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+	WriteRegStr   HKLM "${CONV_KEY}" "Supersedes"      "dp-lift"
+	WriteRegDWORD HKLM "${CONV_KEY}" "ProbeOrder"      50
+	WriteRegStr   HKLM "${CONV_KEY}" "Version"         "${VERSION}"
+!endif
 
 	; Track our own install location for the uninstaller.
 	WriteRegStr HKLM "Software\DisplayXR\Plugins\LeiaSR" "InstallPath" "$INSTDIR"
@@ -531,6 +729,13 @@ Section "Leia SR Plug-in" SecPlugin
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR" \
 		"EstimatedSize" "$0"
 
+!ifdef LEIA_CONV
+	; The provider's session ends restarting nothing; then the mutex goes, and
+	; the service respawns the conversion host on demand.
+	Call ConvRmEnd
+	Call ConvMaintenanceRelease
+!endif
+
 	; #461: bring back what Restart Manager closed (the service relaunches
 	; itself non-elevated with --rm-restart), or — only if RM failed — start
 	; the service via explorer.exe. Nothing is started that was not running
@@ -540,8 +745,13 @@ Section "Leia SR Plug-in" SecPlugin
 SectionEnd
 
 ; An aborted install (e.g. a file still locked) must not leave the processes
-; RM closed down: release the waiting helper and restore the service.
+; RM closed down: release the waiting helpers, the maintenance mutex, and
+; restore the service.
 Function .onInstFailed
+!ifdef LEIA_CONV
+	Call ConvRmEnd
+	Call ConvMaintenanceRelease
+!endif
 	Call RmFinish
 FunctionEnd
 
@@ -574,6 +784,12 @@ Section "Uninstall"
 	; anyone else) does not find us; it then runs on the fallback display
 	; processor.
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\leia-sr"
+!ifdef LEIA_CONV
+	; The conversion provider's row (with any Settings the user set): the
+	; runtime's tasks fall through to the next provider at the next create.
+	DeleteRegKey HKLM "${CONV_KEY}"
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
+!endif
 
 	; Release the DLL before deleting it: the service and in-process apps map
 	; it, and a plain Delete of a mapped DLL fails (it used to fail silently and
@@ -583,14 +799,35 @@ Section "Uninstall"
 	InitPluginsDir
 	StrCpy $RmHelper "$PLUGINSDIR\dxr-rm-close.exe"
 	CopyFiles /SILENT "$INSTDIR\dxr-rm-close.exe" "$PLUGINSDIR"
+	nsExec::Exec '"$RmHelper" is-running ${SVC_EXE}'
+	Pop $0
+	StrCpy $SvcRunning0 0
+	${If} $0 == 0
+		StrCpy $SvcRunning0 1
+	${EndIf}
+!ifdef LEIA_CONV
+	Call un.ConvMaintenanceTake
+	Call un.ConvRmClose
+!endif
 	Call un.RmClose
+	${If} $SvcRunning0 == 1
+		StrCpy $SvcWasRunning 1
+	${EndIf}
 
 	; Remove our files.
 	!insertmacro UnDeleteHeld "$INSTDIR\DisplayXR-LeiaSR.dll"
 	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkanBeta.dll"
 	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkan.dll"
+!ifdef LEIA_CONV
+	!insertmacro UnDeleteHeld "$INSTDIR\${CONV_DLL}"
+!endif
 	Delete "$INSTDIR\dxr-rm-close.exe"
 	Delete "$INSTDIR\Uninstall.exe"
+
+!ifdef LEIA_CONV
+	Call un.ConvRmEnd
+	Call un.ConvMaintenanceRelease
+!endif
 
 	; Bring back what RM closed — the service comes back without the plug-in.
 	Call un.RmFinish
@@ -611,6 +848,10 @@ Section "Uninstall"
 SectionEnd
 
 Function un.onUninstFailed
+!ifdef LEIA_CONV
+	Call un.ConvRmEnd
+	Call un.ConvMaintenanceRelease
+!endif
 	Call un.RmFinish
 FunctionEnd
 

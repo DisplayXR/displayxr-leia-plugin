@@ -132,6 +132,15 @@ else()
         "the DLL from the sr-sdk-v* release into the SR SDK's bin/ dir.")
 endif()
 
+# The conversion provider DLL (src/conv_leia) ships in the same installer when
+# it was built (it needs the NeurD headers); LEIA_CONV turns on its files, its
+# ConversionProviders row and its maintenance-mutex Restart Manager session.
+set(LEIA_CONV_NSIS_DEFINE "")
+if(TARGET DisplayXR-LeiaConversion)
+    set(LEIA_CONV_NSIS_DEFINE "/DLEIA_CONV=1")
+    message(STATUS "Installer: bundling DisplayXR-LeiaConversion.dll (ConversionProviders/leia-conversion row)")
+endif()
+
 add_custom_target(installer
     COMMAND "${NSIS_EXECUTABLE}"
         "/DVERSION=${DXR_LEIA_VERSION}"
@@ -145,9 +154,13 @@ add_custom_target(installer
         "/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
         "/DSIGN_CMD=${SIGN_CMD}"
+        ${LEIA_CONV_NSIS_DEFINE}
         "${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building DisplayXR Leia SR plug-in installer..."
     VERBATIM
 )
 add_dependencies(installer DisplayXR-LeiaSR dxr-rm-close)
+if(TARGET DisplayXR-LeiaConversion)
+    add_dependencies(installer DisplayXR-LeiaConversion)
+endif()
