@@ -128,6 +128,15 @@ struct leia_lift_neurd_params
 	uint32_t viewpoint_source; //!< LEIA_LIFT_VIEWPOINTS_* (leia_lift_depth.h).
 	float nominal_z_m;         //!< The runtime's reference viewing distance,
 	                           //!< metres; 0 = unknown (use ref_z_m).
+
+	/*!
+	 * Conversion provider only (src/conv_leia): the zero-parallax plane as a
+	 * METRIC depth in metres (> 0), in the units of the metric aux depth this
+	 * stream returned. Converted to @ref convergence here, with the stream's own
+	 * metric model scale; until that scale is known the convert runs AUTO.
+	 * 0 = unused (@ref convergence applies). The display processor leaves it 0.
+	 */
+	float convergence_metric_m;
 };
 
 /*!
@@ -231,6 +240,100 @@ leia_lift_neurd_convert(struct leia_lift_neurd *lift,
  */
 bool
 leia_lift_neurd_get_depth(struct leia_lift_neurd *lift, uint64_t id, struct leia_lift_neurd_depth *out);
+
+/*
+ *
+ * Conversion-provider hosting (src/conv_leia, ADR-053). The display processor
+ * never calls these; the module then behaves exactly as described above.
+ *
+ */
+
+/*!
+ * Configuration reader: the conversion provider passes the runtime's
+ * host->get_setting here. Once set, every knob is read through it ONLY (no
+ * environment, no HKLM\SOFTWARE\DisplayXR\Leia\Lift): keys are the registry
+ * value names (Backend, MinVersion, ViewGain, ...), plus Enable (the
+ * DXR_LEIA_LIFT switch) and NeurDPath (an absolute NeurD.dll path that, when
+ * set, is the ONLY place looked at). Set before the first
+ * leia_lift_neurd_create. NULL restores env > HKLM.
+ */
+typedef bool (*leia_lift_neurd_setting_fn)(const char *key, char *buf, uint32_t buf_size);
+
+void
+leia_lift_neurd_set_setting_reader(leia_lift_neurd_setting_fn fn);
+
+/*!
+ * Manual activation (conversion provider): the module never starts its
+ * background activation thread and never re-probes on its own. caps / stream /
+ * convert calls only read the state; leia_lift_neurd_activate() does
+ * discovery + load + init on the CALLER's thread. Set before the first
+ * leia_lift_neurd_create.
+ */
+void
+leia_lift_neurd_set_manual_activation(bool manual);
+
+//! NeurD.dll as discovery sees it, WITHOUT loading it.
+struct leia_lift_neurd_presence
+{
+	bool enabled;   //!< false: Enable=0 (nothing looked at)
+	bool found;     //!< a NeurD.dll was found
+	char path[260]; //!< its full path
+	char where[48]; //!< which discovery step found it
+	//! Its VERSIONINFO file version; false = no usable resource (the floor is then
+	//! checked after the load, in activate).
+	bool have_version;
+	uint32_t ver_major, ver_minor, ver_patch;
+	bool too_old; //!< have_version and older than the floor
+	uint32_t min_major, min_minor, min_patch;
+	char product_name[64]; //!< VERSIONINFO ProductName; "" = none
+};
+
+/*!
+ * Discovery only (SearchPath, one registry read, the version resource): no
+ * LoadLibrary, no thread. Bounded file I/O — call from a control thread.
+ */
+bool
+leia_lift_neurd_probe_presence(struct leia_lift_neurd *lift, struct leia_lift_neurd_presence *out);
+
+//! The process-wide module state, from memory only (no kick, no I/O, no lock
+//! held across a NeurD call).
+struct leia_lift_neurd_status
+{
+	uint32_t module_status; //!< LEIA_LIFT_MODULE_*
+	//! ACTIVATING because the licence activation needs the network (retry later).
+	bool network_retry;
+	//! FAILED for a reason a different NeurD.dll can fix (too old, unloadable).
+	bool recheckable;
+	char version[48];  //!< the loaded NeurD's version, "" when none
+	char detail[96];   //!< one line for a human
+	char licence[64];  //!< NeurD's own licence line (empty until it printed one)
+	char backend[32];  //!< "neurd-<backend>" once READY, else ""
+	bool float_depth;  //!< READY: SBS streams can return the depth of the same inference
+	bool metric_depth; //!< ...and it is metric (VideoModel=metric)
+	bool offaxis;      //!< READY: the metric off-axis camera is available
+	uint64_t latency_ns; //!< EMA of a full convert; 0 = none yet
+	uint64_t nd_luid;    //!< NeurD's D3D11 adapter LUID (READY), else 0
+};
+
+void
+leia_lift_neurd_get_status(struct leia_lift_neurd *lift, struct leia_lift_neurd_status *out);
+
+/*!
+ * Manual mode: discovery + (re)activation on the caller's thread. BLOCKS for
+ * the load and NeurD's init (licence activation, model load — seconds, and
+ * not interruptible once NeurD_init is running). Re-probes at once (no 30 s
+ * rate limit) and ignores the network-retry timer: the caller owns the retry
+ * policy. Returns the resulting LEIA_LIFT_MODULE_* status.
+ */
+uint32_t
+leia_lift_neurd_activate(struct leia_lift_neurd *lift);
+
+/*!
+ * Drop the NeurD stream behind @p id (its temporal state); it is re-created
+ * lazily on the next convert. For a cut / seek (FRAME_RESET).
+ */
+void
+leia_lift_neurd_stream_reset(struct leia_lift_neurd *lift, uint64_t id);
 
 /*!
  * LEGACY mapping (kept for callers of the old helper): x_n = clamp(gain *

@@ -222,6 +222,7 @@ enum knob_src
 	KSRC_DEFAULT = 0,
 	KSRC_ENV,
 	KSRC_REG,
+	KSRC_SETTING, //!< the conversion provider's host->get_setting
 };
 
 const char *
@@ -230,8 +231,37 @@ knob_src_str(knob_src s)
 	switch (s) {
 	case KSRC_ENV: return "env";
 	case KSRC_REG: return "reg";
+	case KSRC_SETTING: return "setting";
 	default: return "default";
 	}
+}
+
+/*
+ * Conversion-provider hosting (leia_lift_neurd_set_setting_reader /
+ * _set_manual_activation). Written once, before the first create, by the
+ * conversion provider DLL; the display DLL never sets them (each DLL compiles
+ * its own copy of this module, so the two never share these statics).
+ */
+leia_lift_neurd_setting_fn g_setting_reader = nullptr;
+bool g_manual = false;
+
+//! One setting through the provider's reader; false = not set.
+bool
+setting_lookup(const char *key, char *out, size_t cap)
+{
+	if (cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (g_setting_reader == nullptr) {
+		return false;
+	}
+	if (!g_setting_reader(key, out, (uint32_t)cap)) {
+		out[0] = '\0';
+		return false;
+	}
+	out[cap - 1] = '\0';
+	return out[0] != '\0';
 }
 
 struct knobs
@@ -276,6 +306,17 @@ knob_src
 knob_lookup(HKEY reg, const char *env_name, const wchar_t *reg_name, char *out, size_t cap)
 {
 	out[0] = '\0';
+	if (g_setting_reader != nullptr) {
+		// Provider hosting: the host's settings ONLY (its environment's
+		// DXR_CONV_<ID>_<KEY> + the registration's Settings\<KEY>) — never this
+		// process's own environment or the display plug-in's knob key
+		// (discovery spec §2.4 "Configuration").
+		char key[64] = {};
+		for (size_t i = 0; i + 1 < sizeof(key) && reg_name[i] != L'\0'; i++) {
+			key[i] = (char)(reg_name[i] < 0x80 ? reg_name[i] : '?');
+		}
+		return setting_lookup(key, out, cap) ? KSRC_SETTING : KSRC_DEFAULT;
+	}
 	const char *e = std::getenv(env_name);
 	if (e != nullptr && e[0] != '\0') {
 		snprintf(out, cap, "%s", e);
@@ -428,15 +469,22 @@ read_knobs()
 	k.relief_m = kDefaultReliefM;
 	k.metric_relief_max_m = kDefaultMetricReliefMaxM;
 
-	const char *e = std::getenv("DXR_LEIA_LIFT");
+	char en[32];
+	const char *e = nullptr;
+	if (g_setting_reader != nullptr) {
+		e = setting_lookup("Enable", en, sizeof(en)) ? en : nullptr;
+	} else {
+		e = std::getenv("DXR_LEIA_LIFT");
+	}
 	if (e != nullptr && (e[0] == '0' || env_ieq(e, "off") || env_ieq(e, "false"))) {
 		k.enabled = false;
 	}
 
 	// Explicit 64-bit view: the service is 64-bit, but a WOW64 host must not
-	// be redirected to Wow6432Node.
+	// be redirected to Wow6432Node. Not opened at all under a setting reader.
 	HKEY reg = nullptr;
-	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kLiftRegKey, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &reg) != ERROR_SUCCESS) {
+	if (g_setting_reader != nullptr ||
+	    RegOpenKeyExW(HKEY_LOCAL_MACHINE, kLiftRegKey, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &reg) != ERROR_SUCCESS) {
 		reg = nullptr;
 	}
 
@@ -799,6 +847,16 @@ bool
 neurd_resolve(char *out, size_t cap, const char **out_where)
 {
 	char buf[MAX_PATH];
+	// Provider hosting: an explicit NeurDPath setting pins the module — it is
+	// the only place looked at (a vendor, or a test, names the exact file).
+	if (setting_lookup("NeurDPath", buf, sizeof(buf))) {
+		*out_where = "NeurDPath setting";
+		if (!file_exists(buf)) {
+			return false;
+		}
+		snprintf(out, cap, "%s", buf);
+		return true;
+	}
 	DWORD n = SearchPathA(nullptr, "NeurD.dll", nullptr, MAX_PATH, buf, nullptr);
 	if (n != 0 && n < MAX_PATH && file_exists(buf)) {
 		snprintf(out, cap, "%s", buf);
@@ -865,6 +923,37 @@ file_neurd_version(const char *path, uint64_t *out)
 	}
 	*out = NEURD_MAKE_VERSION(maj, min, pat);
 	return true;
+}
+
+//! VERSIONINFO ProductName of @p path (first translation), "" when none. No load.
+void
+file_product_name(const char *path, char *out, size_t cap)
+{
+	out[0] = '\0';
+	DWORD handle = 0;
+	DWORD sz = GetFileVersionInfoSizeA(path, &handle);
+	if (sz == 0) {
+		return;
+	}
+	std::vector<uint8_t> blob(sz);
+	if (!GetFileVersionInfoA(path, 0, sz, blob.data())) {
+		return;
+	}
+	struct lang_cp
+	{
+		WORD lang, cp;
+	} *tr = nullptr;
+	UINT len = 0;
+	if (!VerQueryValueA(blob.data(), "\\VarFileInfo\\Translation", reinterpret_cast<void **>(&tr), &len) ||
+	    tr == nullptr || len < sizeof(*tr)) {
+		return;
+	}
+	char q[64];
+	snprintf(q, sizeof(q), "\\StringFileInfo\\%04x%04x\\ProductName", (unsigned)tr[0].lang, (unsigned)tr[0].cp);
+	char *v = nullptr;
+	if (VerQueryValueA(blob.data(), q, reinterpret_cast<void **>(&v), &len) && v != nullptr && len > 0) {
+		snprintf(out, cap, "%s", v);
+	}
 }
 
 /*!
@@ -1391,8 +1480,11 @@ failed_file_changed(const char *path, bool found)
  * WARN once per state transition, never per call.
  */
 void
-kick(const struct knobs &k, bool force_reprobe)
+kick(const struct knobs &k, bool force_reprobe, bool inline_run = false)
 {
+	if (g_manual && !inline_run) {
+		return; // provider hosting: only leia_lift_neurd_activate() advances the state
+	}
 	uint32_t s = g.state.load();
 	char path[MAX_PATH] = {};
 	const char *where = "?";
@@ -1431,8 +1523,8 @@ kick(const struct knobs &k, bool force_reprobe)
 			U_LOG_W("Leia lift: NeurD.dll appeared at %s (%s) — loading", path, where);
 		}
 	} else if (s == G_RETRY_WAIT) {
-		if (now_ms() < g.next_retry_ms.load()) {
-			return;
+		if (!inline_run && now_ms() < g.next_retry_ms.load()) {
+			return; // (inline: the caller owns the retry policy)
 		}
 	} else {
 		return; // LOADING / READY: nothing to do.
@@ -1460,6 +1552,10 @@ kick(const struct knobs &k, bool force_reprobe)
 		g.k0_set.store(true);
 	}
 	g.state.store(G_LOADING);
+	if (inline_run) {
+		activation_worker(); // provider hosting: on the caller's (runtime-owned) thread
+		return;
+	}
 	try {
 		std::thread(activation_worker).detach();
 	} catch (...) {
@@ -2524,6 +2620,19 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		if (p != nullptr) {
 			dp = *p;
 		}
+		if (dp.convergence_metric_m > 0.0f) {
+			// Provider hosting: the plane as a metric depth (the units of the
+			// metric aux depth this stream returned). h0 = S / (255 d) is the
+			// 8-bit disparity NeurD's renderers put at zero parallax, and the
+			// normalised depth there is 1 - h0 (docs/lift-neurd.md). No scale
+			// yet (first frames) = AUTO.
+			if (s->metric_scale > 0.0f) {
+				const float h0 = leia_lift_h_from_metric_depth(s->metric_scale, dp.convergence_metric_m);
+				dp.convergence = h0 > 0.0f ? clampf(1.0f - h0, 0.0f, 1.0f) : -1.0f;
+			} else {
+				dp.convergence = -1.0f;
+			}
+		}
 		uint32_t views = 2;
 		uint32_t cols = 2, rows = 1;
 		int32_t out_type = NEURD_OUTPUT_IMAGE_TYPE_SBS;
@@ -2975,4 +3084,155 @@ leia_lift_neurd_get_depth(struct leia_lift_neurd *l, uint64_t id, struct leia_li
 		}
 	}
 	return false;
+}
+
+/*
+ *
+ * Conversion-provider hosting (leia_lift_neurd.h). The display processor never
+ * calls these.
+ *
+ */
+
+extern "C" void
+leia_lift_neurd_set_setting_reader(leia_lift_neurd_setting_fn fn)
+{
+	g_setting_reader = fn;
+}
+
+extern "C" void
+leia_lift_neurd_set_manual_activation(bool manual)
+{
+	g_manual = manual;
+}
+
+extern "C" bool
+leia_lift_neurd_probe_presence(struct leia_lift_neurd *l, struct leia_lift_neurd_presence *out)
+{
+	if (l == nullptr || out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	const uint64_t floor_v = l->k.min_version;
+	out->min_major = (uint32_t)NEURD_GET_VERSION_MAJOR(floor_v);
+	out->min_minor = (uint32_t)NEURD_GET_VERSION_MINOR(floor_v);
+	out->min_patch = (uint32_t)NEURD_GET_VERSION_PATCH(floor_v);
+	out->enabled = l->k.enabled;
+	if (!l->k.enabled) {
+		return true;
+	}
+	const char *where = "?";
+	out->found = neurd_resolve(out->path, sizeof(out->path), &where);
+	snprintf(out->where, sizeof(out->where), "%s", where != nullptr ? where : "?");
+	if (!out->found) {
+		out->path[0] = '\0';
+		return true;
+	}
+	uint64_t ver = 0;
+	if (file_neurd_version(out->path, &ver)) {
+		out->have_version = true;
+		out->ver_major = (uint32_t)NEURD_GET_VERSION_MAJOR(ver);
+		out->ver_minor = (uint32_t)NEURD_GET_VERSION_MINOR(ver);
+		out->ver_patch = (uint32_t)NEURD_GET_VERSION_PATCH(ver);
+		out->too_old = ver < floor_v;
+	}
+	file_product_name(out->path, out->product_name, sizeof(out->product_name));
+	return true;
+}
+
+extern "C" void
+leia_lift_neurd_get_status(struct leia_lift_neurd *l, struct leia_lift_neurd_status *out)
+{
+	if (out == nullptr) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	if (l == nullptr || !l->k.enabled) {
+		out->module_status = LEIA_LIFT_MODULE_DISABLED;
+		snprintf(out->detail, sizeof(out->detail), "2D->3D conversion turned off (Enable=0)");
+		return;
+	}
+	const uint32_t s = g.state.load();
+	{
+		std::lock_guard<std::mutex> lock(g.info_mtx);
+		snprintf(out->licence, sizeof(out->licence), "%s", g.licence);
+		switch (s) {
+		case G_READY:
+			out->module_status = LEIA_LIFT_MODULE_READY;
+			snprintf(out->detail, sizeof(out->detail), "%s", g.licence[0] != '\0' ? g.licence : "loaded");
+			break;
+		case G_UNPROBED:
+		case G_LOADING:
+			out->module_status = LEIA_LIFT_MODULE_ACTIVATING;
+			snprintf(out->detail, sizeof(out->detail), "loading NeurD");
+			break;
+		case G_RETRY_WAIT:
+			out->module_status = LEIA_LIFT_MODULE_ACTIVATING;
+			out->network_retry = true;
+			snprintf(out->detail, sizeof(out->detail), "licence activation needs the network");
+			break;
+		case G_ABSENT:
+			out->module_status = LEIA_LIFT_MODULE_ABSENT;
+			snprintf(out->detail, sizeof(out->detail), "NeurD is not installed (NeurD.dll not found)");
+			break;
+		default: // G_FAILED
+			out->module_status =
+			    g.fail_kind != LEIA_LIFT_MODULE_UNKNOWN ? g.fail_kind : LEIA_LIFT_MODULE_LOAD_FAILED;
+			snprintf(out->detail, sizeof(out->detail), "%s",
+			         g.fail_detail[0] != '\0' ? g.fail_detail : "NeurD failed to load");
+			break;
+		}
+	}
+	if (s == G_FAILED) {
+		std::lock_guard<std::mutex> lock(g.probe_mtx);
+		out->recheckable = g.fail_recheckable;
+	}
+	if (s == G_READY) {
+		// Written once before the store that published G_READY (see get_caps).
+		if (g.nd != nullptr) {
+			snprintf(out->version, sizeof(out->version), "%u.%u.%u", (unsigned)NEURD_GET_VERSION_MAJOR(g.nd->version),
+			         (unsigned)NEURD_GET_VERSION_MINOR(g.nd->version),
+			         (unsigned)NEURD_GET_VERSION_PATCH(g.nd->version));
+		}
+		snprintf(out->backend, sizeof(out->backend), "%s", g.backend_name);
+		out->float_depth = g.float_depth;
+		out->metric_depth = g.float_depth && g.k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY;
+		out->offaxis = g.offaxis && g.k0.offaxis;
+		out->nd_luid = ((uint64_t)(uint32_t)g.nd_luid.HighPart << 32) | (uint64_t)g.nd_luid.LowPart;
+	}
+	out->latency_ns = g.latency_ns.load();
+}
+
+extern "C" uint32_t
+leia_lift_neurd_activate(struct leia_lift_neurd *l)
+{
+	if (l == nullptr || !l->k.enabled) {
+		return LEIA_LIFT_MODULE_DISABLED;
+	}
+	try {
+		kick(l->k, true, true);
+	} catch (...) {
+		LIFT_WARN_ONCE("Leia lift: exception during activation");
+	}
+	struct leia_lift_neurd_status st;
+	leia_lift_neurd_get_status(l, &st);
+	return st.module_status;
+}
+
+extern "C" void
+leia_lift_neurd_stream_reset(struct leia_lift_neurd *l, uint64_t id)
+{
+	if (l == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g.mtx);
+	for (lift_stream *s : l->streams) {
+		if (s->id == id) {
+			if (s->ns != nullptr && g.state.load() == G_READY && LEIA_NEURD_HAS(g.nd, destroy_stream)) {
+				NeurD_destroy_stream(g.nd, s->ns);
+			}
+			s->ns = nullptr; // re-created (with fresh temporal state) on the next convert
+			s->depth_valid = false;
+			return;
+		}
+	}
 }
