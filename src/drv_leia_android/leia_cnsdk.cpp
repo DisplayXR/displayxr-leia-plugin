@@ -29,19 +29,23 @@
 #include <leia/common/version.h>
 
 /*
- * LeiaInc/CNSDK 0.10.76 — `leia_interlacer_vulkan_initialize_with_queue`: a
- * plain LOADER entry point (vtable `INTRODUCED_IN 0.10.76`), not an
+ * LeiaInc/CNSDK 0.10.77 — `leia_interlacer_vulkan_initialize_with_queue`: a
+ * plain LOADER entry point (vtable `INTRODUCED_IN 0.10.77`), not an
  * experimental one, so the leia_get_experimental_api-by-name pattern used for
  * get_last_weave_result / set_overlay_2d does not apply.
  *
  * It is consumed through a WEAK reference instead, declared here on every
  * header version (a redeclaration that only adds `weak` is legal against a
- * >= 0.10.76 header that already declares it):
+ * >= 0.10.77 header that already declares it):
  *   - built against the 0.10.75 pin, the import is weak-undefined, so the
  *     plug-in still links and loads; bionic binds it at dlopen if the
  *     ON-DEVICE libleiaCore-loader.so (bundled in the runtime APK) exports it,
  *     else the address is NULL;
- *   - a >= 0.10.76 loader against an OLDER core returns NULL from the thunk.
+ *   - a >= 0.10.77 loader against an OLDER core returns NULL from the thunk.
+ *     (The v0.10.77 LOADER itself mis-declared the slot as INTRODUCED_IN
+ *     0.10.76 — CNSDK#751 — so a 0.10.77 loader on a 0.10.76 core would have
+ *     dereferenced a missing slot; 0.10.78 is the first tag with both the
+ *     entry point and the correct threshold, hence the CNSDK_TAG pin.)
  * Both NULLs fall back to the legacy `leia_interlacer_vulkan_initialize`. So the
  * queue path switches on by the APK's CNSDK, without rebuilding this plug-in.
  */
@@ -1611,7 +1615,7 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 	// CNSDK 0.10.x dropped the separate textureFormat param (now just
 	// renderTargetFormat + depthStencilFormat).
 	//
-	// Queue: prefer the runtime's weave queue (CNSDK >= 0.10.76, see the weak
+	// Queue: prefer the runtime's weave queue (CNSDK >= 0.10.77, see the weak
 	// declaration at the top of this file). Without it CNSDK finds the first
 	// graphics family and submits on index 0 — the APP's queue on Adreno, which
 	// is the shared-GSL interleaving of runtime#1905 and the reason every CNSDK
@@ -1624,9 +1628,9 @@ leia_cnsdk_ensure_interlacer(struct leia_cnsdk *cnsdk,
 		    targetFmt, VK_FORMAT_D32_SFLOAT, 3);
 		queue_path = cnsdk->interlacer != NULL
 		                 ? "runtime weave queue (initialize_with_queue)"
-		                 : "legacy (initialize_with_queue returned NULL: core < 0.10.76)";
+		                 : "legacy (initialize_with_queue returned NULL: core < 0.10.77)";
 	} else if (queue != VK_NULL_HANDLE) {
-		queue_path = "legacy (loader has no initialize_with_queue: CNSDK < 0.10.76)";
+		queue_path = "legacy (loader has no initialize_with_queue: CNSDK < 0.10.77)";
 	}
 	if (cnsdk->interlacer == NULL) {
 		cnsdk->interlacer = leia_interlacer_vulkan_initialize(

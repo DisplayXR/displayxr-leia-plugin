@@ -135,7 +135,17 @@ env:
   # fallback typedef in leia_cnsdk.cpp compiles out. The filter itself lives in the
   # impl, i.e. it reaches a device only with the 0.10.75 device-service APK; an older
   # service just lacks the entry point and the DP declines the layer (today's look).
-  CNSDK_TAG: v0.10.75
+  #
+  # 0.10.78: Vulkan weave on the CALLER's queue + per-pass render-scene fence ring
+  # (LeiaInc/CNSDK#748) and semaphore waits at FRAGMENT_SHADER|COLOR_ATTACHMENT_OUTPUT on
+  # every interlacer submit. Publishes `leia_interlacer_vulkan_initialize_with_queue`,
+  # which leia_cnsdk.cpp already imports WEAKLY (NULL = legacy init), so against this pin
+  # the DP's weave_queue is honoured and CNSDK stops submitting on the app's queue 0.
+  # Not 0.10.76 (tagged before #748 merged) and not 0.10.77 (its loader declares the
+  # slot INTRODUCED_IN 0.10.76 — CNSDK#751 fixes that in 0.10.78). Service APKs are now
+  # suffixed by variant (-63mm = the primary: fixed 63 mm IPD, demographic models
+  # stripped — the same build 0.10.75 shipped unsuffixed).
+  CNSDK_TAG: v0.10.78
 
 jobs:
   Android:

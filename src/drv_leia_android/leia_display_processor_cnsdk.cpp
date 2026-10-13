@@ -296,7 +296,7 @@ struct leia_dp_cnsdk
 	//! runtime swaps `vk->main_queue->queue` only around the factory call, and
 	//! the interlacer is created lazily on the first weave, so reading it live
 	//! there would get the wrong queue. Handed to leia_cnsdk_ensure_interlacer
-	//! (CNSDK >= 0.10.76 then submits every weave pass on it).
+	//! (CNSDK >= 0.10.77 then submits every weave pass on it).
 	VkQueue weave_queue;
 	uint32_t weave_queue_family; //!< UINT32_MAX = unknown.
 };
