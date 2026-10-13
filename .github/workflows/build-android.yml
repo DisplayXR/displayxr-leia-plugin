@@ -66,7 +66,7 @@ env:
   # plug-in still runs on older runtimes. (No installer derives a
   # MIN_RUNTIME_VERSION from the Android pin; that derivation is off the
   # Windows DXR_RUNTIME_GIT_TAG, which stays where it is.)
-  RUNTIME_REF_ANDROID: v2.26.0
+  RUNTIME_REF_ANDROID: v2.41.0
   # NDK the runtime APK is built with (displayxr-runtime build-android.yml +
   # gradle.properties). Bump together, or the plug-in links against a different
   # libc++/sysroot than the APK it gets dropped into.
@@ -328,6 +328,18 @@ jobs:
             exit 1
           fi
           echo "PASS: plug-in reports plugin ABI v$want and the class-host Context slot compiled in."
+          # XR_DXR_weave v20: when the pinned runtime announces the set_weave_sync
+          # slot, the plug-in must have compiled it in. Same silent-omission shape
+          # as above (an un-guarded build still loads and runs -- just CPU-waited);
+          # the slot's lifecycle log string is the witness.
+          VKH=displayxr-runtime/src/xrt/include/xrt/xrt_display_processor_vk.h
+          if grep -qE '^\s*#\s*define\s+XRT_DP_VK_HAS_WEAVE_SYNC\b' "$VKH"; then
+            if ! "$NDK_BIN/llvm-strings" -a "$SO" | grep -qF 'first set_weave_sync accepted'; then
+              echo "::error::runtime pin defines XRT_DP_VK_HAS_WEAVE_SYNC but the plug-in did not compile set_weave_sync in"
+              exit 1
+            fi
+            echo "PASS: set_weave_sync (XR_DXR_weave v20) compiled in."
+          fi
 
       - name: Package release tarball
         if: steps.cnsdk.outputs.have_sdk == 'yes'

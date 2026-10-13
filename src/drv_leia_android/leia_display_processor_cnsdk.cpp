@@ -250,12 +250,185 @@ struct leia_dp_cnsdk
 	//! runtime through the appended `get_last_frame_dropped` vtable slot,
 	//! immediately after, on the same thread. Never latched across frames.
 	bool last_frame_dropped;
+
+	// --- Runtime weave sync (VK DP slot set_weave_sync, XR_DXR_weave v20) ---
+	// The runtime's GPU dependencies for the NEXT process_atlas only. Both are
+	// RUNTIME-OWNED binary semaphores: the DP waits / signals them exactly once
+	// per accepted call and never creates, replaces or destroys them (that is
+	// why they never touch retire_semaphore / reset_weave_semaphores).
+	// process_atlas_weave moves them into locals on entry and clears these, so
+	// a stale pair can never leak into a later frame.
+	VkSemaphore sync_wait_sem;
+	VkSemaphore sync_signal_sem;
+	//! DP-owned binary semaphore CNSDK signals as its renderFinishedSemaphore
+	//! when the weave is NOT chained into the compose pair (opaque apps, or a
+	//! transparent app with no backdrop bound). A DP submit then waits it and
+	//! signals the runtime's `sync_signal_sem`. Indirect on purpose: CNSDK#734's
+	//! drop verdict cannot tell a FAILED submit (nothing signalled) from a fence
+	//! TIMEOUT (submitted, will signal late), so handing CNSDK the runtime's
+	//! semaphore directly would make the self-signal the contract requires on a
+	//! drop a possible DOUBLE signal. This one is ours, so a drop just replaces
+	//! it (#1394 machinery) and the runtime's semaphore is signalled exactly once.
+	VkSemaphore op_weave_sem;
+	//! DP-owned binary semaphore CNSDK waits as its imageAvailableSemaphore on
+	//! the opaque path, signalled by an empty in-relay submit that waits the
+	//! runtime's `sync_wait_sem` at ALL_COMMANDS. Indirect because CNSDK
+	//! (0.10.75) attaches that wait at COLOR_ATTACHMENT_OUTPUT only, so its
+	//! first pass's FRAGMENT shader — the one sampling the atlas — is not held
+	//! back by it (CNSDK#748). A binary-semaphore signal completes only after
+	//! all prior work of the signalling batch, and the in-relay's ALL_COMMANDS
+	//! wait makes that include the runtime's writes; so no stage of CNSDK's pass
+	//! can start before them. It also makes the runtime wait deterministic on a
+	//! drop: our own submit consumed it, and only this semaphore is retired.
+	VkSemaphore op_in_sem;
+	//! Fence on the LAST DP submit of a runtime-synced frame (the alpha gate, or
+	//! the out-relay). Replaces the gate's vkQueueWaitIdle as the reclaim guard:
+	//! the next process_atlas waits it (bounded) before it may reuse the gate's
+	//! descriptor set / strip image / command buffer, the compose intermediate,
+	//! or re-signal the DP-owned semaphores. In the steady state it is long
+	//! signalled by then.
+	VkFence tail_fence;
+	bool tail_fence_armed;
+	//! The gate's one-shot command buffer when its free was deferred to the
+	//! next tail_reclaim (it may still be executing). NULL for a relay.
+	VkCommandBuffer tail_cmd;
+	//! The runtime's weave queue, captured at FACTORY time — the in-process
+	//! runtime swaps `vk->main_queue->queue` only around the factory call, and
+	//! the interlacer is created lazily on the first weave, so reading it live
+	//! there would get the wrong queue. Handed to leia_cnsdk_ensure_interlacer
+	//! (CNSDK >= 0.10.76 then submits every weave pass on it).
+	VkQueue weave_queue;
+	uint32_t weave_queue_family; //!< UINT32_MAX = unknown.
 };
 
 inline leia_dp_cnsdk *
 as_impl(struct xrt_display_processor *xdp)
 {
 	return reinterpret_cast<leia_dp_cnsdk *>(xdp);
+}
+
+// Bounded, per the workspace-stability rules: a lost GPU must surface as a
+// skipped/dropped frame, never a wedged weave thread.
+static const uint64_t kTailReclaimTimeoutNs = 1000000000ULL; // 1 s
+
+/*
+ * Reclaim the previous runtime-synced frame's tail submit (see `tail_fence`).
+ * Called at the top of every process_atlas and before anything that destroys
+ * or rewrites the objects that submit used. A no-op unless the last frame ran
+ * with the runtime's semaphores AND its tail did not CPU-wait — i.e. every
+ * pre-v20 runtime, and every frame the runtime did not sync, costs nothing.
+ */
+static bool
+tail_reclaim(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (vk == nullptr) {
+		return false;
+	}
+	bool ok = true;
+	if (impl->tail_fence_armed && impl->tail_fence != VK_NULL_HANDLE) {
+		VkResult res = vk->vkWaitForFences(vk->device, 1, &impl->tail_fence, VK_TRUE, kTailReclaimTimeoutNs);
+		if (res != VK_SUCCESS) {
+			// Lifecycle event, not per-frame.
+			U_LOG_W("weave-sync: tail reclaim wait failed (%d)", res);
+			ok = false;
+		}
+		impl->tail_fence_armed = false;
+	}
+	if (impl->tail_cmd != VK_NULL_HANDLE && impl->cmd_pool != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &impl->tail_cmd);
+		impl->tail_cmd = VK_NULL_HANDLE;
+	}
+	return ok;
+}
+
+// Lazily create the tail fence (unsignalled). Returns VK_NULL_HANDLE on failure,
+// in which case callers keep the pre-v20 synchronous drain.
+static VkFence
+tail_fence_get(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (impl->tail_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {};
+		fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		if (vk->vkCreateFence(vk->device, &fci, nullptr, &impl->tail_fence) != VK_SUCCESS) {
+			impl->tail_fence = VK_NULL_HANDLE;
+			return VK_NULL_HANDLE;
+		}
+	} else {
+		vk->vkResetFences(vk->device, 1, &impl->tail_fence);
+	}
+	return impl->tail_fence;
+}
+
+/*
+ * One empty batch (no command buffers) that waits `wait` and/or signals
+ * `signal`, on the runtime's main queue — the cheapest legal way to honour a
+ * semaphore obligation when no real work carries it: the out-relay
+ * (op_weave_sem → runtime signal), the self-signal on a dropped weave, and
+ * every early return of an accepted set_weave_sync frame.
+ *
+ * RELAY_IDLE = drain the queue afterwards (the pre-v20 drain_semaphore shape, kept
+ * for paths where nothing downstream waits on the GPU). RELAY_TAIL: when this
+ * batch signals a runtime semaphore it carries `tail_fence` instead. RELAY_FWD:
+ * a mid-chain hop (the opaque in-relay) — the next submit in the chain waits it
+ * on the GPU, so neither a fence nor a drain.
+ *
+ * Returns false on a failed submit: then NEITHER semaphore was touched (a
+ * failed vkQueueSubmit has no effect), and the caller reports the frame
+ * dropped so the runtime takes its documented fallback.
+ */
+enum relay_mode
+{
+	RELAY_TAIL, //!< Final batch of the frame: carries tail_fence when it signals.
+	RELAY_IDLE, //!< Drain the queue afterwards (pre-v20 drain_semaphore shape).
+	RELAY_FWD,  //!< Mid-chain hop (in-relay): no fence, no drain.
+};
+
+static bool
+sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, enum relay_mode mode)
+{
+	const bool idle = mode == RELAY_IDLE;
+	struct vk_bundle *vk = impl->vk;
+	if (wait == VK_NULL_HANDLE && signal == VK_NULL_HANDLE) {
+		return true;
+	}
+	if (vk == nullptr || vk->main_queue == nullptr) {
+		return false;
+	}
+	const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	if (wait != VK_NULL_HANDLE) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = &wait;
+		si.pWaitDstStageMask = &stage;
+	}
+	if (signal != VK_NULL_HANDLE) {
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = &signal;
+	}
+	VkFence fence = VK_NULL_HANDLE;
+	if (mode == RELAY_TAIL && signal != VK_NULL_HANDLE) {
+		// Only one tail per frame: the previous one was reclaimed at the top of
+		// process_atlas, and nothing else arms it within a frame before this.
+		if (!impl->tail_fence_armed) {
+			fence = tail_fence_get(impl);
+		}
+	}
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, fence);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("weave-sync: relay submit failed (%d) — frame reported dropped", res);
+		return false;
+	}
+	if (fence != VK_NULL_HANDLE) {
+		impl->tail_fence_armed = true;
+	} else if (idle || (mode == RELAY_TAIL && signal != VK_NULL_HANDLE)) {
+		// No fence to park on (idle requested, or fence create failed): fall back
+		// to the pre-v20 queue drain so reuse stays safe.
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	return true;
 }
 
 // Mono / 2D-mode passthrough: blit the single-tile atlas directly to
@@ -269,7 +442,9 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
                       uint32_t atlas_height,
                       VkImage target_image,
                       uint32_t target_width,
-                      uint32_t target_height)
+                      uint32_t target_height,
+                      VkSemaphore *io_wait_sem,
+                      VkSemaphore *io_signal_sem)
 {
 	DXR_ATRACE("dxr_dp:mono_passthrough_blit");
 	struct vk_bundle *vk = impl->vk;
@@ -368,8 +543,24 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
+	// set_weave_sync (v20): the blit reads the atlas and is the final target
+	// write, so it carries both runtime semaphores itself. The queue drain stays —
+	// the 2D passthrough is not the path being optimised, and keeping it means the
+	// one-shot command buffer below is still freed synchronously.
+	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	if (*io_wait_sem != VK_NULL_HANDLE) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = io_wait_sem;
+		si.pWaitDstStageMask = &wait_stage;
+	}
+	if (*io_signal_sem != VK_NULL_HANDLE) {
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = io_signal_sem;
+	}
 	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
 	if (res == VK_SUCCESS) {
+		*io_wait_sem = VK_NULL_HANDLE;   // consumed
+		*io_signal_sem = VK_NULL_HANDLE; // will be signalled by this batch
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
 	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
@@ -715,6 +906,9 @@ destroy_alpha_gate(leia_dp_cnsdk *impl)
 	if (vk == nullptr) {
 		return;
 	}
+	// The last gate may still be executing (v20 deferred its drain to the tail
+	// fence); everything below is in-flight-sensitive.
+	tail_reclaim(impl);
 	for (uint32_t i = 0; i < impl->ag_fb_count; i++) {
 		if (impl->ag_fb_cache[i].fb != VK_NULL_HANDLE) {
 			vk->vkDestroyFramebuffer(vk->device, impl->ag_fb_cache[i].fb, nullptr);
@@ -1296,6 +1490,34 @@ reset_weave_semaphores(leia_dp_cnsdk *impl)
 	impl->clean_weaves = 0;
 }
 
+// set_weave_sync (v20): lazily create a DP-owned relay semaphore (`op_weave_sem`
+// or `op_in_sem`). VK_NULL_HANDLE on failure; callers degrade conservatively.
+static VkSemaphore
+op_sem_get(leia_dp_cnsdk *impl, VkSemaphore *slot)
+{
+	struct vk_bundle *vk = impl->vk;
+	if (*slot == VK_NULL_HANDLE && vk != nullptr) {
+		VkSemaphoreCreateInfo sci = {};
+		sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		if (vk->vkCreateSemaphore(vk->device, &sci, nullptr, slot) != VK_SUCCESS) {
+			*slot = VK_NULL_HANDLE;
+		}
+	}
+	return *slot;
+}
+
+// runtime#1394 for the relay semaphores: after a CNSDK drop we cannot know
+// whether op_weave_sem was signalled / op_in_sem consumed (failed submit: no; fence timeout: yes, late), so it
+// is retired — destroy deferred exactly like the compose pair — and the next
+// frame lazily creates a fresh, provably unsignalled one. No device idle.
+static void
+reset_op_sem(leia_dp_cnsdk *impl, VkSemaphore *slot)
+{
+	retire_semaphore(impl, *slot);
+	*slot = VK_NULL_HANDLE;
+	impl->clean_weaves = 0;
+}
+
 static bool
 compose_reclaim(leia_dp_cnsdk *impl)
 {
@@ -1771,7 +1993,7 @@ bg_debug_enabled()
 static VkImageView
 compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w, uint32_t atlas_h,
                   uint32_t tile_columns, uint32_t tile_rows, VkFormat atlas_fmt, bool frame_drains,
-                  VkSemaphore *out_wait_sem)
+                  VkSemaphore *out_wait_sem, VkSemaphore *io_runtime_wait)
 {
 	DXR_ATRACE("dxr_dp:compose_pre_weave");
 	struct vk_bundle *vk = impl->vk;
@@ -1904,9 +2126,20 @@ compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w,
 		si.signalSemaphoreCount = 1;
 		si.pSignalSemaphores = &impl->cmp_done_sem;
 	}
+	// set_weave_sync (v20): the compose is the FIRST reader of the runtime's
+	// images (the atlas and the backdrop), so it is the submit that waits the
+	// runtime's semaphore. Consumed deterministically by our own submit — which
+	// is what makes the compose-under chain exact even when CNSDK later drops.
+	const VkPipelineStageFlags rt_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	if (*io_runtime_wait != VK_NULL_HANDLE) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = io_runtime_wait;
+		si.pWaitDstStageMask = &rt_wait_stage;
+	}
 	vk->vkResetFences(vk->device, 1, &impl->cmp_fence);
 	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, impl->cmp_fence);
 	if (res == VK_SUCCESS) {
+		*io_runtime_wait = VK_NULL_HANDLE; // consumed by this batch
 		impl->cmp_fence_armed = true;
 		impl->cmp_cmd = cmd; // freed at the next reclaim, never while in flight
 		if (gpu_sync) {
@@ -2088,11 +2321,19 @@ alpha_gate_run(leia_dp_cnsdk *impl,
                uint32_t canvas_width,
                uint32_t canvas_height,
                bool flattened,
-               VkSemaphore weave_done_sem)
+               VkSemaphore weave_done_sem,
+               VkSemaphore *io_runtime_signal)
 {
 	DXR_ATRACE("dxr_dp:alpha_gate_run");
 	struct vk_bundle *vk = impl->vk;
 	if (vk->main_queue == nullptr) {
+		return false;
+	}
+	// The previous gate may still be executing (v20 tail). It must be done
+	// before the ensure_* calls (which can tear down the strip / pipeline) and
+	// before the descriptor-set update below. No-op on the pre-v20 path, where
+	// the previous gate drained the queue itself.
+	if (!tail_reclaim(impl)) {
 		return false;
 	}
 	if (!alpha_gate_ensure_pipeline(impl, target_format)) {
@@ -2299,14 +2540,38 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		si.pWaitSemaphores = &weave_done_sem;
 		si.pWaitDstStageMask = &weave_wait_stage;
 	}
-	// The queue drain stays: xrEndFrame must see the target ready, and it is
-	// also what keeps ONE compose in flight — the invariant the L11 fast path is
-	// gated on (single intermediate image + single descriptor set).
-	const bool submitted = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
-	if (submitted) {
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	// set_weave_sync (v20): the gate is the frame's LAST write of the target, so
+	// it signals the runtime's semaphore.
+	//
+	// Pre-v20 the queue drain below did two jobs: (1) xrEndFrame had to see the
+	// target ready, and (2) it kept ONE compose in flight — the invariant the L11
+	// fast path is gated on (single intermediate image + single descriptor set +
+	// this one-shot command buffer). When the chain is COMPLETE — the gate waits
+	// the weave on the GPU AND signals the runtime — job (1) belongs to the
+	// runtime's GPU wait on that semaphore, and job (2) moves to `tail_fence`,
+	// which the next process_atlas waits before touching any of it. In every
+	// other configuration (no runtime sync, or an un-chained weave the gate had
+	// to device-idle for) the drain stays exactly as it was.
+	const bool chain_complete = *io_runtime_signal != VK_NULL_HANDLE && gate_waits_weave;
+	if (*io_runtime_signal != VK_NULL_HANDLE) {
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = io_runtime_signal;
 	}
-	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
+	VkFence fence = chain_complete ? tail_fence_get(impl) : VK_NULL_HANDLE;
+	const bool submitted = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, fence) == VK_SUCCESS;
+	if (submitted) {
+		*io_runtime_signal = VK_NULL_HANDLE; // signalled by this batch
+	}
+	if (submitted && fence != VK_NULL_HANDLE) {
+		impl->tail_fence_armed = true;
+		impl->tail_cmd = cmd; // freed at the next tail_reclaim, never while in flight
+		DXR_HW_DBG_ONCE("alpha_gate_run: first v20 chained gate (no queue drain)");
+	} else {
+		if (submitted) {
+			vk->vkQueueWaitIdle(vk->main_queue->queue);
+		}
+		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
+	}
 	DXR_HW_DBG_ONCE("alpha_gate_run: first gated frame (%ux%u tiles=%ux%u)", w, h, tile_columns, tile_rows);
 	return submitted;
 }
@@ -2415,6 +2680,36 @@ get_last_frame_dropped_cnsdk(struct xrt_display_processor_vk *xdp)
 }
 #endif // XRT_DP_VK_HAS_FRAME_DROPPED
 
+/*
+ * set_weave_sync (v20) obligations for ONE process_atlas: the runtime's wait and
+ * signal semaphores, moved out of the impl on entry. Each consumer clears its
+ * member the moment it has handed the semaphore to a real submit; whatever is
+ * still set when process_atlas returns — every early return, a weave that
+ * never ran, a dropped weave's signal — is honoured here by an empty batch. So
+ * an accepted set_weave_sync is always paid, on every path, which is the
+ * contract (and what keeps the runtime's binary semaphores in a known state).
+ *
+ * If even that empty batch fails to submit, nothing was touched and the frame
+ * is reported dropped: the runtime then neither GPU-waits the signal nor
+ * presents, and recreates its pair (xrt_display_processor_vk.h, "Drops").
+ */
+struct WeaveSyncGuard
+{
+	leia_dp_cnsdk *impl;
+	VkSemaphore wait;
+	VkSemaphore signal;
+
+	~WeaveSyncGuard()
+	{
+		if (wait == VK_NULL_HANDLE && signal == VK_NULL_HANDLE) {
+			return;
+		}
+		if (!sync_relay_submit(impl, wait, signal, RELAY_TAIL)) {
+			impl->last_frame_dropped = true;
+		}
+	}
+};
+
 void
 process_atlas_weave(struct xrt_display_processor *xdp,
                     VkCommandBuffer cmd_buffer,
@@ -2457,6 +2752,17 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// us the weave did not reach the GPU.
 	impl->last_frame_dropped = false;
 
+	// set_weave_sync (v20): take this frame's runtime semaphores (NULL/NULL when
+	// the runtime did not sync this frame — every pre-v20 runtime). Declared
+	// BEFORE any early return so the guard's destructor covers all of them.
+	WeaveSyncGuard rt = {impl, impl->sync_wait_sem, impl->sync_signal_sem};
+	impl->sync_wait_sem = VK_NULL_HANDLE;
+	impl->sync_signal_sem = VK_NULL_HANDLE;
+
+	// Reclaim the previous synced frame's tail (gate / relay) before anything
+	// below can reuse what it used. No-op unless that frame deferred its drain.
+	tail_reclaim(impl);
+
 	// 2D under the lens: take this frame's layer (if the runtime offered one) and
 	// clear it at once, so no early return below can leak it into a later frame.
 	// ov2d_last_3d is re-armed only where the stereo weave actually runs.
@@ -2488,7 +2794,7 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 		mono_passthrough_blit(impl, (VkImage)(uintptr_t)atlas_image,
 		                      atlas_w_mono, atlas_h_mono,
 		                      (VkImage)(uintptr_t)target_image,
-		                      target_width, target_height);
+		                      target_width, target_height, &rt.wait, &rt.signal);
 		return;
 	}
 	if (tile_columns != 2 || tile_rows != 1) {
@@ -2513,7 +2819,9 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	if (!leia_cnsdk_ensure_interlacer(impl->cnsdk,
 	                                   impl->vk->device,
 	                                   impl->vk->physical_device,
-	                                   (VkFormat)target_format)) {
+	                                   (VkFormat)target_format,
+	                                   impl->weave_queue,
+	                                   impl->weave_queue_family)) {
 		return;
 	}
 	DXR_HW_DBG_ONCE("process_atlas_weave: first frame with ready interlacer");
@@ -2582,7 +2890,8 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	VkImage weave_atlas_image = (VkImage)(uintptr_t)atlas_image;
 	VkSemaphore compose_done_sem = VK_NULL_HANDLE;
 	VkImageView composed = compose_pre_weave(impl, atlas_view, atlas_w, atlas_h, tile_columns, tile_rows,
-	                                         (VkFormat)view_format, gate_will_run, &compose_done_sem);
+	                                         (VkFormat)view_format, gate_will_run, &compose_done_sem,
+	                                         &rt.wait);
 	const bool did_compose = composed != VK_NULL_HANDLE;
 	if (did_compose) {
 		weave_atlas_view = composed;
@@ -2593,6 +2902,44 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	// would poison the next frame.
 	VkSemaphore weave_done_sem =
 	    (compose_done_sem != VK_NULL_HANDLE) ? impl->cmp_weave_sem : VK_NULL_HANDLE;
+
+	// set_weave_sync (v20), the weave's own edges when the compose did not
+	// provide them:
+	//
+	//  - WAIT: if the runtime's wait semaphore is still ours to honour (no
+	//    compose ran; a compose that ran consumed it at ALL_COMMANDS,
+	//    CPU-synchronised or not), an empty in-relay submit waits it at
+	//    ALL_COMMANDS and signals `op_in_sem`, which CNSDK's first pass waits as
+	//    its `imageAvailableSemaphore` — never the runtime's directly: CNSDK
+	//    waits at COLOR_ATTACHMENT_OUTPUT only, which would let its fragment
+	//    shader sample the atlas before the runtime finished writing it.
+	//  - SIGNAL: if the runtime wants a signal and the weave is not already
+	//    chained into the compose pair, CNSDK signals the DP-owned out-relay
+	//    semaphore, and a DP submit after it (the gate, or the relay below)
+	//    signals the runtime's — see `op_weave_sem` for why never directly.
+	VkSemaphore weave_wait_sem = compose_done_sem;
+	bool weave_uses_in_sem = false;
+	if (weave_wait_sem == VK_NULL_HANDLE && rt.wait != VK_NULL_HANDLE) {
+		VkSemaphore in_sem = op_sem_get(impl, &impl->op_in_sem);
+		if (in_sem == VK_NULL_HANDLE || !sync_relay_submit(impl, rt.wait, in_sem, RELAY_FWD)) {
+			// Cannot order the weave after the runtime's writes on the GPU, and
+			// weaving unordered is a read-before-write. Skip the weave: the guard
+			// pays rt.wait / rt.signal, and the frame is reported dropped.
+			impl->last_frame_dropped = true;
+			return;
+		}
+		rt.wait = VK_NULL_HANDLE; // consumed, deterministically, by the in-relay
+		weave_wait_sem = in_sem;
+		weave_uses_in_sem = true;
+	}
+	bool weave_uses_op_sem = false;
+	if (weave_done_sem == VK_NULL_HANDLE && rt.signal != VK_NULL_HANDLE) {
+		weave_done_sem = op_sem_get(impl, &impl->op_weave_sem);
+		weave_uses_op_sem = weave_done_sem != VK_NULL_HANDLE;
+		// On a create failure weave_done_sem stays NULL: CNSDK signals nothing,
+		// the gate (if any) device-idles as pre-v20, and the guard signals the
+		// runtime after the frame — conservative, still correct.
+	}
 
 	// 2D under the lens: hand CNSDK this frame's layer right before the weave. A
 	// size mismatch cannot normally happen (the runtime only offers a target-sized
@@ -2627,14 +2974,20 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                                   canvas_subrect ? canvas_offset_y : 0,
 	                                   canvas_subrect ? canvas_width    : 0u,
 	                                   canvas_subrect ? canvas_height   : 0u,
-	                                   compose_done_sem,
+	                                   weave_wait_sem,
 	                                   weave_done_sem);
 	if (!wove) {
 		// Can't normally happen — the interlacer was checked ready above — but a
 		// binary semaphore that was signalled and never waited is unrecoverable
-		// next frame, so drain both rather than assume.
+		// next frame, so drain both rather than assume. (leia_cnsdk_weave
+		// returned before do_post_process, so the in-relay's signal is unconsumed
+		// too.)
 		drain_semaphore(impl, compose_done_sem);
+		if (weave_uses_in_sem) {
+			drain_semaphore(impl, impl->op_in_sem);
+		}
 		weave_done_sem = VK_NULL_HANDLE;
+		weave_uses_op_sem = false;
 	}
 
 	/*
@@ -2662,9 +3015,23 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	if (wove && leia_cnsdk_last_weave_dropped(impl->cnsdk)) {
 		impl->last_frame_dropped = true;
 		impl->clean_weaves = 0;
-		if (compose_done_sem != VK_NULL_HANDLE || weave_done_sem != VK_NULL_HANDLE) {
+		if (compose_done_sem != VK_NULL_HANDLE) {
 			reset_weave_semaphores(impl);
 		}
+		if (weave_uses_op_sem) {
+			reset_op_sem(impl, &impl->op_weave_sem);
+		}
+		if (weave_uses_in_sem) {
+			// Consumed by a timed-out weave, still signalled after a failed one:
+			// unknowable, so retire it. The runtime's wait was already consumed
+			// by our in-relay, so nothing of the runtime's is left indeterminate.
+			reset_op_sem(impl, &impl->op_in_sem);
+		}
+		// set_weave_sync: the runtime's signal is still owed (it was never handed
+		// to CNSDK — see op_weave_sem), so the guard signals it on return with an
+		// empty batch: exactly once, whichever way CNSDK's drop went. Belt and
+		// braces — the drop report above already tells the runtime not to rely
+		// on it for this frame.
 		return;
 	}
 
@@ -2696,18 +3063,121 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 		                    canvas_subrect ? canvas_offset_y : 0,
 		                    canvas_subrect ? canvas_width    : 0u,
 		                    canvas_subrect ? canvas_height   : 0u,
-		                    did_compose, weave_done_sem)) {
+		                    did_compose, weave_done_sem, &rt.signal)) {
 			// The gate bailed (pipeline/strip/framebuffer setup failure). The
 			// weave already signalled, so consume it here or the next frame
-			// signals an already-signalled binary semaphore.
-			drain_semaphore(impl, weave_done_sem);
+			// signals an already-signalled binary semaphore — and pay the
+			// runtime's signal in the same batch, after the weave. Drained
+			// (idle): off the happy path, and it restores the one-compose-in-
+			// flight invariant the gate would have kept.
+			if (weave_done_sem != VK_NULL_HANDLE || rt.signal != VK_NULL_HANDLE) {
+				if (!sync_relay_submit(impl, weave_done_sem, rt.signal, RELAY_IDLE)) {
+					if (weave_uses_op_sem) {
+						reset_op_sem(impl, &impl->op_weave_sem);
+					}
+					impl->last_frame_dropped = impl->last_frame_dropped || rt.signal != VK_NULL_HANDLE;
+				}
+				rt.signal = VK_NULL_HANDLE;
+			}
 		}
+	} else if (weave_uses_op_sem) {
+		// set_weave_sync out-relay (opaque app, the common case): wait the
+		// weave's completion on the GPU, signal the runtime. No CPU wait — the
+		// batch carries `tail_fence`, which the next process_atlas reclaims.
+		if (!sync_relay_submit(impl, weave_done_sem, rt.signal, RELAY_TAIL)) {
+			// Nothing touched: the op semaphore is still signalled-or-pending
+			// and the runtime's is unsignalled. Retire ours, report the drop.
+			reset_op_sem(impl, &impl->op_weave_sem);
+			impl->last_frame_dropped = true;
+		}
+		rt.signal = VK_NULL_HANDLE;
 	} else {
 		// Not chained in this configuration, so nothing to drain — but assert
 		// the invariant rather than trust it.
 		drain_semaphore(impl, weave_done_sem);
 	}
 }
+
+#ifdef XRT_DP_VK_HAS_WEAVE_SYNC
+// `debug.dxr.leia.weavesync=0` declines set_weave_sync, so the runtime keeps its
+// pre-v20 CPU waits — the live kill switch for the whole v20 path. Cached like
+// the other knobs: a mid-session flip would race in-flight frames.
+static bool
+weave_sync_enabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = 1;
+#ifdef XRT_OS_ANDROID
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.leia.weavesync", buf) > 0 && buf[0] == '0') {
+			cached = 0;
+		}
+#endif
+		U_LOG_W("Leia CNSDK DP: set_weave_sync %s (debug.dxr.leia.weavesync)",
+		        cached == 1 ? "ENABLED" : "DISABLED — runtime keeps its CPU waits");
+	}
+	return cached == 1;
+}
+
+/*
+ * VK DP slot set_weave_sync (XR_DXR_weave v20). Store the runtime's pair for
+ * the NEXT process_atlas only; process_atlas_weave takes and honours it on every
+ * path (WeaveSyncGuard). How each path chains it:
+ *
+ *   opaque:        rt wait → empty in-relay (ALL_COMMANDS) → op_in_sem
+ *                  → CNSDK pass 0 (imageAvailable) → op_weave_sem
+ *                  → empty out-relay → rt signal   [tail_fence]
+ *   compose-under: rt wait → compose submit → cmp_done_sem → CNSDK
+ *                  → cmp_weave_sem → alpha gate → rt signal   [tail_fence;
+ *                  the gate's vkQueueWaitIdle is gone]
+ *   mono 2D:       rt wait → blit submit → rt signal (drain kept)
+ *   early return / no weave / dropped weave: empty submit pays what is owed.
+ *
+ * Binary only: a non-zero value (timeline, reserved) is declined, as is
+ * everything when the kill switch is off or the bundle has no queue.
+ */
+static bool
+set_weave_sync_cnsdk(struct xrt_display_processor_vk *xdp,
+                     VkSemaphore_XDP wait_sem,
+                     uint64_t wait_value,
+                     VkSemaphore_XDP signal_sem,
+                     uint64_t signal_value)
+{
+	leia_dp_cnsdk *impl = reinterpret_cast<leia_dp_cnsdk *>(xdp); // dp_vk is at offset 0
+	if (impl == nullptr || impl->vk == nullptr || impl->vk->main_queue == nullptr) {
+		return false;
+	}
+	if (wait_value != 0 || signal_value != 0) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("Leia CNSDK DP: set_weave_sync declined — timeline values (%llu/%llu) not supported",
+			        (unsigned long long)wait_value, (unsigned long long)signal_value);
+		}
+		return false;
+	}
+	if (!weave_sync_enabled()) {
+		return false;
+	}
+	// The contract is one call per process_atlas. If a previous pair was never
+	// consumed (two calls back to back), pay it now rather than lose it — an
+	// orphaned binary-semaphore signal would poison the runtime's next frame.
+	if (impl->sync_wait_sem != VK_NULL_HANDLE || impl->sync_signal_sem != VK_NULL_HANDLE) {
+		U_LOG_W("Leia CNSDK DP: set_weave_sync called twice without process_atlas — paying the stale pair");
+		sync_relay_submit(impl, impl->sync_wait_sem, impl->sync_signal_sem, RELAY_IDLE);
+	}
+	impl->sync_wait_sem = (VkSemaphore)wait_sem;
+	impl->sync_signal_sem = (VkSemaphore)signal_sem;
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("Leia CNSDK DP: first set_weave_sync accepted (wait=%p signal=%p) — weave chained on the GPU",
+		        (void *)wait_sem, (void *)signal_sem);
+	}
+	return true;
+}
+#endif // XRT_DP_VK_HAS_WEAVE_SYNC
 
 bool
 is_self_submitting_true(struct xrt_display_processor *xdp)
@@ -2896,8 +3366,21 @@ destroy_impl(struct xrt_display_processor *xdp)
 		leia_cnsdk_destroy(&impl->cnsdk);
 	}
 	destroy_weave_target(impl);
-	destroy_alpha_gate(impl); // #568
-	destroy_compose(impl);    // runtime#1073 T0
+	destroy_alpha_gate(impl); // #568 (reclaims the v20 tail first)
+	tail_reclaim(impl);       // a relay tail, if the last frame was opaque
+	destroy_compose(impl);    // runtime#1073 T0 (also drains retired semaphores)
+	if (impl->vk != nullptr) {
+		if (impl->op_weave_sem != VK_NULL_HANDLE) {
+			impl->vk->vkDestroySemaphore(impl->vk->device, impl->op_weave_sem, nullptr);
+		}
+		if (impl->op_in_sem != VK_NULL_HANDLE) {
+			impl->vk->vkDestroySemaphore(impl->vk->device, impl->op_in_sem, nullptr);
+		}
+		if (impl->tail_fence != VK_NULL_HANDLE) {
+			impl->vk->vkDestroyFence(impl->vk->device, impl->tail_fence, nullptr);
+		}
+	}
+	// sync_wait_sem / sync_signal_sem are runtime-owned: never destroyed here.
 	free(impl);
 }
 
@@ -2928,6 +3411,14 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	impl->cnsdk = cnsdk;
 	impl->vk = static_cast<struct vk_bundle *>(vk_bundle);
 	impl->cmd_pool = (VkCommandPool)(uintptr_t)vk_cmd_pool;
+	// Capture the weave queue NOW (see `weave_queue`): this is the one moment
+	// main_queue holds the queue the runtime means this DP to weave on.
+	impl->weave_queue = VK_NULL_HANDLE;
+	impl->weave_queue_family = UINT32_MAX;
+	if (impl->vk != nullptr && impl->vk->main_queue != nullptr) {
+		impl->weave_queue = impl->vk->main_queue->queue;
+		impl->weave_queue_family = impl->vk->main_queue->family_index;
+	}
 
 	/* ABI major v2 (ADR-020): the 8-byte struct_size header tells the
 	 * runtime how far this vtable extends. The runtime gates every optional
@@ -2989,6 +3480,11 @@ leia_dp_factory_cnsdk(void *vk_bundle,
 	// the pointer is all the runtime needs — struct_size above already covers
 	// the slot (it is sizeof(xrt_display_processor_vk)).
 	impl->dp_vk.get_last_frame_dropped = get_last_frame_dropped_cnsdk;
+#endif
+#ifdef XRT_DP_VK_HAS_WEAVE_SYNC
+	// XR_DXR_weave v20: join the runtime's semaphore chain instead of being
+	// CPU-waited. Inside struct_size above (sizeof(xrt_display_processor_vk)).
+	impl->dp_vk.set_weave_sync = set_weave_sync_cnsdk;
 #endif
 
 	*out_xdp = &impl->dp_vk.base;
