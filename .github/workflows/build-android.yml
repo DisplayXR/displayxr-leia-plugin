@@ -152,7 +152,13 @@ env:
   # Windows'; only in the release RUN's artifacts). This repo only consumes the loader
   # zip, but the runtime's cnsdk_services pin must equal this tag, so moving here moves
   # the tracker on every device. Tracking numbers measured on 0.10.75 are Blink numbers.
-  CNSDK_TAG: v0.10.78
+  #
+  # 0.10.79 (cnsdk-android-0.10.79+200.9aa8ce9): NO API change for this plug-in. Only
+  # LeiaInc/CNSDK#752 — the tracking camera becomes config data with a per-unit override
+  # (persist.debug.cnsdk.cam / debug.cnsdk.cam), which lives in the service APKs. This
+  # repo moves so the runtime can pin the same tag (its APK pair guard requires loader ==
+  # the CNSDK this .so was built against) and ship the 0.10.79 services in the bundle.
+  CNSDK_TAG: v0.10.79
 
 jobs:
   Android:
