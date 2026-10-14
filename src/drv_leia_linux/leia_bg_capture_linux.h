@@ -80,6 +80,35 @@ struct leia_bg_capture_linux *
 leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h);
 
 /*!
+ * As @ref leia_bg_capture_linux_create, for a RE-CREATE after a lost capture
+ * (#364) when @p recreate is true: the first-start-only advice ("install the
+ * extension") is not logged on failure — during the lock screen the extension
+ * is merely disabled, and every attempt would decline that way.
+ *
+ * @param out_fail_reason  optional; on NULL return, a short static string
+ *                         saying why (for the caller's one attempt line).
+ */
+struct leia_bg_capture_linux *
+leia_bg_capture_linux_create_ex(struct vk_bundle *vk,
+                                uint32_t panel_px_w,
+                                uint32_t panel_px_h,
+                                bool recreate,
+                                const char **out_fail_reason);
+
+/*!
+ * True once this capture is DEAD: mutter closed its ScreenCast session (GNOME
+ * does so whenever the session locks — every suspend goes through the lock
+ * screen — and when the user presses "Stop Screen Sharing"; the two are
+ * indistinguishable here), its PipeWire stream errored, or its session-bus
+ * connection dropped. A dead capture never recovers by itself: poll() declines
+ * from then on and the DP must bury it and re-create (#364).
+ *
+ * @param out_reason  optional; set to a short string valid while @p c lives.
+ */
+bool
+leia_bg_capture_linux_lost(struct leia_bg_capture_linux *c, const char **out_reason);
+
+/*!
  * True once the panel's layout changed under the recorded area (moved,
  * rescaled, re-moded). The area is fixed at stream creation, so the DP must
  * destroy and re-create the capture; poll() declines until then.
