@@ -63,6 +63,9 @@
 
 #define DXR_MAX_BUFFERS 16
 
+//! Preview generations, unique across every capture this process creates.
+static _Atomic uint32_t s_preview_gen;
+
 /*! One PipeWire buffer slot, cached as a Vulkan-sampleable image. Two kinds:
  *  dma-buf (zero-copy import) or shm (MemFd/MemPtr staged through a host-visible
  *  buffer — what Mutter's Xorg screencast actually delivers, #109/#110). */
@@ -116,7 +119,16 @@ struct leia_bg_capture_linux {
 	bool exclusion_live;       //!< the extension holds our registration right now
 	uint32_t untrusted_through; //!< frames with seq <= this may contain our own window
 	_Atomic uint32_t pool_buffers; //!< PipeWire buffers currently in the pool (frames that can be in flight)
-	bool session_closed;       //!< mutter closed the session (user pressed "stop sharing", ...)
+	bool session_closed;       //!< mutter closed the session (screen lock, "Stop Screen Sharing", bus loss)
+	const char *lost_reason;   //!< why session_closed was set (static string)
+	//! The PipeWire stream went to ERROR (pw thread writes, render thread
+	//! reads). GNOME's lock screen produces "no more input formats" here just
+	//! before it closes the session. Terminal for THIS capture: the DP buries
+	//! it and re-runs the whole start (#364).
+	_Atomic bool stream_failed;
+	char stream_error[160];    //!< the error text, written before stream_failed is set
+	bool quiet;                //!< a re-create attempt: no first-start-only advice on failure
+	const char *fail_reason;   //!< why create() declined (static string), for the attempt line
 	bool wants_restart;        //!< the panel moved/rescaled: the recorded area is wrong
 	bool logged_distrust;      //!< one WARN per distrust episode
 	bool poll_ok;              //!< verdict of the last poll()
@@ -187,7 +199,8 @@ struct leia_bg_capture_linux {
 	uint8_t *preview_out;            //!< render-thread output (borrowed by the runtime)
 	size_t preview_out_cap;
 	uint32_t preview_out_w, preview_out_h;
-	uint32_t preview_out_gen;        //!< bumps whenever preview_out is rebuilt
+	uint32_t preview_out_gen;        //!< bumps whenever preview_out is rebuilt (process-wide counter)
+	bool preview_ready_logged;
 	uint32_t preview_src_seq;        //!< pp_front.seq preview_out was built from
 	float preview_cu0, preview_cv0, preview_cu1, preview_cv1;
 	bool preview_dmabuf_logged;
@@ -750,6 +763,7 @@ mutter_handshake(struct leia_bg_capture_linux *c, uint32_t panel_px_w, uint32_t 
 	if (dbus_error_is_set(&err) || c->dbus == NULL) {
 		U_LOG_W("leia_bg_capture_linux: no session bus: %s", dbus_error_is_set(&err) ? err.message : "(null)");
 		dbus_error_free(&err);
+		c->fail_reason = "no session bus";
 		return false;
 	}
 	// We manage the connection's lifetime; don't let dbus exit the process.
@@ -768,7 +782,15 @@ mutter_handshake(struct leia_bg_capture_linux *c, uint32_t panel_px_w, uint32_t 
 	uint32_t windows = 0;
 	const enum leia_mutter_exclude_status st = leia_mutter_capture_exclude(c->dbus, 1000, &windows);
 	if (st != LEIA_MUTTER_EXCLUDE_OK) {
-		log_no_capture_once(st);
+		// A re-create attempt during the lock screen lands here every time
+		// (GNOME disables extensions while the shield is up). That is not the
+		// "install the extension" situation, so the advice stays first-start.
+		if (!c->quiet) {
+			log_no_capture_once(st);
+		}
+		c->fail_reason = st == LEIA_MUTTER_EXCLUDE_ABSENT
+		                     ? "capture-exclusion extension not running (screen still locked?)"
+		                     : leia_mutter_exclude_status_str(st);
 		return false;
 	}
 	c->exclusion_live = true;
@@ -778,11 +800,13 @@ mutter_handshake(struct leia_bg_capture_linux *c, uint32_t panel_px_w, uint32_t 
 	c->have_panel_id = leia_mutter_panel_identity_from_sysfs(&c->panel_id);
 	if (!leia_mutter_find_panel(c->dbus, c->have_panel_id ? &c->panel_id : NULL, panel_px_w, panel_px_h,
 	                            &c->panel)) {
+		c->fail_reason = "the 3D panel is not in mutter's layout";
 		return false;
 	}
 
 	// 3. Record exactly that rectangle.
 	if (!leia_mutter_screencast_start(c->dbus, &c->panel, 3000, &c->session_path, &c->stream_path, &c->node_id)) {
+		c->fail_reason = "mutter refused the ScreenCast session";
 		return false;
 	}
 	U_LOG_W("leia_bg_capture_linux: mutter RecordArea(%d,%d %ux%u LOGICAL) on panel %s, cursor hidden, our "
@@ -821,8 +845,9 @@ mutter_pump(struct leia_bg_capture_linux *c)
 	}
 	if (!dbus_connection_read_write(c->dbus, 0)) {
 		if (!c->session_closed) {
+			// Reported (once) by the DP as a lost capture, which it re-creates.
 			c->session_closed = true;
-			U_LOG_W("leia_bg_capture_linux: session bus connection lost — capture distrusted");
+			c->lost_reason = "session bus connection lost";
 		}
 		return;
 	}
@@ -880,10 +905,12 @@ mutter_pump(struct leia_bg_capture_linux *c)
 			}
 		} else if (dbus_message_is_signal(msg, "org.gnome.Mutter.ScreenCast.Session", "Closed")) {
 			if (c->session_path != NULL && dbus_message_has_path(msg, c->session_path) && !c->session_closed) {
+				// GNOME closes every ScreenCast session when the session
+				// locks (each suspend goes through the lock screen); the
+				// user's "Stop Screen Sharing" looks identical. Either way
+				// the DP reports it once and re-creates the capture (#364).
 				c->session_closed = true;
-				U_LOG_W("leia_bg_capture_linux: mutter closed the ScreenCast session (e.g. the user pressed "
-				        "\"Stop Screen Sharing\") — no captured desktop for the rest of this session; "
-				        "transparency falls back to silhouette intersection");
+				c->lost_reason = "mutter closed the ScreenCast session";
 			}
 		} else if (dbus_message_is_signal(msg, "org.gnome.Mutter.DisplayConfig", "MonitorsChanged")) {
 			if (c->layout_serial == 0) {
@@ -1209,10 +1236,14 @@ static void
 on_state_changed(void *data, enum pw_stream_state old, enum pw_stream_state state,
                  const char *error)
 {
-	(void)data;
+	struct leia_bg_capture_linux *c = data;
 	(void)old;
 	if (state == PW_STREAM_STATE_ERROR) {
 		U_LOG_W("leia_bg_capture_linux: stream error: %s", error ? error : "?");
+		if (c != NULL && !atomic_load(&c->stream_failed)) {
+			snprintf(c->stream_error, sizeof(c->stream_error), "PipeWire stream error: %s", error ? error : "?");
+			atomic_store(&c->stream_failed, true); // seq_cst: publishes stream_error
+		}
 	} else {
 		U_LOG_I("leia_bg_capture_linux: stream state -> %s",
 		        pw_stream_state_as_string(state));
@@ -1473,6 +1504,19 @@ unlock:
 struct leia_bg_capture_linux *
 leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h)
 {
+	return leia_bg_capture_linux_create_ex(vk, panel_px_w, panel_px_h, false, NULL);
+}
+
+struct leia_bg_capture_linux *
+leia_bg_capture_linux_create_ex(struct vk_bundle *vk,
+                                uint32_t panel_px_w,
+                                uint32_t panel_px_h,
+                                bool recreate,
+                                const char **out_fail_reason)
+{
+	if (out_fail_reason != NULL) {
+		*out_fail_reason = "capture unavailable";
+	}
 	if (vk == NULL) {
 		U_LOG_W("leia_bg_capture_linux: NULL vk_bundle");
 		return NULL;
@@ -1500,6 +1544,7 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
 		return NULL;
 	}
 	c->vk = vk;
+	c->quiet = recreate;
 	c->vk_format = VK_FORMAT_UNDEFINED;
 	atomic_store(&c->current_buffer, -1);
 	if (pthread_mutex_init(&c->preview_lock, NULL) == 0) {
@@ -1520,6 +1565,7 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
 
 	if (!pipewire_start(c)) {
 		U_LOG_W("leia_bg_capture_linux: PipeWire start failed");
+		c->fail_reason = "PipeWire start failed";
 		goto fail;
 	}
 
@@ -1527,6 +1573,9 @@ leia_bg_capture_linux_create(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t
 	return c;
 
 fail:
+	if (out_fail_reason != NULL && c->fail_reason != NULL) {
+		*out_fail_reason = c->fail_reason; // static strings: outlive c
+	}
 	leia_bg_capture_linux_destroy(c);
 	return NULL;
 }
@@ -1535,6 +1584,24 @@ bool
 leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c)
 {
 	return c != NULL && c->wants_restart;
+}
+
+bool
+leia_bg_capture_linux_lost(struct leia_bg_capture_linux *c, const char **out_reason)
+{
+	if (c == NULL) {
+		return false;
+	}
+	const char *why = NULL;
+	if (c->session_closed) {
+		why = c->lost_reason != NULL ? c->lost_reason : "ScreenCast session closed";
+	} else if (atomic_load(&c->stream_failed)) {
+		why = c->stream_error;
+	}
+	if (why != NULL && out_reason != NULL) {
+		*out_reason = why;
+	}
+	return why != NULL;
 }
 
 VkImageView
@@ -1579,13 +1646,14 @@ capture_poll_impl(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 	// TRUST GATE. A frame is usable only if our windows were excluded when it
 	// was recorded. Declining here makes the DP compose nothing and its
 	// alpha-gate fall back to silhouette intersection for this frame.
-	if (!c->exclusion_live || c->session_closed || c->wants_restart) {
+	if (c->session_closed || atomic_load(&c->stream_failed)) {
+		return false; // lost: the DP logs it once and re-creates the capture (#364)
+	}
+	if (!c->exclusion_live || c->wants_restart) {
 		if (!c->logged_distrust) {
 			c->logged_distrust = true;
 			U_LOG_W("leia_bg_capture_linux: captured desktop not used (%s)",
-			        c->session_closed ? "session closed"
-			        : c->wants_restart ? "panel layout changed"
-			                           : "capture exclusion not live");
+			        c->wants_restart ? "panel layout changed" : "capture exclusion not live");
 		}
 		return false;
 	}
@@ -1883,14 +1951,17 @@ capture_get_preview_impl(struct leia_bg_capture_linux *c, struct xrt_dp_backgrou
 		c->preview_win_y = wy;
 		c->preview_win_w = ww;
 		c->preview_win_h = wh;
-		if (c->preview_out_gen == 0) {
+		if (!c->preview_ready_logged) {
+			c->preview_ready_logged = true;
 			U_LOG_W("leia_bg_capture_linux: background preview ready — window %ux%u DEVICE px -> %ux%u "
 			        "BGRA8 (1/%u box: 1/%u on the pw thread, 1/%u here), covers canvas u[%.4f,%.4f] "
 			        "v[%.4f,%.4f]",
 			        ww, wh, ow, oh, (1u << PANEL_PREVIEW_SHIFT) << k, 1u << PANEL_PREVIEW_SHIFT, 1u << k,
 			        uv[0], uv[2], uv[1], uv[3]);
 		}
-		c->preview_out_gen++;
+		// Process-wide, so a re-created capture (#364) never hands the
+		// runtime a generation it already analysed from the dead one.
+		c->preview_out_gen = atomic_fetch_add(&s_preview_gen, 1u) + 1u;
 	}
 
 	// Field-by-field against the runtime's struct_size (ADR-020): a runtime
@@ -2032,6 +2103,18 @@ bool leia_bg_capture_linux_get_preview(struct leia_bg_capture_linux *c, struct x
 { (void)c; (void)out; return false; }
 #endif
 bool leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c) { (void)c; return false; }
+struct leia_bg_capture_linux *
+leia_bg_capture_linux_create_ex(struct vk_bundle *vk, uint32_t panel_px_w, uint32_t panel_px_h, bool recreate,
+                                const char **out_fail_reason)
+{
+	(void)recreate;
+	if (out_fail_reason != NULL) {
+		*out_fail_reason = "built without libpipewire-0.3 / dbus-1";
+	}
+	return leia_bg_capture_linux_create(vk, panel_px_w, panel_px_h);
+}
+bool leia_bg_capture_linux_lost(struct leia_bg_capture_linux *c, const char **out_reason)
+{ (void)c; (void)out_reason; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 
 #endif // DXR_LEIA_HAVE_PIPEWIRE
