@@ -44,17 +44,38 @@ leia_bg_capture_worker_create(struct vk_bundle *vk);
 /*!
  * Post a capture start for a panel of @p panel_px_w x @p panel_px_h device
  * pixels. The result arrives through @ref leia_bg_capture_worker_poll_created.
- * The caller keeps at most one start in flight.
+ * The caller keeps at most one start in flight. @p recreate marks a re-create
+ * after a lost capture (#364): see leia_bg_capture_linux_create_ex.
  */
 void
-leia_bg_capture_worker_request_create(struct leia_bg_capture_worker *w, uint32_t panel_px_w, uint32_t panel_px_h);
+leia_bg_capture_worker_request_create(struct leia_bg_capture_worker *w,
+                                      uint32_t panel_px_w,
+                                      uint32_t panel_px_h,
+                                      bool recreate);
 
 /*!
  * Non-blocking. True when a posted start has finished; *out_capture is the new
- * capture, or NULL if the start failed (the capture module logged why).
+ * capture, or NULL if the start failed, in which case *out_fail_reason (if
+ * given) is a short static string saying why.
  */
 bool
-leia_bg_capture_worker_poll_created(struct leia_bg_capture_worker *w, struct leia_bg_capture_linux **out_capture);
+leia_bg_capture_worker_poll_created(struct leia_bg_capture_worker *w,
+                                    struct leia_bg_capture_linux **out_capture,
+                                    const char **out_fail_reason);
+
+/*!
+ * Watch the session bus for a session UNLOCK while @p on (#364): GNOME closes
+ * the ScreenCast session at the lock screen, and unlock is when it can be
+ * re-created. The worker thread owns the connection — opened, pumped (every
+ * 250 ms, non-blocking) and closed there, never on the frame thread — so it
+ * costs nothing while off, which is whenever no capture is being recovered.
+ */
+void
+leia_bg_capture_worker_watch_unlock(struct leia_bg_capture_worker *w, bool on);
+
+//! Non-blocking: true (once) if an unlock was seen since the last call.
+bool
+leia_bg_capture_worker_take_unlock(struct leia_bg_capture_worker *w);
 
 //! Post a capture stop. NULL is ignored.
 void

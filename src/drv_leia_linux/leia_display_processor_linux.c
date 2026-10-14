@@ -22,6 +22,7 @@
 #include "leia_edid_probe_linux.h" // RandR panel desktop position (screen_left/top override)
 #include "leia_bg_capture_linux.h"
 #include "leia_bg_capture_worker_linux.h"
+#include "leia_bg_capture_recovery_linux.h"
 #include "leia_compose_push_linux.h"
 #include "leia_screen_linux.h"
 #include "leia_display_claims_linux.h"
@@ -113,6 +114,11 @@ struct leia_dp_linux
 	//! A start declined (no extension / not GNOME / no PipeWire): do not retry
 	//! until the next idle→active edge — it would only decline again.
 	bool bg_create_declined;
+	//! A live capture was LOST (GNOME closes the ScreenCast session at the
+	//! lock screen, so every suspend): re-create it with backoff, and promptly
+	//! on unlock, until a trusted frame flows again (#364).
+	struct leia_bg_recovery bg_recovery;
+	bool bg_recovery_awaiting_frame; //!< a re-created capture is up, first trusted frame not yet seen
 	//! Captures handed back while the GPU may still sample them: stopped only
 	//! after a few more process_atlas calls (the compositor fences each frame).
 	struct
@@ -652,16 +658,73 @@ dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
 		}
 	}
 
+	struct leia_bg_recovery *rec = &ldp->bg_recovery;
+
+	// A live capture died: GNOME closed its ScreenCast session (the lock
+	// screen does that — every suspend), or its stream errored. It never
+	// comes back by itself, so bury it (stopped off the frame thread) and
+	// re-run the whole start with backoff (#364). Until then: no captured
+	// desktop, exactly as when it never started.
+	const char *lost_why = NULL;
+	if (ldp->bg_capture != NULL && dp_capture_wanted(ldp) && leia_bg_capture_linux_lost(ldp->bg_capture, &lost_why)) {
+		const uint64_t now = dp_mono_ns();
+		if (!rec->active) {
+			U_LOG_W("leia_lnx_dp: capture session closed by the compositor (lock/stop) — will re-create (%s)",
+			        lost_why != NULL ? lost_why : "?");
+			leia_bg_recovery_begin(rec, now);
+		} else {
+			// A re-created capture died before its first trusted frame:
+			// that attempt failed after all.
+			const uint64_t d = leia_bg_recovery_attempt_failed(rec, now);
+			if (leia_bg_recovery_should_log(rec->attempts)) {
+				U_LOG_W("leia_lnx_dp: capture re-create attempt %u lost before its first frame (%s) — next "
+				        "attempt in %.0f s or on session unlock",
+				        rec->attempts, lost_why != NULL ? lost_why : "?", (double)d / 1e9);
+			}
+		}
+		dp_capture_bury(ldp, ldp->bg_capture);
+		ldp->bg_capture = NULL;
+		ldp->bg_recovery_awaiting_frame = false;
+		ldp->bg_create_declined = false;
+		leia_bg_capture_worker_watch_unlock(ldp->bg_worker, true);
+	}
+
+	// Session unlocked while recovering: that is when a lock-closed capture
+	// can come back, so try now rather than at the next backoff tick.
+	if (rec->active && leia_bg_capture_worker_take_unlock(ldp->bg_worker) &&
+	    !ldp->bg_recovery_awaiting_frame && ldp->bg_capture == NULL) {
+		leia_bg_recovery_unlocked(rec, dp_mono_ns(), ldp->bg_create_inflight);
+	}
+
 	struct leia_bg_capture_linux *created = NULL;
-	if (ldp->bg_create_inflight && leia_bg_capture_worker_poll_created(ldp->bg_worker, &created)) {
+	const char *fail_why = NULL;
+	if (ldp->bg_create_inflight && leia_bg_capture_worker_poll_created(ldp->bg_worker, &created, &fail_why)) {
 		ldp->bg_create_inflight = false;
-		if (created == NULL) {
+		if (created == NULL && rec->active) {
+			// Expected while the screen is still locked (the extension is
+			// disabled behind the shield): keep trying — GNOME cannot tell us
+			// a lock from a user's "Stop Screen Sharing", and one attempt per
+			// 30 s is cheap.
+			const uint64_t d = leia_bg_recovery_attempt_failed(rec, dp_mono_ns());
+			if (leia_bg_recovery_should_log(rec->attempts)) {
+				U_LOG_W("leia_lnx_dp: capture re-create attempt %u failed (%s) — next attempt in %.0f s or "
+				        "on session unlock",
+				        rec->attempts, fail_why != NULL ? fail_why : "?", (double)d / 1e9);
+			}
+		} else if (created == NULL) {
 			ldp->bg_create_declined = true; // silhouette intersection until the next activation
 		} else if (dp_capture_wanted(ldp) && ldp->bg_capture == NULL) {
 			ldp->bg_capture = created;
-			U_LOG_W(
-			    "leia_lnx_dp: desktop capture running — compose-under-capture once its first trusted "
-			    "frame arrives");
+			if (rec->active) {
+				ldp->bg_recovery_awaiting_frame = true;
+				U_LOG_W("leia_lnx_dp: capture re-create attempt %u succeeded — waiting for its first trusted "
+				        "frame",
+				        rec->attempts);
+			} else {
+				U_LOG_W(
+				    "leia_lnx_dp: desktop capture running — compose-under-capture once its first trusted "
+				    "frame arrives");
+			}
 		} else {
 			dp_capture_bury(ldp, created); // went idle while it was starting
 		}
@@ -672,11 +735,18 @@ dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
 			dp_capture_bury(ldp, ldp->bg_capture);
 			ldp->bg_capture = NULL;
 		}
+		if (rec->active) {
+			// Nothing wants a capture any more; the next activation starts
+			// one afresh, so the recovery (and its unlock watch) ends here.
+			leia_bg_recovery_restored(rec);
+			ldp->bg_recovery_awaiting_frame = false;
+			leia_bg_capture_worker_watch_unlock(ldp->bg_worker, false);
+		}
 		return;
 	}
 
 	if (ldp->bg_capture == NULL && !ldp->bg_create_inflight && !ldp->bg_create_declined &&
-	    dp_mono_ns() >= ldp->bg_capture_retry_ns) {
+	    dp_mono_ns() >= ldp->bg_capture_retry_ns && leia_bg_recovery_due(rec, dp_mono_ns())) {
 		if (ldp->bg_worker == NULL) {
 			ldp->bg_worker = leia_bg_capture_worker_create(ldp->vk);
 		}
@@ -693,7 +763,8 @@ dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
 			pw = info.pixel_width; // DEVICE px — the space present_origin lives in
 			ph = info.pixel_height;
 		}
-		leia_bg_capture_worker_request_create(ldp->bg_worker, pw, ph);
+		const bool recreate = leia_bg_recovery_attempt_posted(rec) != 0;
+		leia_bg_capture_worker_request_create(ldp->bg_worker, pw, ph, recreate);
 		ldp->bg_create_inflight = true;
 	}
 }
@@ -749,6 +820,14 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 		bg = leia_bg_capture_linux_get_view(ldp->bg_capture); // captured panel, poll'd UV sub-rect
 		backdrop = ldp->bg2d_view;                            // may be NULL → gated off below
 		ldp->composed_over_capture = true;
+		if (ldp->bg_recovery.active && ldp->bg_recovery_awaiting_frame) {
+			U_LOG_W("leia_lnx_dp: capture restored after %.1f s (%u attempt%s)",
+			        (double)(dp_mono_ns() - ldp->bg_recovery.lost_ns) / 1e9, ldp->bg_recovery.attempts,
+			        ldp->bg_recovery.attempts == 1 ? "" : "s");
+			leia_bg_recovery_restored(&ldp->bg_recovery);
+			ldp->bg_recovery_awaiting_frame = false;
+			leia_bg_capture_worker_watch_unlock(ldp->bg_worker, false);
+		}
 	} else if (ldp->bg2d_view != VK_NULL_HANDLE) {
 		bg = ldp->bg2d_view; // 2D-under is the background; already canvas-space (UV 0..1)
 	}
