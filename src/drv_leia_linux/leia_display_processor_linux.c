@@ -119,6 +119,24 @@ struct leia_dp_linux
 	//! on unlock, until a trusted frame flows again (#364).
 	struct leia_bg_recovery bg_recovery;
 	bool bg_recovery_awaiting_frame; //!< a re-created capture is up, first trusted frame not yet seen
+
+	// HELD DESKTOP (#364). A DP-owned copy of the last TRUSTED captured frame,
+	// refreshed on every fresh upload. While the live capture cannot be used
+	// (exclusion down at the lock screen, session closed, re-create pending or
+	// waiting for its first frame) the compose samples this instead, so the
+	// fringe keeps the every-view punch rule and the app's own alpha edge —
+	// instead of dropping to silhouette intersection, which visibly clips
+	// content off the display plane (hands, hat brim) by the disparity width.
+	// Dropped only when nothing wants a capture or the panel layout changed.
+	VkImage held_image;
+	VkDeviceMemory held_mem;
+	VkImageView held_view;
+	uint32_t held_w, held_h;        //!< stream size of the copy
+	VkFormat held_format;
+	uint32_t held_cap_w, held_cap_h; //!< panel DEVICE size the window rect maps into
+	bool held_valid;                 //!< holds a trusted frame
+	bool held_in_use;                //!< the last frame composed over it (one WARN per episode)
+	uint64_t held_ns;                //!< when it was last refreshed
 	//! Captures handed back while the GPU may still sample them: stopped only
 	//! after a few more process_atlas calls (the compositor fences each frame).
 	struct
@@ -230,6 +248,32 @@ leia_dp_linux(struct xrt_display_processor *xdp)
  *
  */
 
+//! Free the held desktop copy (#364). Device-idle contexts only, like compose_release.
+static void
+held_release(struct leia_dp_linux *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	if (vk == NULL) {
+		return;
+	}
+	if (ldp->held_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, ldp->held_view, NULL);
+	}
+	if (ldp->held_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->held_image, NULL);
+	}
+	if (ldp->held_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->held_mem, NULL);
+	}
+	ldp->held_view = VK_NULL_HANDLE;
+	ldp->held_image = VK_NULL_HANDLE;
+	ldp->held_mem = VK_NULL_HANDLE;
+	ldp->held_w = ldp->held_h = 0;
+	ldp->held_format = VK_FORMAT_UNDEFINED;
+	ldp->held_valid = false;
+	ldp->held_in_use = false;
+}
+
 static void
 compose_release(struct leia_dp_linux *ldp)
 {
@@ -237,6 +281,7 @@ compose_release(struct leia_dp_linux *ldp)
 	if (vk == NULL) {
 		return;
 	}
+	held_release(ldp);
 	if (ldp->compose_pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, ldp->compose_pipeline, NULL);
 	}
@@ -735,6 +780,9 @@ dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
 			dp_capture_bury(ldp, ldp->bg_capture);
 			ldp->bg_capture = NULL;
 		}
+		// Nothing stale is held over an idle period (see the lifecycle note).
+		ldp->held_valid = false;
+		ldp->held_in_use = false;
 		if (rec->active) {
 			// Nothing wants a capture any more; the next activation starts
 			// one afresh, so the recovery (and its unlock watch) ends here.
@@ -769,6 +817,103 @@ dp_capture_reconcile(struct leia_dp_linux *ldp, bool age_graveyard)
 	}
 }
 
+/*!
+ * Copy the frame the live capture uploaded THIS frame into the held image
+ * (#364). Recorded on the compose command buffer right after poll(), outside
+ * any render pass; mutter records on damage only, so this runs only when the
+ * desktop behind actually changed.
+ */
+static void
+held_refresh(struct leia_dp_linux *ldp, VkCommandBuffer cmd)
+{
+	struct leia_bg_capture_upload up;
+	if (!leia_bg_capture_linux_get_fresh_upload(ldp->bg_capture, &up) || up.width == 0 || up.height == 0) {
+		return;
+	}
+	struct vk_bundle *vk = ldp->vk;
+	if (ldp->held_image == VK_NULL_HANDLE || ldp->held_w != up.width || ldp->held_h != up.height ||
+	    ldp->held_format != up.format) {
+		held_release(ldp);
+		VkExtent2D ext = {up.width, up.height};
+		VkResult res = vk_create_image_simple(vk, ext, up.format,
+		                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		                                      &ldp->held_mem, &ldp->held_image);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: held desktop image create failed: %d", res);
+			held_release(ldp);
+			return;
+		}
+		VkImageSubresourceRange sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		res = vk_create_view(vk, ldp->held_image, VK_IMAGE_VIEW_TYPE_2D, up.format, sub, &ldp->held_view);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("leia_lnx_dp: held desktop view create failed: %d", res);
+			held_release(ldp);
+			return;
+		}
+		ldp->held_w = up.width;
+		ldp->held_h = up.height;
+		ldp->held_format = up.format;
+	}
+
+	// A fresh allocation is UNDEFINED; afterwards the copy is only ever left
+	// in SHADER_READ_ONLY_OPTIMAL (held_valid tracks which).
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = ldp->held_valid ? VK_ACCESS_SHADER_READ_BIT : 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = ldp->held_valid ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = ldp->held_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_dst);
+	VkBufferImageCopy region = {
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageExtent = {up.width, up.height, 1},
+	};
+	vk->vkCmdCopyBufferToImage(cmd, up.staging, ldp->held_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	VkImageMemoryBarrier to_read = to_dst;
+	to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+	                         NULL, 0, NULL, 1, &to_read);
+	ldp->held_cap_w = up.panel_device_w;
+	ldp->held_cap_h = up.panel_device_h;
+	ldp->held_valid = true;
+	ldp->held_ns = dp_mono_ns();
+}
+
+/*!
+ * The window's sub-rect of the held desktop, by the same mapping
+ * leia_bg_capture_linux_poll uses. False when the window is off the panel.
+ */
+static bool
+held_uv(const struct leia_dp_linux *ldp, uint32_t win_w, uint32_t win_h, float uv_origin[2], float uv_extent[2])
+{
+	const int32_t cap_w = (int32_t)ldp->held_cap_w;
+	const int32_t cap_h = (int32_t)ldp->held_cap_h;
+	const int32_t wx = ldp->present_origin_x;
+	const int32_t wy = ldp->present_origin_y;
+	uv_origin[0] = uv_origin[1] = 0.0f;
+	uv_extent[0] = uv_extent[1] = 1.0f;
+	if (cap_w <= 0 || cap_h <= 0 || win_w == 0 || win_h == 0) {
+		return true;
+	}
+	if (wx >= cap_w || wy >= cap_h || wx + (int32_t)win_w <= 0 || wy + (int32_t)win_h <= 0) {
+		return false;
+	}
+	uv_origin[0] = (float)wx / (float)cap_w;
+	uv_origin[1] = (float)wy / (float)cap_h;
+	uv_extent[0] = (float)win_w / (float)cap_w;
+	uv_extent[1] = (float)win_h / (float)cap_h;
+	return true;
+}
+
 // Composite the tiled atlas OVER the bound background into the opaque
 // intermediate, and return the intermediate view for the weaver to interlace.
 // Returns VK_NULL_HANDLE (→ caller weaves the raw atlas) when disabled, when no
@@ -788,7 +933,7 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 	if (!dp_transparency_live(ldp)) {
 		return VK_NULL_HANDLE;
 	}
-	if (ldp->bg_capture == NULL && ldp->bg2d_view == VK_NULL_HANDLE) {
+	if (ldp->bg_capture == NULL && ldp->bg2d_view == VK_NULL_HANDLE && !ldp->held_valid) {
 		return VK_NULL_HANDLE; // no background source → weave the raw atlas
 	}
 	if (!compose_ensure_pipeline(ldp) || !compose_ensure_fill(ldp, atlas_w, atlas_h)) {
@@ -813,6 +958,7 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 		ldp->bg_capture = NULL;
 		ldp->bg_create_declined = false;
 		ldp->bg_capture_retry_ns = dp_mono_ns() + 1000000000ull;
+		ldp->held_valid = false; // recorded under the old layout: wrong geometry now
 	}
 	if (ldp->bg_capture != NULL &&
 	    leia_bg_capture_linux_poll(ldp->bg_capture, cmd, ldp->present_origin_x, ldp->present_origin_y,
@@ -820,6 +966,11 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 		bg = leia_bg_capture_linux_get_view(ldp->bg_capture); // captured panel, poll'd UV sub-rect
 		backdrop = ldp->bg2d_view;                            // may be NULL → gated off below
 		ldp->composed_over_capture = true;
+		held_refresh(ldp, cmd);
+		if (ldp->held_in_use) {
+			ldp->held_in_use = false;
+			U_LOG_W("leia_lnx_dp: live captured desktop back — no longer composing over the held frame");
+		}
 		if (ldp->bg_recovery.active && ldp->bg_recovery_awaiting_frame) {
 			U_LOG_W("leia_lnx_dp: capture restored after %.1f s (%u attempt%s)",
 			        (double)(dp_mono_ns() - ldp->bg_recovery.lost_ns) / 1e9, ldp->bg_recovery.attempts,
@@ -827,6 +978,19 @@ compose_pre_weave(struct leia_dp_linux *ldp,
 			leia_bg_recovery_restored(&ldp->bg_recovery);
 			ldp->bg_recovery_awaiting_frame = false;
 			leia_bg_capture_worker_watch_unlock(ldp->bg_worker, false);
+		}
+	} else if (ldp->held_valid && held_uv(ldp, win_w, win_h, uv_origin, uv_extent)) {
+		// Live capture unusable this frame (#364): compose over the last
+		// trusted desktop so the every-view punch rule — and with it the
+		// app's own alpha edge — holds, rather than silhouette intersection.
+		bg = ldp->held_view;
+		backdrop = ldp->bg2d_view;
+		ldp->composed_over_capture = true;
+		if (!ldp->held_in_use) {
+			ldp->held_in_use = true;
+			U_LOG_W("leia_lnx_dp: live captured desktop unavailable — composing over the last captured "
+			        "frame (%.1f s old) so the app's alpha edge is kept",
+			        (double)(dp_mono_ns() - ldp->held_ns) / 1e9);
 		}
 	} else if (ldp->bg2d_view != VK_NULL_HANDLE) {
 		bg = ldp->bg2d_view; // 2D-under is the background; already canvas-space (UV 0..1)
