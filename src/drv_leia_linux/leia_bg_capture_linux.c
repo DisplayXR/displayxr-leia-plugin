@@ -132,6 +132,7 @@ struct leia_bg_capture_linux {
 	bool wants_restart;        //!< the panel moved/rescaled: the recorded area is wrong
 	bool logged_distrust;      //!< one WARN per distrust episode
 	bool poll_ok;              //!< verdict of the last poll()
+	int poll_uploaded_slot;    //!< shm slot whose staging the last poll() uploaded, -1 = none
 	struct leia_panel_identity panel_id; //!< EDID identity, read once at create (sysfs)
 	bool have_panel_id;
 	//! In-flight ASYNC D-Bus calls issued from the render thread (0 = none).
@@ -1545,6 +1546,7 @@ leia_bg_capture_linux_create_ex(struct vk_bundle *vk,
 	}
 	c->vk = vk;
 	c->quiet = recreate;
+	c->poll_uploaded_slot = -1;
 	c->vk_format = VK_FORMAT_UNDEFINED;
 	atomic_store(&c->current_buffer, -1);
 	if (pthread_mutex_init(&c->preview_lock, NULL) == 0) {
@@ -1584,6 +1586,26 @@ bool
 leia_bg_capture_linux_wants_restart(struct leia_bg_capture_linux *c)
 {
 	return c != NULL && c->wants_restart;
+}
+
+bool
+leia_bg_capture_linux_get_fresh_upload(struct leia_bg_capture_linux *c, struct leia_bg_capture_upload *out)
+{
+	if (c == NULL || out == NULL || !c->poll_ok || c->poll_uploaded_slot < 0 ||
+	    c->poll_uploaded_slot >= DXR_MAX_BUFFERS) {
+		return false;
+	}
+	const struct dxr_bg_buffer *bb = &c->buffers[c->poll_uploaded_slot];
+	if (!bb->is_shm || bb->staging == VK_NULL_HANDLE) {
+		return false;
+	}
+	out->staging = bb->staging;
+	out->width = c->width;
+	out->height = c->height;
+	out->format = c->vk_format;
+	out->panel_device_w = c->panel.device_w > 0 ? c->panel.device_w : c->width;
+	out->panel_device_h = c->panel.device_h > 0 ? c->panel.device_h : c->height;
+	return true;
 }
 
 bool
@@ -1636,6 +1658,7 @@ capture_poll_impl(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
                   float out_bg_uv_origin[2], float out_bg_uv_extent[2])
 {
 	c->poll_ok = false;
+	c->poll_uploaded_slot = -1;
 	c->last_win_x = win_x;
 	c->last_win_y = win_y;
 	c->last_win_w = win_w;
@@ -1745,6 +1768,7 @@ capture_poll_impl(struct leia_bg_capture_linux *c, VkCommandBuffer cmd,
 			                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 			                            NULL, 0, NULL, 1, &to_read);
 			bb->image_initialized = true;
+			c->poll_uploaded_slot = idx;
 
 			uint32_t u = atomic_fetch_add(&c->dbg_uploads, 1) + 1;
 			if (!c->dbg_first_upload_logged) {
@@ -2115,6 +2139,8 @@ leia_bg_capture_linux_create_ex(struct vk_bundle *vk, uint32_t panel_px_w, uint3
 }
 bool leia_bg_capture_linux_lost(struct leia_bg_capture_linux *c, const char **out_reason)
 { (void)c; (void)out_reason; return false; }
+bool leia_bg_capture_linux_get_fresh_upload(struct leia_bg_capture_linux *c, struct leia_bg_capture_upload *out)
+{ (void)c; (void)out; return false; }
 void leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c) { (void)c; }
 
 #endif // DXR_LEIA_HAVE_PIPEWIRE

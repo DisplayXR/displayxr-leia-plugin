@@ -171,6 +171,30 @@ leia_bg_capture_linux_poll(struct leia_bg_capture_linux *c,
                            float out_bg_uv_origin[2],
                            float out_bg_uv_extent[2]);
 
+/*!
+ * The frame the last successful poll() uploaded, described so the caller can
+ * copy it into an image it owns (#364): a held copy of the last trusted
+ * desktop outlives this capture, so the compose keeps the app's own alpha edge
+ * while the live capture is down instead of falling back to silhouette
+ * intersection.
+ */
+struct leia_bg_capture_upload
+{
+	VkBuffer staging;        //!< tightly packed width x height texels, valid for this frame's command buffer
+	uint32_t width, height;  //!< stream size
+	VkFormat format;         //!< texel format (the capture's sampled image format)
+	uint32_t panel_device_w; //!< the captured panel's DEVICE size — the space poll()'s window rect is in
+	uint32_t panel_device_h;
+};
+
+/*!
+ * True when the last poll() succeeded AND recorded a fresh shm upload this
+ * frame (mutter records on damage only, so most frames do not). Render thread,
+ * right after poll(), on the same command buffer.
+ */
+bool
+leia_bg_capture_linux_get_fresh_upload(struct leia_bg_capture_linux *c, struct leia_bg_capture_upload *out);
+
 void
 leia_bg_capture_linux_destroy(struct leia_bg_capture_linux *c);
 
