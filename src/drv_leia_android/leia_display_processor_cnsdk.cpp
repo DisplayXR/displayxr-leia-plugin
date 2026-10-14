@@ -296,7 +296,9 @@ struct leia_dp_cnsdk
 	//! runtime swaps `vk->main_queue->queue` only around the factory call, and
 	//! the interlacer is created lazily on the first weave, so reading it live
 	//! there would get the wrong queue. Handed to leia_cnsdk_ensure_interlacer
-	//! (CNSDK >= 0.10.77 then submits every weave pass on it).
+	//! (CNSDK >= 0.10.77 then submits every weave pass on it) AND, through
+	//! dp_submit_queue(), the queue every submit this file makes itself lands
+	//! on (relays, compose, gate, mono blit, uploads) — runtime#2095.
 	VkQueue weave_queue;
 	uint32_t weave_queue_family; //!< UINT32_MAX = unknown.
 };
@@ -362,8 +364,67 @@ tail_fence_get(leia_dp_cnsdk *impl)
 }
 
 /*
+ * The queue every submit THIS file makes goes to (relays, compose-under, alpha
+ * gate, mono blit, one-time uploads, and the drains next to them).
+ *
+ * In-process (runtime#2095) the bundle's `main_queue->queue`, read live, is the
+ * APP's queue: the app has already submitted its NEXT frame by the time the
+ * DP's out-relay for the current one is submitted (the runtime's non-blocking
+ * hand-off), and a queue is in-order — so a relay on the app's queue signals
+ * the runtime's "weave done" semaphore only after the app's next frame has
+ * rendered, and the host wait on `tail_fence` at the top of the next
+ * process_atlas then stalls the runtime's commit thread for the app's whole
+ * frame. That is exactly the serialisation the runtime removed on its side
+ * (in-process vk_native chains pre_sem → DP → post_sem → present on the GPU
+ * with no host drains). The runtime hands this DP its own repaint queue
+ * through `main_queue->queue` only around the factory call (captured as
+ * `weave_queue`), so that is the queue the DP's submits belong on — the one
+ * CNSDK's weave passes already use, in the same family (the runtime asserts
+ * it; its #868 repaint queue is a second queue of the graphics family). The
+ * queue-lock layer (VK_LAYER_DXR_queue_lock) serialises every submitter per
+ * queue in the process, which is what makes submitting here from the
+ * runtime's commit thread legal, as it already is for CNSDK's own submits.
+ *
+ * In the out-of-process service (the browser path) `main_queue->queue` IS the
+ * weave queue — the factory captures that same handle — so nothing changes.
+ * `weave_queue` is VK_NULL_HANDLE only when the bundle had no main queue at
+ * factory time; then the live value is the only queue there is.
+ *
+ * Logs ONCE which queue the DP's submits use, and checks (also once) that the
+ * bundle's family — the family of the command pool the runtime lent us and of
+ * `main_queue` — matches the captured weave-queue family: a submit from a
+ * pool of another family would be a Vulkan VU violation, so a mismatch is a
+ * lifecycle WARN, never per frame.
+ */
+static VkQueue
+dp_submit_queue(leia_dp_cnsdk *impl)
+{
+	struct vk_bundle *vk = impl->vk;
+	const bool use_weave = impl->weave_queue != VK_NULL_HANDLE;
+	VkQueue q = use_weave ? impl->weave_queue : vk->main_queue->queue;
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		const uint32_t bundle_family = vk->main_queue != nullptr ? vk->main_queue->family_index : UINT32_MAX;
+		const bool family_ok = !use_weave || impl->weave_queue_family == bundle_family;
+		U_LOG_W(
+		    "Leia CNSDK DP: DP submits (relays/compose/gate/blit/uploads) use the %s %p "
+		    "(weave-queue family %u, bundle/cmd-pool family %u%s)",
+		    use_weave ? (q == vk->main_queue->queue ? "weave queue (same handle as the live main queue: "
+		                                              "service, or in-process with no runtime-owned queue)"
+		                                            : "weave queue (runtime-owned, in-process)")
+		              : "main queue (no weave queue captured)",
+		    (void *)q, (unsigned)impl->weave_queue_family, (unsigned)bundle_family,
+		    family_ok ? ""
+		              : " — FAMILY MISMATCH: command buffers recorded from the runtime's pool "
+		                "are being submitted on a queue of another family");
+	}
+	return q;
+}
+
+/*
  * One empty batch (no command buffers) that waits `wait` and/or signals
- * `signal`, on the runtime's main queue — the cheapest legal way to honour a
+ * `signal`, on the DP submit queue (dp_submit_queue) — the cheapest legal way to honour a
  * semaphore obligation when no real work carries it: the out-relay
  * (op_weave_sem → runtime signal), the self-signal on a dropped weave, and
  * every early return of an accepted set_weave_sync frame.
@@ -416,7 +477,8 @@ sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, enu
 			fence = tail_fence_get(impl);
 		}
 	}
-	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, fence);
+	VkQueue queue = dp_submit_queue(impl);
+	VkResult res = vk->vkQueueSubmit(queue, 1, &si, fence);
 	if (res != VK_SUCCESS) {
 		U_LOG_W("weave-sync: relay submit failed (%d) — frame reported dropped", res);
 		return false;
@@ -426,7 +488,7 @@ sync_relay_submit(leia_dp_cnsdk *impl, VkSemaphore wait, VkSemaphore signal, enu
 	} else if (idle || (mode == RELAY_TAIL && signal != VK_NULL_HANDLE)) {
 		// No fence to park on (idle requested, or fence create failed): fall back
 		// to the pre-v20 queue drain so reuse stays safe.
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk->vkQueueWaitIdle(queue);
 	}
 	return true;
 }
@@ -449,10 +511,10 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
 	DXR_ATRACE("dxr_dp:mono_passthrough_blit");
 	struct vk_bundle *vk = impl->vk;
 	if (vk == nullptr || vk->main_queue == nullptr) {
-		// Defensive: this mono 1x1 fallback submits on the main queue
+		// Defensive: this mono 1x1 fallback submits on the DP submit queue
 		// directly. The atlas-weave path guards vk==nullptr already;
 		// mirror it here so a partially-initialized bundle can't deref
-		// vk->main_queue->queue below.
+		// vk->main_queue->queue in dp_submit_queue's fallback below.
 		U_LOG_W("mono_passthrough_blit: vk bundle/main_queue not ready, skipping");
 		return false;
 	}
@@ -557,11 +619,12 @@ mono_passthrough_blit(leia_dp_cnsdk *impl,
 		si.signalSemaphoreCount = 1;
 		si.pSignalSemaphores = io_signal_sem;
 	}
-	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	VkQueue queue = dp_submit_queue(impl);
+	VkResult res = vk->vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 	if (res == VK_SUCCESS) {
 		*io_wait_sem = VK_NULL_HANDLE;   // consumed
 		*io_signal_sem = VK_NULL_HANDLE; // will be signalled by this batch
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk->vkQueueWaitIdle(queue);
 	}
 	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
 	DXR_HW_DBG_ONCE("mono_passthrough_blit: first frame (atlas %ux%u → target %ux%u)",
@@ -646,8 +709,9 @@ transition_weave_depth_once(leia_dp_cnsdk *impl)
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cmd;
-	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	VkQueue queue = dp_submit_queue(impl);
+	if (vk->vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(queue);
 	}
 	vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
 }
@@ -1368,8 +1432,9 @@ drain_semaphore(leia_dp_cnsdk *impl, VkSemaphore sem)
 	si.waitSemaphoreCount = 1;
 	si.pWaitSemaphores = &sem;
 	si.pWaitDstStageMask = &stage;
-	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
-		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	VkQueue queue = dp_submit_queue(impl);
+	if (vk->vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(queue);
 	}
 }
 
@@ -2137,7 +2202,7 @@ compose_pre_weave(leia_dp_cnsdk *impl, VkImageView atlas_view, uint32_t atlas_w,
 		si.pWaitDstStageMask = &rt_wait_stage;
 	}
 	vk->vkResetFences(vk->device, 1, &impl->cmp_fence);
-	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, impl->cmp_fence);
+	VkResult res = vk->vkQueueSubmit(dp_submit_queue(impl), 1, &si, impl->cmp_fence);
 	if (res == VK_SUCCESS) {
 		*io_runtime_wait = VK_NULL_HANDLE; // consumed by this batch
 		impl->cmp_fence_armed = true;
@@ -2558,7 +2623,8 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		si.pSignalSemaphores = io_runtime_signal;
 	}
 	VkFence fence = chain_complete ? tail_fence_get(impl) : VK_NULL_HANDLE;
-	const bool submitted = vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, fence) == VK_SUCCESS;
+	VkQueue queue = dp_submit_queue(impl);
+	const bool submitted = vk->vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS;
 	if (submitted) {
 		*io_runtime_signal = VK_NULL_HANDLE; // signalled by this batch
 	}
@@ -2568,7 +2634,7 @@ alpha_gate_run(leia_dp_cnsdk *impl,
 		DXR_HW_DBG_ONCE("alpha_gate_run: first v20 chained gate (no queue drain)");
 	} else {
 		if (submitted) {
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
+			vk->vkQueueWaitIdle(queue);
 		}
 		vk->vkFreeCommandBuffers(vk->device, impl->cmd_pool, 1, &cmd);
 	}
