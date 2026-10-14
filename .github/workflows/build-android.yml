@@ -135,7 +135,24 @@ env:
   # fallback typedef in leia_cnsdk.cpp compiles out. The filter itself lives in the
   # impl, i.e. it reaches a device only with the 0.10.75 device-service APK; an older
   # service just lacks the entry point and the DP declines the layer (today's look).
-  CNSDK_TAG: v0.10.75
+  #
+  # 0.10.78: Vulkan weave on the CALLER's queue + per-pass render-scene fence ring
+  # (LeiaInc/CNSDK#748) and semaphore waits at FRAGMENT_SHADER|COLOR_ATTACHMENT_OUTPUT on
+  # every interlacer submit. Publishes `leia_interlacer_vulkan_initialize_with_queue`,
+  # which leia_cnsdk.cpp already imports WEAKLY (NULL = legacy init), so against this pin
+  # the DP's weave_queue is honoured and CNSDK stops submitting on the app's queue 0.
+  # Not 0.10.76 (tagged before #748 merged) and not 0.10.77 (its loader declares the
+  # slot INTRODUCED_IN 0.10.76 — CNSDK#751 fixes that in 0.10.78).
+  #
+  # ALSO in this pin, and NOT a weave change: CNSDK#724 (ST-5781, between 0.10.75 and
+  # 0.10.76) switched Android head tracking from the Blink detector to MediaPipe. The
+  # service APKs are now suffixed by variant: -63mm = MediaPipe landmarks + solvePnP depth
+  # with a fixed 63 mm IPD (the primary, what the release page carries), -autoipd =
+  # MediaPipe + demographic IPD models, -blink = the previous detector (0.10.75's, still
+  # Windows'; only in the release RUN's artifacts). This repo only consumes the loader
+  # zip, but the runtime's cnsdk_services pin must equal this tag, so moving here moves
+  # the tracker on every device. Tracking numbers measured on 0.10.75 are Blink numbers.
+  CNSDK_TAG: v0.10.78
 
 jobs:
   Android:
