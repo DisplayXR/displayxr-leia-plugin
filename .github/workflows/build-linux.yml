@@ -191,6 +191,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lens_owner_linux
 
+      - name: Unit test — lost-capture re-create schedule (#364)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_bg_capture_recovery_linux
+
       # Runs the plug-in's own compose SPIR-V on lavapipe: opaque atlas pixels
       # must reach the weaver bit-identical with the desktop capture on, alpha < 1
       # must blend premultiplied in linear light (OpenXR 1.1 §10.6.2). A SKIP

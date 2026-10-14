@@ -267,6 +267,7 @@ add_library(DisplayXR-LeiaSR SHARED
     leia_bg_capture_linux.h
     leia_bg_capture_worker_linux.c
     leia_bg_capture_worker_linux.h
+    leia_bg_capture_recovery_linux.h
     leia_mutter_capture_linux.c
     leia_mutter_capture_linux.h
     leia_sr_linux.h
@@ -339,6 +340,12 @@ install(TARGETS DisplayXR-LeiaSR
 add_executable(test_lens_owner_linux tests/test_lens_owner_linux.c)
 target_include_directories(test_lens_owner_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_lens_owner_linux COMMAND test_lens_owner_linux)
+
+# --- Host unit test: lost-capture re-create schedule (#364) --------------
+# Pure logic from leia_bg_capture_recovery_linux.h; no D-Bus, no PipeWire.
+add_executable(test_bg_capture_recovery_linux tests/test_bg_capture_recovery_linux.c)
+target_include_directories(test_bg_capture_recovery_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_bg_capture_recovery_linux COMMAND test_bg_capture_recovery_linux)
 
 # --- GPU unit test: compose-under-capture colour contract ----------------
 # Runs the plug-in's own compose SPIR-V on any Vulkan device (Mesa lavapipe in

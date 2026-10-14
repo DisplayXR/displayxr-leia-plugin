@@ -64,6 +64,9 @@ SO="$BUILD_DIR/src/drv_leia_linux/DisplayXR-LeiaSR.so"
 echo "==> Unit test: lens-preference ownership (LeiaSR #266)"
 "$BUILD_DIR/src/drv_leia_linux/test_lens_owner_linux"
 
+echo "==> Unit test: lost-capture re-create schedule (#364)"
+"$BUILD_DIR/src/drv_leia_linux/test_bg_capture_recovery_linux"
+
 echo "==> Unit test: compose-under-capture colour (OpenXR 1.1 §10.6.2; offscreen, first Vulkan device)"
 rc=0
 "$BUILD_DIR/src/drv_leia_linux/test_compose_color_linux" || rc=$?
