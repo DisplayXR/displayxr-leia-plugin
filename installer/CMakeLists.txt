@@ -141,7 +141,22 @@ if(TARGET DisplayXR-LeiaConversion)
     message(STATUS "Installer: bundling DisplayXR-LeiaConversion.dll (ConversionProviders/leia-conversion row)")
 endif()
 
+# ADR-054 N4b: provenance-allowlist rows for the runtime-loaded DLLs, generated
+# from the exact bytes in BIN_DIR right before makensis runs.
+set(LEIA_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
+file(TO_NATIVE_PATH "${LEIA_ALLOWLIST_NSH}" LEIA_ALLOWLIST_NSH_NATIVE)
+set(LEIA_ALLOWLIST_SHIP_CONV "")
+if(TARGET DisplayXR-LeiaConversion)
+    set(LEIA_ALLOWLIST_SHIP_CONV "-DSHIP_CONV=1")
+endif()
+
 add_custom_target(installer
+    COMMAND "${CMAKE_COMMAND}"
+        "-DBIN_DIR=${DXR_BIN_DIR}"
+        "-DVERSION=${DXR_LEIA_VERSION}"
+        "-DOUT=${LEIA_ALLOWLIST_NSH}"
+        ${LEIA_ALLOWLIST_SHIP_CONV}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
     COMMAND "${NSIS_EXECUTABLE}"
         "/DVERSION=${DXR_LEIA_VERSION}"
         "/DVERSION_MAJOR=${DXR_LEIA_VERSION_MAJOR}"
@@ -155,6 +170,7 @@ add_custom_target(installer
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
         "/DSIGN_CMD=${SIGN_CMD}"
         ${LEIA_CONV_NSIS_DEFINE}
+        "/DALLOWLIST_NSH=${LEIA_ALLOWLIST_NSH_NATIVE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building DisplayXR Leia SR plug-in installer..."
