@@ -938,15 +938,20 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// service delivers at >= ~2 Hz even with no face). No frames ~2 s after start
 	// -> cycle at once (the #201 race, the common case). Frames that STOP
 	// mid-session -> wait kMidSessionGrace first, because the head-tracking
-	// service now rebuilds a lost camera itself (CNSDK#754) and a cycle racing
-	// that rebuild only costs it a reopen. Between cycles the delay starts at
+	// service now rebuilds a lost camera itself (CNSDK#754): first reopen
+	// ~1.35 s after the loss, then retries at a 2/4/8 s... back-off capped at
+	// 30 s, so an outage of N seconds recovers at the next back-off boundary
+	// (measured on the NP02J: an 8 s camera block recovered 15.6 s after the
+	// loss). The grace is one back-off cap so the common path never sees a
+	// plug-in cycle; a cycle racing that rebuild only costs it a reopen,
+	// harmless but noisy. Between cycles the delay starts at
 	// kCycleBackoffFirst and doubles up to kCycleBackoffMax, reset once frames
 	// flow again. A lifecycle pause stops it (the app's own resume redoes the
 	// handshake) and the resume restarts the grace clock.
 	constexpr int64_t kNsPerMs = 1000 * 1000LL;
 	constexpr int64_t kFramesStale = 3000 * kNsPerMs;
 	constexpr int64_t kStartGrace = 2000 * kNsPerMs;
-	constexpr int64_t kMidSessionGrace = 10000 * kNsPerMs;
+	constexpr int64_t kMidSessionGrace = 30000 * kNsPerMs;
 	constexpr int64_t kCycleBackoffFirst = 15000 * kNsPerMs;
 	constexpr int64_t kCycleBackoffMax = 120000 * kNsPerMs;
 
