@@ -129,6 +129,7 @@ typedef leia_bool (*leia_interlacer_vulkan_set_overlay_2d)(struct leia_interlace
  */
 static const uint64_t kDropVerboseRuns = 32;
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -919,32 +920,86 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	// handshake always races its own connect). Detection is trivial thanks
 	// to the liveness clock (#152 L-c): listener_frame_ns is stamped on
 	// EVERY delivered frame, so "still 0 well after start" == subscribed
-	// nothing. Remedy: bounce start_face_tracking — by then the connection
-	// is up, so the re-sent handshake lands. Bounded attempts; exits the
-	// moment a frame arrives or shutdown is requested.
-	// Wait ~2 s for the first frame; if none, cycle; after each cycle allow
-	// ~5 s for the replayed handshake + service round-trip (measured: frames
-	// can arrive several seconds after the cycle).
-	auto wait_for_frames = [&](int ticks_50ms) -> bool {
-		for (int i = 0; i < ticks_50ms; i++) {
-			if (cnsdk->shutting_down.load(std::memory_order_acquire) ||
-			    cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
-				return true; // stop the watchdog either way
-			}
-			if (cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0) {
-				return true;
-			}
-			std::this_thread::sleep_for(50ms);
+	// nothing. Remedy: cycle the core pause/resume (below) -- by then the
+	// connection is up, so the replayed handshake lands.
+	//
+	// The watchdog runs for the WHOLE session, not just after start, and backs
+	// off instead of giving up. The first version cycled 3 times ~5 s apart and
+	// then stopped for good ("weaves untracked/mono until next app resume").
+	// Both halves of that went wrong on a device (nubia NP02J, 2026-10-14): when
+	// frames are missing because the CAMERA is failing rather than because the
+	// subscription was lost, three pause/resume cycles in ~16 s each closed and
+	// reopened the HTS camera while CamX was recovering, which crashed the camera
+	// provider; and once it gave up, a camera that came back minutes later was
+	// never used. Frames can also stop MID-session (camera HAL restart, another
+	// app taking a front camera) -- the start-only check never saw that.
+	//
+	// Policy: frames count as flowing while one arrived within kFramesStale (the
+	// service delivers at >= ~2 Hz even with no face). No frames ~2 s after start
+	// -> cycle at once (the #201 race, the common case). Frames that STOP
+	// mid-session -> wait kMidSessionGrace first, because the head-tracking
+	// service now rebuilds a lost camera itself (CNSDK#754) and a cycle racing
+	// that rebuild only costs it a reopen. Between cycles the delay starts at
+	// kCycleBackoffFirst and doubles up to kCycleBackoffMax, reset once frames
+	// flow again. A lifecycle pause stops it (the app's own resume redoes the
+	// handshake) and the resume restarts the grace clock.
+	constexpr int64_t kNsPerMs = 1000 * 1000LL;
+	constexpr int64_t kFramesStale = 3000 * kNsPerMs;
+	constexpr int64_t kStartGrace = 2000 * kNsPerMs;
+	constexpr int64_t kMidSessionGrace = 10000 * kNsPerMs;
+	constexpr int64_t kCycleBackoffFirst = 15000 * kNsPerMs;
+	constexpr int64_t kCycleBackoffMax = 120000 * kNsPerMs;
+
+	int64_t grace_until_ns = os_monotonic_get_ns() + kStartGrace;
+	int64_t next_cycle_ns = 0;
+	int64_t backoff_ns = 0;
+	int attempt = 0;
+	bool had_frames = false;
+	bool was_paused = false;
+	while (!cnsdk->shutting_down.load(std::memory_order_acquire)) {
+		std::this_thread::sleep_for(50ms);
+		if (cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
+			was_paused = true;
+			continue;
 		}
-		return cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0;
-	};
-	if (wait_for_frames(40)) { // ~2 s: the healthy path
-		return;
-	}
-	for (int attempt = 1; attempt <= 3; attempt++) {
-		if (cnsdk->shutting_down.load(std::memory_order_acquire) ||
-		    cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
-			return; // app paused/quitting; its own resume redoes the handshake
+		const int64_t now_ns = os_monotonic_get_ns();
+		if (was_paused) {
+			// The app's own resume replays the handshake; give it the start grace.
+			was_paused = false;
+			grace_until_ns = now_ns + kStartGrace;
+			continue;
+		}
+		const int64_t last_ns = cnsdk->listener_frame_ns.load(std::memory_order_relaxed);
+		if (last_ns != 0 && now_ns - last_ns < kFramesStale) {
+			if (attempt > 0) {
+				U_LOG_W("HW_DBG_CNSDK: tracking watchdog: frames flowing after "
+				        "cycle %d — recovered", attempt);
+			}
+			had_frames = true;
+			attempt = 0;
+			backoff_ns = 0;
+			next_cycle_ns = 0;
+			grace_until_ns = 0;
+			continue;
+		}
+		if (had_frames && attempt == 0 && grace_until_ns == 0) {
+			// Frames just stopped mid-session: let the service try first.
+			U_LOG_W("HW_DBG_CNSDK: tracking watchdog: frames stopped mid-session; "
+			        "cycling in %lld ms unless they resume",
+			        (long long)(kMidSessionGrace / kNsPerMs));
+			grace_until_ns = now_ns + kMidSessionGrace;
+			continue;
+		}
+		if (now_ns < grace_until_ns || now_ns < next_cycle_ns) {
+			continue;
+		}
+		// Activity-lifecycle API is only safe with a real Activity
+		// (in-process); never in a service context.
+		if (!cnsdk->host_is_activity) {
+			U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames and no Activity "
+			        "(service context) — cannot cycle, the head-tracking service "
+			        "must recover the camera itself");
+			return;
 		}
 		// start_face_tracking(false/true) does NOT replay the dropped
 		// subscription handshake (measured — 3 bounces, still 0 frames).
@@ -952,35 +1007,25 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		// minimize/refocus workaround takes, and it reliably restores the
 		// frame stream. Call the CNSDK core functions directly (NOT the
 		// plug-in's leia_cnsdk_on_pause wrapper) so the lens-preference
-		// refcount is untouched — no visible 2D blink. Activity-lifecycle
-		// API is only safe with a real Activity (in-process); never in a
-		// service context. tracking_cycling gates process_atlas_weave for
-		// the duration: CNSDK throws if the weave runs mid-teardown
-		// (observed: terminate()/__emutls SIGSEGV on the repaint thread).
-		if (!cnsdk->host_is_activity) {
-			U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames and no Activity "
-			        "(service context) — cannot cycle, session stays untracked");
-			return;
-		}
-		U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames after start — frame "
-		        "subscription likely lost pre-connect (leia-plugin#201); cycling "
-		        "core pause/resume to replay the handshake (attempt %d/3)", attempt);
+		// refcount is untouched — no visible 2D blink. tracking_cycling
+		// gates process_atlas_weave for the duration: CNSDK throws if the
+		// weave runs mid-teardown (observed: terminate()/__emutls SIGSEGV on
+		// the repaint thread).
+		attempt++;
+		backoff_ns = backoff_ns == 0 ? kCycleBackoffFirst : std::min(backoff_ns * 2, kCycleBackoffMax);
+		U_LOG_W("HW_DBG_CNSDK: tracking watchdog: no frames %s (leia-plugin#201); "
+		        "cycling core pause/resume to replay the handshake (attempt %d, "
+		        "next no sooner than %lld s)",
+		        had_frames ? "since they stopped mid-session" : "after start", attempt,
+		        (long long)(backoff_ns / (1000 * kNsPerMs)));
 		cnsdk->tracking_cycling.store(true, std::memory_order_release);
 		std::this_thread::sleep_for(100ms); // let an in-flight weave drain
 		leia_core_on_pause(cnsdk->core);
 		std::this_thread::sleep_for(150ms);
 		leia_core_on_resume(cnsdk->core);
 		cnsdk->tracking_cycling.store(false, std::memory_order_release);
-		if (wait_for_frames(100)) { // ~5 s post-cycle
-			if (cnsdk->listener_frame_ns.load(std::memory_order_relaxed) != 0) {
-				U_LOG_W("HW_DBG_CNSDK: tracking watchdog: frames flowing after "
-				        "cycle %d — recovered", attempt);
-			}
-			return;
-		}
+		next_cycle_ns = os_monotonic_get_ns() + backoff_ns;
 	}
-	U_LOG_W("HW_DBG_CNSDK: tracking watchdog: still no frames after 3 cycles — "
-	        "giving up (session weaves untracked/mono until next app resume)");
 }
 
 } // namespace
