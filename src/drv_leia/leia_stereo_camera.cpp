@@ -204,6 +204,9 @@ struct resolved_camera
 	bool primary = false;
 	//! SR display id for the keep-alive's SrDisplayBindingInfo; 0 = unknown.
 	uint64_t display_id = 0;
+	//! The runtime's registry monitor id of that screen, as this plug-in claimed it
+	//! (what the runtime reports to apps as the camera's display); 0 = unknown.
+	uint64_t monitor_id = 0;
 	char display_name[LEIA_SCAM_NAME_MAX] = {0};
 	//! The screen part of the name ("" = unknown), kept for a device that went away.
 	char display_screen[LEIA_SCAM_NAME_MAX] = {0};
@@ -659,18 +662,21 @@ monitor_friendly_name(const char *device_name)
  * Which screen a device's camera belongs to: the claims table first (what
  * probe_displays stored — no SR call), then SR's own display enumeration
  * (cached, shared with probe_displays). Fills the SR display id the
- * keep-alive binds to and the screen's name ("" = unknown).
+ * keep-alive binds to, the runtime monitor id of the claimed screen (only the
+ * claims table knows it; 0 = not claimed) and the screen's name ("" = unknown).
  */
 void
-resolve_screen(const char *serial, uint64_t *out_display_id, std::string *out_screen)
+resolve_screen(const char *serial, uint64_t *out_display_id, uint64_t *out_monitor_id, std::string *out_screen)
 {
 	*out_display_id = 0;
+	*out_monitor_id = 0;
 	out_screen->clear();
 	char device_name[32] = {0};
 	std::string product;
 	leia_win_claim_binding claim = {};
 	if (leia_win_claims_find_serial(serial, &claim)) {
 		*out_display_id = claim.sr_display_id;
+		*out_monitor_id = claim.monitor_id;
 		std::snprintf(device_name, sizeof(device_name), "%s", claim.device_name);
 	}
 	if (*out_display_id == 0 || device_name[0] == '\0') {
@@ -781,9 +787,10 @@ resolve_locked()
 		c.primary = g_registry[i].primary;
 		peek_eye_size(c.serial, c.primary, &c.eye_w, &c.eye_h);
 		try {
-			resolve_screen(c.serial, &c.display_id, &screens[i]);
+			resolve_screen(c.serial, &c.display_id, &c.monitor_id, &screens[i]);
 		} catch (...) {
 			c.display_id = 0;
+			c.monitor_id = 0;
 			screens[i].clear();
 		}
 		std::snprintf(c.display_screen, sizeof(c.display_screen), "%s", screens[i].c_str());
@@ -815,10 +822,11 @@ resolve_locked()
 		std::snprintf(cams[i].platform_hint, sizeof(cams[i].platform_hint), "%s", hint);
 		g_cams[i] = cams[i];
 		char line[512];
-		std::snprintf(line, sizeof(line), "[%u] \"%s\" leia-sr:%s%s%s display=0x%016llx %ux%u%s; ", i,
-		              cams[i].display_name, cams[i].serial, cams[i].primary ? " (primary)" : "",
-		              present[i] ? "" : " (GONE)", (unsigned long long)cams[i].display_id, cams[i].eye_w,
-		              cams[i].eye_h, cams[i].calibrated ? " calibrated" : " RAW");
+		std::snprintf(line, sizeof(line), "[%u] \"%s\" leia-sr:%s%s%s display=0x%016llx monitor=0x%016llx %ux%u%s; ",
+		              i, cams[i].display_name, cams[i].serial, cams[i].primary ? " (primary)" : "",
+		              present[i] ? "" : " (GONE)", (unsigned long long)cams[i].display_id,
+		              (unsigned long long)cams[i].monitor_id, cams[i].eye_w, cams[i].eye_h,
+		              cams[i].calibrated ? " calibrated" : " RAW");
 		set += line;
 	}
 	g_cam_count = n;
@@ -1405,6 +1413,11 @@ leia_stereo_camera_enumerate(struct xrt_plugin_instance *inst,
 			// first field run advertised a hard-coded 30 Hz for a ~60 Hz camera).
 			info.max_frame_rate = rate_get(rc.serial);
 			info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID
+			// The camera's screen (runtime #1961). The copy below stops at the
+			// runtime's struct_size, so an older runtime never sees it.
+			info.monitor_id = rc.monitor_id;
+#endif
 			auto *dst = reinterpret_cast<xrt_plugin_stereo_camera_info *>(reinterpret_cast<uint8_t *>(out) +
 			                                                               (size_t)i * sz);
 			std::memcpy(dst, &info, sz < sizeof(info) ? sz : sizeof(info));
