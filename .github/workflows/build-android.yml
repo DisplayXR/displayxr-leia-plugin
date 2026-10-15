@@ -158,7 +158,13 @@ env:
   # (persist.debug.cnsdk.cam / debug.cnsdk.cam), which lives in the service APKs. This
   # repo moves so the runtime can pin the same tag (its APK pair guard requires loader ==
   # the CNSDK this .so was built against) and ship the 0.10.79 services in the bundle.
-  CNSDK_TAG: v0.10.79
+  #
+  # 0.10.80 (cnsdk-android-0.10.80+202.528800d): the Vulkan weaver's per-RenderState
+  # fence, UBOs and descriptor set are ringed per in-flight frame (LeiaInc/CNSDK#753) —
+  # layer 2 of the GPU-side weave-sync chain (runtime ADR-055 / #2095: layer 1 = runtime
+  # semaphores, layer 3 = this plug-in's DP submits on the captured weave queue, #374).
+  # Only leia/common/RendererVulkan.cpp changed; no API, loader or INTRODUCED_IN change.
+  CNSDK_TAG: v0.10.80
 
 jobs:
   Android:
