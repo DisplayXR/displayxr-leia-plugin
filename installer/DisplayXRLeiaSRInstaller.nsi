@@ -125,6 +125,20 @@ AllowSkipFiles off
 !include "WordFunc.nsh"
 !insertmacro VersionCompare
 
+; ADR-054 N4b: the runtime's provenance gate enforces by default - a plug-in DLL
+; must be Authenticode-signed or have its SHA-256 under
+; HKLM\Software\DisplayXR\Trust\Allowlist. installer/gen_allowlist_nsh.cmake
+; computes the rows for the runtime-loaded DLLs from the exact bytes packed; a hand-run makensis without
+; the define writes nothing (a signed release needs no row).
+!ifdef ALLOWLIST_NSH
+	!include "${ALLOWLIST_NSH}"
+!else
+	!macro DXR_ALLOWLIST_WRITE
+	!macroend
+	!macro DXR_ALLOWLIST_REMOVE
+	!macroend
+!endif
+
 ; installer/CMakeLists.txt always passes this (derived from the runtime ABI
 ; pin, empty for a non-release pin). Default it so a hand-run makensis
 ; compiles instead of erroring on an unknown constant — an absent define
@@ -637,6 +651,10 @@ Section "Leia SR Plug-in" SecPlugin
 	File "${BIN_DIR}\plugins\${CONV_DLL}"
 !endif
 
+	; ADR-054 N4b: digests of the DLLs just written, so the enforcing provenance
+	; gate admits them even when this build is unsigned.
+	!insertmacro DXR_ALLOWLIST_WRITE
+
 	; -----------------------------------------------------------------
 	; Register at HKLM\Software\DisplayXR\DisplayProcessors\leia-sr per
 	; the contract in docs/specs/runtime/plugin-discovery.md.
@@ -784,6 +802,8 @@ Section "Uninstall"
 	; anyone else) does not find us; it then runs on the fallback display
 	; processor.
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\leia-sr"
+	; ADR-054 N4b: drop only the allowlist rows this installer wrote.
+	!insertmacro DXR_ALLOWLIST_REMOVE
 !ifdef LEIA_CONV
 	; The conversion provider's row (with any Settings the user set): the
 	; runtime's tasks fall through to the next provider at the next create.
