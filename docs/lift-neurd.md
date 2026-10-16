@@ -20,7 +20,7 @@ carries bit 8.
 
 | Slot | Plug-in behaviour |
 |---|---|
-| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.6 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
+| `lift_get_caps` | Non-blocking. `modes` = DEPTH\|SBS (1\|2) once NeurD is present, else 0. **Never NVIEW**: not available on NeurD ≤ 0.4.10 (public output types fix the tile grid); SBS with explicit viewpoints only. `state` 0 unavailable / 1 activating / 2 ready. `max_streams` 32 (NeurD's process limit), `max_views` 8, `depth_semantics` 0 (relative), `backend` e.g. `neurd-directml`, `typical_latency_ns` = measured EMA (prior: 22 ms DirectML, 14 ms CUDA). |
 | `lift_stream_create` | Non-blocking. Re-probes NeurD first (see *Absent is not permanent*). Succeeds while NeurD is still activating — the NeurD stream is created lazily on the first convert. Fails soft (returns false, latches nothing in the plug-in) while unavailable. The runtime (`d3d11_lift.cpp`) calls it only once caps say READY, and a false there marks that runtime stream permanently failed — which is why caps report READY only when the module is READY. |
 | `lift_stream_destroy` | Releases the stream's NeurD stream and bridge resources. |
 | `lift_convert` | **Synchronous, blocking** (≈ bridge + inference). Returns an `ID3D11Texture2D*` on the caller's device — `R8G8B8A8_UNORM` for SBS, `R8_UNORM` for DEPTH (polarity flipped at the bridge, in the R8 unpack, from NeurD's near = high disparity to the spec's RELATIVE larger = farther) — owned by the stream and valid until the next convert on that stream. Returns false while activating/unavailable. |
@@ -52,7 +52,7 @@ the widest that fits D3D11's 16384-texel limit; a wider request fails with a WAR
 ## Process model
 
 **Supported NeurD versions.** By default the plug-in accepts **NeurD 0.4.6 or newer** —
-the only release tested on hardware. An older `NeurD.dll` is refused from its version
+the oldest release tested on hardware. An older `NeurD.dll` is refused from its version
 resource before it is loaded (or, lacking one, right after it is loaded), before backend
 selection, init, licensing or any model load: one WARN names the
 found version and the minimum, and lift reports unavailable (`modes=0 / state=0`) exactly
@@ -62,6 +62,18 @@ backend for the D3D path, 0.4.3–0.4.4 have no head-tracked viewpoints, 0.4.5 l
 metric video model.) The floor is the `MinVersion` knob (`DXR_LEIA_LIFT_MIN_VERSION`, see
 *Knobs*); lower it only for demos and testing. 0.3.11 remains the hard floor of the code
 (see *NeurD 0.3.x*).
+
+| NeurD | Accepted by default | What the module does with it |
+|---|---|---|
+| < 0.3.11 | no | refused (no stream API) |
+| 0.3.11 – 0.4.5 | no (`MinVersion` must be lowered) | see *NeurD 0.3.x*; 0.4.5 adds interactive viewpoints |
+| 0.4.6 – 0.4.8 | **yes** (default floor) | interactive SBS + DEPTH, global props, NeurD auto-convergence = saliency |
+| 0.4.9 | yes | + per-stream props, `convert_stream_dx_ex` (aux depth of the same inference, metric off-axis camera) |
+| **0.4.10** (header pin) | yes | same API as 0.4.9; NeurD's own auto-convergence is the stereographer screen-plane rule (see *NeurD 0.4.10*) |
+
+The floor stays at 0.4.6: nothing in 0.4.10 is needed for correctness — every 0.4.9 entry
+point is gated on the loaded NeurD's table, and 0.4.10 changes only the rule behind
+`AUTO_CONVERGENCE`, which the plug-in reads back in unchanged units.
 
 - **Dynamic load only.** `NeurD.dll` is found in NeurD's own loader order: `PATH` →
   `NEURD_PATH` (full path to the DLL) → `HKLM\SOFTWARE\LeiaInc\NeurD` (default value =
@@ -288,7 +300,7 @@ default pattern. (The N-view paths are unreachable today: NVIEW streams are refu
 
 ## N-view
 
-**Not available on NeurD ≤ 0.4.6.** NeurD's `Config::adjust()` runs on every convert
+**Not available on NeurD ≤ 0.4.10** (0.4.7 – 0.4.10 changed nothing here). NeurD's `Config::adjust()` runs on every convert
 (including the interactive one) and re-derives the tile grid from the output type —
 SBS → 2×1, TB → 1×2, DEPTH → 1×1 — and the public `NEURD_PROP_OUTPUT_TYPE` accepts only
 those, so `OUTPUT_TILES_W/H` are overridden. Panel-verified: a 4-view request came back
@@ -314,7 +326,7 @@ prints `NeurD header features: …`), and at **run** time on the loaded NeurD's 
 runs exactly the pre-0.4.9 paths; the activation WARN says which features are live:
 
 ```
-Leia lift: NeurD READY — backend neurd-directml, interactive viewpoints available, per-stream props yes, float depth METRIC, off-axis camera available
+Leia lift: NeurD READY — backend neurd-directml, interactive viewpoints available, per-stream props yes, float depth METRIC, off-axis camera available, NeurD auto-convergence stereographer screen-plane rule
 ```
 
 | Feature | NeurD entry points (all `INTRODUCED_IN` 0.4.9) | Runtime side | Without it |
@@ -426,6 +438,46 @@ Leia lift: stream 3 camera = OFF-AXIS (screen 320x180 mm, relief 80 mm relative 
 Leia lift: stream 3 camera = LEGACY dimensionless (NeurD has no off-axis convert (< 0.4.9))
 ```
 
+## NeurD 0.4.10: stereographer auto-convergence
+
+0.4.10 adds **no API** (the public headers are byte-identical to 0.4.9's; every `NeurD_prop`
+value, including `AUTO_CONVERGENCE_MIN/MAX_LIMIT`, is unchanged — nothing the plug-in sets was
+removed). What changed is the rule behind `NEURD_PROP_AUTO_CONVERGENCE` (media_sdk #571, #573,
+#574):
+
+- **Rule.** The saliency-masked mean disparity (and the saliency model — no longer loaded at
+  init) is replaced by the **stereographer screen-plane rule**: the mean of the centre-weighted
+  80th percentile of nearness and the dominant depth clump, far background excluded, followed
+  by a critically damped spring (τ 1 s; scene cuts confirmed by two measurements, then τ 0.05 s).
+  It is a port of the runtime's own `u_lift_autoconv.c` (runtime #1858), so NeurD AUTO and the
+  runtime's caller-set policy now aim at the same screen plane.
+- **No stall.** Measurements (at most every 125 ms) average the disparity into a ≤ 128×128 grid
+  on the GPU and read it back **asynchronously**; the first measurement of a feed (and after a
+  feed-composition reset) is still synchronous. The 0.4.6 – 0.4.9 saliency pass ran a second
+  model synchronously every 20 frames.
+- **Units unchanged.** NeurD still renders with, and reports in `NeurD_depth_info::convergence`
+  / `NeurD_get_[stream_]prop_1f(CONVERGENCE)`, the convergence it used: `c = −(d − 128)·0.1/128`
+  with `d` the 0..255 disparity put on the screen, clamped to the MIN/MAX limits (default ±0.1).
+  So the off-axis AUTO anchor `h₀ = 0.5 − 5c` and the aux depth's `convergence_depth` need no
+  change. With the async readback the value is the follower's state at that convert, i.e. it
+  can trail the content by one measurement — the same frame-to-frame continuity the off-axis
+  path already assumed.
+
+The plug-in's only code change is diagnostic: the READY line and each stream's AUTO line name
+the rule of the **loaded** NeurD (`stereographer screen-plane rule` from 0.4.10,
+`saliency mean disparity (NeurD < 0.4.10)` for 0.4.6 – 0.4.9). That matters only for converts
+that run NeurD AUTO — under a runtime with #1858 that is the first one or two converts of a
+stream (or every convert with `DXR_LIFT_AUTO_CONVERGENCE=module` in the service environment).
+
+**Not done (runtime-side, TODO).** With NeurD ≥ 0.4.10 the runtime could hand AUTO back to the
+module for video streams and stop requesting aux depth just to measure convergence (one fewer
+R32F bridge per convert when the app did not ask for depth). That is a runtime policy decision
+and needs the module to say which rule it runs: e.g. an appended
+`uint32_t module_autoconv` (`XRT_DP_LIFT_AUTOCONV_NONE / _MODULE_OPAQUE / _STEREOGRAPHER`) in
+`struct xrt_dp_lift_caps` (runtime `src/xrt/include/xrt/xrt_dp_lift.h`, announced by a new
+`XRT_DP_LIFT_HAS_MODULE_AUTOCONV` macro), which this plug-in would fill as
+`nd->version >= 0.4.10 ? STEREOGRAPHER : MODULE_OPAQUE`. Not proposed here.
+
 ## Parameters
 
 | `xrt_dp_lift_params` | NeurD |
@@ -463,7 +515,7 @@ above. The plug-in's part:
   for the first one or two converts, so a stream usually logs both):
 
 ```
-Leia lift: stream 3 convergence = NeurD auto-convergence (caller AUTO)
+Leia lift: stream 3 convergence = NeurD auto-convergence (caller AUTO; stereographer screen-plane rule)
 Leia lift: stream 3 convergence = caller-set (runtime auto-convergence policy or the app) — NeurD auto-convergence OFF
 ```
 
@@ -558,7 +610,7 @@ exactly like the SR SDK:
 | | |
 |---|---|
 | Pins | `NEURD_SDK_REF` + `NEURD_SDK_REPO` in `scripts/build-windows.bat` **and** `.github/workflows/build-windows.yml` (`jobs.Build.env`), kept equal by `scripts/check_sr_pins.py` (lint.yml). |
-| Current pin | `v0.4.9` — the first media_sdk release carrying `NeurD_convert_stream_dx_ex` and per-stream props (media_sdk#561; tag on `dev@20bf39e`, the commit that passed QA as `v0.4.9-QA`). Headers are identical across a version's `-DEV`/`-QA`/release tags. |
+| Current pin | `v0.4.10` (media_sdk release `0.4.10+194.c679105`). Its public headers (`NeurD.h`, `_NeurD_detail.h`, `_NeurD_table.h`) are **byte-identical to v0.4.9's** — the first release carrying `NeurD_convert_stream_dx_ex` and per-stream props (media_sdk#561) — and to the release SDK zip's `include/` (modulo CRLF); only the generated `NeurD_version.h` says 0.4.10. So a v0.4.9 header build and a v0.4.10 one compile the same code. Headers are identical across a version's `-DEV`/`-QA`/release tags. |
 | Auth | `gh` with read access to `LeiaInc/media_sdk` (`gh auth login`, or `GH_TOKEN`). CI uses `secrets.LEIALOFT_GITHUB_TOKEN`, the SR SDK token — that token must be granted read on `media_sdk`. |
 | Failure | Soft. The .bat prints a WARN and builds without lift; CI emits a `::warning::` annotation (`continue-on-error`) and ships without lift. CMake prints `NeurD headers NOT found ... lift compiled OUT`. |
 | Override | `set NEURD_SDK_ROOT=<dir with include\NeurD.h + NeurD_version.h>` (e.g. a local media_sdk drop) skips the fetch. |
@@ -624,6 +676,10 @@ lift-enabled runtime + this plug-in registered:
    (same parallax direction and comparable depth at ReliefDepthM 0.08). A stream created with
    aux depth logs `float depth per convert (NeurD_convert_stream_dx_ex, aux depth requested)`, and the runtime's
    lift result carries a depth texture (R32F, 640×416 today).
+2d. NeurD 0.4.10: the READY line ends `NeurD auto-convergence stereographer screen-plane rule`
+   (0.4.6 – 0.4.9: `saliency mean disparity (NeurD < 0.4.10)`), and a stream's first AUTO
+   convert logs `convergence = NeurD auto-convergence (caller AUTO; stereographer screen-plane
+   rule)`. Everything in 2c is unchanged.
 3. Absent-NeurD check: `set DXR_LEIA_LIFT=0` (or rename the NeurD install key) →
    `lift caps` reports `modes=0 state=unavailable`, and a normal
    `cube_handle_d3d11_win` session weaves exactly as before.

@@ -113,9 +113,17 @@ constexpr float kDefaultDepthGain = 2.0f;
 //! much, reduce a bit").
 constexpr int32_t kDefaultDilate = 2;
 //! Oldest NeurD lift accepts by default (MinVersion knob). A product decision, deliberately NOT
-//! NEURD_VERSION: only 0.4.6 is hardware-tested, and older ones fail converts with the default
-//! backend instead of reporting unavailable, so callers would not fall back to their own path.
+//! NEURD_VERSION: 0.4.6 is the oldest hardware-tested NeurD, and older ones fail converts with the
+//! default backend instead of reporting unavailable, so callers would not fall back to their own
+//! path. 0.4.10 is not required: its API is 0.4.9's, and 0.4.9 features are gated per call.
 constexpr uint64_t kDefaultMinNeurDVersion = NEURD_MAKE_VERSION(0, 4, 6);
+//! First NeurD whose own auto-convergence (NEURD_PROP_AUTO_CONVERGENCE) is the stereographer
+//! screen-plane rule — a port of the runtime's u_lift_autoconv.c, measured on an async GPU-averaged
+//! disparity grid (media_sdk #571 / #573 / #574). 0.4.6 - 0.4.9 ran the saliency-masked mean
+//! disparity instead. Both report the CONVERGENCE they rendered with in the same units
+//! (c = -(d - 128) * 0.1 / 128, clamped to the AUTO_CONVERGENCE_MIN/MAX_LIMIT props, default
+//! +-0.1), so the off-axis anchor h0 = 0.5 - 5c is unchanged; only the logs name the rule.
+constexpr uint64_t kNeurDStereographerAutoConvVersion = NEURD_MAKE_VERSION(0, 4, 10);
 //! ReliefDepthM default: relief thickness of RELATIVE depth on the off-axis
 //! path, metres. Matches the panel-calibrated legacy look (DepthGain 2: ~1 % of
 //! the width of disparity at the ends of the range, i.e. ~±3.5 cm of depth in
@@ -197,6 +205,19 @@ backend_str(enum NeurD_backend b)
 	case NEURD_BACKEND_OPENVINO: return "openvino";
 	default: return "unknown";
 	}
+}
+
+//! Which rule NeurD's own auto-convergence runs in the LOADED NeurD (logs only).
+const char *
+autoconv_rule_str(uint64_t neurd_version)
+{
+	if (neurd_version >= kNeurDStereographerAutoConvVersion) {
+		return "stereographer screen-plane rule";
+	}
+	if (neurd_version >= NEURD_MAKE_VERSION(0, 4, 6)) {
+		return "saliency mean disparity (NeurD < 0.4.10)";
+	}
+	return "pre-0.4.6";
 }
 
 /*
@@ -1434,13 +1455,14 @@ activation_worker()
 		if (next == G_READY) {
 			U_LOG_W(
 			    "Leia lift: NeurD READY — backend %s, interactive viewpoints %s, per-stream props %s, "
-			    "float depth %s, off-axis camera %s",
+			    "float depth %s, off-axis camera %s, NeurD auto-convergence %s",
 			    g.backend_name, g.interactive_unavailable ? "UNAVAILABLE (NeurD < 0.4.5)" : "available",
 			    g.stream_props ? "yes" : "no (NeurD < 0.4.9: global props)",
 			    g.float_depth ? (k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY ? "METRIC" : "relative")
 			                  : "no (NeurD < 0.4.9 or not DirectML)",
 			    g.offaxis ? (k0.offaxis ? "available" : "available, OFF (OffAxis=0)")
-			              : "no (NeurD < 0.4.9)");
+			              : "no (NeurD < 0.4.9)",
+			    autoconv_rule_str(nd->version));
 		}
 	}
 	g.state.store(next);
@@ -2649,10 +2671,14 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		const bool auto_conv = !(dp.convergence >= 0.0f);
 		if (s->mode != LEIA_LIFT_MODE_DEPTH && s->conv_src_logged != (auto_conv ? 0 : 1)) {
 			s->conv_src_logged = auto_conv ? 0 : 1;
-			U_LOG_W("Leia lift: stream %llu convergence = %s", (unsigned long long)s->id,
-			        auto_conv ? "NeurD auto-convergence (caller AUTO)"
-			                  : "caller-set (runtime auto-convergence policy or the app) — NeurD "
-			                    "auto-convergence OFF");
+			if (auto_conv) {
+				U_LOG_W("Leia lift: stream %llu convergence = NeurD auto-convergence (caller AUTO; %s)",
+				        (unsigned long long)s->id, autoconv_rule_str(nd->version));
+			} else {
+				U_LOG_W("Leia lift: stream %llu convergence = caller-set (runtime auto-convergence policy or "
+				        "the app) — NeurD auto-convergence OFF",
+				        (unsigned long long)s->id);
+			}
 		}
 		// strength: 1 = NeurD's calibrated budget, 0 = flat; negative/NaN = default.
 		// The element's strength (1 = nominal) times the depth-gain calibration:
