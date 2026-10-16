@@ -50,11 +50,11 @@ set SR_SDK_REPO=LeiaInc/SR-SDK-Windows-Releases-Internal-Public
 :: PRIVATE LeiaInc/media_sdk repo at NEURD_SDK_REF into the gitignored
 :: NeurD-SDK-<ref>\include (never committed -- Leia-private, like the SR SDK).
 :: Same gh auth as the SR fetch. KEEP IN SYNC with build-windows.yml
-:: (scripts/check_sr_pins.py asserts it). Pin a media_sdk RELEASE TAG; v0.4.6
-:: is the newest tag and its headers are byte-identical to dev@25a713d93 (the
-:: tip the module was written against). A failed fetch is SOFT: lift compiles
-:: out, nothing else changes.
-set NEURD_SDK_REF=v0.4.9
+:: (scripts/check_sr_pins.py asserts it). Pin a media_sdk RELEASE TAG. v0.4.10's
+:: public headers are byte-identical to v0.4.9's (0.4.10 changed NeurD's
+:: auto-convergence internally, not its API). A failed fetch is SOFT: lift
+:: compiles out, nothing else changes.
+set NEURD_SDK_REF=v0.4.10
 set NEURD_SDK_REPO=LeiaInc/media_sdk
 :: Stamp-aware (ST-5318) Vulkan weaver for SR 1.36.x. Separate tag because it is
 :: grafted from a different SR branch than SR_TAG's SDK — see the release notes.
