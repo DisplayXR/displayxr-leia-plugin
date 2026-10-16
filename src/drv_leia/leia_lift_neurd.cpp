@@ -2246,7 +2246,7 @@ leia_lift_neurd_destroy(struct leia_lift_neurd **plift)
 	delete l;
 }
 
-extern "C" //! NeurD's installed version string (HKLM\SOFTWARE\LeiaInc\NeurD "Version",
+//! NeurD's installed version string (HKLM\SOFTWARE\LeiaInc\NeurD "Version",
 //! written by its installer, e.g. "0.4.9-v0.4.9-QA+190.20bf39e"); "" if none.
 static void
 neurd_registry_version(char *buf, size_t size)
