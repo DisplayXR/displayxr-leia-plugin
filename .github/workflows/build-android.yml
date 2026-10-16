@@ -171,7 +171,13 @@ env:
   # session with a 1 s → 30 s back-off instead of staying untracked until the service
   # restarts. Service-side only; no API, loader or INTRODUCED_IN change. Measured on the
   # NP02J: an 8 s camera block recovers 15.6 s after the loss, no client restart.
-  CNSDK_TAG: v0.10.81
+  #
+  # 0.10.82 (cnsdk-android-0.10.82+206.45ea1ae): fixes a head-tracking-service deadlock
+  # (LeiaInc/CNSDK#755) — tearing down the tracking engine while camera frames were still
+  # arriving could wedge the service for good (often ~1 min after boot), leaving every app
+  # untracked/2D until the service was force-stopped. Service-side only; no API, loader or
+  # INTRODUCED_IN change.
+  CNSDK_TAG: v0.10.82
 
 jobs:
   Android:
