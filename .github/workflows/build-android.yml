@@ -177,7 +177,13 @@ env:
   # arriving could wedge the service for good (often ~1 min after boot), leaving every app
   # untracked/2D until the service was force-stopped. Service-side only; no API, loader or
   # INTRODUCED_IN change.
-  CNSDK_TAG: v0.10.82
+  #
+  # 0.10.83 (cnsdk-android-0.10.83+208.5d40493): panel SPR wake guard (LeiaInc/CNSDK#756) —
+  # on SPR panels (Lume phone class) a sleep/wake could leave the panel's subpixel rendering
+  # on, so every 3D app wove a double image until the app was refocused; the display service
+  # now gives the first 3D after wake/start a 2D->3D pass once the panel has settled.
+  # Disabled on the nubia Pad 3D II. Service-side only; no API, loader or INTRODUCED_IN change.
+  CNSDK_TAG: v0.10.83
 
 jobs:
   Android:
