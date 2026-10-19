@@ -71,6 +71,39 @@ leia_lnx_edid_parse(const uint8_t *edid, size_t len, struct leia_lnx_edid_panel 
 bool
 leia_lnx_edid_table_contains(uint16_t manufacturer_id, uint16_t product_id);
 
+//! Upper bound on displays the SR runtime reports that the scan also accepts.
+#define LEIA_LNX_EDID_MAX_SR_PANELS 8
+
+/*!
+ * One display the SR runtime drives (srEnumerateDisplays, FPC-verified), as
+ * the panel scan matches it: EDID (manufacturer, product) when SR reports
+ * them, else the DRM connector ("HDMI-A-1").
+ */
+struct leia_lnx_edid_sr_panel
+{
+	uint16_t manufacturer_id; //!< 0 = SR did not report EDID ids
+	uint16_t product_id;
+	char connector[32]; //!< may be empty
+};
+
+/*!
+ * Replace the set of panels the SR runtime reports. The frozen table is a
+ * copy of SR's product-code map and drifts as new panels ship: a prototype
+ * whose product folder SR installs from its FPC (ProductCodeInstaller, FPC
+ * product payload) has EDID ids no table lists. Every scan in this module
+ * (DRM, RandR, physical size) accepts these panels like table entries — the
+ * Windows arm's "defer to SR on a table miss". An entry with a connector but
+ * no EDID ids takes the ids from that connector's EDID, so the RandR join
+ * (which never sees DRM connector names) matches it too. Invalidates the
+ * panel cache when the set changed. Thread-safe.
+ */
+void
+leia_lnx_edid_set_sr_panels(const struct leia_lnx_edid_sr_panel *panels, uint32_t count);
+
+//! True when (manufacturer, product) is in the frozen table or is a panel the SR runtime reported.
+bool
+leia_lnx_edid_is_leia_panel(uint16_t manufacturer_id, uint16_t product_id);
+
 /*!
  * One pass over /sys/class/drm: every connected connector whose EDID matches
  * the Leia table, sorted by connector name (readdir order is arbitrary, and

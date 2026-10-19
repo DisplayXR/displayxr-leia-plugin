@@ -539,6 +539,32 @@ test_device_store(void)
 	(void)rmdir(root);
 }
 
+/* Panels the SR runtime reports (leia_lnx_edid_set_sr_panels): a prototype the
+ * frozen table does not list counts as a Leia panel once SR reports it, and
+ * stops counting when SR no longer does. */
+static void
+test_sr_panels(void)
+{
+	const uint16_t len_zr_man = 0xAE30, len_zr_prod = 0x67D1; // "LEN" 27in ZR prototype
+	CHECK(!leia_lnx_edid_table_contains(len_zr_man, len_zr_prod));
+	CHECK(!leia_lnx_edid_is_leia_panel(len_zr_man, len_zr_prod));
+
+	struct leia_lnx_edid_sr_panel sr = {.manufacturer_id = len_zr_man, .product_id = len_zr_prod};
+	leia_lnx_edid_set_sr_panels(&sr, 1);
+	CHECK(leia_lnx_edid_is_leia_panel(len_zr_man, len_zr_prod));
+	CHECK(!leia_lnx_edid_is_leia_panel(len_zr_man, 0x0001));
+	CHECK(leia_lnx_edid_is_leia_panel(ACR_ID, DS1_PROD)); // the table still answers
+
+	// An entry with neither EDID ids nor a connector matches nothing and is dropped.
+	struct leia_lnx_edid_sr_panel empty = {0};
+	leia_lnx_edid_set_sr_panels(&empty, 1);
+	CHECK(!leia_lnx_edid_is_leia_panel(len_zr_man, len_zr_prod));
+
+	leia_lnx_edid_set_sr_panels(&sr, 1);
+	leia_lnx_edid_set_sr_panels(NULL, 0);
+	CHECK(!leia_lnx_edid_is_leia_panel(len_zr_man, len_zr_prod));
+}
+
 int
 main(void)
 {
@@ -552,6 +578,7 @@ main(void)
 	test_claims_stride();
 	test_binding_table();
 	test_device_store();
+	test_sr_panels();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_display_claims_linux: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

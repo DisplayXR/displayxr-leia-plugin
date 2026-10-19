@@ -4,7 +4,7 @@
 
 #include "leia_mutter_capture_linux.h"
 
-#include "../drv_leia/leia_edid_table.h"
+#include "leia_edid_probe_linux.h"
 
 #include "util/u_logging.h"
 
@@ -200,10 +200,9 @@ leia_mutter_panel_identity_from_sysfs(struct leia_panel_identity *out)
 			continue;
 		}
 		const uint16_t man = (uint16_t)(edid[8] | (edid[9] << 8));
-		for (size_t i = 0; i < LEIA_EDID_TABLE_LEN && !table_hit.valid; i++) {
-			if (leia_edid_table[i][0] == man && leia_edid_table[i][1] == id.product_code) {
-				table_hit = id;
-			}
+		// The frozen table, or a panel the SR runtime reports (leia_lnx_edid_set_sr_panels).
+		if (!table_hit.valid && leia_lnx_edid_is_leia_panel(man, id.product_code)) {
+			table_hit = id;
 		}
 		const bool internal = strncmp(dash + 1, "eDP", 3) == 0 || strncmp(dash + 1, "LVDS", 4) == 0 ||
 		                      strncmp(dash + 1, "DSI", 3) == 0;
