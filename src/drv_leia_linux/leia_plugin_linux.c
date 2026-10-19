@@ -64,6 +64,78 @@ static bool g_probe_bound;
  *
  */
 
+/*!
+ * Hand the SR runtime's FPC-verified displays to the panel scan
+ * (leia_lnx_edid_set_sr_panels), so a panel SR drives counts as a Leia panel
+ * whether or not the frozen EDID table lists it. Never creates an SR context.
+ * @return the enumeration's count, or -1 when it is unavailable.
+ */
+static int32_t
+sr_panels_publish(struct leia_lnx_sr_display *out, uint32_t cap)
+{
+	const int32_t n = leia_lnx_sr_enumerate_displays(out, cap);
+	if (n < 0) {
+		return n;
+	}
+	struct leia_lnx_edid_sr_panel panels[LEIA_LNX_EDID_MAX_SR_PANELS];
+	uint32_t k = 0;
+	for (int32_t i = 0; i < n && k < LEIA_LNX_EDID_MAX_SR_PANELS; i++) {
+		if (!out[i].fpc_verified) {
+			continue;
+		}
+		memset(&panels[k], 0, sizeof(panels[k]));
+		panels[k].manufacturer_id = out[i].manufacturer_id;
+		panels[k].product_id = out[i].product_id;
+		snprintf(panels[k].connector, sizeof(panels[k].connector), "%s", out[i].connector);
+		k++;
+	}
+	leia_lnx_edid_set_sr_panels(panels, k);
+	return n;
+}
+
+/*!
+ * probe()'s answer on an EDID-table miss: defer to the SR runtime, the
+ * authoritative check (Windows parity, leia_edid_probe.c). The table is a
+ * frozen copy of SR's product-code map; a prototype whose product folder the
+ * SR service installed from its FPC (ProductCodeInstaller payload) is a Leia
+ * panel SR drives, with EDID ids no table lists.
+ *
+ * Gated on the SR device store having an active device, so a box whose SR
+ * service never authenticated an FPC (or has no SR at all) pays one readlink,
+ * not an SR connect. The link outlives an unplug, so it is only the gate: the
+ * bind needs a live SR context (zero budget: one connect attempt, no wait)
+ * that answers with a display, FPC-verified when the runtime can enumerate.
+ */
+static bool
+sr_defer_probe(void)
+{
+#ifndef DXR_LEIA_WEAVER_SDK
+	return false; // the stub backend has no SR runtime to ask (it would answer "display found")
+#else
+	char serial[64];
+	if (!leia_lnx_sr_device_store_serial(serial, sizeof(serial), NULL, 0)) {
+		return false;
+	}
+	if (!leiasr_probe_display(0.0)) {
+		U_LOG_I("leia_lnx_plugin: SR device store names %s but the SR runtime reports no display", serial);
+		return false;
+	}
+	struct leia_lnx_sr_display sr[LEIA_LNX_SR_MAX_DISPLAYS];
+	const int32_t n = sr_panels_publish(sr, LEIA_LNX_SR_MAX_DISPLAYS);
+	bool verified = n < 0; // a runtime without srEnumerateDisplays: its display answer is all there is
+	for (int32_t i = 0; i < n && !verified; i++) {
+		verified = sr[i].fpc_verified;
+	}
+	if (!verified) {
+		U_LOG_I("leia_lnx_plugin: SR runtime lists %d display(s), none FPC-verified", n);
+		return false;
+	}
+	U_LOG_W("leia_lnx_plugin: no panel in the frozen EDID table, but the SR runtime drives %s (FPC %s) — binding",
+	        n < 0 ? "a display" : "an FPC-verified display", serial);
+	return true;
+#endif
+}
+
 static xrt_result_t
 leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 {
@@ -72,15 +144,18 @@ leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 	 *   1. DXR_LEIA_FORCE_PROBE=1 — unconditional override (bring-up/CI).
 	 *   2. DRM/EDID match against the frozen Leia panel table — a real
 	 *      panel auto-binds, no env var needed.
-	 *   3. Decline — the plug-in must not hijack a Linux box with no Leia
+	 *   3. Table miss: defer to the SR runtime (sr_defer_probe) — a panel SR
+	 *      drives binds whether or not the table lists it.
+	 *   4. Decline — the plug-in must not hijack a Linux box with no Leia
 	 *      panel just because it is registered.
 	 */
 	const bool forced = debug_get_bool_option_leia_force_probe();
 	uint16_t edid_man = 0, edid_prod = 0;
 	const bool panel = forced ? false : leia_lnx_edid_panel_present(&edid_man, &edid_prod);
-	if (!forced && !panel) {
-		U_LOG_I("leia_lnx_plugin: probe declined — no Leia panel in /sys/class/drm EDID scan; "
-		        "set DXR_LEIA_FORCE_PROBE=1 to force-bind for bring-up/CI");
+	const bool sr_panel = !forced && !panel && sr_defer_probe();
+	if (!forced && !panel && !sr_panel) {
+		U_LOG_I("leia_lnx_plugin: probe declined — no Leia panel in /sys/class/drm EDID scan and no display "
+		        "from the SR runtime; set DXR_LEIA_FORCE_PROBE=1 to force-bind for bring-up/CI");
 		*out_inst = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
@@ -107,6 +182,8 @@ leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 
 	if (forced) {
 		U_LOG_W("leia_lnx_plugin: probe FORCED (DXR_LEIA_FORCE_PROBE=1)");
+	} else if (sr_panel) {
+		// sr_defer_probe logged the bind.
 	} else {
 		U_LOG_W("leia_lnx_plugin: Leia panel detected via DRM/EDID (manufacturer %u, product %u) — binding",
 		        edid_man, edid_prod);
@@ -243,12 +320,15 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	// registry per client connect, and a burst of rebuilds must not cost a
 	// sysfs scan + an X connection each; a hot-plugged panel is still picked
 	// up by the first rebuild after the TTL (review C).
+	// SR's displays first: publishing them lets the panel scan accept a panel
+	// SR drives that the frozen table does not list (and rescans when that set
+	// changed), so it is matched like any table panel below.
+	struct leia_lnx_sr_display sr_displays[LEIA_LNX_SR_MAX_DISPLAYS];
+	const int32_t sr_count = sr_panels_publish(sr_displays, LEIA_LNX_SR_MAX_DISPLAYS);
+
 	struct leia_lnx_edid_panel panels[LEIA_LNX_EDID_MAX_PANELS];
 	const uint32_t panel_count =
 	    leia_lnx_edid_panels_snapshot(panels, LEIA_LNX_EDID_MAX_PANELS, LEIA_LNX_PROBE_PANEL_TTL_NS);
-
-	struct leia_lnx_sr_display sr_displays[LEIA_LNX_SR_MAX_DISPLAYS];
-	const int32_t sr_count = leia_lnx_sr_enumerate_displays(sr_displays, LEIA_LNX_SR_MAX_DISPLAYS);
 
 	char fpc_serial[64] = {0};
 	const bool have_legacy_serial = sr_count < 0 && leiasr_lnx_peek_fpc_serial(fpc_serial, sizeof(fpc_serial));

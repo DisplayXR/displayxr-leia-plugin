@@ -254,8 +254,15 @@ edid_vendor_in_table(uint16_t v)
  *   1. a built-in display (CGDisplayIsBuiltin) — DXR_LEIA_ALLOW_BUILTIN=1 for
  *      a real built-in Leia panel;
  *   2. the monitor's NATIVE mode is not the resolution SR reports;
- *   3. the monitor's EDID (vendor, product) is not a Leia panel and its vendor
- *      makes no Leia panel at all (leia_edid_table.h).
+ *   3. only when rule 2 could not be evaluated (SR reported no pixel size, or
+ *      the native mode is unreadable): the monitor's EDID (vendor, product) is
+ *      not a Leia panel and its vendor makes no Leia panel at all
+ *      (leia_edid_table.h).
+ * A non-built-in monitor whose native mode IS SR's resolution is accepted
+ * whatever its EDID: that size match is the real evidence, while the frozen
+ * table drifts as prototypes ship (the 27in "ZR", EDID LEN/0x67D1, is driven by
+ * SR from its FPC product folder yet is in no table). The table only stands in
+ * for the size check when there is no size to check.
  */
 static const char *
 sr_display_reject_reason(const struct leia_mac_display_info *info, CGDirectDisplayID did, char *buf, size_t cap)
@@ -269,11 +276,13 @@ sr_display_reject_reason(const struct leia_mac_display_info *info, CGDirectDispl
 		return buf;
 	}
 	uint32_t nw = 0, nh = 0;
-	if (info->pixel_width != 0 && info->pixel_height != 0 && native_display_px(did, &nw, &nh) &&
-	    (nw != info->pixel_width || nh != info->pixel_height)) {
-		snprintf(buf, cap, "its monitor (CGDirectDisplayID %u) is natively %ux%u px but SR reports %ux%u", did, nw,
-		         nh, info->pixel_width, info->pixel_height);
-		return buf;
+	if (info->pixel_width != 0 && info->pixel_height != 0 && native_display_px(did, &nw, &nh)) {
+		if (nw != info->pixel_width || nh != info->pixel_height) {
+			snprintf(buf, cap, "its monitor (CGDirectDisplayID %u) is natively %ux%u px but SR reports %ux%u", did,
+			         nw, nh, info->pixel_width, info->pixel_height);
+			return buf;
+		}
+		return NULL; // not built-in and natively SR's resolution: trust SR over the table
 	}
 	const uint16_t v = (uint16_t)CGDisplayVendorNumber(did);
 	const uint16_t p = (uint16_t)CGDisplayModelNumber(did);

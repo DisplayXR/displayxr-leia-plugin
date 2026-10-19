@@ -46,6 +46,107 @@ leia_lnx_edid_table_contains(uint16_t manufacturer_id, uint16_t product_id)
 	return false;
 }
 
+/*
+ * Panels the SR runtime reports (leia_lnx_edid_set_sr_panels): accepted by
+ * every scan here like table entries.
+ */
+static pthread_mutex_t g_sr_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_sr_count = 0;
+static struct leia_lnx_edid_sr_panel g_sr_panels[LEIA_LNX_EDID_MAX_SR_PANELS];
+
+//! EDID ids of the monitor on DRM connector @p connector ("HDMI-A-1"), from sysfs.
+static bool
+connector_edid_ids(const char *connector, uint16_t *out_man, uint16_t *out_prod)
+{
+	DIR *drm = opendir("/sys/class/drm");
+	if (drm == NULL) {
+		return false;
+	}
+	bool found = false;
+	struct dirent *entry;
+	while (!found && (entry = readdir(drm)) != NULL) {
+		const char *dash = strchr(entry->d_name, '-');
+		if (strncmp(entry->d_name, "card", 4) != 0 || dash == NULL || strcmp(dash + 1, connector) != 0) {
+			continue;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "/sys/class/drm/%s/edid", entry->d_name);
+		FILE *f = fopen(path, "rb");
+		if (f == NULL) {
+			continue;
+		}
+		uint8_t edid[128];
+		const size_t len = fread(edid, 1, sizeof(edid), f);
+		fclose(f);
+		if (len == sizeof(edid) && memcmp(edid, EDID_MAGIC, sizeof(EDID_MAGIC)) == 0) {
+			*out_man = (uint16_t)(edid[8] | (edid[9] << 8));
+			*out_prod = (uint16_t)(edid[10] | (edid[11] << 8));
+			found = true;
+		}
+	}
+	closedir(drm);
+	return found;
+}
+
+void
+leia_lnx_edid_set_sr_panels(const struct leia_lnx_edid_sr_panel *panels, uint32_t count)
+{
+	struct leia_lnx_edid_sr_panel next[LEIA_LNX_EDID_MAX_SR_PANELS];
+	memset(next, 0, sizeof(next));
+	uint32_t n = 0;
+	for (uint32_t i = 0; panels != NULL && i < count && n < LEIA_LNX_EDID_MAX_SR_PANELS; i++) {
+		struct leia_lnx_edid_sr_panel p = panels[i];
+		if (p.manufacturer_id == 0 && p.connector[0] != '\0') {
+			(void)connector_edid_ids(p.connector, &p.manufacturer_id, &p.product_id);
+		}
+		if (p.manufacturer_id == 0 && p.connector[0] == '\0') {
+			continue; // nothing to match it by
+		}
+		next[n++] = p;
+	}
+
+	pthread_mutex_lock(&g_sr_lock);
+	const bool changed = n != g_sr_count || memcmp(next, g_sr_panels, sizeof(next)) != 0;
+	if (changed) {
+		memcpy(g_sr_panels, next, sizeof(next));
+		g_sr_count = n;
+	}
+	pthread_mutex_unlock(&g_sr_lock);
+
+	if (changed) {
+		for (uint32_t i = 0; i < n; i++) {
+			U_LOG_W("leia_lnx_edid: the SR runtime drives a panel (accepted with or without a frozen-table entry): "
+			        "manufacturer %u, product %u, connector '%s'",
+			        next[i].manufacturer_id, next[i].product_id, next[i].connector);
+		}
+		leia_lnx_edid_cache_invalidate();
+	}
+}
+
+//! A table entry, or a panel SR reported: by EDID ids, or by @p connector (may be NULL).
+static bool
+is_leia_panel_at(uint16_t manufacturer_id, uint16_t product_id, const char *connector)
+{
+	if (leia_lnx_edid_table_contains(manufacturer_id, product_id)) {
+		return true;
+	}
+	bool hit = false;
+	pthread_mutex_lock(&g_sr_lock);
+	for (uint32_t i = 0; i < g_sr_count && !hit; i++) {
+		const struct leia_lnx_edid_sr_panel *p = &g_sr_panels[i];
+		hit = (p->manufacturer_id != 0 && p->manufacturer_id == manufacturer_id && p->product_id == product_id) ||
+		      (connector != NULL && p->connector[0] != '\0' && strcmp(p->connector, connector) == 0);
+	}
+	pthread_mutex_unlock(&g_sr_lock);
+	return hit;
+}
+
+bool
+leia_lnx_edid_is_leia_panel(uint16_t manufacturer_id, uint16_t product_id)
+{
+	return is_leia_panel_at(manufacturer_id, product_id, NULL);
+}
+
 bool
 leia_lnx_edid_parse(const uint8_t *edid, size_t len, struct leia_lnx_edid_panel *out)
 {
@@ -127,7 +228,7 @@ leia_lnx_edid_enumerate_panels(struct leia_lnx_edid_panel *out, uint32_t cap, bo
 			// Empty file = connector present but no monitor.
 			struct leia_lnx_edid_panel p;
 			if (!leia_lnx_edid_parse(edid, len, &p) ||
-			    !leia_lnx_edid_table_contains(p.manufacturer_id, p.product_id)) {
+			    !is_leia_panel_at(p.manufacturer_id, p.product_id, dash + 1)) {
 				continue;
 			}
 			snprintf(p.connector, sizeof(p.connector), "%s", dash + 1);
@@ -237,13 +338,8 @@ leia_lnx_edid_panel_physical_size(float *out_width_m, float *out_height_m)
 
 		const uint16_t man = (uint16_t)(edid[8] | (edid[9] << 8));
 		const uint16_t prod = (uint16_t)(edid[10] | (edid[11] << 8));
-		bool in_table = false;
-		for (size_t i = 0; i < LEIA_EDID_TABLE_LEN; i++) {
-			if (leia_edid_table[i][0] == man && leia_edid_table[i][1] == prod) {
-				in_table = true;
-				break;
-			}
-		}
+		const char *dash = strchr(entry->d_name, '-');
+		const bool in_table = is_leia_panel_at(man, prod, dash != NULL ? dash + 1 : NULL);
 		// Internal-panel connectors (eDP/LVDS/DSI) are never the 3D display.
 		const bool internal = strstr(entry->d_name, "eDP") != NULL ||
 		                      strstr(entry->d_name, "LVDS") != NULL ||
@@ -362,7 +458,7 @@ randr_fill_positions(struct leia_lnx_edid_panel *panels, uint32_t *count, uint32
 		// Only connected outputs driven by a CRTC have a desktop position.
 		if (oi->connection != XCB_RANDR_CONNECTION_CONNECTED || oi->crtc == XCB_NONE ||
 		    !randr_output_edid(conn, outputs[i], edid_atom, &rp) ||
-		    !leia_lnx_edid_table_contains(rp.manufacturer_id, rp.product_id)) {
+		    !leia_lnx_edid_is_leia_panel(rp.manufacturer_id, rp.product_id)) {
 			free(oi);
 			continue;
 		}
