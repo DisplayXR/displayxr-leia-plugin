@@ -64,21 +64,38 @@ static bool g_probe_bound;
  *
  */
 
+//! LeiaSR's own Linux panel match: EDID physical size within 3 cm of SR's display size.
+#define LEIA_LNX_SR_SIZE_TOLERANCE_M 0.03f
+
 /*!
- * Hand the SR runtime's FPC-verified displays to the panel scan
+ * Hand the panels the SR runtime drives to the panel scan
  * (leia_lnx_edid_set_sr_panels), so a panel SR drives counts as a Leia panel
  * whether or not the frozen EDID table lists it. Never creates an SR context.
+ *   - srEnumerateDisplays available: its FPC-verified displays (EDID ids,
+ *     else connector).
+ *   - Not available (an SR SDK/runtime that predates it, e.g. the 1.38 SDK the
+ *     release .deb is built against): the ONE connected monitor whose EDID
+ *     physical size is SR's display size (LeiaSR's own rule). None or several
+ *     = nothing published: SR keeps answering with its last device after an
+ *     unplug, and that answer must not bind or claim another monitor.
  * @return the enumeration's count, or -1 when it is unavailable.
  */
 static int32_t
 sr_panels_publish(struct leia_lnx_sr_display *out, uint32_t cap)
 {
-	const int32_t n = leia_lnx_sr_enumerate_displays(out, cap);
-	if (n < 0) {
-		return n;
-	}
 	struct leia_lnx_edid_sr_panel panels[LEIA_LNX_EDID_MAX_SR_PANELS];
 	uint32_t k = 0;
+	const int32_t n = leia_lnx_sr_enumerate_displays(out, cap);
+	if (n < 0) {
+		struct leiasr_lnx_display_info di;
+		if (leiasr_lnx_query_display_info(&di) && di.valid &&
+		    leia_lnx_edid_match_physical_size(di.width_m, di.height_m, LEIA_LNX_SR_SIZE_TOLERANCE_M, panels,
+		                                      LEIA_LNX_EDID_MAX_SR_PANELS) == 1) {
+			k = 1;
+		}
+		leia_lnx_edid_set_sr_panels(panels, k);
+		return n;
+	}
 	for (int32_t i = 0; i < n && k < LEIA_LNX_EDID_MAX_SR_PANELS; i++) {
 		if (!out[i].fpc_verified) {
 			continue;
@@ -120,18 +137,19 @@ sr_defer_probe(void)
 		U_LOG_I("leia_lnx_plugin: SR device store names %s but the SR runtime reports no display", serial);
 		return false;
 	}
+	// Publish what SR drives, then require a CONNECTED monitor to be it: the
+	// device store and SR's display answer both outlive an unplug.
 	struct leia_lnx_sr_display sr[LEIA_LNX_SR_MAX_DISPLAYS];
 	const int32_t n = sr_panels_publish(sr, LEIA_LNX_SR_MAX_DISPLAYS);
-	bool verified = n < 0; // a runtime without srEnumerateDisplays: its display answer is all there is
-	for (int32_t i = 0; i < n && !verified; i++) {
-		verified = sr[i].fpc_verified;
-	}
-	if (!verified) {
-		U_LOG_I("leia_lnx_plugin: SR runtime lists %d display(s), none FPC-verified", n);
+	uint16_t man = 0, prod = 0;
+	if (!leia_lnx_edid_panel_present(&man, &prod)) {
+		U_LOG_I("leia_lnx_plugin: SR runtime answers for %s, but no connected monitor is its panel (%s)", serial,
+		        n < 0 ? "no monitor has SR's display size" : "no FPC-verified display is connected");
 		return false;
 	}
-	U_LOG_W("leia_lnx_plugin: no panel in the frozen EDID table, but the SR runtime drives %s (FPC %s) — binding",
-	        n < 0 ? "a display" : "an FPC-verified display", serial);
+	U_LOG_W("leia_lnx_plugin: no panel in the frozen EDID table, but the SR runtime drives the connected panel "
+	        "(manufacturer %u, product %u, FPC %s, matched by %s) — binding",
+	        man, prod, serial, n < 0 ? "SR's display size" : "srEnumerateDisplays");
 	return true;
 #endif
 }

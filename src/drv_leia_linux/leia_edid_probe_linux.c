@@ -303,6 +303,58 @@ edid_physical_size_m(const uint8_t *edid, float *out_w_m, float *out_h_m)
 	return false;
 }
 
+uint32_t
+leia_lnx_edid_match_physical_size(float width_m,
+                                  float height_m,
+                                  float tol_m,
+                                  struct leia_lnx_edid_sr_panel *out,
+                                  uint32_t cap)
+{
+	if (width_m <= 0.0f || height_m <= 0.0f) {
+		return 0;
+	}
+	DIR *drm = opendir("/sys/class/drm");
+	if (drm == NULL) {
+		return 0;
+	}
+	uint32_t n = 0;
+	struct dirent *entry;
+	while ((entry = readdir(drm)) != NULL) {
+		const char *dash = strchr(entry->d_name, '-');
+		if (strncmp(entry->d_name, "card", 4) != 0 || dash == NULL) {
+			continue;
+		}
+		char path[512];
+		snprintf(path, sizeof(path), "/sys/class/drm/%s/edid", entry->d_name);
+		FILE *f = fopen(path, "rb");
+		if (f == NULL) {
+			continue;
+		}
+		uint8_t edid[128];
+		const size_t len = fread(edid, 1, sizeof(edid), f);
+		fclose(f);
+		float w = 0, h = 0;
+		if (len < sizeof(edid) || memcmp(edid, EDID_MAGIC, sizeof(EDID_MAGIC)) != 0 ||
+		    !edid_physical_size_m(edid, &w, &h)) {
+			continue; // no monitor on this connector, or no usable size
+		}
+		const float dw = w > width_m ? w - width_m : width_m - w;
+		const float dh = h > height_m ? h - height_m : height_m - h;
+		if (dw > tol_m || dh > tol_m) {
+			continue;
+		}
+		if (out != NULL && n < cap) {
+			memset(&out[n], 0, sizeof(out[n]));
+			out[n].manufacturer_id = (uint16_t)(edid[8] | (edid[9] << 8));
+			out[n].product_id = (uint16_t)(edid[10] | (edid[11] << 8));
+			snprintf(out[n].connector, sizeof(out[n].connector), "%s", dash + 1);
+		}
+		n++;
+	}
+	closedir(drm);
+	return n;
+}
+
 bool
 leia_lnx_edid_panel_physical_size(float *out_width_m, float *out_height_m)
 {
