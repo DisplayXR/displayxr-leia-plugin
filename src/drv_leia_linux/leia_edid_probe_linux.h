@@ -105,6 +105,23 @@ bool
 leia_lnx_edid_is_leia_panel(uint16_t manufacturer_id, uint16_t product_id);
 
 /*!
+ * Connected monitors whose EDID physical size is @p width_m x @p height_m
+ * within @p tol_m on both axes — the rule the LeiaSR runtime itself uses to
+ * find its panel on Linux (3 cm). For SR runtimes / SDKs without
+ * srEnumerateDisplays: SR's display size then identifies the panel, and a
+ * size no connected monitor has means SR's answer is about a panel that is not
+ * here (SR keeps reporting the last device after an unplug). Writes up to
+ * @p cap entries (connector + EDID ids) to @p out.
+ * @return the number of matching monitors (may exceed @p cap).
+ */
+uint32_t
+leia_lnx_edid_match_physical_size(float width_m,
+                                  float height_m,
+                                  float tol_m,
+                                  struct leia_lnx_edid_sr_panel *out,
+                                  uint32_t cap);
+
+/*!
  * One pass over /sys/class/drm: every connected connector whose EDID matches
  * the Leia table, sorted by connector name (readdir order is arbitrary, and
  * "first panel" must mean the same panel on every call). With
