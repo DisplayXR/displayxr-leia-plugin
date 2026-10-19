@@ -459,13 +459,19 @@ jobs:
       # srWeaverSetComposeFilterStrength (85) — which the 2D-under-the-lens
       # build probe (src/drv_leia_linux/CMakeLists.txt) keys on. Snap +
       # present-origin are still present. Same tarball layout as 1.37.0.10693.
-      SR_TAG: 1.38.0.10108
+      #
+      # 1.39.0.63983 (sr-sdk-v1.39.0.63983, the RC6 runtime's SDK): adds
+      # srEnumerateDisplays (slot 97) + SrDisplayDescriptor, which per-monitor
+      # claims and the SR deferral on an EDID-table miss key on. 1.38.0.10108
+      # predates it, so v2.16.5 shipped with display enumeration compiled out
+      # (#414). The "Assert SR display enumeration" step below now refuses that.
+      SR_TAG: 1.39.0.63983
       # The exact asset and its sha256. The download is pinned to this name
       # and refused on a hash mismatch: a re-uploaded asset under the same tag
       # must be a deliberate pin change, never a silent swap. Move all three
       # together.
-      SR_SDK_ASSET: LeiaSR-SDK-1.38.0.10108-linux64.tar.gz
-      SR_SDK_SHA256: c6c13a6e813112afb43376bd7c8c1a6c47e001964d9b522fa308d3cae4621dd8
+      SR_SDK_ASSET: LeiaSR-SDK-1.39.0.63983-linux64.tar.gz
+      SR_SDK_SHA256: 23bbe806e78fb6a9ca66a8586067de4e2cc9fc0856a3652a2698b5817c95ca34
       # Private Leia artifact repo hosting every sr-sdk-v* release (see
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
@@ -621,6 +627,27 @@ jobs:
             echo "::warning::srWeaverSnapToPhase absent from $SO (DXR_LEIA_LNX_ALLOW_NO_SNAP=ON) — window drags will NOT phase-snap. Not releasable."
           else
             echo "::error::srWeaverSnapToPhase absent from the shipped $SO — window drags would never phase-snap (#271). Move SR_TAG to a Linux SDK that ships it."
+            exit 1
+          fi
+
+      # Release check (#414): the SHIPPED .so must carry SR display enumeration
+      # (srEnumerateDisplays). Without it, per-monitor claims have no SR panel
+      # identity and the SR deferral on an EDID-table miss falls back to the
+      # size match. v2.16.5 shipped without it because the SDK pin predated the
+      # call. The marker is the enumeration's own log format, compiled only
+      # with DXR_LEIA_LNX_HAVE_SR_DISPLAY_ENUM; the bare name
+      # "srEnumerateDisplays" also appears in other log strings of a build
+      # without it, so it proves nothing.
+      - name: Assert SR display enumeration in the shipped .so (#414)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
+        run: |
+          SO=_debx/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so
+          hits=$(strings "$SO" | grep -c 'leia_sr_sdk: SR display #' || true)
+          echo "SR display enumeration marker hits in $SO: $hits"
+          if [ "$hits" -gt 0 ]; then
+            echo "OK: SR display enumeration compiled in"
+          else
+            echo "::error::SR display enumeration (srEnumerateDisplays) compiled out of the shipped $SO (#414). Move SR_TAG to a Linux SDK that declares it."
             exit 1
           fi
 
