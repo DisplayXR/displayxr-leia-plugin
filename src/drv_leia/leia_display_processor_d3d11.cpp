@@ -99,7 +99,7 @@ VS_OUTPUT main(uint id : SV_VertexID) {
 //
 // leia-plugin#276: the two flat paths (2D, weaver-not-ready) bypass the weaver,
 // so they must do the output encode the weaver does via
-// leiasr_d3d11_set_srgb_conversion(write=atlas_is_linear) (ADR-021 Model B;
+// the weaver's write=atlas_is_linear on a UNORM target (ADR-021 Model B;
 // this DP declares EITHER). encode_srgb != 0 applies the standard sRGB OETF to
 // straight RGB, alpha untouched; encode_srgb == 0 returns the sample unchanged.
 static const char *blit_ps_source = R"(
@@ -1694,6 +1694,75 @@ env_alpha_gate_force_full(void)
 	return cached == 1;
 }
 
+//! How a view stores colour, for the weaver's sRGB pair (ST-5863).
+enum weave_view_encoding
+{
+	WEAVE_VIEW_UNORM8, //!< 8-bit UNORM: the shader must decode / encode
+	WEAVE_VIEW_SRGB8,  //!< 8-bit *_UNORM_SRGB view: the hardware decodes / encodes
+	WEAVE_VIEW_OTHER,  //!< typeless, 10-bit (maybe HDR10 / PQ), float, unknown
+};
+
+static weave_view_encoding
+weave_view_encoding_of(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8X8_UNORM: return WEAVE_VIEW_UNORM8;
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return WEAVE_VIEW_SRGB8;
+	default: return WEAVE_VIEW_OTHER;
+	}
+}
+
+/*!
+ * The weaver's sRGB (read, write) pair, so the weave -- its anti-crosstalk
+ * subtraction and view blend, both sums of light -- runs in linear light
+ * (ST-5863; the SR weaver's own rule, WeaverLinearLight.h, fed with the
+ * encoding only this DP knows):
+ *
+ *   read  = the atlas is ENCODED and the SRV the weaver samples is a plain 8-bit
+ *           UNORM view (an *_UNORM_SRGB view decodes in hardware; a LINEAR atlas
+ *           needs no decode)
+ *   write = the bound target is a plain 8-bit UNORM view (an *_UNORM_SRGB RTV
+ *           encodes in hardware)
+ *
+ * A target of any other format (typeless, 10-bit HDR10 / PQ, float) keeps the
+ * pair this DP always declared, (false, atlas_is_linear). Model A (ENCODED) into
+ * a UNORM target used to declare (false, false) and so wove gamma values; on a
+ * 27in panel the off-axis correction blew up.
+ */
+static void
+weave_srgb_pair(ID3D11DeviceContext *ctx, ID3D11ShaderResourceView *srv, bool atlas_is_linear, bool *out_read,
+                bool *out_write)
+{
+	DXGI_FORMAT input = DXGI_FORMAT_UNKNOWN;
+	if (srv != nullptr) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv->GetDesc(&srv_desc);
+		input = srv_desc.Format;
+	}
+	DXGI_FORMAT target = DXGI_FORMAT_UNKNOWN;
+	ID3D11RenderTargetView *rtv = nullptr;
+	ctx->OMGetRenderTargets(1, &rtv, nullptr);
+	if (rtv != nullptr) {
+		D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv->GetDesc(&rtv_desc);
+		target = rtv_desc.Format;
+		rtv->Release();
+	}
+
+	const weave_view_encoding target_enc = weave_view_encoding_of(target);
+	if (target_enc == WEAVE_VIEW_OTHER) {
+		*out_read = false;
+		*out_write = atlas_is_linear;
+		return;
+	}
+	*out_read = !atlas_is_linear && weave_view_encoding_of(input) == WEAVE_VIEW_UNORM8;
+	*out_write = target_enc == WEAVE_VIEW_UNORM8;
+}
+
 //! The 8- and 10-bit UNORM families (incl. their TYPELESS / _SRGB members).
 static bool
 alpha_gate_mask_format_ok(DXGI_FORMAT f)
@@ -2106,17 +2175,14 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		                                 : "Leia panel attached again — weaving resumes");
 	}
 
-	// ADR-021: drive the weaver's sRGB conversion from the atlas encoding the
-	// runtime declared out-of-band via set_atlas_encoding (stored in
-	// ldp->atlas_encoding). When the runtime composed in linear (Model B) it
-	// declares LINEAR, so the weaver must encode on output (write=true) — the
-	// matched encode lives here in the DP (this DP declares EITHER). When ENCODED
-	// (Model A) no conversion (passthrough). read stays false: the runtime's
-	// linear atlas is already linear, and ENCODED needs no input decode. The
-	// `format` arg remains the real atlas DXGI format (used below for the SRV).
-	// (Standard sRGB only — no vendor curve; see ADR-021 §2/§4.)
+	// ADR-021: the atlas encoding the runtime declared out-of-band via
+	// set_atlas_encoding (stored in ldp->atlas_encoding). It feeds the flat
+	// paths' encode below and the weaver's sRGB pair, which is declared right
+	// before the weave from the SRV the weaver actually samples and the bound
+	// target (weave_srgb_pair). The `format` arg remains the real atlas DXGI
+	// format (used below for the SRV). (Standard sRGB only — no vendor curve;
+	// see ADR-021 §2/§4.)
 	const bool atlas_is_linear = (ldp->atlas_encoding == XRT_ATLAS_ENCODING_LINEAR);
-	leiasr_d3d11_set_srgb_conversion(ldp->leiasr, /*read=*/false, /*write=*/atlas_is_linear);
 
 	// runtime#542: atlas processing follows the CONTENT, not the lens. The
 	// runtime hands us the grid it packed; a multi-view atlas weaves, a
@@ -2406,6 +2472,13 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	if (timing != nullptr) {
 		QueryPerformanceCounter(&ldt_q0);
 	}
+	// The weave runs in linear light (ST-5863): declared every frame, because the
+	// weaver keeps a declaration and the atlas encoding can change mid-session.
+	bool srgb_read = false;
+	bool srgb_write = atlas_is_linear;
+	weave_srgb_pair(ctx, static_cast<ID3D11ShaderResourceView *>(weaver_srv), atlas_is_linear, &srgb_read,
+	                &srgb_write);
+	leiasr_d3d11_set_srgb_conversion(ldp->leiasr, srgb_read, srgb_write);
 	leiasr_d3d11_weave(ldp->leiasr);
 	if (timing != nullptr) {
 		LARGE_INTEGER q1 = {};
