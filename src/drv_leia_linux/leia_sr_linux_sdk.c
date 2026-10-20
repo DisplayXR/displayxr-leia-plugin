@@ -832,6 +832,7 @@ struct leiasr_lnx
 	 * (render thread) — see leiasr_lnx_set_atlas_linear(). */
 	bool atlas_linear;
 	bool hw_encodes;
+	bool input_decodes; //!< the atlas view the weaver samples is a *_SRGB view: sampling decodes
 	bool srgb_dirty;
 	bool srgb_applied;
 	SrBool32 srgb_read;
@@ -1067,14 +1068,33 @@ sdk_format_is_srgb(VkFormat format)
  * srSDK semantics: read = SR_TRUE decodes sRGB→linear as the shader samples
  * the atlas; write = SR_TRUE encodes linear→sRGB as it writes the target.
  *
+ * The weave itself must run on LINEAR values: the anti-crosstalk term
+ * L - g*(R - L) subtracts the fraction of the other view's light that leaks
+ * through the lens, and the view blend mixes light, so both are energy sums.
+ * Fed gamma-encoded values the correction is wrong in proportion to the
+ * encoding, and where it is strongest (large angles, the 0.50 cap) it shows
+ * as the correction blowing up. So the shader always decodes what is encoded
+ * and always encodes what the target will not:
+ *
  *   atlas     target    read  write  why
- *   ENCODED   *_UNORM   F     F      passthrough, nobody converts (#247's fix)
+ *   ENCODED   *_UNORM   T     T      decode, weave in linear, encode
  *   ENCODED   *_SRGB    T     F      decode so the HW encode doesn't double
  *   LINEAR    *_UNORM   F     T      we encode; the HW won't (#778-era pair)
  *   LINEAR    *_SRGB    F     F      hand the HW linear, it encodes
  *
- *   read  = !atlas_linear && hw_encodes
- *   write =  atlas_linear && !hw_encodes
+ *   read  = !atlas_linear && !input_decodes
+ *   write = !hw_encodes
+ *
+ * input_decodes: the atlas view the weaver samples is itself a *_SRGB view (the
+ * runtime's choice, not this plug-in's), whose sampler already decodes; the
+ * shader then must not decode a second time. The runtime reads an sRGB
+ * swapchain through a UNORM view today (#1935), so the table above holds.
+ *
+ * The first row was (F,F), a passthrough that wove gamma values; on a 27"
+ * panel (product ZR) the anti-crosstalk visibly blew up off-axis. (T,T) is the
+ * identity for every pixel the weave does not mix or correct: the decode and
+ * encode are the shader's own float math around the weave, so no 8-bit
+ * intermediate rounds a dark code.
  *
  * History worth not re-learning: this pair flipped twice on honest on-panel
  * readings six weeks apart — (F,T) for runtime#778's crushed-dark (linear bytes
@@ -1083,12 +1103,14 @@ sdk_format_is_srgb(VkFormat format)
  * for #247's washed-out. Both readings were real; the bug was that a single
  * *constant* cannot express two different atlases. It is no longer a constant —
  * the runtime says which atlas it sent, so both rows are reachable without
- * anyone flipping anything a third time.
+ * anyone flipping anything a third time. Neither reading was about the
+ * conversion pair as such: (T,T) on an ENCODED atlas leaves those pixels
+ * byte-for-byte where (F,F) did.
  *
  * DXR_LEIA_SRGB **stays**, as the plug-in-side kill switch / diagnostic
  * override: "RW", each of 0/1, applied LAST so it wins over both inputs above
  * (=01 restores the pre-#247 pair for a rebuild-free on-panel A/B; =00 pins
- * passthrough if a runtime ever declares LINEAR wrongly). It is a diagnostic,
+ * the old gamma-space passthrough, e.g. to A/B the anti-crosstalk). It is a diagnostic,
  * not a setting: never document it as one.
  *
  * Called at create and, when the declaration changed, from the weave — so the
@@ -1103,14 +1125,16 @@ sdk_apply_srgb_conversion(struct leiasr_lnx *lnx)
 	}
 	lnx->srgb_dirty = false;
 
-	SrBool32 srgb_read = (!lnx->atlas_linear && lnx->hw_encodes) ? SR_TRUE : SR_FALSE;
-	SrBool32 srgb_write = (lnx->atlas_linear && !lnx->hw_encodes) ? SR_TRUE : SR_FALSE;
+	SrBool32 srgb_read = (!lnx->atlas_linear && !lnx->input_decodes) ? SR_TRUE : SR_FALSE;
+	SrBool32 srgb_write = !lnx->hw_encodes ? SR_TRUE : SR_FALSE;
 	const char *reason =
 	    lnx->atlas_linear
 	        ? (lnx->hw_encodes ? "atlas LINEAR + *_SRGB target: hand the HW linear, it encodes"
 	                           : "atlas LINEAR + *_UNORM target: we encode, the HW won't")
+	        : lnx->input_decodes ? (lnx->hw_encodes ? "atlas ENCODED on an *_SRGB view + *_SRGB target: the hardware decodes and encodes"
+	                                                : "atlas ENCODED on an *_SRGB view + *_UNORM target: the sampler decodes, we encode")
 	        : (lnx->hw_encodes ? "atlas ENCODED + *_SRGB target: decode so the HW encode doesn't double"
-	                           : "atlas ENCODED + *_UNORM target: passthrough, nobody converts");
+	                           : "atlas ENCODED + *_UNORM target: decode, weave in linear light, encode");
 
 	const char *srgb_override = getenv("DXR_LEIA_SRGB");
 	if (srgb_override != NULL && srgb_override[0] != '\0' && srgb_override[1] != '\0') {
@@ -1787,6 +1811,13 @@ leiasr_lnx_weave(struct leiasr_lnx *lnx,
 	 * before the weave is recorded — here, on the render thread, rather than
 	 * wherever the runtime happened to call the DP slot from. Dirty only when
 	 * the declaration actually changed, so this is not a per-frame SDK call. */
+	/* The view the weaver samples is the runtime's: an *_SRGB view would decode
+	 * in the sampler, so the shader must not decode it a second time. */
+	const bool input_decodes = sdk_format_is_srgb((VkFormat)input->view_format);
+	if (input_decodes != lnx->input_decodes) {
+		lnx->input_decodes = input_decodes;
+		lnx->srgb_dirty = true;
+	}
 	if (lnx->srgb_dirty) {
 		sdk_apply_srgb_conversion(lnx);
 	}
