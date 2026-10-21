@@ -200,6 +200,10 @@ export DXR_NOTARY_PROFILE=<notarytool keychain profile>   # or DXR_NOTARY_KEY_PA
 ./installer/macos/build_pkg.sh
 ```
 
+Stapling fetches the ticket from Apple's CloudKit and can time out right after an `Accepted`
+notarization (`stapler` error 68). The `.pkg` is then signed and notarized but not stapled;
+retry with `scripts/macos_sign_notarize.sh staple <pkg>` (it re-runs the Gatekeeper check).
+
 ## CI: none, by necessity
 
 No CI job can build the `.pkg`: the plug-in needs the LeiaSR **macOS** SDK
