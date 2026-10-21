@@ -1,0 +1,45 @@
+#!/bin/bash
+# Copyright 2026, Leia Inc / DisplayXR
+# SPDX-License-Identifier: Apache-2.0
+#
+# postinstall — DisplayXR Leia SR plug-in (macOS .pkg).
+#
+# The payload (dylib + discovery manifest + uninstaller) is already in place.
+# Replacing a dylib on disk never disturbs a process that has the old one
+# mapped (the installer writes a new file), so nothing has to be closed first
+# — but a running displayxr-service keeps the OLD plug-in until it restarts.
+# Same rule as the Windows installer's Restart Manager pass: restart the
+# service only if it was running, never start one that was not.
+#
+# Test hooks (installer/macos/test_pkg_scripts.sh): stat / id / launchctl are
+# taken from PATH.
+
+TARGET_VOL="${3:-/}"
+AGENT_LABEL="com.displayxr.service"
+
+log() { echo "[leia-sr postinstall] $*"; }
+
+if [ "$TARGET_VOL" != "/" ]; then
+    log "installed to $TARGET_VOL (not the running system): no service restart"
+    exit 0
+fi
+
+console_user="$(stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "$console_user" ] || [ "$console_user" = "root" ]; then
+    log "no console user: no service restart"
+    exit 0
+fi
+console_uid="$(id -u "$console_user" 2>/dev/null || true)"
+[ -n "$console_uid" ] || exit 0
+
+# `launchctl print` succeeds only when the agent is loaded in that GUI domain;
+# "state = running" says it is actually up (KeepAlive leaves it loaded after a
+# clean quit, and that quit must be respected).
+if launchctl print "gui/$console_uid/$AGENT_LABEL" 2>/dev/null | grep -q 'state = running'; then
+    log "restarting $AGENT_LABEL for $console_user so it loads the new plug-in"
+    launchctl kickstart -k "gui/$console_uid/$AGENT_LABEL" 2>/dev/null ||
+        log "kickstart failed: restart the DisplayXR service (or log out and in) to load the plug-in"
+else
+    log "$AGENT_LABEL not running: nothing to restart (in-process apps load the plug-in at their next launch)"
+fi
+exit 0

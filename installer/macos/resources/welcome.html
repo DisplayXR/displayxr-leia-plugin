@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>DisplayXR Leia SR Plug-in</title></head>
+<body style="font-family: -apple-system, Helvetica, sans-serif; font-size: 13px;">
+<h2>DisplayXR Leia SR Plug-in @VERSION@</h2>
+<p>The Leia SR display processor for the DisplayXR OpenXR runtime: it weaves DisplayXR
+content for Leia SR 3D displays with the LeiaSR Metal weaver.</p>
+<ul>
+<li>Installs <code>DisplayXR-LeiaSR.dylib</code> to
+<code>/Library/Application Support/DisplayXR/lib/displayxr/plugins/</code> and its discovery
+manifest <code>050-leia-sr.json</code> to
+<code>/Library/Application Support/DisplayXR/DisplayProcessors/</code>.</li>
+<li>Can be installed before or after the DisplayXR runtime and the LeiaSR platform. Without
+the LeiaSR platform the plug-in loads and reports the platform as absent; the runtime then
+uses its simulated display.</li>
+<li>If a DisplayXR runtime older than @MIN_RUNTIME_VERSION_TEXT@ is installed, the installer
+stops and asks you to update the runtime first.</li>
+<li>A running DisplayXR service is restarted so it picks up the plug-in.</li>
+</ul>
+<p>To uninstall:<br>
+<code>sudo "/Library/Application Support/DisplayXR/LeiaSR/uninstall.sh"</code></p>
+</body>
+</html>

@@ -12,7 +12,7 @@ name: lint
 #   which is the pair a repin is most likely to split. See
 #   scripts/check_sr_pins.py.
 #
-# Pure file reads of four paths in this repo -- no network, no token, no SDK,
+# Pure file reads -- no network, no token, no SDK,
 # no build. Add other lightweight lint jobs here as needed.
 
 on:
@@ -32,3 +32,25 @@ jobs:
 
       - name: SR SDK pins agree between build-windows.bat and CI
         run: python3 scripts/check_sr_pins.py
+
+  # macOS .pkg scripts (installer/macos): the runtime-floor gate in preinstall,
+  # the restart-only-if-running rule in postinstall and the uninstaller, run
+  # against a fake root with fake pkgutil / launchctl / stat / id. Pure bash,
+  # so it runs here; the .pkg ITSELF cannot be built in CI (no LeiaSR macOS
+  # SDK in any CI-reachable release -- see docs/installer.md, macOS section).
+  MacPkgScripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: |
+          for f in installer/macos/build_pkg.sh installer/macos/uninstall.sh \
+                   installer/macos/test_pkg_scripts.sh installer/macos/scripts/preinstall \
+                   installer/macos/scripts/postinstall scripts/build-macos.sh \
+                   scripts/macos_sign_notarize.sh; do
+            bash -n "$f"
+          done
+
+      - name: pre/postinstall + uninstall dry run
+        run: bash installer/macos/test_pkg_scripts.sh

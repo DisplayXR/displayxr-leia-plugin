@@ -5,7 +5,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repo.
 ## What this repo is
 
 The **Leia SR display-processor plug-in** for the DisplayXR runtime.
-Three platform arms, all implementing the `xrt_plugin_iface` ABI from
+Four platform arms, all implementing the `xrt_plugin_iface` ABI from
 [`displayxr-runtime/src/xrt/include/xrt/xrt_plugin.h`](https://github.com/DisplayXR/displayxr-runtime/blob/main/src/xrt/include/xrt/xrt_plugin.h):
 
 - **Windows** (`src/drv_leia`) → `DisplayXR-LeiaSR.dll`, SR SDK weavers
@@ -26,6 +26,13 @@ Three platform arms, all implementing the `xrt_plugin_iface` ABI from
   `DisplayProcessors/` roots). The **stub** probe declines by default and
   `DXR_LEIA_FORCE_PROBE=1` force-binds it; on a real panel the SDK backend
   auto-binds via DRM/EDID and needs no env.
+- **macOS** (`src/drv_leia_macos`) → `DisplayXR-LeiaSR.dylib`, srSDK v2 Metal
+  weaver through the static `libsrSDK_loader.a` (the SR runtime dylib is found at
+  run time; LeiaSR ships its own `.pkg`). JSON-manifest discovery. End-user
+  artifact: `DisplayXRLeiaSRPlugin-<version>.pkg`, built LOCALLY by
+  `installer/macos/build_pkg.sh` from a `scripts/build-macos.sh --release`
+  tree — CI cannot build it (no LeiaSR macOS SDK in any CI-reachable release).
+  See `docs/installer.md` § macOS.
 
 End-user artifact: `DisplayXRLeiaSRSetup-<version>.exe`, installed to
 `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\`. **No prerequisites** (runtime#1803):
@@ -204,6 +211,21 @@ The installed **`leiasr-runtime` .deb is the SDK dev package** (headers under
 registers `/etc/leia/sr/1/active_runtime.json`). There is no separate SDK
 download for Linux. Full recipe + bring-up gotchas:
 [`docs/linux-track-b-runbook.md`](docs/linux-track-b-runbook.md).
+
+### macOS (srSDK Metal weaver)
+```bash
+export DXR_RUNTIME_SOURCE_DIR=../displayxr-runtime LEIASR_MACOS_DIR=../LeiaSR-macos
+./scripts/build-macos.sh                     # Debug, build-macos/, + displayxr-cli checks
+./scripts/build-macos.sh --release --no-test # Release, build-macos-release/ (what ships)
+./installer/macos/build_pkg.sh               # -> build-macos-release/_pkg/DisplayXRLeiaSRPlugin-<ver>.pkg
+./installer/macos/test_pkg_scripts.sh        # dry-run pre/postinstall + uninstall (fake root)
+```
+`--release` compiles cJSON in (Homebrew's is hidden from `find_package`) and
+targets macOS 14.0; `build_pkg.sh` refuses any load path / rpath into
+`/opt/homebrew`, `/usr/local`, `/tmp`, `/Users`. Unsigned by default; the
+`DXR_MACOS_*` / `DXR_NOTARY_*` env vars of `scripts/macos_sign_notarize.sh`
+(a verbatim copy of the runtime's) sign + notarize. **Never install the .pkg
+on a dev Mac** — validate with `pkgutil --expand` / `--payload-files`.
 
 ### Android (CNSDK)
 ```bash

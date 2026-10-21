@@ -1,5 +1,7 @@
 # Windows installer: install and uninstall in any order
 
+(The macOS `.pkg` is [at the end](#macos-installer-pkg).)
+
 `DisplayXRLeiaSRSetup-<version>.exe` (`installer/DisplayXRLeiaSRInstaller.nsi`) installs
 the plug-in DLL, its two bundled Vulkan weavers and an uninstaller into
 `%ProgramFiles%\DisplayXR\Plugins\LeiaSR\`, and registers the plug-in under
@@ -104,3 +106,110 @@ for the service. A test-only holder (`rm-test-holder`, built only on request:
 for restart, and exits on the Restart Manager close query exactly like the service. Launch
 it **non-elevated** (e.g. via `explorer.exe <a .bat>`): Restart Manager never restarts an
 elevated process.
+
+# macOS installer (.pkg)
+
+`DisplayXRLeiaSRPlugin-<version>.pkg` is built by `installer/macos/build_pkg.sh` from a
+Release tree (`scripts/build-macos.sh --release`). Package identifier
+`com.displayxr.leia-sr-plugin` (the same id the earlier hand-made QA-kit package used, so it
+upgrades over it in place).
+
+```bash
+export DXR_RUNTIME_SOURCE_DIR=../displayxr-runtime LEIASR_MACOS_DIR=../LeiaSR-macos
+./scripts/build-macos.sh --release --no-test
+./installer/macos/build_pkg.sh [--version X.Y.Z] [--out DIR]
+```
+
+## What it installs
+
+| Path | What |
+|---|---|
+| `/Library/Application Support/DisplayXR/lib/displayxr/plugins/DisplayXR-LeiaSR.dylib` | the plug-in (next to the runtime `.pkg`'s `DisplayXR-SimDisplay.dylib`) |
+| `/Library/Application Support/DisplayXR/DisplayProcessors/050-leia-sr.json` | discovery manifest, `id` `leia-sr`, `probe_order` 50, absolute `binary_path` |
+| `/Library/Application Support/DisplayXR/LeiaSR/uninstall.sh` | uninstaller |
+
+`DisplayProcessors/` under `/Library/Application Support/DisplayXR` is the system-wide root the
+runtime's POSIX loader searches on macOS (`target_plugin_build_discovery_roots()` in the
+runtime's `src/xrt/targets/common/target_component_loader.c`; the per-user
+`~/Library/Application Support/DisplayXR/DisplayProcessors/` shadows it). The payload is
+root-owned and under the prefix the loader's provenance check classifies as
+`platform-trusted` (`target_component_platform_trusted_path()`, same file).
+
+It does **not** bundle the LeiaSR platform (that has its own `.pkg`): the SR SDK is linked
+statically (`libsrSDK_loader.a`), which finds the SR runtime dylib at run time. The dylib links
+only system frameworks — `--release` compiles cJSON in, because the installed runtime ships no
+`libcjson` — and `build_pkg.sh` fails the build if any load path or `LC_RPATH` points at
+`/opt/homebrew`, `/usr/local`, `/tmp`, `/Users` or `/opt/leiasr`, if the dylib exports more than
+`xrtPluginNegotiate`, or is not arm64. The package's minimum macOS is read from the dylib's
+`LC_BUILD_VERSION` (`--release` targets 14.0, as the runtime `.pkg` does). The static SR loader in the
+LeiaSR-macos tree is built for the host macOS (the link warns that `sr_loader.c.o` is newer than
+14.0); it imports only libc / `dlopen` symbols that exist on every supported macOS, so the warning
+is benign — re-check it if the loader grows.
+
+On hosts where every file carries an unremovable xattr (`com.apple.provenance`, set by sandboxed
+or agent shells) `pkgbuild` archives an AppleDouble `._<name>` entry next to every payload path.
+`build_pkg.sh` detects that and rebuilds the component's `Payload` (cpio, root-owned) and `Bom`
+(`mkbom -i`, 0/0) from the staged tree; it also fails if the final payload is not exactly the
+three files above.
+
+## Runtime floor (the only gate) — same policy as Windows
+
+`MIN_RUNTIME_VERSION` is derived from `DXR_RUNTIME_GIT_TAG_MACOS` in `CMakeLists.txt` (the
+Windows installer derives its floor from `DXR_RUNTIME_GIT_TAG` the same way; a non-release pin
+gives no floor; `DXR_MIN_RUNTIME_VERSION` overrides). The installed runtime's version is the
+`com.displayxr.runtime` package receipt.
+
+| State at install time | What the installer does |
+|---|---|
+| No runtime receipt | Installs; the runtime finds the manifest whenever it is installed. |
+| Runtime receipt below the floor | Refuses. The Installer GUI says why (Distribution `installation-check`, reading `/var/db/receipts/com.displayxr.runtime.plist`); `preinstall` repeats the check (`pkgutil --pkg-info`) and exits 1, so `installer -pkg` is gated too. |
+| Runtime receipt not a plain `X.Y.Z` (dev builds: `0.0.0-dev.<sha>`) | Not gated, like a Windows runtime with no `Version`. |
+| LeiaSR platform absent | Installs. Deliberately no SR check. |
+
+## Running processes
+
+Replacing a dylib on disk never disturbs a process that has the old one mapped, so nothing is
+closed first. `postinstall` restarts the DisplayXR service LaunchAgent
+(`launchctl kickstart -k gui/<console uid>/com.displayxr.service`) **only if it was running**,
+so it loads the new plug-in; nothing is started that was not running. In-process apps pick it up
+at their next launch.
+
+## Uninstall
+
+```bash
+sudo "/Library/Application Support/DisplayXR/LeiaSR/uninstall.sh"
+```
+
+Removes the manifest first, then the dylib, restarts the service if it was running (it comes
+back on the fallback display processor), forgets the receipt, and deletes its own directory.
+It never touches the runtime, sim-display or LeiaSR. (The runtime's own uninstaller removes all
+of `/Library/Application Support/DisplayXR`, plug-in included, but leaves this package's
+receipt.)
+
+## Signing
+
+Unsigned by default. `scripts/macos_sign_notarize.sh` is a verbatim copy of the runtime's
+(`displayxr-runtime/scripts/macos_sign_notarize.sh`); with its environment set, the dylib gets a
+Developer ID signature with the hardened runtime and a secure timestamp, the product is
+`productsign`ed, notarized and stapled:
+
+```bash
+export DXR_MACOS_APP_IDENTITY="Developer ID Application: <Org> (<TEAM>)"
+export DXR_MACOS_INSTALLER_IDENTITY="Developer ID Installer: <Org> (<TEAM>)"
+export DXR_NOTARY_PROFILE=<notarytool keychain profile>   # or DXR_NOTARY_KEY_PATH/_KEY_ID/_ISSUER
+./installer/macos/build_pkg.sh
+```
+
+## CI: none, by necessity
+
+No CI job can build the `.pkg`: the plug-in needs the LeiaSR **macOS** SDK
+(`sr/sr_metal.h` + `libsrSDK_loader.a`), and no CI-reachable release carries one (the private
+`LeiaInc/SR-SDK-Windows-Releases-Internal-Public` mirror has win64/linux64 SDKs only). So a
+release `.pkg` is built and signed on a Mac with a LeiaSR macOS tree and attached by hand
+(`gh release upload vX.Y.Z DisplayXRLeiaSRPlugin-X.Y.Z.pkg`). For a tag's exact identity, build
+from that tag, or — when only packaging files differ from it — pass `DXR_PLUGIN_GIT_DESC=vX.Y.Z`
+(#203). What CI does run is `installer/macos/test_pkg_scripts.sh` (`lint.yml`): the
+pre/postinstall and uninstall scripts against a fake root with fake `pkgutil` / `launchctl`.
+
+Never install the `.pkg` on a shared dev Mac; validate with `pkgutil --expand`,
+`pkgutil --payload-files`, `otool -L` and `spctl --assess --type install -vv`.

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!--
+  Distribution for DisplayXRLeiaSRPlugin-<version>.pkg. Placeholders (@...@)
+  are filled by installer/macos/build_pkg.sh.
+
+  installation-check = the runtime floor, the same policy as the Windows
+  installer's exit 5 and as scripts/preinstall (the backstop): refuse ONLY
+  when a DisplayXR runtime receipt exists, carries a plain X.Y.Z version, and
+  that version is below @MIN_RUNTIME_VERSION@. No runtime, a dev runtime, or
+  no LeiaSR platform all install.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>DisplayXR Leia SR Plug-in @VERSION@</title>
+    <organization>com.displayxr</organization>
+    <os-version min="@MIN_MACOS@"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64" rootVolumeOnly="true"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt" mime-type="text/plain"/>
+    <installation-check script="dxr_runtime_floor_ok()"/>
+    <script><![CDATA[
+function dxr_runtime_floor_ok() {
+    var floor = '@MIN_RUNTIME_VERSION@';
+    if (floor == '') { return true; }
+    var r = system.files.plistAtPath('/var/db/receipts/com.displayxr.runtime.plist');
+    if (!r || !r.PackageVersion) { return true; }
+    var v = '' + r.PackageVersion;
+    if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(v)) { return true; }
+    if (system.compareVersions(v, floor) >= 0) { return true; }
+    my.result.type = 'Fatal';
+    my.result.title = 'DisplayXR runtime too old';
+    my.result.message = 'The installed DisplayXR runtime is ' + v + '. This Leia SR plug-in needs ' +
+        'DisplayXR runtime ' + floor + ' or newer; an older runtime would reject it and fall back ' +
+        'to the simulated display. Update the DisplayXR runtime, then run this installer again.';
+    return false;
+}
+    ]]></script>
+    <choices-outline>
+        <line choice="leia_sr_plugin"/>
+    </choices-outline>
+    <choice id="leia_sr_plugin" visible="true" title="DisplayXR Leia SR Plug-in"
+        description="Leia SR display processor (Metal weaver) for the DisplayXR runtime.">
+        <pkg-ref id="com.displayxr.leia-sr-plugin"/>
+    </choice>
+    <pkg-ref id="com.displayxr.leia-sr-plugin" version="@VERSION@" onConclusion="none">leia-sr-plugin.pkg</pkg-ref>
+</installer-gui-script>

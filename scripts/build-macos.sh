@@ -4,7 +4,18 @@
 #
 # Build + validate the macOS arm of the Leia plug-in (srSDK Metal weaver).
 #
-#   ./scripts/build-macos.sh [--no-test] [--clean]
+#   ./scripts/build-macos.sh [--no-test] [--clean] [--release]
+#
+#   --release  Release build in build-macos-release/ (Debug otherwise, in
+#              build-macos/), with the BUNDLED cJSON compiled in (Homebrew's
+#              cjson is hidden from find_package) so the dylib has no
+#              Homebrew load path. This is the build installer/macos/build_pkg.sh
+#              packages. DXR_MACOS_DEPLOYMENT_TARGET is passed as
+#              CMAKE_OSX_DEPLOYMENT_TARGET; --release defaults it to 14.0,
+#              the floor the runtime's own CI-built .pkg ships with (its
+#              Mach-Os carry minos 14.0). Unset, a build targets the HOST
+#              macOS, and the .pkg (whose os-version min is read from the
+#              dylib) would refuse every older Mac.
 #
 # Environment:
 #   DXR_RUNTIME_SOURCE_DIR  Local displayxr-runtime checkout (default:
@@ -22,7 +33,7 @@
 #                           build/macos/sr. LEIASR_DATA_DIR is always
 #                           build/macos/sr (where build.py stages the inis).
 #
-# Output (build-macos/):
+# Output (build-macos/, or build-macos-release/ with --release):
 #   _plugins/DisplayXR-LeiaSR.dylib + 050-leia-sr.json
 #   _plugins/DisplayXR-SimDisplay.dylib + 200-sim-display.json (the fallback,
 #     so `displayxr-cli displays --claims` shows the claim resolution)
@@ -33,7 +44,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_TYPE=Debug
 BUILD_DIR="$ROOT/build-macos"
+for arg in "$@"; do
+    if [ "$arg" = "--release" ]; then
+        BUILD_TYPE=Release
+        BUILD_DIR="$ROOT/build-macos-release"
+    fi
+done
 PARENT="$(cd "$ROOT/.." && pwd)"
 # Runtime source for the macOS arm. Its per-screen slots (create_dp_metal_for_screen,
 # xrt_display_processor_metal::set_present_origin / snap_window_rect) and macOS
@@ -58,8 +76,9 @@ for arg in "$@"; do
     case "$arg" in
     --no-test) RUN_TEST=0 ;;
     --clean) rm -rf "$BUILD_DIR" ;;
+    --release) ;; # handled above (selects BUILD_DIR before --clean runs)
     *)
-        echo "Unknown option: $arg (supported: --no-test --clean)" >&2
+        echo "Unknown option: $arg (supported: --no-test --clean --release)" >&2
         exit 2
         ;;
     esac
@@ -96,11 +115,27 @@ else
     exit 1
 fi
 
-echo "==> Configuring (runtime: $RUNTIME_DIR)"
+CFG_ARGS=()
+if [ "$BUILD_TYPE" = "Release" ]; then
+    # A shipped dylib must not depend on Homebrew's libcjson (the installed
+    # runtime does not ship one): hide it from EVERY find_package(cJSON) --
+    # the runtime's and displayxr-mcp's -- so both compile their bundled copy.
+    # (-DXRT_HAVE_SYSTEM_CJSON=OFF alone is not enough: the mcp dep still finds
+    # Homebrew's cJSON and its headers then shadow the runtime's cJSON.c.)
+    CFG_ARGS+=("-DCMAKE_DISABLE_FIND_PACKAGE_cJSON=ON" "-DDISPLAYXR_MCP_USE_VENDORED_CJSON=ON")
+fi
+if [ "$BUILD_TYPE" = "Release" ] && [ -z "${DXR_MACOS_DEPLOYMENT_TARGET+x}" ]; then
+    DXR_MACOS_DEPLOYMENT_TARGET=14.0
+fi
+if [ -n "${DXR_MACOS_DEPLOYMENT_TARGET:-}" ]; then
+    CFG_ARGS+=("-DCMAKE_OSX_DEPLOYMENT_TARGET=$DXR_MACOS_DEPLOYMENT_TARGET")
+fi
+
+echo "==> Configuring $BUILD_TYPE (runtime: $RUNTIME_DIR)"
 cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     -DDXR_RUNTIME_SOURCE_DIR="$RUNTIME_DIR" \
-    "${SR_ARGS[@]}"
+    "${SR_ARGS[@]}" ${CFG_ARGS[@]+"${CFG_ARGS[@]}"}
 
 echo "==> Building plug-in + runtime dylib + displayxr-cli + sim-display (one tree)"
 cmake --build "$BUILD_DIR" -j "${DXR_BUILD_JOBS:-4}" --target DisplayXR-LeiaSR openxr_displayxr cli drv_sim_display_plugin

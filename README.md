@@ -4,7 +4,7 @@
 
 This plug-in turns Leia SR glasses-free 3D displays (e.g. Samsung Odyssey 3D, Acer SpatialLabs) into OpenXR targets for the [DisplayXR runtime](https://github.com/DisplayXR/displayxr-runtime). Building a plug-in for your own display? Start from this worked example, alongside the [vendor onboarding guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/guides/vendor-plugin-onboarding.md).
 
-**Get it:** download `DisplayXRLeiaSRSetup-<version>.exe` from the [Releases page](https://github.com/DisplayXR/displayxr-leia-plugin/releases). It has no prerequisites: install it before or after the DisplayXR runtime and the LeiaSR platform, in any order — the runtime picks it up once both are present. See [docs/installer.md](docs/installer.md).
+**Get it:** download `DisplayXRLeiaSRSetup-<version>.exe` from the [Releases page](https://github.com/DisplayXR/displayxr-leia-plugin/releases). It has no prerequisites: install it before or after the DisplayXR runtime and the LeiaSR platform, in any order — the runtime picks it up once both are present. See [docs/installer.md](docs/installer.md). macOS: `DisplayXRLeiaSRPlugin-<version>.pkg` (built locally by `installer/macos/build_pkg.sh`; attached to releases by hand — see the macOS section of the same doc).
 
 ## How it works
 
