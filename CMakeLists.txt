@@ -253,11 +253,22 @@ set(DXR_RUNTIME_GIT_TAG_LINUX "v2.47.1" CACHE STRING
 
 # macOS carries its own pin for the same reason as _LINUX / _ANDROID: the Metal
 # arm can move without dragging the Windows installer's derived
-# MIN_RUNTIME_VERSION along. Same value as the Windows pin today. The _MACOS
-# suffix is invisible to the runtime's check_plugin_abi.py regex
-# (DXR_RUNTIME_GIT_TAG\s+") for the same reason _LINUX is. Dev builds point
-# DXR_RUNTIME_SOURCE_DIR at a local checkout instead (scripts/build-macos.sh).
-set(DXR_RUNTIME_GIT_TAG_MACOS "v2.31.0" CACHE STRING
+# MIN_RUNTIME_VERSION along. The _MACOS suffix is invisible to the runtime's
+# check_plugin_abi.py regex (DXR_RUNTIME_GIT_TAG\s+") for the same reason
+# _LINUX is. Dev builds point DXR_RUNTIME_SOURCE_DIR at a local checkout instead
+# (scripts/build-macos.sh).
+#
+# FLOOR IS v2.39.0: the first tag carrying every feature macro
+# src/drv_leia_macos compiles against -- XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY
+# and XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN (v2.39.0), the per-screen Metal slots
+# XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN / XRT_DP_METAL_HAS_PRESENT_ORIGIN
+# / XRT_DP_METAL_HAS_SNAP_WINDOW_RECT (v2.32.0) and
+# XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR (v2.30.0). All are #ifdef-guarded,
+# so an older pin still COMPILES but silently drops per-screen DPs, hotplug
+# rescan and the not-ready claim. This pin is also the .pkg's runtime floor
+# (installer/macos/build_pkg.sh), so move it only when the code needs a newer
+# macro, never to chase a release.
+set(DXR_RUNTIME_GIT_TAG_MACOS "v2.39.0" CACHE STRING
     "Runtime git ref for macOS builds.")
 
 # Android carries its own pin too, and as of the get_last_frame_dropped repin it
