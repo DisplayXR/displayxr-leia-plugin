@@ -1,0 +1,69 @@
+#!/bin/bash
+# Copyright 2026, Leia Inc / DisplayXR
+# SPDX-License-Identifier: Apache-2.0
+#
+# preinstall — DisplayXR Leia SR plug-in (macOS .pkg).
+#
+# The ONE gate, same policy as the Windows installer (docs/installer.md):
+# refuse when the DisplayXR runtime IS installed and its version is below the
+# plug-in's floor. Everything else installs:
+#   - runtime not installed      -> install; the runtime finds the manifest
+#                                   whenever it is installed later
+#   - runtime version unknown or  -> install, not gated (dev / from-source
+#     not a plain X.Y.Z             runtimes carry no comparable version)
+#   - LeiaSR platform absent      -> install; deliberately no SR check, the
+#                                   plug-in loads without SR and reports the
+#                                   platform as absent at run time
+#
+# The floor (@MIN_RUNTIME_VERSION@) is substituted by build_pkg.sh from
+# DXR_RUNTIME_GIT_TAG_MACOS in CMakeLists.txt. Empty = no gate (non-release pin).
+# Distribution.xml carries the same check as an installation-check so the
+# Installer GUI can say why; this script is the backstop that also holds for
+# `installer -pkg` and for any front end that skips the JavaScript.
+#
+# Args (from Installer): $1 package path, $2 install location, $3 target volume.
+# Test hooks (installer/macos/test_pkg_scripts.sh): pkgutil is taken from PATH.
+
+MIN_RUNTIME_VERSION="@MIN_RUNTIME_VERSION@"
+RUNTIME_PKG_ID="com.displayxr.runtime"
+TARGET_VOL="${3:-/}"
+
+log() { echo "[leia-sr preinstall] $*"; }
+
+# 0 when $1 >= $2; both plain X.Y.Z.
+version_ge() {
+    local IFS=.
+    local -a a=($1) b=($2)
+    local i
+    for i in 0 1 2; do
+        if ((10#${a[$i]:-0} > 10#${b[$i]:-0})); then return 0; fi
+        if ((10#${a[$i]:-0} < 10#${b[$i]:-0})); then return 1; fi
+    done
+    return 0
+}
+
+# (Test the placeholder by its leading '@', never by its full text: the build's
+# substitution would rewrite that literal too and turn the check into x = x.)
+if [ -z "$MIN_RUNTIME_VERSION" ] || [[ "$MIN_RUNTIME_VERSION" == @* ]]; then
+    log "no runtime floor baked in (non-release pin): not gated"
+    exit 0
+fi
+
+rt_ver="$(pkgutil --volume "$TARGET_VOL" --pkg-info "$RUNTIME_PKG_ID" 2>/dev/null | awk '/^version: /{print $2; exit}')"
+if [ -z "$rt_ver" ]; then
+    log "DisplayXR runtime not installed yet: the plug-in will be used once the DisplayXR runtime is installed."
+    exit 0
+fi
+if ! [[ "$rt_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    log "DisplayXR runtime $rt_ver has no release version: not gated (floor $MIN_RUNTIME_VERSION)."
+    exit 0
+fi
+if version_ge "$rt_ver" "$MIN_RUNTIME_VERSION"; then
+    log "DisplayXR runtime $rt_ver >= floor $MIN_RUNTIME_VERSION: OK"
+    exit 0
+fi
+
+log "REFUSING: installed DisplayXR runtime $rt_ver is older than $MIN_RUNTIME_VERSION, the minimum this" \
+    "plug-in was built for. Its loader would reject the plug-in and silently fall back to sim-display." \
+    "Update the DisplayXR runtime first."
+exit 1
