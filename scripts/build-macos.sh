@@ -55,9 +55,9 @@ done
 PARENT="$(cd "$ROOT/.." && pwd)"
 # Runtime source for the macOS arm. Its per-screen slots (create_dp_metal_for_screen,
 # xrt_display_processor_metal::set_present_origin / snap_window_rect) and macOS
-# monitor enumeration landed on runtime main (#1872/#1873/#1875) after the
-# DXR_RUNTIME_GIT_TAG_MACOS pin; until a tag carries them, build against
-# runtime main (fetched from origin). Unless DXR_RUNTIME_SOURCE_DIR names a checkout, that ref is
+# monitor enumeration (#1872/#1873/#1875) are tagged since v2.32.0, and the
+# DXR_RUNTIME_GIT_TAG_MACOS pin (the release/.pkg floor) carries them; dev
+# builds still default to runtime main (fetched from origin) to track it. Unless DXR_RUNTIME_SOURCE_DIR names a checkout, that ref is
 # exported READ-ONLY (git archive, no worktree, no checkout change) from
 # ../displayxr-runtime into build-macos/_runtime-src. DXR_RUNTIME_DEV_REF=""
 # uses ../displayxr-runtime as is.
