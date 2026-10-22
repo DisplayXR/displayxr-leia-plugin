@@ -144,6 +144,8 @@ void setOutputFrameBuffer(VkFramebuffer framebuffer, int width, int height, VkFo
 
 The input images must be in `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. The output framebuffer must be in `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL`. The weaver **records commands** into the provided command buffer and **manages its own render pass** internally (begin/end). Throws an exception if `commandBuffer`, `viewport`, or `scissorRect` are not set.
 
+**Pass the swapchain's actual format.** The `format` argument of `setOutputFrameBuffer()` must be the `VkSurfaceFormatKHR.format` the swapchain was actually created with, not the format the app asked for. The weaver trusts this argument and cannot check it against the image behind the `VkFramebuffer`, so a mismatch fails silently: a 10-bit render pass drawing into an 8-bit swapchain image produces garbage, with no error.
+
 ---
 
 ## Output
