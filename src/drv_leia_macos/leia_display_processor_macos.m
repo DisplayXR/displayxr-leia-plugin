@@ -17,6 +17,26 @@
  *   - anything else (1x1 2D frame, an N-view grid) -> passthrough blit of
  *     view 0 into the canvas, weaver bypassed — the Linux/Windows 2D path.
  *
+ * Transparency (runtime#2264, this repo #418): the SR weave flattens alpha, so
+ * a transparent session cannot simply present the atlas' alpha. While the
+ * runtime hands this DP a background (set_background_2d: the live desktop
+ * behind the window from the runtime's displayxr-desktop-capture helper, with
+ * any 2D-under layers over it, window-sized, sRGB-encoded) the stereo path is
+ * the Windows/Linux compose-under model:
+ *
+ *   1. compose: premultiplied atlas OVER the background, in linear light,
+ *      opaque atlas texels written verbatim (compose_under_bg.frag's colour
+ *      contract) -> an opaque, atlas-sized fill the weaver consumes;
+ *   2. weave the fill into a readable scratch (the drawable may be
+ *      framebufferOnly);
+ *   3. alpha gate into the target: (0,0,0,0) where EVERY view's atlas texel is
+ *      transparent (WindowServer shows the live desktop), else the woven
+ *      colour at alpha 1 — alpha_gate.frag's Windows rule, safe because the
+ *      capture excludes our own window.
+ *
+ * No background (opaque content, no capture yet, no grant) ⟹ the plain weave,
+ * exactly as before.
+ *
  * Window phase: srWeaverSetPresentOrigin gets the app window's content origin
  * relative to the panel's CGDisplayBounds, in panel (backing) pixels, whenever
  * that origin changes (window moves; first frame). Never latched off: an SR
@@ -58,6 +78,7 @@
 
 #include "leia_display_processor_macos.h"
 #include "leia_sr_macos.h"
+#include "leia_transp_msl_macos.h"
 #include "leia_lens_owner_linux.h" // pure-C lens ownership rules (LeiaSR #266); not Linux-specific
 
 #include "xrt/xrt_display_processor_metal.h"
@@ -107,6 +128,7 @@ static NSString *const k_blit_msl =
      "fragment float4 leia_blit_fs(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
      "                             sampler s [[sampler(0)]], constant Tile &tile [[buffer(0)]]) {\n"
      "    return t.sample(s, in.uv * tile.scale); }\n";
+
 
 struct leia_dp_mac
 {
@@ -181,6 +203,18 @@ struct leia_dp_mac
 	uint64_t frames;
 	uint64_t last_eye_log_ns;
 	bool weave_logged, blit_logged, grid_logged, size_logged;
+
+	//! Transparency (file header). The background the runtime handed over for
+	//! this frame (retained; nil = none), and the passes' resources.
+	id<MTLTexture> bg_tex;
+	uint32_t bg_w, bg_h;
+	id<MTLRenderPipelineState> compose_pipeline;
+	MTLPixelFormat compose_format;
+	id<MTLRenderPipelineState> gate_pipeline;
+	MTLPixelFormat gate_format;
+	id<MTLTexture> fill;  //!< atlas-sized compose output = the weaver's input
+	id<MTLTexture> woven; //!< target-sized weave output, read by the gate
+	bool transp_logged, transp_off_logged, transp_failed;
 };
 
 static inline struct leia_dp_mac *
@@ -611,6 +645,182 @@ encode_clear_and_blit(struct leia_dp_mac *ldp,
 
 /*
  *
+ * Transparency: compose-under + alpha gate (file header).
+ *
+ */
+
+static id<MTLRenderPipelineState>
+transp_pipeline(struct leia_dp_mac *ldp, NSString *fs_name, MTLPixelFormat format)
+{
+	NSError *err = nil;
+	id<MTLLibrary> lib = [ldp->device newLibraryWithSource:k_transp_msl options:nil error:&err];
+	if (lib == nil) {
+		U_LOG_E("leia_mac_dp: transparency shader compile failed: %s", err.localizedDescription.UTF8String);
+		return nil;
+	}
+	id<MTLFunction> vs = [lib newFunctionWithName:@"leia_tri_vs"];
+	id<MTLFunction> fs = [lib newFunctionWithName:fs_name];
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = vs;
+	desc.fragmentFunction = fs;
+	desc.colorAttachments[0].pixelFormat = format;
+	id<MTLRenderPipelineState> pso = [ldp->device newRenderPipelineStateWithDescriptor:desc error:&err];
+	[desc release];
+	[vs release];
+	[fs release];
+	[lib release];
+	if (pso == nil) {
+		U_LOG_E("leia_mac_dp: %s pipeline failed: %s", fs_name.UTF8String, err.localizedDescription.UTF8String);
+	}
+	return pso;
+}
+
+//! (Re)allocate @p *tex as a @p w x @p h render-target + shader-read texture.
+static bool
+transp_ensure_tex(struct leia_dp_mac *ldp, id<MTLTexture> *tex, uint32_t w, uint32_t h, MTLPixelFormat format)
+{
+	if (*tex != nil && (*tex).width == w && (*tex).height == h && (*tex).pixelFormat == format) {
+		return true;
+	}
+	[*tex release];
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                             width:w
+	                                                                            height:h
+	                                                                         mipmapped:NO];
+	d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	d.storageMode = MTLStorageModePrivate;
+	*tex = [ldp->device newTextureWithDescriptor:d];
+	return *tex != nil;
+}
+
+static bool
+transp_ready(struct leia_dp_mac *ldp, id<MTLTexture> atlas, uint32_t in_w, uint32_t in_h, id<MTLTexture> target)
+{
+	if (ldp->compose_pipeline == nil || ldp->compose_format != atlas.pixelFormat) {
+		[ldp->compose_pipeline release];
+		ldp->compose_pipeline = transp_pipeline(ldp, @"leia_compose_fs", atlas.pixelFormat);
+		ldp->compose_format = atlas.pixelFormat;
+	}
+	if (ldp->gate_pipeline == nil || ldp->gate_format != target.pixelFormat) {
+		[ldp->gate_pipeline release];
+		ldp->gate_pipeline = transp_pipeline(ldp, @"leia_gate_fs", target.pixelFormat);
+		ldp->gate_format = target.pixelFormat;
+	}
+	if (ldp->compose_pipeline == nil || ldp->gate_pipeline == nil ||
+	    !ensure_blit_pipeline(ldp, target.pixelFormat) /* the shared sampler */) {
+		return false;
+	}
+	return transp_ensure_tex(ldp, &ldp->fill, in_w, in_h, atlas.pixelFormat) &&
+	       transp_ensure_tex(ldp, &ldp->woven, (uint32_t)target.width, (uint32_t)target.height,
+	                         target.pixelFormat);
+}
+
+static bool
+is_srgb_format(MTLPixelFormat f)
+{
+	return f == MTLPixelFormatBGRA8Unorm_sRGB || f == MTLPixelFormatRGBA8Unorm_sRGB;
+}
+
+//! Pass 1: premultiplied atlas over the background into ldp->fill.
+static void
+encode_compose(struct leia_dp_mac *ldp,
+               id<MTLCommandBuffer> cmd,
+               id<MTLTexture> atlas,
+               uint32_t cols,
+               uint32_t rows,
+               int32_t cx,
+               int32_t cy,
+               uint32_t cw,
+               uint32_t ch)
+{
+	struct
+	{
+		float bg_origin[2];
+		float bg_extent[2];
+		uint32_t tiles[2];
+		uint32_t atlas_linear;
+		uint32_t pad;
+	} p;
+	// The background covers the whole target (the window); the canvas is the
+	// part of it each tile shows.
+	const float bw = (float)ldp->bg_w, bh = (float)ldp->bg_h;
+	p.bg_origin[0] = (float)cx / bw;
+	p.bg_origin[1] = (float)cy / bh;
+	p.bg_extent[0] = (float)cw / bw;
+	p.bg_extent[1] = (float)ch / bh;
+	p.tiles[0] = cols;
+	p.tiles[1] = rows;
+	// An _sRGB view decodes on read and encodes on write, so the shader sees
+	// linear light; a UNORM one holds the ENCODED bytes the runtime declares.
+	p.atlas_linear = is_srgb_format(atlas.pixelFormat) ? 1u : 0u;
+	p.pad = 0;
+
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = ldp->fill;
+	pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+	[enc setRenderPipelineState:ldp->compose_pipeline];
+	[enc setFragmentTexture:atlas atIndex:0];
+	[enc setFragmentTexture:ldp->bg_tex atIndex:1];
+	[enc setFragmentSamplerState:ldp->sampler atIndex:0];
+	[enc setFragmentBytes:&p length:sizeof(p) atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+}
+
+//! Pass 3: woven colour where any view is opaque, (0,0,0,0) elsewhere, into the target.
+static void
+encode_gate(struct leia_dp_mac *ldp,
+            id<MTLCommandBuffer> cmd,
+            id<MTLTexture> atlas,
+            uint32_t view_w,
+            uint32_t view_h,
+            uint32_t cols,
+            uint32_t rows,
+            id<MTLTexture> target,
+            MTLViewport vp)
+{
+	struct
+	{
+		uint32_t tiles[2];
+		float tile_px[2];
+	} p = {{cols, rows}, {(float)view_w, (float)view_h}};
+
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = target;
+	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+	// Outside the canvas: transparent, this is a transparent session.
+	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+	id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+	[enc setViewport:vp];
+	[enc setRenderPipelineState:ldp->gate_pipeline];
+	[enc setFragmentTexture:ldp->woven atIndex:0];
+	[enc setFragmentTexture:atlas atIndex:1];
+	[enc setFragmentBytes:&p length:sizeof(p) atIndex:0];
+	[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[enc endEncoding];
+}
+
+static void
+transp_release(struct leia_dp_mac *ldp)
+{
+	[ldp->bg_tex release];
+	ldp->bg_tex = nil;
+	[ldp->compose_pipeline release];
+	ldp->compose_pipeline = nil;
+	[ldp->gate_pipeline release];
+	ldp->gate_pipeline = nil;
+	[ldp->fill release];
+	ldp->fill = nil;
+	[ldp->woven release];
+	ldp->woven = nil;
+}
+
+
+/*
+ *
  * Post-weave capture (debug): touch /tmp/dxr_leia_woven_trigger and the next
  * woven frame's target is written to /tmp/dxr_leia_woven.png — the pixels the
  * weaver produced, before WindowServer composites them (the runtime's
@@ -756,11 +966,31 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 
 	update_present_origin(ldp);
 
-	SrResult res = srWeaverSetInputTextureMetal(ldp->weaver, (__bridge void *)atlas, in_w, in_h,
-	                                            (SrMetalPixelFormat)format);
+	// Transparency: compose the atlas over the runtime's background, weave the
+	// fill into a scratch, gate into the target (file header).
+	const bool transp = ldp->bg_tex != nil && !ldp->screen_bound && !ldp->transp_failed &&
+	                    transp_ready(ldp, atlas, in_w, in_h, target);
+	if (ldp->bg_tex != nil && !transp && !ldp->transp_failed) {
+		ldp->transp_failed = true;
+		U_LOG_W("leia_mac_dp: transparency passes unavailable — weaving opaque (logged once)");
+	}
+	if (transp) {
+		encode_compose(ldp, cmd, atlas, tile_columns, tile_rows, cx, cy, cw, ch);
+		if (!ldp->transp_logged) {
+			ldp->transp_logged = true;
+			U_LOG_W("leia_mac_dp: transparent weave: atlas %ux%u composed over the runtime's %ux%u desktop "
+			        "background, alpha-gated into the target",
+			        in_w, in_h, ldp->bg_w, ldp->bg_h);
+		}
+	}
+	id<MTLTexture> weave_in = transp ? ldp->fill : atlas;
+	id<MTLTexture> weave_out = transp ? ldp->woven : target;
+
+	SrResult res = srWeaverSetInputTextureMetal(ldp->weaver, (__bridge void *)weave_in, in_w, in_h,
+	                                            (SrMetalPixelFormat)weave_in.pixelFormat);
 	if (SR_SUCCEEDED(res)) {
-		res = srWeaverSetOutputTextureMetal(ldp->weaver, (__bridge void *)target, target_width,
-		                                    target_height, (SrMetalPixelFormat)target.pixelFormat);
+		res = srWeaverSetOutputTextureMetal(ldp->weaver, (__bridge void *)weave_out, target_width,
+		                                    target_height, (SrMetalPixelFormat)weave_out.pixelFormat);
 	}
 	if (SR_SUCCEEDED(res)) {
 		res = srWeaverSetCommandBufferMetal(ldp->weaver, (__bridge void *)cmd);
@@ -780,6 +1010,9 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 		encode_clear_and_blit(ldp, cmd, target, atlas, tile_columns, tile_rows, vp);
 		return;
 	}
+	if (transp) {
+		encode_gate(ldp, cmd, atlas, view_width, view_height, tile_columns, tile_rows, target, vp);
+	}
 	maybe_capture_woven(ldp, cmd, target);
 	if (!ldp->weave_logged) {
 		ldp->weave_logged = true;
@@ -788,6 +1021,32 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 		        ldp->screen_bound ? " (SEGMENT DP)" : "", in_w, in_h, view_width, view_height, format, target_width, target_height,
 		        (unsigned long)target.pixelFormat, cx, cy, cw, ch);
 	}
+}
+
+//! The runtime's background for the next process_atlas (file header): retained
+//! until replaced; NULL clears it (opaque content, or no capture).
+static void
+leia_dp_mac_set_background_2d(struct xrt_display_processor_metal *xdp,
+                              void *background_texture,
+                              uint32_t width,
+                              uint32_t height)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	id<MTLTexture> tex = (__bridge id<MTLTexture>)background_texture;
+	if (width == 0 || height == 0) {
+		tex = nil;
+	}
+	if (tex != ldp->bg_tex) {
+		[tex retain];
+		[ldp->bg_tex release];
+		ldp->bg_tex = tex;
+	}
+	if (tex == nil && ldp->transp_logged && !ldp->transp_off_logged) {
+		ldp->transp_off_logged = true;
+		U_LOG_W("leia_mac_dp: background cleared — opaque weave (logged once)");
+	}
+	ldp->bg_w = width;
+	ldp->bg_h = height;
 }
 
 #ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN
@@ -1048,6 +1307,7 @@ leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
 	if (ldp->panel_cs != NULL) {
 		CGColorSpaceRelease(ldp->panel_cs);
 	}
+	transp_release(ldp);
 	if (ldp->retags > 0) {
 		U_LOG_W("leia_mac_dp: colour-space tag was reset and re-applied %llu time(s) this session",
 		        (unsigned long long)ldp->retags);
@@ -1204,6 +1464,7 @@ leia_dp_mac_create(void *metal_device,
 	ldp->base.get_display_dimensions = leia_dp_mac_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_mac_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_mac_destroy;
+	ldp->base.set_background_2d = leia_dp_mac_set_background_2d;
 #ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_mac_set_present_origin;
 #endif
@@ -1212,8 +1473,9 @@ leia_dp_mac_create(void *metal_device,
 #endif
 	// Left NULL, as on the Linux arm's first cut: get_window_metrics (the
 	// Metal compositor computes it from the view), is_alpha_native (a weave is
-	// opaque), colour capability / encoding (ENCODED default), background,
-	// zones, scanout caps, background preview.
+	// opaque — NULL reads as false, which is what makes the runtime deliver
+	// the desktop background above), colour capability / encoding (ENCODED
+	// default), zones, scanout caps, background preview.
 
 	struct leia_mac_display_info info = {0};
 	(void)leia_mac_get_display_info(&info);

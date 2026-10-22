@@ -132,3 +132,15 @@ target_include_directories(test_sr_readiness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 if(COMMAND add_test)
     add_test(NAME test_sr_readiness COMMAND test_sr_readiness)
 endif()
+
+# GPU test of the transparency passes (compose-under colour contract + alpha
+# gate punch rule) on a real Metal device, against the shipped MSL
+# (leia_transp_msl_macos.h). No SR SDK, no panel. Exit 77 = no device (skip).
+add_executable(test_transp_metal_macos test_transp_metal_macos.m)
+target_include_directories(test_transp_metal_macos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(test_transp_metal_macos PRIVATE -fobjc-arc)
+target_link_libraries(test_transp_metal_macos PRIVATE "-framework Metal" "-framework Foundation")
+if(COMMAND add_test)
+    add_test(NAME test_transp_metal_macos COMMAND test_transp_metal_macos)
+    set_tests_properties(test_transp_metal_macos PROPERTIES SKIP_RETURN_CODE 77)
+endif()
