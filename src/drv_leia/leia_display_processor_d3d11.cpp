@@ -527,6 +527,19 @@ struct leia_display_processor_d3d11_impl
 	//! (Model A) — so an old runtime that never calls the setter stays passthrough.
 	enum xrt_atlas_encoding atlas_encoding;
 
+#ifdef XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+	//! @name PQ (HDR10) atlas weave — srWeaverSetColorEncoding (weave_pq_pair)
+	//! @{
+	bool pq_disabled;       //!< the weaver refused a pair: PQ declined for this DP's lifetime
+	bool pq_pair_set;       //!< this DP left a non-(AUTO, AUTO) pair on the weaver
+	int32_t pq_last_output; //!< enum leiasr_color_encoding last applied (for the change WARN)
+	DXGI_FORMAT pq_last_target;
+	bool pq_clip_warned;     //!< one-time "8-bit target clips above 203 nits"
+	bool pq_fallback_warned; //!< one-time "PQ declared but the weaver cannot take it"
+	bool pq_overlay_warned;  //!< one-time "SR skips the 2D layer in a PQ weave"
+	//! @}
+#endif
+
 	//! @name #224 local 2D/3D zones — 1×1 leg
 	//! The runtime publishes the XR_DXR_local_3d_zone mask per frame; on this
 	//! single-zone panel the OR-collapse is "mask has any non-zero pixel ⟹
@@ -1768,6 +1781,113 @@ weave_srgb_pair(ID3D11DeviceContext *ctx, ID3D11ShaderResourceView *srv, bool at
 	*out_write = target_enc == WEAVE_VIEW_UNORM8;
 }
 
+#ifdef XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+//! Short DXGI format name for the PQ pair WARN (only the formats it maps).
+static const char *
+weave_target_format_str(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+	case DXGI_FORMAT_B8G8R8X8_UNORM: return "B8G8R8X8_UNORM";
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return "B8G8R8X8_UNORM_SRGB";
+	case DXGI_FORMAT_UNKNOWN: return "no RTV bound";
+	default: return "other";
+	}
+}
+
+/*!
+ * The weaver's colour-encoding pair for a PQ (HDR10, SMPTE ST 2084) atlas,
+ * declared through srWeaverSetColorEncoding (leiasr_d3d11_set_color_encoding)
+ * so the weave runs in linear light (203 cd/m^2 = 1.0) and re-encodes on write:
+ *
+ *   input  = PQ
+ *   output = from the RTV bound at weave time:
+ *            R10G10B10A2_UNORM  -> PQ      (HDR10 swapchain)
+ *            R16G16B16A16_FLOAT -> LINEAR  (scRGB)
+ *            8-bit UNORM / _SRGB, anything else -> SRGB (SDR; SR hard-clips
+ *            above 203 nits -- no tone mapping -- one-time WARN)
+ *
+ * An explicit side overrides the shader sRGB pair, so a PQ weave does not also
+ * declare weave_srgb_pair's pair. The SR runtime is called only when the pair
+ * changes (leiasr tracks what the weaver holds).
+ *
+ * When the atlas is not PQ and this DP left a non-default pair on the weaver,
+ * (AUTO, AUTO) is declared once to hand control back to the sRGB pair;
+ * otherwise the function is never called, so the SDR path is unchanged.
+ *
+ * @return true when the PQ pair is in force for this weave (the caller then
+ *         skips the sRGB pair); false for the ordinary sRGB-pair path.
+ */
+static bool
+weave_pq_pair(struct leia_display_processor_d3d11_impl *ldp, ID3D11DeviceContext *ctx)
+{
+	if (ldp->atlas_encoding != XRT_ATLAS_ENCODING_PQ || ldp->pq_disabled) {
+		if (ldp->pq_pair_set) {
+			ldp->pq_pair_set = false;
+			ldp->pq_last_output = LEIASR_COLOR_ENCODING_AUTO;
+			ldp->pq_last_target = DXGI_FORMAT_UNKNOWN;
+			(void)leiasr_d3d11_set_color_encoding(ldp->leiasr, LEIASR_COLOR_ENCODING_AUTO,
+			                                      LEIASR_COLOR_ENCODING_AUTO);
+			U_LOG_W("Leia D3D11 DP: weaver colour encoding -> (AUTO, AUTO) - atlas no longer PQ, the sRGB "
+			        "pair decides again");
+		}
+		if (ldp->atlas_encoding == XRT_ATLAS_ENCODING_PQ && !ldp->pq_fallback_warned) {
+			// Only after the weaver refused a pair it was offered: the runtime
+			// declares PQ only once accepts_atlas_encoding said yes.
+			ldp->pq_fallback_warned = true;
+			U_LOG_W("Leia D3D11 DP: PQ atlas declared but the weaver cannot take a PQ input - woven as an "
+			        "sRGB-encoded atlas (colours will be wrong; logged once)");
+		}
+		return false;
+	}
+
+	DXGI_FORMAT target = DXGI_FORMAT_UNKNOWN;
+	ID3D11RenderTargetView *rtv = nullptr;
+	ctx->OMGetRenderTargets(1, &rtv, nullptr);
+	if (rtv != nullptr) {
+		D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv->GetDesc(&rtv_desc);
+		target = rtv_desc.Format;
+		rtv->Release();
+	}
+	enum leiasr_color_encoding output = LEIASR_COLOR_ENCODING_SRGB;
+	switch (target) {
+	case DXGI_FORMAT_R10G10B10A2_UNORM: output = LEIASR_COLOR_ENCODING_PQ; break;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: output = LEIASR_COLOR_ENCODING_LINEAR; break;
+	default: output = LEIASR_COLOR_ENCODING_SRGB; break;
+	}
+
+	if (!leiasr_d3d11_set_color_encoding(ldp->leiasr, LEIASR_COLOR_ENCODING_PQ, output)) {
+		if (!leiasr_d3d11_is_ready(ldp->leiasr)) {
+			return false; // weaver (re)creating: nothing woven this frame anyway
+		}
+		ldp->pq_disabled = true; // leiasr logged the SR result once
+		U_LOG_W("Leia D3D11 DP: srWeaverSetColorEncoding(PQ, %s) refused - PQ weave disabled for this DP",
+		        leiasr_color_encoding_str(output));
+		return false;
+	}
+	ldp->pq_pair_set = true;
+	if ((int32_t)output != ldp->pq_last_output || target != ldp->pq_last_target) {
+		ldp->pq_last_output = (int32_t)output;
+		ldp->pq_last_target = target;
+		U_LOG_W("Leia D3D11 DP: weaver colour encoding -> (PQ, %s) for target %s (0x%x)",
+		        leiasr_color_encoding_str(output), weave_target_format_str(target), (unsigned)target);
+	}
+	if (output == LEIASR_COLOR_ENCODING_SRGB && !ldp->pq_clip_warned) {
+		ldp->pq_clip_warned = true;
+		U_LOG_W("Leia D3D11 DP: PQ atlas woven to an SDR target (%s) - highlights above 203 cd/m^2 are "
+		        "hard-clipped (no tone mapping; logged once)",
+		        weave_target_format_str(target));
+	}
+	return true;
+}
+#endif // XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+
 //! The 8- and 10-bit UNORM families (incl. their TYPELESS / _SRGB members).
 static bool
 alpha_gate_mask_format_ok(DXGI_FORMAT f)
@@ -2479,11 +2599,24 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 	// The weave runs in linear light (ST-5863): declared every frame, because the
 	// weaver keeps a declaration and the atlas encoding can change mid-session.
-	bool srgb_read = false;
-	bool srgb_write = atlas_is_linear;
-	weave_srgb_pair(ctx, static_cast<ID3D11ShaderResourceView *>(weaver_srv), atlas_is_linear, &srgb_read,
-	                &srgb_write);
-	leiasr_d3d11_set_srgb_conversion(ldp->leiasr, srgb_read, srgb_write);
+	// A PQ atlas instead declares an explicit colour-encoding pair, which
+	// overrides the sRGB pair on both sides (weave_pq_pair).
+	bool pq_weave = false;
+#ifdef XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+	pq_weave = weave_pq_pair(ldp, ctx);
+	if (pq_weave && overlay_srv != nullptr && !ldp->pq_overlay_warned) {
+		ldp->pq_overlay_warned = true;
+		U_LOG_W("Leia D3D11 DP: PQ weave with a 2D over-layer - the SR weaver does not compose the layer in a "
+		        "PQ weave (logged once)");
+	}
+#endif
+	if (!pq_weave) {
+		bool srgb_read = false;
+		bool srgb_write = atlas_is_linear;
+		weave_srgb_pair(ctx, static_cast<ID3D11ShaderResourceView *>(weaver_srv), atlas_is_linear, &srgb_read,
+		                &srgb_write);
+		leiasr_d3d11_set_srgb_conversion(ldp->leiasr, srgb_read, srgb_write);
+	}
 	leiasr_d3d11_weave(ldp->leiasr);
 	if (timing != nullptr) {
 		LARGE_INTEGER q1 = {};
@@ -3098,6 +3231,28 @@ leia_dp_d3d11_set_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum x
 	leia_dp_d3d11(xdp)->atlas_encoding = atlas_encoding;
 }
 
+#ifdef XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+/*
+ * Appended slot 35 (accepts_atlas_encoding): the runtime declares PQ through
+ * set_atlas_encoding only after this returns true for it. ENCODED and LINEAR
+ * are what get_handoff_color_capability's EITHER already promises. PQ needs the
+ * installed SR runtime to take srWeaverSetColorEncoding (LeiaSR ST-5875) on
+ * this DP's weaver -- resolved from the SR dispatch table, without calling into
+ * the weaver -- and no earlier refusal on this DP.
+ */
+static bool
+leia_dp_d3d11_accepts_atlas_encoding(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding encoding)
+{
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	switch (encoding) {
+	case XRT_ATLAS_ENCODING_ENCODED:
+	case XRT_ATLAS_ENCODING_LINEAR: return true;
+	case XRT_ATLAS_ENCODING_PQ: return !ldp->pq_disabled && leiasr_d3d11_color_encoding_available(ldp->leiasr);
+	default: return false;
+	}
+}
+#endif
+
 #ifdef XRT_DP_D3D11_HAS_FRAME_TIMING
 static void
 leia_dp_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 *xdp,
@@ -3564,6 +3719,9 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.destroy = leia_dp_d3d11_destroy;
 	ldp->base.get_handoff_color_capability = leia_dp_d3d11_get_handoff_color_capability;
 	ldp->base.set_atlas_encoding = leia_dp_d3d11_set_atlas_encoding;
+#ifdef XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY
+	ldp->base.accepts_atlas_encoding = leia_dp_d3d11_accepts_atlas_encoding; // PQ (HDR10) atlas (slot 35)
+#endif
 	// #224 local 2D/3D zones — 1×1 leg (slots 12–14, runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d11_get_local_zone_caps;
 	ldp->base.publish_local_zone_mask = leia_dp_d3d11_publish_local_zone_mask;

@@ -266,6 +266,21 @@ else()
     message(STATUS "SR per-display user presence (event 20): DISABLED (SDK predates SrDisplayUserPresenceCapabilities) - "
                    "every DP keeps the eye-pair heuristic")
 endif()
+# Weaver colour encoding (srWeaverSetColorEncoding, LeiaSR ST-5875, Windows
+# dispatch slot 109). NOT a compile gate: the D3D11 arm resolves the function
+# from the SR runtime's dispatch table at RUN time (leia_sr_d3d11.cpp), so PQ
+# (HDR10) atlases weave on an SR runtime that has it even with an SDK drop that
+# predates it. When the SDK header declares it (sr-sdk-v2-1.39.0.x), this only
+# turns on static_asserts holding the local slot index and enum values to the
+# SDK's.
+set(LEIA_SR_COLOR_ENCODING_SDK FALSE)
+if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_h)
+    if(_leia_sr_h MATCHES "srWeaverSetColorEncoding")
+        set(LEIA_SR_COLOR_ENCODING_SDK TRUE)
+    endif()
+    unset(_leia_sr_h)
+endif()
 if(LEIA_SR_LENS_BINDING_AVAILABLE)
     message(STATUS "SR lens per device (D3): ENABLED - a screen-bound D3D11 DP binds and drives its own lens")
 else()
@@ -569,6 +584,9 @@ if(LEIA_SR_V2_AVAILABLE)
     if(LEIA_SR_USER_PRESENCE_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_USER_PRESENCE=1)
     endif()
+endif()
+if(LEIA_SR_COLOR_ENCODING_SDK)
+    target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_SDK_HAS_SR_COLOR_ENCODING=1)
 endif()
 
 if(LEIA_SR_VULKAN_AVAILABLE)

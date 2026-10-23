@@ -29,6 +29,9 @@
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN
 #include <sr/sr_display.h> // SrDisplayBindingInfo (multi-screen M6)
 #endif
+#ifdef DXR_LEIA_SDK_HAS_SR_COLOR_ENCODING
+#include <sr/sr_loader.h> // SrDispatchTable: static_asserts on the colour-encoding slot
+#endif
 #endif
 
 #include <d3d11.h>
@@ -39,6 +42,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -97,6 +101,12 @@ struct leiasr_d3d11
 	SrWeaver compose_strength_weaver = nullptr; //!< the weaver compose_strength_* describes
 	bool compose_strength_unsupported_logged = false;
 #endif
+	//! ST-5875 colour encoding: the (input, output) pair last applied to
+	//! color_enc_weaver (sticky in SR), so srWeaverSetColorEncoding is called
+	//! only on change. A weaver other than color_enc_weaver runs (AUTO, AUTO).
+	SrWeaver color_enc_weaver = nullptr;
+	int32_t color_enc_in = 0;
+	int32_t color_enc_out = 0;
 #endif
 
 	// D3D11 resources, AddRef'd by bind_d3d11() and released by the
@@ -3007,6 +3017,170 @@ leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr)
 	return leiasr_d3d11_compose_available(leiasr) && leiasr->compose_coverage;
 #else
 	(void)leiasr;
+	return false;
+#endif
+}
+
+/*
+ * ST-5875 colour encoding (srWeaverSetColorEncoding).
+ *
+ * It is not called through the static loader's trampoline, because an SDK
+ * drop older than sr-sdk-v2-1.39.0.x has no slot for it (the pinned 1.39.0.2793
+ * SDK declares it). Instead it is resolved at run time from the SR runtime's
+ * own dispatch table:
+ * the runtime the loader already loaded (LeiaSR_runtime.dll) exports the
+ * bootstrap srGetDispatchTable(table, size), which fills min(size, its table)
+ * and zeroes the rest. The table is append-only and frozen for SR API major 1
+ * (sr_loader.h), and srWeaverSetColorEncoding sits at Windows slot 109 -- the
+ * first slot past the 1.38 SDK's 109-entry table. A runtime that predates it
+ * leaves the slot NULL. When the SDK in use declares the function, the
+ * static_asserts below hold the local slot and values to it, so a drift fails
+ * the build instead of mis-dispatching on a panel.
+ */
+#ifdef DXR_LEIA_HAS_SR_V2
+namespace {
+
+constexpr size_t k_sr_slot_weaver_set_color_encoding = 109; // Windows (DX11/DX12 slots present)
+constexpr size_t k_sr_dispatch_probe_slots = 160;           // > any table; the runtime zero-fills the tail
+
+#ifdef DXR_LEIA_SDK_HAS_SR_COLOR_ENCODING
+static_assert(offsetof(SrDispatchTable, pfnWeaverSetColorEncoding) ==
+                  k_sr_slot_weaver_set_color_encoding * sizeof(void *),
+              "srWeaverSetColorEncoding moved in the SR dispatch table");
+static_assert(sizeof(SrDispatchTable) <= k_sr_dispatch_probe_slots * sizeof(void *), "SR dispatch table grew");
+static_assert((int)SR_COLOR_ENCODING_AUTO == LEIASR_COLOR_ENCODING_AUTO &&
+                  (int)SR_COLOR_ENCODING_SRGB == LEIASR_COLOR_ENCODING_SRGB &&
+                  (int)SR_COLOR_ENCODING_LINEAR == LEIASR_COLOR_ENCODING_LINEAR &&
+                  (int)SR_COLOR_ENCODING_PQ == LEIASR_COLOR_ENCODING_PQ,
+              "SrColorEncoding values moved");
+#endif
+
+typedef SrResult(SR_CALL *PFN_leia_srGetDispatchTable)(void *pTable, size_t tableSizeBytes);
+typedef SrResult(SR_CALL *PFN_leia_srWeaverSetColorEncoding)(SrWeaver weaver, int32_t input, int32_t output);
+
+//! 0 = not resolved yet, 1 = resolved (s_set_color_encoding valid), -1 = unavailable for the process.
+std::atomic<int> s_color_enc_state{0};
+std::atomic<PFN_leia_srWeaverSetColorEncoding> s_set_color_encoding{nullptr};
+std::mutex s_color_enc_mtx;
+
+PFN_leia_srWeaverSetColorEncoding
+color_encoding_fn(void)
+{
+	const int st = s_color_enc_state.load(std::memory_order_acquire);
+	if (st != 0) {
+		return st > 0 ? s_set_color_encoding.load(std::memory_order_relaxed) : nullptr;
+	}
+	std::lock_guard<std::mutex> lock(s_color_enc_mtx);
+	if (s_color_enc_state.load(std::memory_order_relaxed) != 0) {
+		return s_set_color_encoding.load(std::memory_order_relaxed);
+	}
+	if (leia_sr_api_selected() != LEIA_SR_API_V2) {
+		s_color_enc_state.store(-1, std::memory_order_release);
+		return nullptr; // the v1 C++ weaver has no such control
+	}
+	// The SR loader loaded the runtime when it selected v2 (srCreateInstance).
+	// Not loaded (yet) = ask again later, nothing cached.
+	HMODULE rt = GetModuleHandleW(L"LeiaSR_runtime.dll");
+	if (rt == nullptr) {
+		return nullptr;
+	}
+	void *get_table_sym = reinterpret_cast<void *>(GetProcAddress(rt, "srGetDispatchTable"));
+	const auto get_table = reinterpret_cast<PFN_leia_srGetDispatchTable>(get_table_sym);
+	void *table[k_sr_dispatch_probe_slots] = {};
+	SrResult r = SR_ERROR_RUNTIME_UNAVAILABLE;
+	if (get_table != nullptr) {
+		r = get_table(table, sizeof(table));
+	}
+	PFN_leia_srWeaverSetColorEncoding fn = nullptr;
+	if (SR_SUCCEEDED(r)) {
+		fn = reinterpret_cast<PFN_leia_srWeaverSetColorEncoding>(table[k_sr_slot_weaver_set_color_encoding]);
+	}
+	s_set_color_encoding.store(fn, std::memory_order_relaxed);
+	s_color_enc_state.store(fn != nullptr ? 1 : -1, std::memory_order_release);
+	U_LOG_W("SR weaver colour encoding (srWeaverSetColorEncoding, dispatch slot %u): %s",
+	        (unsigned)k_sr_slot_weaver_set_color_encoding,
+	        fn != nullptr ? "AVAILABLE - PQ (HDR10) atlases can be woven in linear light"
+	        : get_table == nullptr ? "UNAVAILABLE (SR runtime exports no dispatch table)"
+	                               : "UNAVAILABLE (the installed SR runtime predates it)");
+	return fn;
+}
+
+} // namespace
+#endif // DXR_LEIA_HAS_SR_V2
+
+const char *
+leiasr_color_encoding_str(enum leiasr_color_encoding e)
+{
+	switch (e) {
+	case LEIASR_COLOR_ENCODING_AUTO: return "AUTO";
+	case LEIASR_COLOR_ENCODING_SRGB: return "SRGB";
+	case LEIASR_COLOR_ENCODING_LINEAR: return "LINEAR";
+	case LEIASR_COLOR_ENCODING_PQ: return "PQ";
+	default: return "?";
+	}
+}
+
+bool
+leiasr_d3d11_color_encoding_available(struct leiasr_d3d11 *leiasr)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr == nullptr) {
+		return false;
+	}
+	if (w_ready(leiasr) && leiasr->weaver_v2 == nullptr) {
+		return false; // a v1 weaver
+	}
+	return color_encoding_fn() != nullptr;
+#else
+	(void)leiasr;
+	return false;
+#endif
+}
+
+bool
+leiasr_d3d11_set_color_encoding(struct leiasr_d3d11 *leiasr,
+                                enum leiasr_color_encoding input,
+                                enum leiasr_color_encoding output)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr == nullptr || !w_ready(leiasr) || leiasr->weaver_v2 == nullptr) {
+		return false;
+	}
+	if (leiasr->color_enc_weaver != leiasr->weaver_v2) {
+		// A new weaver (#144 recreate, #158 reconnect) starts at the SR default.
+		leiasr->color_enc_weaver = leiasr->weaver_v2;
+		leiasr->color_enc_in = LEIASR_COLOR_ENCODING_AUTO;
+		leiasr->color_enc_out = LEIASR_COLOR_ENCODING_AUTO;
+	}
+	if (leiasr->color_enc_in == (int32_t)input && leiasr->color_enc_out == (int32_t)output) {
+		return true; // sticky in SR, unchanged
+	}
+	const PFN_leia_srWeaverSetColorEncoding fn = color_encoding_fn();
+	if (fn == nullptr) {
+		return false;
+	}
+	const SrResult r = fn(leiasr->weaver_v2, (int32_t)input, (int32_t)output);
+	if (SR_SUCCEEDED(r)) {
+		leiasr->color_enc_in = (int32_t)input;
+		leiasr->color_enc_out = (int32_t)output;
+		return true;
+	}
+	// FUNCTION_UNSUPPORTED / RUNTIME_UNAVAILABLE: the runtime predates it.
+	// FEATURE_NOT_SUPPORTED: this backend cannot honour it. Either way it will
+	// not start working mid-process: disable it, once.
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED || r == SR_ERROR_RUNTIME_UNAVAILABLE ||
+	    r == SR_ERROR_FEATURE_NOT_SUPPORTED) {
+		s_color_enc_state.store(-1, std::memory_order_release);
+	}
+	const bool disabled = s_color_enc_state.load(std::memory_order_relaxed) < 0;
+	U_LOG_W("srWeaverSetColorEncoding(%s, %s): %s%s", leiasr_color_encoding_str(input),
+	        leiasr_color_encoding_str(output), leia_sr_v2_result_str(r),
+	        disabled ? " - colour-encoding control disabled for this process" : "");
+	return false;
+#else
+	(void)leiasr;
+	(void)input;
+	(void)output;
 	return false;
 #endif
 }

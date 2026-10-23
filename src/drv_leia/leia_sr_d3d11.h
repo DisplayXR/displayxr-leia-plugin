@@ -265,6 +265,58 @@ bool
 leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr);
 
 /*!
+ * How the weaver's input views / render target are encoded, for
+ * leiasr_d3d11_set_color_encoding. The values are the SR runtime's
+ * (srWeaverSetColorEncoding, LeiaSR ST-5875) and must not change.
+ *
+ * @ingroup drv_leia
+ */
+enum leiasr_color_encoding
+{
+	LEIASR_COLOR_ENCODING_AUTO = 0,   //!< decided from the surface format (the SR default)
+	LEIASR_COLOR_ENCODING_SRGB = 1,   //!< sRGB-encoded, whatever the format says
+	LEIASR_COLOR_ENCODING_LINEAR = 2, //!< linear light (scRGB on a float target)
+	LEIASR_COLOR_ENCODING_PQ = 3,     //!< SMPTE ST 2084, 203 cd/m^2 = linear 1.0
+};
+
+//! Short name of an encoding, for logs.
+const char *
+leiasr_color_encoding_str(enum leiasr_color_encoding e);
+
+/*!
+ * Can the INSTALLED SR runtime take an explicit colour-encoding declaration
+ * (srWeaverSetColorEncoding) on this weaver? True when the process runs the SR
+ * v2 API, the runtime's dispatch table carries the function, and no call has
+ * failed with "runtime predates it" / "backend cannot" (that disables it for
+ * the process). Never calls into the weaver, so it is safe from any thread and
+ * before the weaver is ready. False on the v1 weaver and on a build without
+ * the SR v2 API. The first real leiasr_d3d11_set_color_encoding is the probe.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_color_encoding_available(struct leiasr_d3d11 *leiasr);
+
+/*!
+ * Declare the (input, output) encoding pair for the next weaves. Calls the SR
+ * runtime only when the pair differs from what this weaver already has (a new
+ * weaver starts at (AUTO, AUTO)); sticky in SR. An explicit side overrides the
+ * shader sRGB pair (leiasr_d3d11_set_srgb_conversion) for that side; AUTO
+ * hands it back.
+ *
+ * @return true when the weaver now runs @p input / @p output; false when the
+ *         weaver is not ready, is v1, or the SR runtime refused (a "runtime
+ *         predates it" answer disables the function for the process; logged
+ *         once).
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d11_set_color_encoding(struct leiasr_d3d11 *leiasr,
+                                enum leiasr_color_encoding input,
+                                enum leiasr_color_encoding output);
+
+/*!
  * XR_DXR_weave v15: the app's lens-filter strength for the 2D layer, [0,1], or
  * negative for the SR runtime's default (sr_config / compiled 0.6). Forwarded
  * to srWeaverSetComposeFilterStrength (LeiaSR ST-5799) ONLY when it changes,
