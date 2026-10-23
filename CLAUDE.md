@@ -153,10 +153,11 @@ uses for `LeiaInc/CNSDK`), so fork PRs cannot build the Windows/Linux arms.
 On first run the script pulls the SR SDK at `SR_TAG` / `SR_VKSTAMP_TAG` /
 `SR_V2_TAG` (set in `scripts/build-windows.bat`; keep in sync with
 `build-windows.yml`). CI enforces that sync: `scripts/check_sr_pins.py`,
-run by `.github/workflows/lint.yml` on every PR, asserts all five pins
-(`SR_TAG`, `SR_VKSTAMP_TAG`, `SR_V2_TAG`, `SR_V2_DIR`, `SR_SDK_REPO`) are
-declared exactly once and identically in both files, and that
-`SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build.
+run by `.github/workflows/lint.yml` on every PR, asserts all six pins
+(`SR_TAG`, `SR_VKSTAMP_TAG`, `SR_V2_TAG`, `SR_V2_DIR`, `SR_V2_SHA256`,
+`SR_SDK_REPO`) are declared exactly once and identically in both files, and
+that `SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build. Both download sites
+refuse the SR v2 zip unless its sha256 equals `SR_V2_SHA256`.
 
 **NeurD headers (2D→3D lift) follow the same rule.** They are Leia-private
 and come from the private **`LeiaInc/media_sdk`** repo at `NEURD_SDK_REF`

@@ -67,17 +67,6 @@
 extern "C" {
 #endif
 
-/*
- * SR enum / struct-tag values this needs, as plain integers: the pinned SDK
- * (sr-sdk-v2-1.38.0.x) predates them. Values per LeiaSR
- * release-candidate/david-q4-2026. The SDK-typed side static_asserts them
- * against the real header when the SDK has it
- * (DXR_LEIA_SDK_HAS_SR_USER_PRESENCE). TODO: drop these once the SR v2 pin
- * moves to sr-sdk-v2-1.39.0.x and use the SDK names directly.
- */
-#define LEIA_SR_EVENT_DISPLAY_USER_PRESENCE 20
-#define LEIA_SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES 32
-
 //! The serial field's capacity (SR: printable ASCII, no spaces).
 #define LEIA_SR_PRESENCE_SERIAL_MAX 64
 

@@ -25,15 +25,6 @@
 #include <new>
 #include <string.h>
 
-#ifdef DXR_LEIA_SDK_HAS_SR_USER_PRESENCE
-// The SDK carries the real names: hold the local values (leia_sr_presence.h)
-// to them, so the day the pin moves a drift fails the build, not the panel.
-static_assert(LEIA_SR_EVENT_DISPLAY_USER_PRESENCE == (int)SR_EVENT_TYPE_DISPLAY_USER_PRESENCE,
-              "SR_EVENT_TYPE_DISPLAY_USER_PRESENCE moved");
-static_assert(LEIA_SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES == (int)SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES,
-              "SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES moved");
-#endif
-
 struct leia_sr_presence_monitor
 {
 	SrSystemMonitor monitor = nullptr;
@@ -49,6 +40,14 @@ struct leia_sr_presence_monitor
 
 namespace {
 
+#ifdef DXR_LEIA_HAS_SR_USER_PRESENCE
+constexpr int kUserPresenceEvent = (int)SR_EVENT_TYPE_DISPLAY_USER_PRESENCE;
+#else
+// SDK predates event 20: the capability query answers "unsupported", so no
+// monitor is ever attached; -1 matches no SR event if one somehow were.
+constexpr int kUserPresenceEvent = -1;
+#endif
+
 void SR_CALL
 on_system_event(const SrSystemEvent *event, void *user_data)
 {
@@ -56,7 +55,7 @@ on_system_event(const SrSystemEvent *event, void *user_data)
 	if (m == nullptr || event == nullptr) {
 		return;
 	}
-	if ((int)event->eventType != LEIA_SR_EVENT_DISPLAY_USER_PRESENCE) {
+	if ((int)event->eventType != kUserPresenceEvent) {
 		return;
 	}
 	struct leia_sr_presence_msg msg = {};
