@@ -1722,9 +1722,14 @@ weave_view_encoding_of(DXGI_FORMAT f)
  * (ST-5863; the SR weaver's own rule, WeaverLinearLight.h, fed with the
  * encoding only this DP knows):
  *
- *   read  = the atlas is ENCODED and the SRV the weaver samples is a plain 8-bit
- *           UNORM view (an *_UNORM_SRGB view decodes in hardware; a LINEAR atlas
- *           needs no decode)
+ *   read  = the atlas is ENCODED and the SRV the weaver samples is not an
+ *           *_UNORM_SRGB view (that one decodes in hardware; a LINEAR atlas needs
+ *           no decode). The ENCODED declaration is what makes a 10-bit or float
+ *           atlas safe to decode: the runtime's deep atlas (DXR_ATLAS_FORMAT,
+ *           runtime #2273) carries sRGB-encoded values, and without the decode the
+ *           weaver treated them as linear and the write below encoded them a second
+ *           time -- a washed-out image (dark background 13 -> 59 of 255). A float
+ *           atlas carrying LINEAR light declares LINEAR and is not decoded.
  *   write = the bound target is a plain 8-bit UNORM view (an *_UNORM_SRGB RTV
  *           encodes in hardware)
  *
@@ -1759,7 +1764,7 @@ weave_srgb_pair(ID3D11DeviceContext *ctx, ID3D11ShaderResourceView *srv, bool at
 		*out_write = atlas_is_linear;
 		return;
 	}
-	*out_read = !atlas_is_linear && weave_view_encoding_of(input) == WEAVE_VIEW_UNORM8;
+	*out_read = !atlas_is_linear && weave_view_encoding_of(input) != WEAVE_VIEW_SRGB8;
 	*out_write = target_enc == WEAVE_VIEW_UNORM8;
 }
 
