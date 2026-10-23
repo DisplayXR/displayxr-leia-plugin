@@ -167,6 +167,25 @@ struct leia_win_claim_binding
 	//! @ref serial) — read back by get_screen_status, never re-queried.
 	bool fpc_verified;
 	char serial[64]; //!< FPC serial when @ref fpc_verified, else empty
+
+        /*!
+         * @name The claimed monitor as the RUNTIME enumerated it (#430)
+         *
+         * The descriptor's desktop rect, in this process's (the host's) DPI
+         * space — the space get_display_info's `display_screen_left/top` is
+         * read in by the runtime, which is why it is the descriptor's and not
+         * SR's own rect. Lets get_display_info report the panel's position when
+         * the frozen-EDID-table probe missed it but the claim found it.
+         * @{
+         */
+        bool has_pos; //!< The descriptor carried a desktop position.
+        int32_t screen_left, screen_top;
+        uint32_t pixel_w,
+            pixel_h; //!< The monitor's current mode (descriptor), 0 = unknown.
+        //! The claim was made at XRT_DISPLAY_CLAIM_VERIFIED (FPC-verified, or
+        //! the legacy table + READY rule) — not EDID-only, not AMBIGUOUS.
+        bool verified;
+        /*! @} */
 };
 
 /*!
@@ -235,6 +254,30 @@ leia_win_claims_store(const struct leia_win_claim_binding *bindings, uint32_t co
 //! Look up a claimed monitor's binding; false when it was not claimed.
 bool
 leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out);
+
+/*!
+ * Which claimed monitor is THE panel get_display_info describes, when the
+ * frozen-EDID-table probe could not say (displayxr-leia-plugin#430: a
+ * Lenovo 3D monitor the table lacks, on a non-main monitor, SR-verified by
+ * the claims — the runtime then put the panel rect on the laptop screen).
+ * Pure: no lock, no I/O.
+ *
+ * Only VERIFIED bindings with a desktop position count; an EDID-only or
+ * AMBIGUOUS claim is not identity enough to move an app's window. One such
+ * binding: it. Several: the one whose SR native mode (else the descriptor's
+ * mode) is @p panel_w x @p panel_h, when exactly one is. Otherwise false —
+ * no guess; the runtime then decides from its own claim registry.
+ */
+bool leia_win_claims_pick_panel(const struct leia_win_claim_binding *bindings,
+                                uint32_t count, uint32_t panel_w,
+                                uint32_t panel_h,
+                                struct leia_win_claim_binding *out);
+
+/*!
+ * @ref leia_win_claims_pick_panel over the stored table (thread-safe).
+ */
+bool leia_win_claims_panel(uint32_t panel_w, uint32_t panel_h,
+                           struct leia_win_claim_binding *out);
 
 /*!
  * Look up the claimed monitor whose SR display carries FPC serial @p serial

@@ -197,9 +197,46 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
 		out_info->display_screen_left = edid.screen_left;
 		out_info->display_screen_top = edid.screen_top;
-	}
+        } else {
+                /*
+                 * #430: the frozen EDID table does not know this panel (a
+                 * Lenovo 3D monitor on a laptop's non-main output), so the
+                 * probe has no position — and (0, 0) means "no preference",
+                 * which put the panel rect, Unity's TargetDisplay and the weave
+                 * adapter on the laptop screen. probe_displays() already found
+                 * the panel from SR's own enumeration and VERIFIED it: report
+                 * THAT monitor's origin. Same space as the EDID probe's (the
+                 * runtime's descriptor, read in this process). No SR call — a
+                 * lock-guarded table read.
+                 */
+                struct leia_win_claim_binding claim;
+                memset(&claim, 0, sizeof(claim));
+                if (leia_win_claims_panel(out_info->display_pixel_width,
+                                          out_info->display_pixel_height,
+                                          &claim)) {
+                  out_info->display_screen_left = claim.screen_left;
+                  out_info->display_screen_top = claim.screen_top;
+                  static uint64_t s_logged_monitor = 0;
+                  static int32_t s_logged_left = 0, s_logged_top = 0;
+                  if (s_logged_monitor != claim.monitor_id ||
+                      s_logged_left != claim.screen_left ||
+                      s_logged_top != claim.screen_top) {
+                    s_logged_monitor = claim.monitor_id;
+                    s_logged_left = claim.screen_left;
+                    s_logged_top = claim.screen_top;
+                    U_LOG_W("leia_plugin: EDID table has no position for the "
+                            "panel; reporting the "
+                            "VERIFIED claim's monitor 0x%016llx '%s' at (%d, "
+                            "%d) %ux%u (#430)",
+                            (unsigned long long)claim.monitor_id,
+                            claim.device_name, (int)claim.screen_left,
+                            (int)claim.screen_top, claim.pixel_w,
+                            claim.pixel_h);
+                  }
+                }
+        }
 
-	/* Leia: MANAGED eye tracking only — the SR SDK owns the grace
+        /* Leia: MANAGED eye tracking only — the SR SDK owns the grace
 	 * period + transition handling. */
 	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
 	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
