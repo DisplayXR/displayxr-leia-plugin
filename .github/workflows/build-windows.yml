@@ -96,8 +96,16 @@ jobs:
       # 2192 = + LeiaSR #485 (ST-5481): DECLARATION grep 99 -> 100, APPENDS ONLY
       # (EnumerateMonitors, Windows slot 108, tag 31 -- used by probe_displays
       # under DXR_LEIA_HAS_SR_MONITOR_ENUM).
-      SR_V2_TAG: sr-sdk-v2-1.38.0.2192
-      SR_V2_DIR: LeiaSR-SDK-1.38.0+2192.242007fdc9-win64-Release
+      # 2793 = first 1.39.0 (sr-sdk-v2-1.39.0.2793). Dispatch table 110 -> 111
+      # entries, every existing index keeps its function: the nine reserved
+      # entries (Metal, GL/VK compose inputs) now carry their real names, and one
+      # is APPENDED (SetColorEncoding -- not called on main). Also declares SR
+      # event 20 / SrDisplayUserPresenceCapabilities, so the plug-in's local
+      # stand-ins for them are gone (DXR_LEIA_HAS_SR_USER_PRESENCE).
+      SR_V2_TAG: sr-sdk-v2-1.39.0.2793
+      SR_V2_DIR: LeiaSR-SDK-1.39.0+2793.357f4d0da8-win64-Release
+      # sha256 of "$SR_V2_DIR.zip"; the download is refused on a mismatch.
+      SR_V2_SHA256: a4ae4e1179927d79c91a2fb4b808704762d0cca1c14cc50a57f8b9184e2244a8
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
@@ -196,6 +204,8 @@ jobs:
         run: |
           gh release download $env:SR_V2_TAG -R $env:SR_SDK_REPO -p "$env:SR_V2_DIR.zip" -D .
           if ($LASTEXITCODE -ne 0) { throw "Failed to download SR v2 SDK ($env:SR_V2_TAG)" }
+          $have = (Get-FileHash -Algorithm SHA256 "$env:SR_V2_DIR.zip").Hash.ToLowerInvariant()
+          if ($have -ne $env:SR_V2_SHA256) { throw "$env:SR_V2_DIR.zip sha256 mismatch: got $have, pinned $env:SR_V2_SHA256" }
           tar -xf "$env:SR_V2_DIR.zip" -C .
           # The two files the CMake gate keys on — fail here, not at configure.
           foreach ($f in @("include/sr/sr_instance.h", "lib/srSDK_loader.lib")) {

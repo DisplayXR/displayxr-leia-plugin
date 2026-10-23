@@ -34,7 +34,7 @@ setlocal enabledelayedexpansion
 set SCRIPT_DIR=%~dp0
 set REPO=%SCRIPT_DIR%..\
 :: --- SR SDK pins ------------------------------------------------------
-:: SR_TAG / SR_VKSTAMP_TAG / SR_V2_TAG / SR_V2_DIR / SR_SDK_REPO are set
+:: SR_TAG / SR_VKSTAMP_TAG / SR_V2_TAG / SR_V2_DIR / SR_V2_SHA256 / SR_SDK_REPO are set
 :: here AND in .github/workflows/build-windows.yml (jobs.Build.env). KEEP
 :: THEM IN SYNC -- enforced by scripts/check_sr_pins.py, which
 :: .github/workflows/lint.yml runs on every PR, so a half-applied repin
@@ -107,8 +107,17 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: 2192 = RC @ 242007fdc (+ LeiaSR #485, ST-5481): DECLARATION grep 99 -> 100, 2141's 99 an
 :: exact ordered prefix, APPENDS ONLY -- pfnEnumerateMonitors (Windows slot 108, tag 31), used by
 :: probe_displays under DXR_LEIA_HAS_SR_MONITOR_ENUM (SR's own monitor <-> SR display join).
-set SR_V2_TAG=sr-sdk-v2-1.38.0.2192
-set SR_V2_DIR=LeiaSR-SDK-1.38.0+2192.242007fdc9-win64-Release
+:: 2793 = first 1.39.0. The DECLARATION grep is NOT a prefix check here (100 -> 110):
+:: the nine reserved entries (Metal, GL/VK compose inputs) became declared pfn* in
+:: place. Compared by PHYSICAL index over the SrDispatchTable struct instead: 110 -> 111
+:: entries, every index keeps its function, the nine reserved ones now named, and one
+:: APPENDED -- pfnWeaverSetColorEncoding (not called on main). Also declares SR event 20 /
+:: SrDisplayUserPresenceCapabilities (DXR_LEIA_HAS_SR_USER_PRESENCE; no local stand-ins).
+set SR_V2_TAG=sr-sdk-v2-1.39.0.2793
+set SR_V2_DIR=LeiaSR-SDK-1.39.0+2793.357f4d0da8-win64-Release
+:: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC
+:: with build-windows.yml (check_sr_pins.py asserts it).
+set SR_V2_SHA256=a4ae4e1179927d79c91a2fb4b808704762d0cca1c14cc50a57f8b9184e2244a8
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
@@ -228,6 +237,14 @@ if not exist "%LEIASR_V2_SDKROOT%\lib\srSDK_loader.lib" (
     gh release download %SR_V2_TAG% -R %SR_SDK_REPO% -p "%SR_V2_DIR%.zip" -D "%REPO_NOSLASH%"
     if !ERRORLEVEL! NEQ 0 (
         echo ERROR: Failed to download the SR v2 SDK ^(%SR_V2_TAG%^).
+        exit /b 1
+    )
+    set "SR_V2_HAVE="
+    for /f "delims=" %%H in ('certutil -hashfile "%REPO%%SR_V2_DIR%.zip" SHA256 ^| findstr /v ":"') do if not defined SR_V2_HAVE set "SR_V2_HAVE=%%H"
+    if defined SR_V2_HAVE set "SR_V2_HAVE=!SR_V2_HAVE: =!"
+    if /I not "!SR_V2_HAVE!"=="%SR_V2_SHA256%" (
+        echo ERROR: %SR_V2_DIR%.zip sha256 is "!SR_V2_HAVE!", pinned SR_V2_SHA256 is %SR_V2_SHA256%.
+        del "%REPO%%SR_V2_DIR%.zip" 2>nul
         exit /b 1
     )
     powershell -Command "Expand-Archive -Path '%REPO%%SR_V2_DIR%.zip' -DestinationPath '%REPO_NOSLASH%' -Force"

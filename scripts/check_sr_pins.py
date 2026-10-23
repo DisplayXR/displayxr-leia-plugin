@@ -25,7 +25,7 @@ reverse), the DLL compiles clean either way, and the mismatch only shows up as
 
 What is checked
 ---------------
-1. Each of SR_TAG, SR_VKSTAMP_TAG, SR_V2_TAG, SR_V2_DIR, SR_SDK_REPO appears
+1. Each of SR_TAG, SR_VKSTAMP_TAG, SR_V2_TAG, SR_V2_DIR, SR_V2_SHA256, SR_SDK_REPO appears
    EXACTLY ONCE in the .bat, exactly once in build-windows.yml, and the two
    values are equal. "Exactly once" matters as much as "equal": a second
    `set SR_TAG=` further down the .bat silently wins and would make a
@@ -70,7 +70,17 @@ LINUX_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-linux.yml"
 # NEURD_SDK_REF / NEURD_SDK_REPO pin the private NeurD headers the 2D->3D lift
 # module is built against (docs/lift-neurd.md) -- same two-file duplication,
 # same drift hazard, so they ride the same check.
-PINS = ("SR_TAG", "SR_VKSTAMP_TAG", "SR_V2_TAG", "SR_V2_DIR", "SR_SDK_REPO", "NEURD_SDK_REF", "NEURD_SDK_REPO")
+# SR_V2_SHA256 is the sha256 of the SR_V2_DIR zip both download sites verify.
+PINS = (
+    "SR_TAG",
+    "SR_VKSTAMP_TAG",
+    "SR_V2_TAG",
+    "SR_V2_DIR",
+    "SR_V2_SHA256",
+    "SR_SDK_REPO",
+    "NEURD_SDK_REF",
+    "NEURD_SDK_REPO",
+)
 
 # sr-sdk-v2-1.37.0.1502  ->  ("1.37.0", "1502")
 SR_V2_TAG_RE = re.compile(r"^sr-sdk-v2-(\d+\.\d+\.\d+)\.(\d+)$")

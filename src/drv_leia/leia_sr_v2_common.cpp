@@ -26,8 +26,8 @@
 #ifdef DXR_LEIA_HAS_SR_TRACKER_BINDING
 #include <sr/sr_eye_tracker.h> // SrEyeTrackerBindingCapabilities (SR D4)
 #endif
-#ifdef DXR_LEIA_SDK_HAS_SR_USER_PRESENCE
-#include <sr/sr_system.h> // SrDisplayUserPresenceCapabilities (static_assert only)
+#ifdef DXR_LEIA_HAS_SR_USER_PRESENCE
+#include <sr/sr_system.h> // SrDisplayUserPresenceCapabilities
 #endif
 
 #include <atomic>
@@ -479,31 +479,27 @@ leia_sr_v2_query_display(SrInstance instance,
  * SrDisplayUserPresenceCapabilities::displayUserPresenceEvent (SR event 20,
  * struct tag 32, LeiaSR q4 line), in a query of its OWN: whatever an older
  * runtime makes of a tag it does not know, it cannot cost the routing /
- * binding answer of the caller. Our own layout {sType, pNext, SrBool32} because the
- * pinned SDK predates the struct (leia_sr_presence.h); a runtime that does
- * not know it leaves it untouched (0 = not supported).
+ * binding answer of the caller. A runtime that does not know the struct
+ * leaves it untouched (0 = not supported). An SDK that predates it
+ * (no DXR_LEIA_HAS_SR_USER_PRESENCE) answers "not supported" without asking.
  */
 static bool
 query_user_presence_cap(SrInstance instance)
 {
-	struct
-	{
-		SrStructureType sType;
-		void *pNext;
-		SrBool32 displayUserPresenceEvent;
-	} presence_caps = {(SrStructureType)LEIA_SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES, nullptr, SR_FALSE};
-#ifdef DXR_LEIA_SDK_HAS_SR_USER_PRESENCE
-	static_assert(sizeof(presence_caps) == sizeof(SrDisplayUserPresenceCapabilities),
-	              "local SrDisplayUserPresenceCapabilities layout drifted from the SDK's");
-	static_assert(offsetof(SrDisplayUserPresenceCapabilities, displayUserPresenceEvent) ==
-	                  offsetof(decltype(presence_caps), displayUserPresenceEvent),
-	              "local SrDisplayUserPresenceCapabilities layout drifted from the SDK's");
-#endif
+#ifdef DXR_LEIA_HAS_SR_USER_PRESENCE
+	SrDisplayUserPresenceCapabilities presence_caps{};
+	presence_caps.sType = SR_TYPE_DISPLAY_USER_PRESENCE_CAPABILITIES;
+	presence_caps.pNext = nullptr;
+	presence_caps.displayUserPresenceEvent = SR_FALSE;
 	SrRuntimeCapabilities caps{};
 	caps.sType = SR_TYPE_RUNTIME_CAPABILITIES;
 	caps.pNext = &presence_caps;
 	const SrResult r = srGetRuntimeCapabilities(instance, &caps);
 	return SR_SUCCEEDED(r) && presence_caps.displayUserPresenceEvent == SR_TRUE;
+#else
+	(void)instance;
+	return false;
+#endif
 }
 #endif
 
