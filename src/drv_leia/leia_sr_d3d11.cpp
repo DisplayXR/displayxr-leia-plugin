@@ -99,7 +99,12 @@ struct leiasr_d3d11
 #endif
 #endif
 
-	// D3D11 resources (references, not owned)
+	// D3D11 resources, AddRef'd by bind_d3d11() and released by the
+	// destructor. Owned, not borrowed: a destroy while the async create is
+	// PENDING hands sr to the worker, and the caller may release its device
+	// while that worker is still inside SR::CreateDX11Weaver on it (runtime
+	// #918 split retire on a 10-bit atlas; the crash was EnterCriticalSection
+	// on the freed device).
 	ID3D11Device *device = nullptr;
 	ID3D11DeviceContext *d3d11_context = nullptr;
 
@@ -333,6 +338,25 @@ struct leiasr_d3d11
 	//! runtime#939: set by lens_worker_join on the way to a destroy/reconnect so a
 	//! worker sitting in its 2D dwell applies at once instead of finishing the wait.
 	std::atomic<bool> lens_quit{false};
+
+	void
+	bind_d3d11(void *dev, void *ctx)
+	{
+		device = static_cast<ID3D11Device *>(dev);
+		d3d11_context = static_cast<ID3D11DeviceContext *>(ctx);
+		device->AddRef();
+		d3d11_context->AddRef();
+	}
+
+	~leiasr_d3d11()
+	{
+		if (d3d11_context != nullptr) {
+			d3d11_context->Release();
+		}
+		if (device != nullptr) {
+			device->Release();
+		}
+	}
 };
 
 namespace {
@@ -2083,8 +2107,7 @@ leiasr_d3d11_create(double max_time,
 	}
 
 	leiasr_d3d11 *sr = new leiasr_d3d11;
-	sr->device = static_cast<ID3D11Device *>(d3d11_device);
-	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	sr->bind_d3d11(d3d11_device, d3d11_context);
 	sr->view_width = view_width;
 	sr->view_height = view_height;
 	// #158: the reconnect worker recreates from this, not from a caller.
@@ -2123,8 +2146,7 @@ leiasr_d3d11_create_async(double max_time,
 	}
 
 	leiasr_d3d11 *sr = new leiasr_d3d11;
-	sr->device = static_cast<ID3D11Device *>(d3d11_device);
-	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	sr->bind_d3d11(d3d11_device, d3d11_context);
 	sr->view_width = view_width;
 	sr->view_height = view_height;
 	// #158: the reconnect worker recreates from this, not from a caller.
@@ -2165,8 +2187,7 @@ leiasr_d3d11_create_for_screen(double max_time,
 	}
 
 	leiasr_d3d11 *sr = new leiasr_d3d11;
-	sr->device = static_cast<ID3D11Device *>(d3d11_device);
-	sr->d3d11_context = static_cast<ID3D11DeviceContext *>(d3d11_context);
+	sr->bind_d3d11(d3d11_device, d3d11_context);
 	sr->view_width = 0;
 	sr->view_height = 0;
 	sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
