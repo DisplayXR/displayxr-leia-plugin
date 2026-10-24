@@ -2187,6 +2187,47 @@ leia_dp_vk_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
+/*
+ * Appended VK-variant slot (accepts_atlas_encoding, displayxr-runtime#2340):
+ * the runtime declares PQ (HDR10) through the base set_atlas_encoding only
+ * after this returns true for it.
+ *
+ * An explicit "no" for PQ, not a missing answer. The D3D11 DP weaves PQ by
+ * declaring the pair through srWeaverSetColorEncoding, and that entry point
+ * takes the API-agnostic SrWeaver handle the v2 Vulkan weaver also is -- but
+ * the pinned SR SDK documents it as honoured by the Direct3D 11 backend only:
+ * on a Vulkan weaver a PQ declaration returns SR_ERROR_FEATURE_NOT_SUPPORTED
+ * (SRGB / LINEAR / AUTO work on every backend). Saying yes here would get an
+ * HDR10 atlas woven as if it were sRGB-encoded, so the runtime keeps the
+ * Vulkan path SDR. When the SR runtime gains a Vulkan PQ path, this becomes the
+ * D3D11 DP's check (weaver exposes the control, no earlier refusal) plus a
+ * set_atlas_encoding that declares (PQ, output-from-target) before the weave.
+ *
+ * ENCODED is what this DP weaves today. It declares no handoff colour
+ * capability and no set_atlas_encoding, so it never hears a LINEAR atlas
+ * and does not claim one.
+ */
+static bool
+leia_dp_vk_accepts_atlas_encoding(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding)
+{
+	(void)xdp;
+	switch (encoding) {
+	case XRT_ATLAS_ENCODING_ENCODED: return true;
+	case XRT_ATLAS_ENCODING_PQ: {
+		static bool s_pq_declined_logged = false;
+		if (!s_pq_declined_logged) {
+			s_pq_declined_logged = true;
+			U_LOG_W("Leia VK DP: PQ (HDR10) atlas declined - the SR Vulkan weaver has no PQ colour-encoding "
+			        "path (srWeaverSetColorEncoding is D3D11-only); the atlas stays SDR (logged once)");
+		}
+		return false;
+	}
+	default: return false;
+	}
+}
+#endif
+
 
 /*
  *
@@ -2274,6 +2315,9 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 #ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_vk_set_present_origin; // multi-screen M6 (windowless segment phase)
+#endif
+#ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
+	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340: explicit "no" for PQ
 #endif
 	ldp->vk = vk;
 	ldp->view_count = 2;
@@ -2434,6 +2478,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	// so the enable degrades to a graceful no-op (compose can't start without an
 	// HWND); kept wired for vtable parity with the factory.
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background;
+#ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
+	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340 (vtable parity with the factory)
+#endif
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.
 	ldp->base.base.destroy = leia_dp_destroy;
