@@ -39,8 +39,8 @@ chase. It ships everything the plug-in configures against under `/opt/leiasr`:
 | CMake config package | `/opt/leiasr/lib/cmake/srSDK/srSDKConfig.cmake` |
 | active-runtime registration | `/etc/leia/sr/1/active_runtime.json` (written by this .deb) |
 
-So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`, `Deb` job `SR_TAG`) pins `1.39.0.63983`
-(asset `LeiaSR-SDK-1.39.0.63983-linux64.tar.gz`, sha256 checked against `SR_SDK_SHA256`;
+So `SRSDK_ROOT=/opt/leiasr`. CI (`build-linux.yml`, `Deb` job `SR_TAG`) pins `1.39.0.33690`
+(asset `LeiaSR-SDK-1.39.0.33690-linux64.tar.gz`, sha256 checked against `SR_SDK_SHA256`;
 the first Linux SDK with the SR compose API — `srWeaverSetComposeInputsVulkan` etc. —
 that the 2D-under-the-lens build probe keys on; the previous pin was `1.37.0.10693`).
 **The SDK must ship `srWeaverSnapToPhase` + `srWeaverSetPresentOrigin` (LeiaSR#85)** —

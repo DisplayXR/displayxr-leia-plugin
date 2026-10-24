@@ -465,13 +465,17 @@ jobs:
       # claims and the SR deferral on an EDID-table miss key on. 1.38.0.10108
       # predates it, so v2.16.5 shipped with display enumeration compiled out
       # (#414). The "Assert SR display enumeration" step below now refuses that.
-      SR_TAG: 1.39.0.63983
+      #
+      # 1.39.0.33690 (sr-sdk-v1.39.0.33690, the RC9 runtime's SDK): the newest
+      # Linux SDK (the plug-in always builds against the newest published one).
+      # No new slot the plug-in uses; same tarball layout as 1.39.0.63983.
+      SR_TAG: 1.39.0.33690
       # The exact asset and its sha256. The download is pinned to this name
       # and refused on a hash mismatch: a re-uploaded asset under the same tag
       # must be a deliberate pin change, never a silent swap. Move all three
       # together.
-      SR_SDK_ASSET: LeiaSR-SDK-1.39.0.63983-linux64.tar.gz
-      SR_SDK_SHA256: 23bbe806e78fb6a9ca66a8586067de4e2cc9fc0856a3652a2698b5817c95ca34
+      SR_SDK_ASSET: LeiaSR-SDK-1.39.0.33690-linux64.tar.gz
+      SR_SDK_SHA256: 9c3b4bfe17f1cdda231787c4a6e80ac5f57ed99a87384e7395a08a46b90c5b3e
       # Private Leia artifact repo hosting every sr-sdk-v* release (see
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
