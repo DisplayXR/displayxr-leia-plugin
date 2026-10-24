@@ -113,11 +113,18 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: entries, every index keeps its function, the nine reserved ones now named, and one
 :: APPENDED -- pfnWeaverSetColorEncoding (not called on main). Also declares SR event 20 /
 :: SrDisplayUserPresenceCapabilities (DXR_LEIA_HAS_SR_USER_PRESENCE; no local stand-ins).
-set SR_V2_TAG=sr-sdk-v2-1.39.0.2793
-set SR_V2_DIR=LeiaSR-SDK-1.39.0+2793.357f4d0da8-win64-Release
+:: 2950 = 1.39.0 superset of 2793. Compared by PHYSICAL index over SrDispatchTable:
+:: 110 -> 119 entries (sizeof/8), 2793's 110 an exact ordered prefix, APPENDS ONLY --
+:: pfnWeaverSetColorEncoding unchanged at Windows slot 109; 110-116 pfnCreateViewerTracker,
+:: pfnDestroyViewerTracker, pfnViewerTrackerGetViewers, pfnViewerTrackerAddCallback,
+:: pfnViewerTrackerRemoveCallback, pfnWeaverGetViewers, pfnWeaverSetMultiViewerMode;
+:: 117-118 pfnGetMultiViewerConfig, pfnSetMultiViewerConfig. New struct tags 33-36 and
+:: SR_ERROR_ACCESS_DENIED (-14). None of the new API is used by this plug-in.
+set SR_V2_TAG=sr-sdk-v2-1.39.0.2950
+set SR_V2_DIR=LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
 :: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC
 :: with build-windows.yml (check_sr_pins.py asserts it).
-set SR_V2_SHA256=a4ae4e1179927d79c91a2fb4b808704762d0cca1c14cc50a57f8b9184e2244a8
+set SR_V2_SHA256=53395b80ea8dc4afadf113d48bc1a4942e0bf15e3cbc50119745f7aa1fbdfcb1
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
