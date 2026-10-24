@@ -3025,7 +3025,7 @@ leiasr_d3d11_compose_writes_coverage(struct leiasr_d3d11 *leiasr)
  * ST-5875 colour encoding (srWeaverSetColorEncoding).
  *
  * It is not called through the static loader's trampoline, because an SDK
- * drop older than sr-sdk-v2-1.39.0.x has no slot for it (the pinned 1.39.0.2793
+ * drop older than sr-sdk-v2-1.39.0.x has no slot for it (the pinned 1.39.0.2950
  * SDK declares it). Instead it is resolved at run time from the SR runtime's
  * own dispatch table:
  * the runtime the loader already loaded (LeiaSR_runtime.dll) exports the
