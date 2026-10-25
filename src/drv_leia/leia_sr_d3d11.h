@@ -100,6 +100,15 @@ void
 leiasr_d3d11_set_present_origin(struct leiasr_d3d11 *leiasr, int32_t panel_x, int32_t panel_y);
 
 /*!
+ * runtime ADR-060 R2 (L4): does this weaver take its phase from
+ * @ref leiasr_d3d11_set_present_origin (EXTERNAL routing, no window)?
+ * @p out_known is false while an async create is still pending — the plan is
+ * not settled yet; the caller then predicts from the probe's routing caps.
+ */
+bool
+leiasr_d3d11_phases_from_present_origin(struct leiasr_d3d11 *leiasr, bool *out_known);
+
+/*!
  * Destroy a D3D11 SR weaver instance.
  *
  * @param leiasr The instance to destroy (can be NULL).

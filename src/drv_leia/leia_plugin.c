@@ -63,6 +63,12 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifndef XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
+/* runtime ADR-060 R2: claim-mask capability hint, from xrt_plugin.h once the
+ * runtime pin includes it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value. */
+#define XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE (1u << 24)
+#endif
+
 
 /*
  *
@@ -381,6 +387,20 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	struct leia_win_sr_monitor sr_monitors[LEIA_WIN_SR_MAX_MONITORS];
 	const int32_t sr_mon_count =
 	    sr_count >= 0 ? leia_win_sr_enumerate_monitors(sr_monitors, LEIA_WIN_SR_MAX_MONITORS) : -1;
+
+	/*
+	 * runtime ADR-060 R2 (L4): hint that this box's SR can route a windowless
+	 * weaver EXTERNALLY, so the D3D11 service may make a windowless weave DP
+	 * for a present-owner (phase from set_present_origin) instead of binding a
+	 * weaver to another process's window. Read from the probe instance the
+	 * enumeration above just used; the DP instance's scanout bit stays the
+	 * authority. Per-screen D3D11 weavers only (the service's path).
+	 */
+#if defined(DXR_LEIA_HAS_SR_MULTI_WIN) && defined(XRT_HAVE_LEIA_SR_D3D11)
+	if (leia_win_sr_probe_external_routing()) {
+		apis |= XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
+	}
+#endif
 
 	const struct leia_win_claim_inputs in = {
 	    .sr_displays = sr_displays,

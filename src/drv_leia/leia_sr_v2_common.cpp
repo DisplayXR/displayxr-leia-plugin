@@ -637,6 +637,7 @@ SRWLOCK g_enum_lock = SRWLOCK_INIT;
 SrInstance g_probe_instance = nullptr;
 bool g_enum_unsupported = false; // installed SR runtime predates slot 106: final for this process
 bool g_caps_logged = false;
+bool g_probe_external_routing = false; // L4: latched by log_caps_once_locked
 uint64_t g_last_create_fail_ns = 0;
 
 struct leia_win_sr_display g_cache[LEIA_WIN_SR_MAX_DISPLAYS];
@@ -729,6 +730,7 @@ log_caps_once_locked()
 		U_LOG_W("leia_plugin: srGetRuntimeCapabilities failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
 		return;
 	}
+	g_probe_external_routing = route_caps.externalRouting != SR_FALSE;
 	U_LOG_W("leia_plugin: SR multi-display caps: externalRouting=%u routingFlags=0x%llx displayBinding=%u "
 	        "maxBoundDisplays=%u",
 	        (unsigned)route_caps.externalRouting, (unsigned long long)route_caps.supportedFlags,
@@ -857,6 +859,15 @@ refresh_locked(uint64_t now_ns)
 }
 
 } // namespace
+
+extern "C" bool
+leia_win_sr_probe_external_routing(void)
+{
+	AcquireSRWLockShared(&g_enum_lock);
+	const bool r = g_probe_external_routing;
+	ReleaseSRWLockShared(&g_enum_lock);
+	return r;
+}
 
 extern "C" int32_t
 leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
