@@ -102,10 +102,17 @@ jobs:
       # is APPENDED (SetColorEncoding -- not called on main). Also declares SR
       # event 20 / SrDisplayUserPresenceCapabilities, so the plug-in's local
       # stand-ins for them are gone (DXR_LEIA_HAS_SR_USER_PRESENCE).
-      SR_V2_TAG: sr-sdk-v2-1.39.0.2793
-      SR_V2_DIR: LeiaSR-SDK-1.39.0+2793.357f4d0da8-win64-Release
+      # 2950 = 1.39.0 superset of 2793 (sr-sdk-v2-1.39.0.2950). Dispatch table
+      # 110 -> 119 entries (sizeof/8), APPENDS ONLY (compared by physical index over
+      # SrDispatchTable): SetColorEncoding stays at Windows slot 109; 110-116
+      # CreateViewerTracker, DestroyViewerTracker, ViewerTrackerGetViewers,
+      # ViewerTrackerAdd/RemoveCallback, WeaverGetViewers, WeaverSetMultiViewerMode;
+      # 117-118 Get/SetMultiViewerConfig. New struct tags 33-36 and
+      # SR_ERROR_ACCESS_DENIED (-14). None of the new API is used here.
+      SR_V2_TAG: sr-sdk-v2-1.39.0.2950
+      SR_V2_DIR: LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
       # sha256 of "$SR_V2_DIR.zip"; the download is refused on a mismatch.
-      SR_V2_SHA256: a4ae4e1179927d79c91a2fb4b808704762d0cca1c14cc50a57f8b9184e2244a8
+      SR_V2_SHA256: 53395b80ea8dc4afadf113d48bc1a4942e0bf15e3cbc50119745f7aa1fbdfcb1
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
