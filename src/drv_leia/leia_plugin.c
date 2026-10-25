@@ -399,6 +399,13 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 #if defined(DXR_LEIA_HAS_SR_MULTI_WIN) && defined(XRT_HAVE_LEIA_SR_D3D11)
 	if (leia_win_sr_probe_external_routing()) {
 		apis |= XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
+		/* Once per process (probe_displays re-runs per registry refresh). */
+		static bool s_hint_logged = false;
+		if (!s_hint_logged) {
+			s_hint_logged = true;
+			U_LOG_W("leia_plugin: hints windowless phase (SR externalRouting=1) — the runtime may weave a "
+			        "present-owner with a windowless per-screen D3D11 DP (runtime ADR-060 R2)");
+		}
 	}
 #endif
 
