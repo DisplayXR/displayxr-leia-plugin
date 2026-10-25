@@ -303,6 +303,16 @@ leia_win_monitor_at(int32_t left, int32_t top);
 void
 leia_win_sr_enumerate_shutdown(void);
 
+/*!
+ * runtime ADR-060 R2 (L4): does the installed SR runtime support EXTERNAL
+ * weaver routing, as the process-wide probe instance's capability query
+ * reported it (SrWeaverRoutingCapabilities::externalRouting)? Answered from the
+ * probe made by @ref leia_win_sr_enumerate_displays — false until that has run,
+ * when it is compiled out, or when SR is older than routing. Cheap; any thread.
+ */
+bool
+leia_win_sr_probe_external_routing(void);
+
 #ifdef __cplusplus
 }
 #endif
