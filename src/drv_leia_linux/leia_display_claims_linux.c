@@ -33,6 +33,12 @@
  *     system-global, so with two panels there is no way to say whose it is);
  *     else EDID.
  *
+ *  No monitor matched while probe() bound the plug-in (leia_lnx_claims_pass):
+ *  the fallback claim is for the probe-time cases only — a forced probe, or a
+ *  panel whose monitor the matcher cannot pair. Once a panel was seen, a miss
+ *  is an unplug (or a replug the monitor list has not caught up with) and
+ *  nothing is claimed — the Windows arm's P-c rule.
+ *
  * @author David Fattal
  * @ingroup drv_leia_linux
  */
@@ -389,6 +395,78 @@ leia_lnx_fallback_claim(const struct xrt_display_descriptor *displays,
 		snprintf(out_binding->connector, sizeof(out_binding->connector), "%s", connector);
 	}
 	return true;
+}
+
+enum leia_lnx_unmatched
+leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count)
+{
+	// Never found a panel (a forced probe on a panel-less box): the fallback
+	// is the only way the bound plug-in owns a monitor.
+	if (history == NULL || !history->seen) {
+		return LEIA_LNX_UNMATCHED_FALLBACK;
+	}
+	// Windows parity (P-c, leia_plugin.c): after a Leia panel was seen, a
+	// miss is an UNPLUG and nothing is claimed. This path used to claim the
+	// primary monitor — with the runtime's live re-probe
+	// (displayxr-runtime#2305) that moved the panel rect onto the laptop
+	// screen on every unplug.
+	if (panel_count == 0) {
+		return LEIA_LNX_UNMATCHED_PANEL_GONE;
+	}
+	// Connected, and its monitor has paired before: the runtime's monitor list
+	// has not caught up with a replug yet. The fallback would land on the
+	// primary for that pass, and the runtime would follow it there.
+	if (history->paired) {
+		return LEIA_LNX_UNMATCHED_NOT_LISTED;
+	}
+	// Connected, never paired: a descriptor the matcher cannot pair — the
+	// probe-time case the fallback exists for.
+	return LEIA_LNX_UNMATCHED_FALLBACK;
+}
+
+uint32_t
+leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
+                     uint32_t display_count,
+                     const struct leia_lnx_claim_inputs *in,
+                     bool probe_bound,
+                     struct leia_lnx_panel_history *history,
+                     struct xrt_display_claim *out_claims,
+                     struct leia_lnx_claim_binding *out_bindings,
+                     uint32_t max_claims,
+                     enum leia_lnx_unmatched *out_unmatched)
+{
+	if (out_unmatched != NULL) {
+		*out_unmatched = LEIA_LNX_UNMATCHED_NONE;
+	}
+	if (displays == NULL || display_count == 0 || in == NULL || out_claims == NULL || max_claims == 0) {
+		return 0;
+	}
+
+	if (history != NULL && in->panel_count > 0) {
+		history->seen = true;
+	}
+	const uint32_t n = leia_lnx_compute_claims(displays, display_count, in, out_claims, out_bindings, max_claims);
+	if (n > 0) {
+		if (history != NULL) {
+			history->seen = true; // also a panel only the SR enumeration lists
+			history->paired = true;
+		}
+		return n;
+	}
+	if (!probe_bound) {
+		return 0;
+	}
+
+	const enum leia_lnx_unmatched u = leia_lnx_unmatched_decide(history, in->panel_count);
+	if (out_unmatched != NULL) {
+		*out_unmatched = u;
+	}
+	if (u == LEIA_LNX_UNMATCHED_FALLBACK &&
+	    leia_lnx_fallback_claim(displays, display_count, in->panels, in->panel_count, in->supported_apis,
+	                            &out_claims[0], out_bindings != NULL ? &out_bindings[0] : NULL)) {
+		return 1;
+	}
+	return 0;
 }
 
 
