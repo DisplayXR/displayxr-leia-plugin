@@ -165,6 +165,14 @@ struct leia_lnx_panel_history
  * came back. Anything still unpaired after 5 s is a monitor the matcher cannot
  * pair — XWayland without EDID ids, an origin that does not line up, another
  * Leia panel swapped in.
+ *
+ * The bound is only checked when a probe pass runs: nothing here wakes up at
+ * 5 s. With no further monitor change, it is the runtime's later follow-up
+ * sweeps (6, 8, 12 s ... after the change; offs_ms in
+ * displayxr-runtime target_display_hotplug.c) that run the pass which ends the
+ * wait and makes the fallback claim. Removing or thinning those sweeps leaves
+ * such a panel unclaimed until the next monitor change, so move this bound
+ * into a timer first.
  */
 #define LEIA_LNX_NOT_LISTED_MAX_NS (5000ll * 1000ll * 1000ll)
 
