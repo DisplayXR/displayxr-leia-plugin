@@ -183,7 +183,15 @@ env:
   # on, so every 3D app wove a double image until the app was refocused; the display service
   # now gives the first 3D after wake/start a 2D->3D pass once the panel has settled.
   # Disabled on the nubia Pad 3D II. Service-side only; no API, loader or INTRODUCED_IN change.
-  CNSDK_TAG: v0.10.83
+  #
+  # 0.10.85 (cnsdk-android-0.10.85+210.7647837): head-tracking stall recovery
+  # (LeiaInc/CNSDK#758) — when the tracking camera stops delivering frames without an
+  # error (camera-side CRC recovery), the engine now rebuilds the session after 2 s with the
+  # #754 back-off instead of staying untracked until the plug-in watchdog cycles it (~30 s;
+  # the watchdog stays as the backstop). Also CNSDK#757: a tracking-camera override now uses
+  # that camera's camera->display pose (it always used entry 0). No API, loader or
+  # INTRODUCED_IN change. (v0.10.84 is a version tag with #757 only and no release.)
+  CNSDK_TAG: v0.10.85
 
 jobs:
   Android:
