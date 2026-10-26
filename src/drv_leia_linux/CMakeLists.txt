@@ -341,6 +341,13 @@ add_executable(test_lens_owner_linux tests/test_lens_owner_linux.c)
 target_include_directories(test_lens_owner_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_lens_owner_linux COMMAND test_lens_owner_linux)
 
+# --- Host unit test: exit-time SR teardown order -------------------------
+# Pure logic from leia_sr_exit_linux.h plus a forked child that runs real exit
+# handlers in the DS1 order (SR static, exit hook, ELF destructor); no SDK.
+add_executable(test_sr_exit_linux tests/test_sr_exit_linux.c)
+target_include_directories(test_sr_exit_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_sr_exit_linux COMMAND test_sr_exit_linux)
+
 # --- Host unit test: lost-capture re-create schedule (#364) --------------
 # Pure logic from leia_bg_capture_recovery_linux.h; no D-Bus, no PipeWire.
 add_executable(test_bg_capture_recovery_linux tests/test_bg_capture_recovery_linux.c)
