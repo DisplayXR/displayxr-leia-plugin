@@ -538,6 +538,84 @@ test_find_serial(void)
 	CHECK(!leia_win_claims_find_serial("SRX1", &out));
 }
 
+/*
+ * #430: a Lenovo 3D monitor (LEN67D1, not in the frozen table) on \\.\DISPLAY5
+ * at (-3840, 0), FPC-verified by SR, next to the laptop's primary screen. The
+ * EDID probe has no position, so get_display_info reads it from the claim.
+ */
+static void test_panel_from_claim(void) {
+        const uint16_t len_id = leia_win_pnp_to_manufacturer_id("LEN");
+        struct xrt_display_descriptor d[2] = {
+            desc(0xA, LGD_ID, 0x1234, 0, 0, true),
+            desc(0xB, len_id, 0x67D1, -3840, 0, false),
+        };
+        struct leia_win_sr_display s[1] = {
+            srd(0x77, "LEN", 0x67D1, true, "SRLEN1", -3840, 0, true)};
+        const struct leia_win_claim_inputs in = {
+            .sr_displays = s,
+            .sr_display_count = 1,
+            .table_contains = table_contains,
+            .sr_monitor_count = -1,
+        };
+        struct xrt_display_claim c[4];
+        struct leia_win_claim_binding b[4];
+        const uint32_t n = leia_win_compute_claims(d, 2, &in, c, b, 4);
+        CHECK(n == 1);
+        CHECK(b[0].verified && b[0].has_pos);
+        CHECK(b[0].screen_left == -3840 && b[0].screen_top == 0);
+        CHECK(b[0].pixel_w == 3840 && b[0].pixel_h == 2160);
+
+        struct leia_win_claim_binding out;
+        CHECK(leia_win_claims_pick_panel(b, n, 3840, 2160, &out) &&
+              out.monitor_id == 0xB && out.screen_left == -3840);
+        CHECK(leia_win_claims_pick_panel(b, n, 0, 0, &out) &&
+              out.monitor_id == 0xB); // geometry not resolved yet
+
+        // Through the stored table, as get_display_info reads it.
+        leia_win_claims_store(b, n);
+        CHECK(leia_win_claims_panel(3840, 2160, &out) &&
+              out.screen_left == -3840);
+        leia_win_claims_store(NULL, 0);
+        CHECK(!leia_win_claims_panel(3840, 2160, &out));
+}
+
+static void test_panel_pick_rules(void) {
+        struct leia_win_claim_binding b[3];
+        memset(b, 0, sizeof(b));
+        for (int i = 0; i < 3; i++) {
+                b[i].monitor_id = 0x10u + (uint64_t)i;
+                b[i].has_pos = true;
+                b[i].screen_left = 3840 * i;
+                b[i].pixel_w = 3840;
+                b[i].pixel_h = 2160;
+        }
+        struct leia_win_claim_binding out;
+
+        // EDID-only (not verified) claims are never identity enough.
+        CHECK(!leia_win_claims_pick_panel(b, 3, 3840, 2160, &out));
+
+        // A verified claim without a position is skipped.
+        b[0].verified = true;
+        b[0].has_pos = false;
+        CHECK(!leia_win_claims_pick_panel(b, 3, 3840, 2160, &out));
+
+        // Two verified panels: the size settles it when exactly one matches...
+        b[0].has_pos = true;
+        b[1].verified = true;
+        b[1].native_w = 2560;
+        b[1].native_h = 1440;
+        CHECK(leia_win_claims_pick_panel(b, 3, 2560, 1440, &out) &&
+              out.monitor_id == 0x11);
+        CHECK(leia_win_claims_pick_panel(b, 3, 3840, 2160, &out) &&
+              out.monitor_id == 0x10);
+
+        // ...and twins are not guessed.
+        b[1].native_w = 0;
+        b[1].native_h = 0;
+        CHECK(!leia_win_claims_pick_panel(b, 3, 3840, 2160, &out));
+        CHECK(!leia_win_claims_pick_panel(NULL, 0, 3840, 2160, &out));
+}
+
 int
 main(void)
 {
@@ -554,7 +632,9 @@ main(void)
 	test_join_unavailable();
 	test_store();
 	test_find_serial();
-	if (g_failures != 0) {
+        test_panel_from_claim();
+        test_panel_pick_rules();
+        if (g_failures != 0) {
 		fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;
 	}

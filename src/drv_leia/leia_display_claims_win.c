@@ -49,6 +49,7 @@ struct desc_view
 	uint16_t man, prod;
 	int32_t left, top;
 	bool has_pos;
+        uint32_t pixel_w, pixel_h;
 };
 
 #define DESC_HAS(d, field)                                                                                             \
@@ -78,7 +79,11 @@ desc_read(const struct xrt_display_descriptor *d)
 		v.man = d->edid_manufacturer;
 		v.prod = d->edid_product;
 	}
-	if (DESC_HAS(d, screen_top)) {
+        if (DESC_HAS(d, pixel_height)) {
+                v.pixel_w = d->pixel_width;
+                v.pixel_h = d->pixel_height;
+        }
+        if (DESC_HAS(d, screen_top)) {
 		v.left = d->screen_left;
 		v.top = d->screen_top;
 		v.has_pos = true;
@@ -266,7 +271,15 @@ leia_win_compute_claims(const struct xrt_display_descriptor *displays,
 			// calibration for (or the SR list is stale) — EDID confidence.
 		}
 
-		if (out_bindings != NULL) {
+                b.has_pos = v.has_pos;
+                b.screen_left = v.left;
+                b.screen_top = v.top;
+                b.pixel_w = v.pixel_w;
+                b.pixel_h = v.pixel_h;
+                b.verified =
+                    c->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED;
+
+                if (out_bindings != NULL) {
 			out_bindings[n] = b;
 		}
 		n++;
@@ -342,6 +355,56 @@ leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out)
 	}
 	BIND_UNLOCK();
 	return found;
+}
+
+bool leia_win_claims_pick_panel(const struct leia_win_claim_binding *bindings,
+                                uint32_t count, uint32_t panel_w,
+                                uint32_t panel_h,
+                                struct leia_win_claim_binding *out) {
+        if (bindings == NULL) {
+                return false;
+        }
+        int32_t only = -1;
+        uint32_t verified = 0;
+        int32_t by_size = -1;
+        uint32_t size_hits = 0;
+        for (uint32_t i = 0; i < count; i++) {
+                const struct leia_win_claim_binding *b = &bindings[i];
+                if (!b->verified || !b->has_pos) {
+                        continue;
+                }
+                verified++;
+                only = (int32_t)i;
+                const uint32_t w = b->native_w != 0 ? b->native_w : b->pixel_w;
+                const uint32_t h = b->native_h != 0 ? b->native_h : b->pixel_h;
+                if (panel_w != 0 && panel_h != 0 && w == panel_w &&
+                    h == panel_h) {
+                        size_hits++;
+                        by_size = (int32_t)i;
+                }
+        }
+        int32_t pick = -1;
+        if (verified == 1) {
+                pick = only;
+        } else if (verified > 1 && size_hits == 1) {
+                pick = by_size;
+        }
+        if (pick < 0) {
+                return false;
+        }
+        if (out != NULL) {
+                *out = bindings[pick];
+        }
+        return true;
+}
+
+bool leia_win_claims_panel(uint32_t panel_w, uint32_t panel_h,
+                           struct leia_win_claim_binding *out) {
+        BIND_LOCK();
+        const bool ok = leia_win_claims_pick_panel(g_bindings, g_binding_count,
+                                                   panel_w, panel_h, out);
+        BIND_UNLOCK();
+        return ok;
 }
 
 bool
