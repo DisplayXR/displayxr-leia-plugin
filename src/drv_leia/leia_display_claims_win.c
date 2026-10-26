@@ -483,4 +483,10 @@ void
 leia_win_sr_enumerate_shutdown(void)
 {
 }
+
+bool
+leia_win_sr_probe_external_routing(void)
+{
+	return false;
+}
 #endif

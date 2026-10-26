@@ -77,6 +77,12 @@ leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_
 #include "leia_lift_viewpoint.h"
 #include "leia_sr_ready.h" // leiasr_geometry_get: nominal viewing distance = lift z reference
 #include <cstddef> // offsetof
+
+#ifndef XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN
+// runtime ADR-060 R2: from xrt_display_scanout.h once the runtime pin includes
+// it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value.
+#define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
+#endif
 #endif
 
 
@@ -510,6 +516,7 @@ struct leia_display_processor_d3d11_impl
 
 	ID3D11Device *device;              //!< Cached device reference (not owned, for blit init).
 	HWND hwnd;                         //!< Native window handle from factory, used by bg-capture for self-exclusion + window-on-monitor rect.
+	bool screen_bound;                 //!< made by create_dp_d3d11_for_screen (multi-screen M6 / runtime ADR-060 R2)
 
 	//! @name 2D blit shader resources (passthrough stretch-blit)
 	//! @{
@@ -3686,6 +3693,37 @@ leia_dp_d3d11_get_backend_state(struct xrt_display_processor_d3d11 *xdp, uint32_
 #endif
 
 
+/*!
+ * runtime ADR-060 R2 (L4): canvas weave scope (a GPU weaver), plus
+ * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN for a WINDOWLESS per-screen
+ * weaver routed EXTERNALLY — the one whose phase follows set_present_origin, so
+ * the runtime may use it for a window it does not hold. While the #144 async
+ * create is still pending the plan is not settled: answer from the probe's
+ * routing caps, which is what the plan will chain (leia_win_sr_plan_weaver).
+ * A window-bound weaver never sets it: the SDK reads its own window.
+ */
+static bool
+leia_dp_d3d11_get_scanout_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_SCANOUT_CAPS_SIZE_V1) {
+		return false;
+	}
+	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
+	out_caps->weave_scope = (uint32_t)XRT_DP_WEAVE_SCOPE_CANVAS;
+	out_caps->flags = 0;
+	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
+		out_caps->reserved[i] = 0;
+	}
+	if (ldp->screen_bound && ldp->hwnd == nullptr) {
+		bool known = false;
+		const bool external = leiasr_d3d11_phases_from_present_origin(ldp->leiasr, &known);
+		if (known ? external : leia_win_sr_probe_external_routing()) {
+			out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+		}
+	}
+	return true;
+}
+
 static void
 leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 {
@@ -3711,6 +3749,7 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.set_present_origin = leia_dp_d3d11_set_present_origin; // multi-screen M6 (slot 32)
 #endif
 #endif
+	ldp->base.get_scanout_caps = leia_dp_d3d11_get_scanout_caps; // runtime ADR-060 R2 (L4)
 	// The struct is calloc'd: 0.0 would mean "no lens filtering". Start (and,
 	// against a runtime without the v15 slot, stay) at "SR default".
 	ldp->overlay_filter_strength = -1.0f;
@@ -4005,6 +4044,7 @@ leia_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
 	ldp->async_weaver = async_weaver;
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
 	ldp->hwnd = static_cast<HWND>(window_handle);
+	ldp->screen_bound = true;
 	ldp->view_count = 2;
 	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
 	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');

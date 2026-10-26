@@ -607,6 +607,14 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	sr.external_routed = plan.routing_external;
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
+	if (sr.screen_bound && hwnd == nullptr && !sr.needs_present_origin) {
+		// runtime ADR-060 R2: the DP may already have told the runtime (predicted
+		// from the probe's caps) that it phases from the present origin. SR
+		// refused EXTERNAL for this create, so it cannot: this windowless weaver
+		// reads no window and ignores the origin — its phase is display-scoped.
+		U_LOG_W("SR refused EXTERNAL routing for a WINDOWLESS per-screen weaver — its phase cannot follow the "
+		        "runtime's present origin (display-scoped until the DP is recreated)");
+	}
 
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
@@ -2228,6 +2236,17 @@ leiasr_d3d11_create_for_screen(double max_time,
 	        "until ready",
 	        (unsigned long long)display_id, hwnd);
 	return XRT_SUCCESS;
+}
+
+bool
+leiasr_d3d11_phases_from_present_origin(struct leiasr_d3d11 *leiasr, bool *out_known)
+{
+	*out_known = false;
+	if (leiasr == nullptr || leiasr->async_state.load(std::memory_order_acquire) != LEIASR_ASYNC_READY) {
+		return false;
+	}
+	*out_known = true;
+	return leiasr->needs_present_origin;
 }
 
 void
