@@ -54,8 +54,17 @@ DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
 #define LEIA_LNX_PROBE_PANEL_TTL_NS (1000ull * 1000ull * 1000ull)
 
 //! probe() bound this plug-in (forced or a panel found). probe_displays then
-//! guarantees the plug-in at least one monitor (leia_lnx_fallback_claim).
+//! guarantees the plug-in at least one monitor (leia_lnx_fallback_claim) —
+//! except when the panel it found is unplugged, or replugged but not listed
+//! yet: that claims nothing (leia_lnx_unmatched_decide).
 static bool g_probe_bound;
+//! What earlier passes saw of the panel (Windows P-c parity).
+static struct leia_lnx_panel_history g_panel_history;
+//! The last pass's no-match verdict, so its WARN fires once per transition.
+static enum leia_lnx_unmatched g_last_unmatched;
+//! Guards the three above: probe_displays runs on the runtime's hotplug worker
+//! as well as the main thread (displayxr-runtime#2305).
+static pthread_mutex_t g_claim_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 /*
@@ -209,7 +218,12 @@ leia_lnx_plugin_probe(struct xrt_plugin_instance **out_inst)
 
 	/* No per-instance state — hardware state lives in file-scope statics
 	 * inside the plug-in .so, mirroring the Windows/Android arms. */
+	pthread_mutex_lock(&g_claim_lock);
 	g_probe_bound = true;
+	if (!forced) {
+		g_panel_history.seen = true; // bound on a real panel: a later miss is an unplug
+	}
+	pthread_mutex_unlock(&g_claim_lock);
 	*out_inst = NULL;
 	return XRT_SUCCESS;
 }
@@ -307,6 +321,56 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	return true;
 }
 
+/*!
+ * One WARN per change of probe_displays' no-match verdict — it is re-evaluated
+ * on every registry rebuild and hotplug sweep: the fallback claim, the panel
+ * gone, the panel back but its monitor not listed yet, and the panel back.
+ */
+static void
+log_unmatched_change(enum leia_lnx_unmatched prev,
+                     enum leia_lnx_unmatched now,
+                     uint32_t n,
+                     const struct xrt_display_claim *claims,
+                     const struct leia_lnx_claim_binding *bindings,
+                     uint32_t panel_count,
+                     uint32_t display_count)
+{
+	if (now == prev) {
+		return;
+	}
+	const unsigned long long mon = n > 0 ? (unsigned long long)claims[0].monitor_id : 0;
+	const char *conn = n > 0 ? bindings[0].connector : "";
+	const char *on = conn[0] != '\0' ? " on " : "";
+	switch (now) {
+	case LEIA_LNX_UNMATCHED_FALLBACK:
+		if (n > 0) {
+			U_LOG_W("leia_lnx_plugin: probe() bound but no monitor matched a Leia panel — "
+			        "fallback claim on monitor 0x%016llx%s%s (EDID confidence)",
+			        mon, on, conn);
+		}
+		break;
+	case LEIA_LNX_UNMATCHED_PANEL_GONE:
+		U_LOG_W("leia_lnx_plugin: the Leia panel is gone (no Leia panel in the EDID scan: unplugged) — "
+		        "claiming no monitor, so the runtime keeps the last panel rect; no fallback claim on the "
+		        "primary (displayxr-runtime#2305)");
+		break;
+	case LEIA_LNX_UNMATCHED_NOT_LISTED:
+		U_LOG_W("leia_lnx_plugin: the Leia panel is connected (%u in the EDID scan) but none of the "
+		        "runtime's %u monitor(s) pairs with it yet — claiming none until one does "
+		        "(displayxr-runtime#2305)",
+		        panel_count, display_count);
+		break;
+	case LEIA_LNX_UNMATCHED_NONE:
+	default:
+		if (n > 0 && (prev == LEIA_LNX_UNMATCHED_PANEL_GONE || prev == LEIA_LNX_UNMATCHED_NOT_LISTED)) {
+			U_LOG_W("leia_lnx_plugin: the Leia panel is back — claiming monitor 0x%016llx%s%s again "
+			        "(displayxr-runtime#2305)",
+			        mon, on, conn);
+		}
+		break;
+	}
+}
+
 static uint32_t
 leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
                                const struct xrt_display_descriptor *displays,
@@ -365,28 +429,25 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	const uint32_t cap = max_claims < (uint32_t)(sizeof(bindings) / sizeof(bindings[0]))
 	                         ? max_claims
 	                         : (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
-	uint32_t n = leia_lnx_compute_claims(displays, display_count, &in, out_claims, bindings, cap);
 
-	// probe() bound us but no monitor matched (DXR_LEIA_FORCE_PROBE=1, or a
-	// descriptor the matcher cannot pair). The runtime gives a plug-in that
-	// implements probe_displays no fallback claim of its own, so without
-	// this the bound plug-in would own no monitor and another plug-in would
-	// win the panel. One EDID-confidence claim on the bound panel's monitor
-	// (by size), else the primary monitor.
-	if (n == 0 && g_probe_bound &&
-	    leia_lnx_fallback_claim(displays, display_count, panels, panel_count, XRT_DP_API_BIT_VK, &out_claims[0],
-	                            &bindings[0])) {
-		n = 1;
-		static bool fallback_logged;
-		if (!fallback_logged) {
-			fallback_logged = true;
-			U_LOG_W(
-			    "leia_lnx_plugin: probe() bound but no monitor matched a Leia panel — fallback claim on "
-			    "monitor 0x%016llx%s%s (EDID confidence)",
-			    (unsigned long long)out_claims[0].monitor_id, bindings[0].connector[0] ? " on " : "",
-			    bindings[0].connector);
-		}
-	}
+	// probe() bound us but no monitor matched: the runtime gives a plug-in
+	// that implements probe_displays no fallback claim of its own, so in the
+	// probe-time cases (DXR_LEIA_FORCE_PROBE=1, or a descriptor the matcher
+	// cannot pair) one EDID-confidence claim on the bound panel's monitor (by
+	// size), else the primary monitor — without it another plug-in would win
+	// the panel. Not when the panel EDID found is gone, nor while a panel that
+	// paired before waits for the monitor list to catch up with a replug:
+	// claiming nothing then is what lets the runtime keep the last panel rect
+	// (displayxr-runtime#2305) instead of following the claim to the primary.
+	enum leia_lnx_unmatched unmatched = LEIA_LNX_UNMATCHED_NONE;
+	pthread_mutex_lock(&g_claim_lock);
+	const uint32_t n = leia_lnx_claims_pass(displays, display_count, &in, g_probe_bound, &g_panel_history,
+	                                        out_claims, bindings, cap, &unmatched);
+	const enum leia_lnx_unmatched prev_unmatched = g_last_unmatched;
+	g_last_unmatched = unmatched;
+	pthread_mutex_unlock(&g_claim_lock);
+
+	log_unmatched_change(prev_unmatched, unmatched, n, out_claims, bindings, panel_count, display_count);
 
 	// Plug-in-private monitor table: displayId per claimed monitor, for the
 	// per-DP SR binding (M4/M5). Nothing consumes it yet.

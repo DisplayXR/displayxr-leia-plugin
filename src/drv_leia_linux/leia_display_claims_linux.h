@@ -115,7 +115,8 @@ leia_lnx_compute_claims(const struct xrt_display_descriptor *displays,
 /*!
  * The claim to make when probe() BOUND the plug-in but
  * leia_lnx_compute_claims() matched no monitor (DXR_LEIA_FORCE_PROBE=1, or a
- * descriptor the matcher cannot pair with the panel). A plug-in that
+ * descriptor the matcher cannot pair with the panel — never an unplug, see
+ * @ref leia_lnx_unmatched). A plug-in that
  * implements probe_displays no longer gets the runtime's fallback claim, so
  * without this the bound plug-in owns no monitor and another plug-in wins
  * the panel. One EDID-confidence claim (no serial, no SR display), on:
@@ -133,6 +134,66 @@ leia_lnx_fallback_claim(const struct xrt_display_descriptor *displays,
                         uint32_t supported_apis,
                         struct xrt_display_claim *out_claim,
                         struct leia_lnx_claim_binding *out_binding);
+
+/*!
+ * What earlier passes saw of the panel — sticky for the process, the Linux twin
+ * of the Windows arm's `g_hit_seen` (leia_platform_state.c, P-c). The caller
+ * owns it and serialises access (probe_displays runs on the runtime's hotplug
+ * worker as well as the main thread).
+ */
+struct leia_lnx_panel_history
+{
+	//! A Leia panel was found by EDID: probe() bound on one, or a pass's panel
+	//! scan listed one. A forced probe (DXR_LEIA_FORCE_PROBE=1) sets nothing.
+	bool seen;
+	//! A pass paired a Leia panel with a runtime monitor (leia_lnx_compute_claims).
+	bool paired;
+};
+
+//! What a pass with probe() bound does when no monitor matched a Leia panel.
+enum leia_lnx_unmatched
+{
+	//! A monitor matched, or probe() did not bind: nothing to decide.
+	LEIA_LNX_UNMATCHED_NONE = 0,
+	//! The probe-time cases — a forced probe that never found a panel, or a
+	//! connected panel whose monitor the matcher has never paired: one
+	//! leia_lnx_fallback_claim() claim, as before.
+	LEIA_LNX_UNMATCHED_FALLBACK,
+	//! The panel EDID found is gone (unplugged): claim nothing, so the
+	//! runtime keeps the last panel rect (displayxr-runtime#2305).
+	LEIA_LNX_UNMATCHED_PANEL_GONE,
+	//! The panel is connected and was paired before, but no monitor the
+	//! runtime lists pairs with it now (a replug the monitor list has not
+	//! caught up with yet): claim nothing, as for an unplug.
+	LEIA_LNX_UNMATCHED_NOT_LISTED,
+};
+
+/*!
+ * The rule behind @ref leia_lnx_unmatched, for a pass whose claims matched
+ * nothing with probe() bound. @p panel_count = Leia panels in this pass's
+ * panel scan (table panels and panels the SR runtime drives).
+ */
+enum leia_lnx_unmatched
+leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count);
+
+/*!
+ * One probe_displays pass: leia_lnx_compute_claims(), then — only when it
+ * matched nothing and @p probe_bound — the @ref leia_lnx_unmatched rule, and
+ * the fallback claim when that rule says so. Folds this pass into @p history
+ * first. @p out_unmatched (may be NULL) receives the rule's answer, NONE when
+ * a monitor matched or probe() did not bind.
+ * @return the number of claims written (<= @p max_claims).
+ */
+uint32_t
+leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
+                     uint32_t display_count,
+                     const struct leia_lnx_claim_inputs *in,
+                     bool probe_bound,
+                     struct leia_lnx_panel_history *history,
+                     struct xrt_display_claim *out_claims,
+                     struct leia_lnx_claim_binding *out_bindings,
+                     uint32_t max_claims,
+                     enum leia_lnx_unmatched *out_unmatched);
 
 /*!
  * Replace the plug-in-private monitor table with the latest probe's bindings

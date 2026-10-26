@@ -269,8 +269,19 @@ identity, never by name). The runtime's monitors are matched against that list
   still claims exactly one monitor at `EDID` confidence. It picks the monitor whose pixel
   size is the panel's, else the primary monitor, else the first. A plug-in that implements
   `probe_displays` gets no fallback claim from the runtime, so without this the bound
-  plug-in would own no monitor and sim-display would win the panel. Logged once:
-  `probe() bound but no monitor matched a Leia panel — fallback claim on monitor …`.
+  plug-in would own no monitor and sim-display would win the panel. Logged once per
+  change: `probe() bound but no monitor matched a Leia panel — fallback claim on monitor …`.
+- **No fallback after an unplug** (the Windows arm's P-c rule). The fallback is for those
+  probe-time cases only. Once a Leia panel was found by EDID (`probe()` bound on it, or any
+  pass's panel scan listed it), a pass whose scan lists no Leia panel is an UNPLUG and
+  claims **nothing**. A pass whose scan lists the panel while none of the runtime's
+  monitors pairs with it, after one did, is a replug the monitor list has not caught up
+  with, and also claims nothing. With the runtime's live re-probe
+  (displayxr-runtime#2305), the fallback used to move the panel rect to the primary
+  monitor on every unplug. Claiming nothing lets the runtime keep the last panel rect
+  until the claim returns. Logged once per transition: `the Leia panel is gone …`,
+  `the Leia panel is connected … but none of the runtime's … monitor(s) pairs with it
+  yet …`, `the Leia panel is back — claiming monitor … again …`.
 - `supported_apis` = Vulkan only (this arm has no GL DP).
 
 **Cost and logging.** `probe_displays` runs on every runtime registry rebuild, which happens per client connect. It therefore reads the panel list from a shared cache with a 1 s TTL (one sysfs scan and one X connection per burst). It logs the `claim monitor … confidence=…` lines at INFO, and only when the answer changes. The same cache feeds the per-frame position getters. It is refreshed by that TTL and invalidated by SR display connect/topology events, so a hot-plugged or moved panel resolves on the next rebuild instead of never. A failed `srEnumerateDisplays` is retried on the next probe (only `SR_ERROR_FUNCTION_UNSUPPORTED` is final for a context).
