@@ -19,7 +19,10 @@
  *    registered BEFORE srInitialize (no late attach), the seam's display
  *    query is callable pre-create, and srDestroyInstance joins SDK threads
  *    unboundedly — so the context outlives DP create/destroy cycles and is
- *    torn down at .so unload.
+ *    torn down at process exit by an atexit hook armed AFTER SR's statics
+ *    (so it runs before they are destroyed), or by the ELF destructor on a
+ *    real dlclose. Never by the ELF destructor at exit: SR's statics are gone
+ *    by then and ~SRContext double-frees (leia_sr_exit_linux.h).
  *
  *  - The weave drives the SDK through the "framebuffer = 0, render pass
  *    already begun" path: we own a single-color-attachment VkRenderPass
@@ -77,6 +80,7 @@
 #include "leia_sr_linux.h"
 #include "leia_edid_probe_linux.h"
 #include "leia_lens_owner_linux.h"
+#include "leia_sr_exit_linux.h"
 #include "leia_display_claims_linux.h"
 #include "leia_sr_routing_linux.h"
 #ifdef DXR_LEIA_LNX_HAVE_SR_ROUTING
@@ -217,6 +221,12 @@ static struct sr_ctx g_ctx = {
  */
 static struct leia_lens_owner g_lens_owner;
 
+/*!
+ * Exit-time teardown state (leia_sr_exit_linux.h), guarded by g_ctx_lock.
+ * Outside g_ctx for the same reason as g_lens_owner: it spans contexts.
+ */
+static struct leia_sr_exit g_exit;
+
 //! True when an SDK callback belongs to the live context (see sr_ctx::generation).
 static inline bool
 sr_ctx_callback_is_current(void *user_data)
@@ -342,6 +352,63 @@ sr_ctx_abandon_locked(void)
 }
 
 /*!
+ * The exit-time teardown (leia_sr_exit_linux.h). Registered with atexit()
+ * after SR's statics, so exit() runs it BEFORE destroying them — unlike the
+ * ELF destructor, which _dl_fini runs after every exit handler, i.e. after
+ * SR's `startedContexts()` set is gone (the DS1 ASan double free).
+ *
+ * Runs on the exiting thread. g_ctx_lock waits out any SR call another thread
+ * makes under it (a display-hotplug sweep's srEnumerateDisplays, a display
+ * query); the weave and eye-pose calls take no plug-in lock, which is why a
+ * live weaver means "leave the context alone".
+ */
+static void
+sr_ctx_exit_hook(void)
+{
+	pthread_mutex_lock(&g_ctx_lock);
+	const enum leia_sr_exit_action action = leia_sr_exit_on_hook(
+	    &g_exit, g_ctx.state == SR_CTX_READY, g_ctx.live_weavers, atomic_load(&g_ctx.context_invalid));
+	switch (action) {
+	case LEIA_SR_EXIT_TEARDOWN:
+		sr_ctx_teardown_locked();
+		g_ctx.state = SR_CTX_UNINIT;
+		U_LOG_I("leia_sr_sdk: process exit — SR context torn down before SR's statics (exit hook)");
+		break;
+	case LEIA_SR_EXIT_LEAVE_WEAVER_ALIVE:
+		U_LOG_W("leia_sr_sdk: process exit with %u weaver(s) still alive — the SR context is left to the OS "
+		        "(no SR call at exit)",
+		        g_ctx.live_weavers);
+		break;
+	case LEIA_SR_EXIT_LEAVE_CONTEXT_INVALID:
+		U_LOG_W("leia_sr_sdk: process exit on an invalidated SR context — left to the OS (srDestroyInstance "
+		        "could block on the dead SRService connection)");
+		break;
+	case LEIA_SR_EXIT_NOTHING:
+	default: break;
+	}
+	pthread_mutex_unlock(&g_ctx_lock);
+}
+
+/*!
+ * (Re-)register sr_ctx_exit_hook after @p site has pulled SR statics in: exit
+ * handlers run in reverse order of registration, so the hook then runs before
+ * any SR static registered up to now (leia_sr_exit_linux.h). Bounded: once
+ * per context generation, once per process for the other sites. Caller holds
+ * g_ctx_lock.
+ */
+static void
+sr_ctx_arm_exit_hook_locked(enum leia_sr_exit_site site)
+{
+	if (!leia_sr_exit_should_arm(&g_exit, site, atomic_load(&g_ctx.generation))) {
+		return;
+	}
+	if (atexit(sr_ctx_exit_hook) != 0) {
+		U_LOG_W("leia_sr_sdk: atexit() failed — at exit the SR context falls back to the ELF destructor, "
+		        "which runs after SR's statics are destroyed");
+	}
+}
+
+/*!
  * Send one lens call and record it as sent on success. Caller holds g_ctx_lock
  * and has checked g_ctx.lens != NULL. @p why names the caller in the log.
  */
@@ -404,6 +471,12 @@ static enum leiasr_lnx_result
 sr_ctx_ensure(double retry_budget_s)
 {
 	pthread_mutex_lock(&g_ctx_lock);
+	if (!leia_sr_exit_allows_create(&g_exit)) {
+		/* The process is exiting (the exit hook ran): SR's statics are being
+		 * destroyed. Neither hand out the context nor build a new one. */
+		pthread_mutex_unlock(&g_ctx_lock);
+		return LEIASR_LNX_ERROR_SERVICE_UNAVAILABLE;
+	}
 	if (g_ctx.state == SR_CTX_READY && atomic_load(&g_ctx.context_invalid)) {
 		if (g_ctx.live_weavers == 0) {
 			/* The connection to SRService is gone and nothing is bound to
@@ -526,6 +599,11 @@ sr_ctx_ensure(double retry_budget_s)
 	 * control" is carried over to a new context. */
 	sr_ctx_reapply_lens_locked();
 
+	/* srCreateEyeTracker / srInitialize / srCreateDisplay have registered
+	 * SR's statics (startedContexts() among them) by now: the exit hook
+	 * registered after them runs before their destructors. */
+	sr_ctx_arm_exit_hook_locked(LEIA_SR_EXIT_SITE_CONTEXT);
+
 	pthread_mutex_unlock(&g_ctx_lock);
 	return LEIASR_LNX_SUCCESS;
 
@@ -537,11 +615,18 @@ fail:
 	return out;
 }
 
+/*!
+ * A real dlclose() of the plug-in (no exit: SR's statics are alive) still
+ * tears the context down here. At process exit this runs from _dl_fini, after
+ * every exit handler — SR's static destructors included — so it must not
+ * touch SR then; the exit hook has already done the teardown (or decided to
+ * leave the context), and this is a no-op (leia_sr_exit_linux.h).
+ */
 __attribute__((destructor)) static void
 sr_ctx_shutdown(void)
 {
 	pthread_mutex_lock(&g_ctx_lock);
-	if (g_ctx.state == SR_CTX_READY) {
+	if (leia_sr_exit_on_unload(&g_exit, g_ctx.state == SR_CTX_READY) == LEIA_SR_EXIT_TEARDOWN) {
 		sr_ctx_teardown_locked();
 		g_ctx.state = SR_CTX_UNINIT;
 	}
@@ -1647,6 +1732,12 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		sr_ctx_weaver_unpin();
 		return LEIASR_LNX_ERROR_FAILED;
 	}
+	/* The first weaver pulls in the weaver's statics (and adds its tracker
+	 * sense to the context, which srDestroyInstance deletes): re-arm the
+	 * exit hook after them (leia_sr_exit_linux.h). */
+	pthread_mutex_lock(&g_ctx_lock);
+	sr_ctx_arm_exit_hook_locked(LEIA_SR_EXIT_SITE_WEAVER);
+	pthread_mutex_unlock(&g_ctx_lock);
 	lnx->external_routed = plan.routing_external;
 	lnx->display_bound = plan.bind_display;
 	lnx->display_binding_refused = binding_attempted && !plan.bind_display;
@@ -2551,6 +2642,10 @@ leia_lnx_sr_enumerate_displays(struct leia_lnx_sr_display *out, uint32_t cap)
 		}
 		g_sr_display_count = (int32_t)count;
 		g_sr_displays_generation = gen;
+		// The first enumeration may pull in display-enumeration statics
+		// (often on the runtime's display-hotplug thread): re-arm the exit
+		// hook after them (leia_sr_exit_linux.h).
+		sr_ctx_arm_exit_hook_locked(LEIA_SR_EXIT_SITE_DISPLAY_ENUM);
 	}
 
 	if (g_sr_display_count >= 0) {

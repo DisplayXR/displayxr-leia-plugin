@@ -64,6 +64,9 @@ SO="$BUILD_DIR/src/drv_leia_linux/DisplayXR-LeiaSR.so"
 echo "==> Unit test: lens-preference ownership (LeiaSR #266)"
 "$BUILD_DIR/src/drv_leia_linux/test_lens_owner_linux"
 
+echo "==> Unit test: exit-time SR teardown order (before SR's statics)"
+"$BUILD_DIR/src/drv_leia_linux/test_sr_exit_linux"
+
 echo "==> Unit test: lost-capture re-create schedule (#364)"
 "$BUILD_DIR/src/drv_leia_linux/test_bg_capture_recovery_linux"
 

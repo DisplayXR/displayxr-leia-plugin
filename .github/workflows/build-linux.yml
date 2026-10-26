@@ -191,6 +191,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_lens_owner_linux
 
+      - name: Unit test — exit-time SR teardown order
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_sr_exit_linux
+
       - name: Unit test — lost-capture re-create schedule (#364)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_bg_capture_recovery_linux
