@@ -276,12 +276,24 @@ identity, never by name). The runtime's monitors are matched against that list
   pass's panel scan listed it), a pass whose scan lists no Leia panel is an UNPLUG and
   claims **nothing**. A pass whose scan lists the panel while none of the runtime's
   monitors pairs with it, after one did, is a replug the monitor list has not caught up
-  with, and also claims nothing. With the runtime's live re-probe
-  (displayxr-runtime#2305), the fallback used to move the panel rect to the primary
-  monitor on every unplug. Claiming nothing lets the runtime keep the last panel rect
-  until the claim returns. Logged once per transition: `the Leia panel is gone …`,
-  `the Leia panel is connected … but none of the runtime's … monitor(s) pairs with it
-  yet …`, `the Leia panel is back — claiming monitor … again …`.
+  with, and also claims nothing — for at most 5 s (`LEIA_LNX_NOT_LISTED_MAX_NS`). The
+  runtime polls every 500 ms and re-sweeps 0.5 to 4 s after a monitor change, so a normal
+  replug is listed well inside that. A panel still unpaired after 5 s is on a monitor the
+  matcher cannot pair (XWayland without EDID ids, an origin that does not line up, another
+  Leia panel swapped in), and the plug-in falls back as for a probe-time miss. With the
+  runtime's live re-probe (displayxr-runtime#2305), the fallback used to move the panel
+  rect to the primary monitor on every unplug. Claiming nothing lets the runtime keep the
+  last panel rect until the claim returns. Logged once per transition: `the Leia panel is
+  gone …`, `the Leia panel is connected … but none of the runtime's … monitor(s) pairs
+  with it yet …`, `no listed monitor paired with the reconnected Leia panel within … ms …`,
+  `the Leia panel is back — claiming monitor … again …`.
+- **A panel only the SR runtime vouches for** (not in the frozen EDID table, accepted
+  because `srEnumerateDisplays` or SR's display size names it) is in the panel scan only
+  while the SR runtime answers. Stopping SRService takes it out of the scan, so the
+  plug-in reads that as an unplug and claims nothing, where it used to fall back to the
+  primary monitor. The claim returns on the first pass after the SR runtime lists the panel
+  again.
+  A table-listed panel (the DS1) is not affected: the scan finds it without SR.
 - `supported_apis` = Vulkan only (this arm has no GL DP).
 
 **Cost and logging.** `probe_displays` runs on every runtime registry rebuild, which happens per client connect. It therefore reads the panel list from a shared cache with a 1 s TTL (one sysfs scan and one X connection per burst). It logs the `claim monitor … confidence=…` lines at INFO, and only when the answer changes. The same cache feeds the per-frame position getters. It is refreshed by that TTL and invalidated by SR display connect/topology events, so a hot-plugged or moved panel resolves on the next rebuild instead of never. A failed `srEnumerateDisplays` is retried on the next probe (only `SR_ERROR_FUNCTION_UNSUPPORTED` is final for a context).

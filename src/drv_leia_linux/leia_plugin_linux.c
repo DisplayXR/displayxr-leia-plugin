@@ -34,6 +34,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include "vk/vk_helpers.h" // sizeof/offsetof(struct vk_bundle) fingerprint (#233)
 #include "leia_interface.h"
@@ -56,7 +57,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(leia_force_probe, "DXR_LEIA_FORCE_PROBE", false)
 //! probe() bound this plug-in (forced or a panel found). probe_displays then
 //! guarantees the plug-in at least one monitor (leia_lnx_fallback_claim) —
 //! except when the panel it found is unplugged, or replugged but not listed
-//! yet: that claims nothing (leia_lnx_unmatched_decide).
+//! yet (for up to LEIA_LNX_NOT_LISTED_MAX_NS): that claims nothing
+//! (leia_lnx_unmatched_decide).
 static bool g_probe_bound;
 //! What earlier passes saw of the panel (Windows P-c parity).
 static struct leia_lnx_panel_history g_panel_history;
@@ -343,7 +345,12 @@ log_unmatched_change(enum leia_lnx_unmatched prev,
 	const char *on = conn[0] != '\0' ? " on " : "";
 	switch (now) {
 	case LEIA_LNX_UNMATCHED_FALLBACK:
-		if (n > 0) {
+		if (n > 0 && prev == LEIA_LNX_UNMATCHED_NOT_LISTED) {
+			U_LOG_W("leia_lnx_plugin: no listed monitor paired with the reconnected Leia panel within "
+			        "%lld ms — a monitor the matcher cannot pair, not a replug catching up; fallback claim "
+			        "on monitor 0x%016llx%s%s (EDID confidence)",
+			        (long long)(LEIA_LNX_NOT_LISTED_MAX_NS / 1000000), mon, on, conn);
+		} else if (n > 0) {
 			U_LOG_W("leia_lnx_plugin: probe() bound but no monitor matched a Leia panel — "
 			        "fallback claim on monitor 0x%016llx%s%s (EDID confidence)",
 			        mon, on, conn);
@@ -356,9 +363,9 @@ log_unmatched_change(enum leia_lnx_unmatched prev,
 		break;
 	case LEIA_LNX_UNMATCHED_NOT_LISTED:
 		U_LOG_W("leia_lnx_plugin: the Leia panel is connected (%u in the EDID scan) but none of the "
-		        "runtime's %u monitor(s) pairs with it yet — claiming none until one does "
-		        "(displayxr-runtime#2305)",
-		        panel_count, display_count);
+		        "runtime's %u monitor(s) pairs with it yet — claiming none until one does, for up to "
+		        "%lld ms (displayxr-runtime#2305)",
+		        panel_count, display_count, (long long)(LEIA_LNX_NOT_LISTED_MAX_NS / 1000000));
 		break;
 	case LEIA_LNX_UNMATCHED_NONE:
 	default:
@@ -436,12 +443,14 @@ leia_lnx_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	// cannot pair) one EDID-confidence claim on the bound panel's monitor (by
 	// size), else the primary monitor — without it another plug-in would win
 	// the panel. Not when the panel EDID found is gone, nor while a panel that
-	// paired before waits for the monitor list to catch up with a replug:
-	// claiming nothing then is what lets the runtime keep the last panel rect
-	// (displayxr-runtime#2305) instead of following the claim to the primary.
+	// paired before waits (up to LEIA_LNX_NOT_LISTED_MAX_NS) for the monitor
+	// list to catch up with a replug: claiming nothing then is what lets the
+	// runtime keep the last panel rect (displayxr-runtime#2305) instead of
+	// following the claim to the primary.
 	enum leia_lnx_unmatched unmatched = LEIA_LNX_UNMATCHED_NONE;
+	const int64_t now_ns = os_monotonic_get_ns();
 	pthread_mutex_lock(&g_claim_lock);
-	const uint32_t n = leia_lnx_claims_pass(displays, display_count, &in, g_probe_bound, &g_panel_history,
+	const uint32_t n = leia_lnx_claims_pass(displays, display_count, &in, g_probe_bound, now_ns, &g_panel_history,
 	                                        out_claims, bindings, cap, &unmatched);
 	const enum leia_lnx_unmatched prev_unmatched = g_last_unmatched;
 	g_last_unmatched = unmatched;
