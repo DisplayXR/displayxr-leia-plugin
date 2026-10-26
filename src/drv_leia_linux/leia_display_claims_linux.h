@@ -148,7 +148,25 @@ struct leia_lnx_panel_history
 	bool seen;
 	//! A pass paired a Leia panel with a runtime monitor (leia_lnx_compute_claims).
 	bool paired;
+	//! The @ref LEIA_LNX_UNMATCHED_NOT_LISTED wait is running: since
+	//! @ref unlisted_since_ns the panel has been connected, paired before, and
+	//! paired with no listed monitor. Stops when it pairs again or goes away.
+	bool unlisted;
+	int64_t unlisted_since_ns; //!< monotonic; valid only while @ref unlisted
 };
+
+/*!
+ * How long a panel that paired before may stay connected with no listed monitor
+ * pairing with it before probe_displays falls back as for a probe-time miss.
+ * A replug the monitor list has not caught up with clears within a sweep or
+ * two: the runtime polls every 500 ms (DXR_DISPLAY_HOTPLUG_POLL_MS) and re-runs
+ * follow-up sweeps 0.5, 1, 1.5, 2, 3 and 4 s after a monitor change (then 6, 8,
+ * 12 s ...); on a DS1 the HDMI monitor was listed one follow-up after the panel
+ * came back. Anything still unpaired after 5 s is a monitor the matcher cannot
+ * pair — XWayland without EDID ids, an origin that does not line up, another
+ * Leia panel swapped in.
+ */
+#define LEIA_LNX_NOT_LISTED_MAX_NS (5000ll * 1000ll * 1000ll)
 
 //! What a pass with probe() bound does when no monitor matched a Leia panel.
 enum leia_lnx_unmatched
@@ -156,32 +174,37 @@ enum leia_lnx_unmatched
 	//! A monitor matched, or probe() did not bind: nothing to decide.
 	LEIA_LNX_UNMATCHED_NONE = 0,
 	//! The probe-time cases — a forced probe that never found a panel, or a
-	//! connected panel whose monitor the matcher has never paired: one
-	//! leia_lnx_fallback_claim() claim, as before.
+	//! connected panel whose monitor the matcher has never paired (or has not
+	//! for @ref LEIA_LNX_NOT_LISTED_MAX_NS): one leia_lnx_fallback_claim()
+	//! claim, as before.
 	LEIA_LNX_UNMATCHED_FALLBACK,
 	//! The panel EDID found is gone (unplugged): claim nothing, so the
 	//! runtime keeps the last panel rect (displayxr-runtime#2305).
 	LEIA_LNX_UNMATCHED_PANEL_GONE,
 	//! The panel is connected and was paired before, but no monitor the
 	//! runtime lists pairs with it now (a replug the monitor list has not
-	//! caught up with yet): claim nothing, as for an unplug.
+	//! caught up with yet): claim nothing, as for an unplug — for at most
+	//! @ref LEIA_LNX_NOT_LISTED_MAX_NS, then FALLBACK.
 	LEIA_LNX_UNMATCHED_NOT_LISTED,
 };
 
 /*!
  * The rule behind @ref leia_lnx_unmatched, for a pass whose claims matched
  * nothing with probe() bound. @p panel_count = Leia panels in this pass's
- * panel scan (table panels and panels the SR runtime drives).
+ * panel scan (table panels and panels the SR runtime drives). @p now_ns
+ * (monotonic) is judged against @p history's NOT_LISTED wait; with no wait
+ * running, this pass is its first.
  */
 enum leia_lnx_unmatched
-leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count);
+leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count, int64_t now_ns);
 
 /*!
- * One probe_displays pass: leia_lnx_compute_claims(), then — only when it
- * matched nothing and @p probe_bound — the @ref leia_lnx_unmatched rule, and
- * the fallback claim when that rule says so. Folds this pass into @p history
- * first. @p out_unmatched (may be NULL) receives the rule's answer, NONE when
- * a monitor matched or probe() did not bind.
+ * One probe_displays pass at @p now_ns (monotonic): leia_lnx_compute_claims(),
+ * then — only when it matched nothing and @p probe_bound — the
+ * @ref leia_lnx_unmatched rule, and the fallback claim when that rule says so.
+ * Folds this pass into @p history (and starts or stops its NOT_LISTED wait).
+ * @p out_unmatched (may be NULL) receives the rule's answer, NONE when a
+ * monitor matched or probe() did not bind.
  * @return the number of claims written (<= @p max_claims).
  */
 uint32_t
@@ -189,6 +212,7 @@ leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
                      uint32_t display_count,
                      const struct leia_lnx_claim_inputs *in,
                      bool probe_bound,
+                     int64_t now_ns,
                      struct leia_lnx_panel_history *history,
                      struct xrt_display_claim *out_claims,
                      struct leia_lnx_claim_binding *out_bindings,

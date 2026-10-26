@@ -36,6 +36,10 @@ static int g_failures;
 #define DS1_PROD 1u    /* {29188, 1} = ACER_DS1 (alt) in leia_edid_table.h */
 #define LGD_ID 0xE430u /* "LGD", not in the table */
 
+#define MS(x) ((int64_t)(x)*1000ll * 1000ll)
+//! Any monotonic origin for the claims-pass clock.
+#define T0 MS(1000000)
+
 /*! Build a 128-byte EDID base block: ids, serial, DTD #1 with px + mm. */
 static void
 make_edid(uint8_t *e, uint16_t man, uint16_t prod, uint32_t serial, uint32_t w, uint32_t h, uint32_t wmm, uint32_t hmm)
@@ -395,16 +399,25 @@ test_unmatched_decide(void)
 {
 	struct leia_lnx_panel_history h = {0};
 	// Forced probe that never found a panel: fallback, panel or not.
-	CHECK(leia_lnx_unmatched_decide(&h, 0) == LEIA_LNX_UNMATCHED_FALLBACK);
-	CHECK(leia_lnx_unmatched_decide(NULL, 0) == LEIA_LNX_UNMATCHED_FALLBACK);
+	CHECK(leia_lnx_unmatched_decide(&h, 0, T0) == LEIA_LNX_UNMATCHED_FALLBACK);
+	CHECK(leia_lnx_unmatched_decide(NULL, 0, T0) == LEIA_LNX_UNMATCHED_FALLBACK);
 	// Seen, never paired: connected = unpairable descriptor (fallback), absent = unplugged.
 	h.seen = true;
-	CHECK(leia_lnx_unmatched_decide(&h, 1) == LEIA_LNX_UNMATCHED_FALLBACK);
-	CHECK(leia_lnx_unmatched_decide(&h, 0) == LEIA_LNX_UNMATCHED_PANEL_GONE);
+	CHECK(leia_lnx_unmatched_decide(&h, 1, T0) == LEIA_LNX_UNMATCHED_FALLBACK);
+	CHECK(leia_lnx_unmatched_decide(&h, 0, T0) == LEIA_LNX_UNMATCHED_PANEL_GONE);
 	// Seen and paired: connected = its monitor not listed yet, absent = unplugged.
+	// No wait running: this pass is the wait's first.
 	h.paired = true;
-	CHECK(leia_lnx_unmatched_decide(&h, 1) == LEIA_LNX_UNMATCHED_NOT_LISTED);
-	CHECK(leia_lnx_unmatched_decide(&h, 0) == LEIA_LNX_UNMATCHED_PANEL_GONE);
+	CHECK(leia_lnx_unmatched_decide(&h, 1, T0) == LEIA_LNX_UNMATCHED_NOT_LISTED);
+	CHECK(leia_lnx_unmatched_decide(&h, 0, T0) == LEIA_LNX_UNMATCHED_PANEL_GONE);
+	// ... for LEIA_LNX_NOT_LISTED_MAX_NS from the wait's start, then the fallback.
+	h.unlisted = true;
+	h.unlisted_since_ns = T0;
+	CHECK(leia_lnx_unmatched_decide(&h, 1, T0 + LEIA_LNX_NOT_LISTED_MAX_NS - 1) == LEIA_LNX_UNMATCHED_NOT_LISTED);
+	CHECK(leia_lnx_unmatched_decide(&h, 1, T0 + LEIA_LNX_NOT_LISTED_MAX_NS) == LEIA_LNX_UNMATCHED_FALLBACK);
+	CHECK(leia_lnx_unmatched_decide(&h, 0, T0 + LEIA_LNX_NOT_LISTED_MAX_NS) == LEIA_LNX_UNMATCHED_PANEL_GONE);
+	// A normal replug is listed within a follow-up sweep or two (runtime: 0.5 .. 4 s).
+	CHECK(LEIA_LNX_NOT_LISTED_MAX_NS > MS(4000));
 }
 
 /* A DS1 unplug / replug through leia_lnx_claims_pass, the way probe_displays
@@ -432,34 +445,34 @@ test_claims_pass_unplug(void)
 
 	// probe() bound on the panel EDID found (it sets seen); the pass claims it.
 	struct leia_lnx_panel_history h = {.seen = true};
-	uint32_t n = leia_lnx_claims_pass(both, 2, &in, true, &h, c, b, 4, &u);
+	uint32_t n = leia_lnx_claims_pass(both, 2, &in, true, T0, &h, c, b, 4, &u);
 	CHECK(n == 1 && c[0].monitor_id == 0xD && strcmp(b[0].connector, "HDMI-A-1") == 0);
 	CHECK(u == LEIA_LNX_UNMATCHED_NONE && h.seen && h.paired);
 
 	// Unplugged, the monitor still listed (EDID unreadable): no claim, no eDP.
 	in.panel_count = 0;
 	c[0].monitor_id = 0xBAD;
-	n = leia_lnx_claims_pass(both, 2, &in, true, &h, c, b, 4, &u);
+	n = leia_lnx_claims_pass(both, 2, &in, true, T0, &h, c, b, 4, &u);
 	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_PANEL_GONE);
 	CHECK(c[0].monitor_id == 0xBAD); // nothing written
 	// ... and once the runtime drops the monitor: still nothing.
-	n = leia_lnx_claims_pass(edp_only, 1, &in, true, &h, c, b, 4, &u);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, T0, &h, c, b, 4, &u);
 	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_PANEL_GONE);
 
 	// Replugged: the panel scan has it before the runtime lists its monitor.
 	in.panel_count = 1;
-	n = leia_lnx_claims_pass(edp_only, 1, &in, true, &h, c, b, 4, &u);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, T0, &h, c, b, 4, &u);
 	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED);
 
 	// Back: the normal claim again.
-	n = leia_lnx_claims_pass(both, 2, &in, true, &h, c, b, 4, &u);
+	n = leia_lnx_claims_pass(both, 2, &in, true, T0, &h, c, b, 4, &u);
 	CHECK(n == 1 && c[0].monitor_id == 0xD && c[0].confidence == XRT_DISPLAY_CLAIM_EDID);
 	CHECK(strcmp(b[0].connector, "HDMI-A-1") == 0 && u == LEIA_LNX_UNMATCHED_NONE);
 
 	// probe() declined: no fallback ever (the runtime's own rules apply).
 	struct leia_lnx_panel_history fresh = {0};
 	in.panel_count = 0;
-	n = leia_lnx_claims_pass(both, 2, &in, false, &fresh, c, b, 4, &u);
+	n = leia_lnx_claims_pass(both, 2, &in, false, T0, &fresh, c, b, 4, &u);
 	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NONE);
 }
 
@@ -480,7 +493,7 @@ test_claims_pass_probe_time(void)
 	// DXR_LEIA_FORCE_PROBE=1, no panel at all: the primary, every pass.
 	struct leia_lnx_panel_history h = {0}; // a forced probe sets nothing
 	for (int pass = 0; pass < 2; pass++) {
-		const uint32_t n = leia_lnx_claims_pass(d, 2, &in, true, &h, c, b, 4, &u);
+		const uint32_t n = leia_lnx_claims_pass(d, 2, &in, true, T0, &h, c, b, 4, &u);
 		CHECK(n == 1 && c[0].monitor_id == 0xB && c[0].confidence == XRT_DISPLAY_CLAIM_EDID);
 		CHECK(b[0].connector[0] == '\0' && u == LEIA_LNX_UNMATCHED_FALLBACK);
 		CHECK(!h.seen && !h.paired);
@@ -499,7 +512,7 @@ test_claims_pass_probe_time(void)
 	CHECK(leia_lnx_compute_claims(x, 2, &in, c, b, 4) == 0);
 	CHECK(leia_lnx_fallback_claim(x, 2, &p, 1, XRT_DP_API_BIT_VK, &ref, NULL));
 	struct leia_lnx_panel_history seen = {.seen = true}; // probe() bound on it by EDID
-	uint32_t n = leia_lnx_claims_pass(x, 2, &in, true, &seen, c, b, 4, &u);
+	uint32_t n = leia_lnx_claims_pass(x, 2, &in, true, T0, &seen, c, b, 4, &u);
 	CHECK(n == 1 && u == LEIA_LNX_UNMATCHED_FALLBACK);
 	CHECK(c[0].monitor_id == ref.monitor_id && strcmp(b[0].connector, "HDMI-A-1") == 0);
 	CHECK(seen.seen && !seen.paired);
@@ -512,15 +525,97 @@ test_claims_pass_probe_time(void)
 	};
 	ds1[0].flags = 1u;
 	struct leia_lnx_panel_history forced = {0};
-	n = leia_lnx_claims_pass(ds1, 2, &in, true, &forced, c, b, 4, &u);
+	n = leia_lnx_claims_pass(ds1, 2, &in, true, T0, &forced, c, b, 4, &u);
 	CHECK(n == 1 && c[0].monitor_id == 0xD && forced.seen && forced.paired);
 	in.panel_count = 0;
-	n = leia_lnx_claims_pass(ds1, 2, &in, true, &forced, c, b, 4, &u);
+	n = leia_lnx_claims_pass(ds1, 2, &in, true, T0, &forced, c, b, 4, &u);
 	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_PANEL_GONE);
 
 	// Nothing to claim into.
-	CHECK(leia_lnx_claims_pass(d, 2, &in, true, &h, c, b, 0, &u) == 0 && u == LEIA_LNX_UNMATCHED_NONE);
-	CHECK(leia_lnx_claims_pass(d, 0, &in, true, &h, c, b, 4, NULL) == 0);
+	CHECK(leia_lnx_claims_pass(d, 2, &in, true, T0, &h, c, b, 0, &u) == 0 && u == LEIA_LNX_UNMATCHED_NONE);
+	CHECK(leia_lnx_claims_pass(d, 0, &in, true, T0, &h, c, b, 4, NULL) == 0);
+}
+
+/* The NOT_LISTED wait is bounded (LEIA_LNX_NOT_LISTED_MAX_NS): a replug the
+ * monitor list catches up with inside it claims nothing; a panel that paired
+ * once and stays unpaired past it (XWayland without EDID ids, an origin that
+ * does not line up, another Leia panel swapped in) falls back as for a
+ * probe-time miss, instead of claiming nothing for the rest of the process. */
+static void
+test_claims_pass_not_listed_bound(void)
+{
+	const int64_t bound = LEIA_LNX_NOT_LISTED_MAX_NS;
+	const struct xrt_display_descriptor edp = desc(0xE, LGD_ID, 0x0601, 3072, 1920, 0, 0);
+	const struct xrt_display_descriptor ds1 = desc(0xD, ACR_ID, DS1_PROD, 3840, 2160, 3072, 0);
+	struct xrt_display_descriptor both[2] = {edp, ds1};
+	struct xrt_display_descriptor edp_only[1] = {edp};
+	both[0].flags = 1u; // primary
+	edp_only[0].flags = 1u;
+
+	struct leia_lnx_edid_panel p = panel("HDMI-A-1", 7, false, 0, 0);
+	struct leia_lnx_claim_inputs in = {
+	    .panels = &p, .panel_count = 1, .sr_display_count = -1, .supported_apis = XRT_DP_API_BIT_VK};
+	struct xrt_display_claim c[4];
+	struct leia_lnx_claim_binding b[4];
+	enum leia_lnx_unmatched u;
+
+	struct leia_lnx_panel_history h = {.seen = true};
+	uint32_t n = leia_lnx_claims_pass(both, 2, &in, true, T0, &h, c, b, 4, &u);
+	CHECK(n == 1 && c[0].monitor_id == 0xD && h.paired && !h.unlisted);
+
+	// Connected, its monitor not listed: nothing, for the whole bound.
+	const int64_t t1 = T0 + MS(100);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t1, &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED);
+	CHECK(h.unlisted && h.unlisted_since_ns == t1);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t1 + bound - MS(1), &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED && h.unlisted_since_ns == t1);
+
+	// Past the bound: the fallback (no monitor has the panel's size -> the primary).
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t1 + bound, &h, c, b, 4, &u);
+	CHECK(n == 1 && u == LEIA_LNX_UNMATCHED_FALLBACK && c[0].monitor_id == 0xE);
+	// ... and it stays there: the wait is not restarted, so no claim / no-claim flapping.
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t1 + bound + MS(10000), &h, c, b, 4, &u);
+	CHECK(n == 1 && u == LEIA_LNX_UNMATCHED_FALLBACK && c[0].monitor_id == 0xE);
+
+	// Pairs again: the normal claim, the wait cleared.
+	n = leia_lnx_claims_pass(both, 2, &in, true, t1 + bound + MS(11000), &h, c, b, 4, &u);
+	CHECK(n == 1 && c[0].monitor_id == 0xD && u == LEIA_LNX_UNMATCHED_NONE && !h.unlisted);
+
+	// Unlisted again: a fresh wait from that pass.
+	const int64_t t2 = T0 + MS(60000);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t2, &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED && h.unlisted_since_ns == t2);
+
+	// Gone, then back: the wait restarts on the return (with t2's clock this
+	// last pass would be past the bound).
+	in.panel_count = 0;
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t2 + MS(3000), &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_PANEL_GONE && !h.unlisted);
+	in.panel_count = 1;
+	const int64_t t3 = t2 + MS(6000);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t3, &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED && h.unlisted_since_ns == t3);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t3 + bound - MS(1), &h, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED);
+	n = leia_lnx_claims_pass(edp_only, 1, &in, true, t3 + bound, &h, c, b, 4, &u);
+	CHECK(n == 1 && u == LEIA_LNX_UNMATCHED_FALLBACK);
+
+	// Paired once, back on a monitor the matcher cannot pair (XWayland: no
+	// EDID ids, the eDP shares the panel's size, no RandR origin): nothing for
+	// the bound, then today's size-then-primary fallback.
+	struct xrt_display_descriptor x[2] = {
+	    desc(0xA, 0, 0, 3840, 2160, 0, 0),
+	    desc(0xB, 0, 0, 3840, 2160, 3840, 0),
+	};
+	struct xrt_display_claim ref;
+	CHECK(leia_lnx_fallback_claim(x, 2, &p, 1, XRT_DP_API_BIT_VK, &ref, NULL));
+	struct leia_lnx_panel_history once = {.seen = true, .paired = true};
+	n = leia_lnx_claims_pass(x, 2, &in, true, T0, &once, c, b, 4, &u);
+	CHECK(n == 0 && u == LEIA_LNX_UNMATCHED_NOT_LISTED);
+	n = leia_lnx_claims_pass(x, 2, &in, true, T0 + bound, &once, c, b, 4, &u);
+	CHECK(n == 1 && u == LEIA_LNX_UNMATCHED_FALLBACK && c[0].monitor_id == ref.monitor_id);
+	CHECK(strcmp(b[0].connector, "HDMI-A-1") == 0);
 }
 
 /*! A future runtime appended fields: walk with ITS stride, not ours. */
@@ -714,6 +809,7 @@ main(void)
 	test_unmatched_decide();
 	test_claims_pass_unplug();
 	test_claims_pass_probe_time();
+	test_claims_pass_not_listed_bound();
 	test_claims_stride();
 	test_binding_table();
 	test_device_store();

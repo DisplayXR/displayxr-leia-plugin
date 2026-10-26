@@ -36,8 +36,9 @@
  *  No monitor matched while probe() bound the plug-in (leia_lnx_claims_pass):
  *  the fallback claim is for the probe-time cases only — a forced probe, or a
  *  panel whose monitor the matcher cannot pair. Once a panel was seen, a miss
- *  is an unplug (or a replug the monitor list has not caught up with) and
- *  nothing is claimed — the Windows arm's P-c rule.
+ *  is an unplug (or, for up to LEIA_LNX_NOT_LISTED_MAX_NS, a replug the
+ *  monitor list has not caught up with) and nothing is claimed — the Windows
+ *  arm's P-c rule.
  *
  * @author David Fattal
  * @ingroup drv_leia_linux
@@ -398,7 +399,7 @@ leia_lnx_fallback_claim(const struct xrt_display_descriptor *displays,
 }
 
 enum leia_lnx_unmatched
-leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count)
+leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t panel_count, int64_t now_ns)
 {
 	// Never found a panel (a forced probe on a panel-less box): the fallback
 	// is the only way the bound plug-in owns a monitor.
@@ -415,12 +416,17 @@ leia_lnx_unmatched_decide(const struct leia_lnx_panel_history *history, uint32_t
 	}
 	// Connected, and its monitor has paired before: the runtime's monitor list
 	// has not caught up with a replug yet. The fallback would land on the
-	// primary for that pass, and the runtime would follow it there.
+	// primary for that pass, and the runtime would follow it there. Bounded:
+	// past LEIA_LNX_NOT_LISTED_MAX_NS it is no replug but a monitor the
+	// matcher cannot pair, the case below.
 	if (history->paired) {
-		return LEIA_LNX_UNMATCHED_NOT_LISTED;
+		const int64_t waited = history->unlisted ? now_ns - history->unlisted_since_ns : 0;
+		if (waited < LEIA_LNX_NOT_LISTED_MAX_NS) {
+			return LEIA_LNX_UNMATCHED_NOT_LISTED;
+		}
 	}
-	// Connected, never paired: a descriptor the matcher cannot pair — the
-	// probe-time case the fallback exists for.
+	// Connected, never paired (or not for that long): a descriptor the matcher
+	// cannot pair — the probe-time case the fallback exists for.
 	return LEIA_LNX_UNMATCHED_FALLBACK;
 }
 
@@ -429,6 +435,7 @@ leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
                      uint32_t display_count,
                      const struct leia_lnx_claim_inputs *in,
                      bool probe_bound,
+                     int64_t now_ns,
                      struct leia_lnx_panel_history *history,
                      struct xrt_display_claim *out_claims,
                      struct leia_lnx_claim_binding *out_bindings,
@@ -442,14 +449,19 @@ leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
 		return 0;
 	}
 
-	if (history != NULL && in->panel_count > 0) {
-		history->seen = true;
+	if (history != NULL) {
+		if (in->panel_count > 0) {
+			history->seen = true;
+		} else {
+			history->unlisted = false; // gone: a return starts a fresh NOT_LISTED wait
+		}
 	}
 	const uint32_t n = leia_lnx_compute_claims(displays, display_count, in, out_claims, out_bindings, max_claims);
 	if (n > 0) {
 		if (history != NULL) {
 			history->seen = true; // also a panel only the SR enumeration lists
 			history->paired = true;
+			history->unlisted = false;
 		}
 		return n;
 	}
@@ -457,7 +469,14 @@ leia_lnx_claims_pass(const struct xrt_display_descriptor *displays,
 		return 0;
 	}
 
-	const enum leia_lnx_unmatched u = leia_lnx_unmatched_decide(history, in->panel_count);
+	const enum leia_lnx_unmatched u = leia_lnx_unmatched_decide(history, in->panel_count, now_ns);
+	// The wait starts on the first NOT_LISTED pass and keeps running through
+	// the fallback that ends it: restarting it there would alternate 5 s of
+	// nothing with a fallback claim for as long as the monitor stays unpaired.
+	if (u == LEIA_LNX_UNMATCHED_NOT_LISTED && history != NULL && !history->unlisted) {
+		history->unlisted = true;
+		history->unlisted_since_ns = now_ns;
+	}
 	if (out_unmatched != NULL) {
 		*out_unmatched = u;
 	}
