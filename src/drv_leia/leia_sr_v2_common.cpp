@@ -57,12 +57,12 @@ leia_sr_v2_snap_to_phase(SrWeaver weaver,
 	int32_t sy = target_y;
 	const SrResult r = srWeaverSnapToPhase(weaver, origin_x, origin_y, target_x, target_y, &sx, &sy);
 	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
-		static bool warned = false;
-		if (!warned) {
+		// Window threads of several sessions can get here at once: latch atomically.
+		static std::atomic<bool> warned{false};
+		if (!warned.exchange(true)) {
 			U_LOG_W("#625 snap (%s): this SR runtime has no srWeaverSnapToPhase - window drags will not "
-			        "phase-snap",
+			        "phase-snap (DXR_LEIA_SR_API=v1 still snaps D3D11)",
 			        arm);
-			warned = true;
 		}
 		return false;
 	}
@@ -73,11 +73,12 @@ leia_sr_v2_snap_to_phase(SrWeaver weaver,
 		U_LOG_E("srWeaverSnapToPhase (%s) failed: %s (%d)", arm, leia_sr_v2_result_str(r), (int)r);
 		return false;
 	}
-	static bool logged_first = false;
-	if (!logged_first) {
+	// First successful snap, once: tells "ran and corrected" from "never called"
+	// (the ambiguity behind LeiaInc/LeiaSR#163). A zero delta is still logged.
+	static std::atomic<bool> logged_first{false};
+	if (!logged_first.exchange(true)) {
 		U_LOG_W("#625 snap (%s): v2 srWeaverSnapToPhase LIVE — (%d,%d) -> (%d,%d), delta (%d,%d)", arm, target_x,
 		        target_y, sx, sy, sx - target_x, sy - target_y);
-		logged_first = true;
 	}
 	*out_x = sx;
 	*out_y = sy;
