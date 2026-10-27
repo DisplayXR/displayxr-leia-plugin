@@ -118,6 +118,7 @@
 
 #ifdef DXR_LEIA_HAS_SR_V2
 #include "leia_sr_v2_common.h"
+#include "leia_platform_state.h" // leia_sr_client_bind: gates the delay-loaded OpenCV
 #include <sr/sr_eye_tracker.h>
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN
 #include <sr/sr_display.h> // SrDisplayBindingInfo: a keep-alive tracker per device
@@ -1329,6 +1330,15 @@ cam_decode(xrt_plugin_stereo_camera *c, const leia_scam_header &hdr)
 			U_LOG_W(
 			    "leia stereo camera: JPEG SOF %ux%u does not match the header %llux%llu — frame dropped",
 			    jw, jh, (unsigned long long)hdr.width, (unsigned long long)hdr.height);
+		}
+		return false;
+	}
+	// opencv_world343 is delay-loaded from the SR bin dir (runtime#2436): no cv
+	// call before the bind that resolves it, or a missing DLL is an SEH fault.
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		if (!c->warned_decode) {
+			c->warned_decode = true;
+			U_LOG_W("leia stereo camera: the SR client DLLs (incl. OpenCV) are not usable — frame dropped");
 		}
 		return false;
 	}

@@ -5,8 +5,9 @@
  * @brief  Delay-load resolution of the SR platform client DLLs.
  *
  * The plug-in links the SR client DLLs (SimulatedRealityCore / Displays /
- * DirectX / OpenGL) with /DELAYLOAD, so the plug-in DLL itself loads on a box
- * WITHOUT the SR platform (install-order epic, displayxr-runtime#1803, P-a).
+ * DirectX / OpenGL), and the SR bin dir's opencv_world343, with /DELAYLOAD,
+ * so the plug-in DLL itself loads on a box WITHOUT the SR platform
+ * (install-order epic, displayxr-runtime#1803, P-a).
  * Two consequences, both handled here:
  *
  *  1. WHERE the DLLs come from. They used to be found only through the
@@ -55,6 +56,10 @@
 static const char *const k_sr_dlls[] = {
     "SimulatedRealityCore.dll",
     "SimulatedRealityDisplays.dll",
+    // The stereo camera's JPEG decode (cv::imdecode) imports it directly; it
+    // ships in the SR bin dir and is not on every host's search path
+    // (runtime#2436), so it is resolved and bound like the SR client DLLs.
+    "opencv_world343.dll",
 #ifdef XRT_HAVE_LEIA_SR_D3D11
     "SimulatedRealityDirectX.dll",
 #endif
