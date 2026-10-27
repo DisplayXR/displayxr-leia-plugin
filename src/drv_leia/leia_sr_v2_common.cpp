@@ -40,6 +40,50 @@
 #include <string.h>
 #include <windows.h>
 
+bool
+leia_sr_v2_snap_to_phase(SrWeaver weaver,
+                         const char *arm,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y)
+{
+	if (weaver == nullptr || out_x == nullptr || out_y == nullptr) {
+		return false;
+	}
+	int32_t sx = target_x;
+	int32_t sy = target_y;
+	const SrResult r = srWeaverSnapToPhase(weaver, origin_x, origin_y, target_x, target_y, &sx, &sy);
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		static bool warned = false;
+		if (!warned) {
+			U_LOG_W("#625 snap (%s): this SR runtime has no srWeaverSnapToPhase - window drags will not "
+			        "phase-snap",
+			        arm);
+			warned = true;
+		}
+		return false;
+	}
+	if (r == SR_DECLINED) {
+		return false; // "nothing to correct": a real answer, the caller keeps its target
+	}
+	if (!SR_SUCCEEDED(r)) {
+		U_LOG_E("srWeaverSnapToPhase (%s) failed: %s (%d)", arm, leia_sr_v2_result_str(r), (int)r);
+		return false;
+	}
+	static bool logged_first = false;
+	if (!logged_first) {
+		U_LOG_W("#625 snap (%s): v2 srWeaverSnapToPhase LIVE — (%d,%d) -> (%d,%d), delta (%d,%d)", arm, target_x,
+		        target_y, sx, sy, sx - target_x, sy - target_y);
+		logged_first = true;
+	}
+	*out_x = sx;
+	*out_y = sy;
+	return true;
+}
+
 const char *
 leia_sr_v2_result_str(SrResult r)
 {
