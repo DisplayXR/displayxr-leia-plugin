@@ -620,10 +620,13 @@ endif()
 # HKLM\SOFTWARE\Dimenco\Simulated Reality (falling back to the normal search)
 # and binds every import eagerly behind leia_sr_client_bind(), which gates every
 # SR call. Keep this list equal to k_sr_dlls[] in that file (same gates).
-# opencv_world343 is NOT here: the linker drops it (no direct import), it is an
-# SR DLL's dependency, resolved from the SR bin dir via
-# LOAD_WITH_ALTERED_SEARCH_PATH.
-set(LEIA_SR_DELAYLOAD_DLLS SimulatedRealityCore.dll SimulatedRealityDisplays.dll)
+# opencv_world343 (shipped in the SR bin dir) is on the list too: the stereo
+# camera's cv::imdecode makes it a DIRECT import, and as a static import the OS
+# loader had to find it at plug-in load time — a host without the SR bin dir on
+# its search path then failed the whole plug-in (error 126, runtime#2436). It is
+# resolved the same way but bound separately and optionally
+# (leia_sr_opencv_bind, LEIA_SR_OPENCV_DLL in that file).
+set(LEIA_SR_DELAYLOAD_DLLS SimulatedRealityCore.dll SimulatedRealityDisplays.dll opencv_world343.dll)
 if(LEIA_SR_D3D11_AVAILABLE)
     list(APPEND LEIA_SR_DELAYLOAD_DLLS SimulatedRealityDirectX.dll)
 endif()

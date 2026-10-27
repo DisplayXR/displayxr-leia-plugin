@@ -5,8 +5,9 @@
  * @brief  Delay-load resolution of the SR platform client DLLs.
  *
  * The plug-in links the SR client DLLs (SimulatedRealityCore / Displays /
- * DirectX / OpenGL) with /DELAYLOAD, so the plug-in DLL itself loads on a box
- * WITHOUT the SR platform (install-order epic, displayxr-runtime#1803, P-a).
+ * DirectX / OpenGL), and the SR bin dir's opencv_world343, with /DELAYLOAD,
+ * so the plug-in DLL itself loads on a box WITHOUT the SR platform
+ * (install-order epic, displayxr-runtime#1803, P-a).
  * Two consequences, both handled here:
  *
  *  1. WHERE the DLLs come from. They used to be found only through the
@@ -64,6 +65,15 @@ static const char *const k_sr_dlls[] = {
 };
 #define K_SR_DLL_COUNT (sizeof(k_sr_dlls) / sizeof(k_sr_dlls[0]))
 
+/*
+ * OpenCV, also delay-loaded and resolved from the SR bin dir, but OPTIONAL:
+ * only the stereo camera's JPEG decode (cv::imdecode) imports it, and it is
+ * not on every host's search path (runtime#2436). It is bound separately by
+ * leia_sr_opencv_bind(), so a missing or renamed OpenCV costs the stereo
+ * camera, never the weaver. Must match the /DELAYLOAD list in CMakeLists.txt.
+ */
+#define LEIA_SR_OPENCV_DLL "opencv_world343.dll"
+
 static SRWLOCK g_dir_lock = SRWLOCK_INIT;
 //! Cached SR client DLL directory (with trailing backslash). A POSITIVE read
 //! is cached for the life of the process; a miss is re-read on the next call
@@ -86,7 +96,7 @@ is_sr_dll(const char *name)
 			return true;
 		}
 	}
-	return false;
+	return _stricmp(name, LEIA_SR_OPENCV_DLL) == 0;
 }
 
 //! Read the dir. Caller holds g_dir_lock exclusively.
@@ -265,6 +275,37 @@ leia_sr_client_bound(void)
 	return InterlockedCompareExchange(&g_bound, 0, 0) != 0;
 }
 
+static volatile LONG g_cv_bound = 0;
+static volatile LONG g_cv_logged = 0;
+
+bool
+leia_sr_opencv_bind(void)
+{
+	if (InterlockedCompareExchange(&g_cv_bound, 0, 0) != 0) {
+		return true;
+	}
+	AcquireSRWLockExclusive(&g_bind_lock);
+	DWORD code = 0;
+	if (InterlockedCompareExchange(&g_cv_bound, 0, 0) == 0 &&
+	    bind_one(LEIA_SR_OPENCV_DLL, &code) == LEIA_SR_BIND_OK) {
+		InterlockedExchange(&g_cv_bound, 1);
+	}
+	const bool ok = InterlockedCompareExchange(&g_cv_bound, 0, 0) != 0;
+	if (!ok && InterlockedExchange(&g_cv_logged, 1) == 0) {
+		wchar_t dir[MAX_PATH] = L"(SR install dir not found)";
+		AcquireSRWLockExclusive(&g_dir_lock);
+		if (read_dir_locked()) {
+			wcscpy_s(dir, MAX_PATH, g_dir);
+		}
+		ReleaseSRWLockExclusive(&g_dir_lock);
+		U_LOG_W("Leia SR: %s not usable (code 0x%08lx) — expected in %ls; the stereo camera's JPEG frames are "
+		        "dropped, weaving is unaffected (runtime#2436)",
+		        LEIA_SR_OPENCV_DLL, (unsigned long)code, dir);
+	}
+	ReleaseSRWLockExclusive(&g_bind_lock);
+	return ok;
+}
+
 #else // !_WIN32
 
 enum leia_sr_bind_result
@@ -275,6 +316,12 @@ leia_sr_client_bind(void)
 
 bool
 leia_sr_client_bound(void)
+{
+	return false;
+}
+
+bool
+leia_sr_opencv_bind(void)
 {
 	return false;
 }
