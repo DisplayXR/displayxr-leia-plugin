@@ -117,6 +117,10 @@ struct leiasr_gl
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
+	//! The binding's desktop origin: what get_display_pixel_info reports
+	//! instead of the SR location (runtime #2311). Set before the create.
+	struct leia_win_screen_origin bind_origin = {false, 0, 0};
+	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
 	bool display_bound = false;
@@ -885,7 +889,11 @@ leiasr_gl_create(double max_time,
 }
 
 xrt_result_t
-leiasr_gl_create_for_screen(double max_time, void *hwnd, uint64_t display_id, struct leiasr_gl **out)
+leiasr_gl_create_for_screen(double max_time,
+                            void *hwnd,
+                            uint64_t display_id,
+                            const struct leia_win_screen_origin *origin,
+                            struct leiasr_gl **out)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leia_sr_api_selected() != LEIA_SR_API_V2) {
@@ -897,6 +905,9 @@ leiasr_gl_create_for_screen(double max_time, void *hwnd, uint64_t display_id, st
 	leiasr_gl *sr = new leiasr_gl;
 	sr->screen_bound = true;
 	sr->bind_display_id = display_id;
+	if (origin != nullptr) {
+		sr->bind_origin = *origin;
+	}
 	if (!create_v2(max_time, hwnd, *sr)) {
 		delete sr;
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -910,6 +921,7 @@ leiasr_gl_create_for_screen(double max_time, void *hwnd, uint64_t display_id, st
 	(void)max_time;
 	(void)hwnd;
 	(void)display_id;
+	(void)origin;
 	(void)out;
 	U_LOG_W("SR GL per-screen weaver: plug-in built without the SR v2 SDK — not creating");
 	return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -1117,10 +1129,22 @@ leiasr_gl_get_display_pixel_info(struct leiasr_gl *leiasr,
 		return false;
 	}
 
+	// runtime #2311: a per-screen weaver reports its binding's origin, not the
+	// SR location snapshot from create (see leia_sr_multi_win.h).
+	int32_t left = 0;
+	int32_t top = 0;
+	if (leia_win_screen_origin_pick(&leiasr->bind_origin, leiasr->display_screen_left, leiasr->display_screen_top,
+	                                &left, &top) &&
+	    !leiasr->bind_origin_logged.exchange(true, std::memory_order_relaxed)) {
+		U_LOG_W("SR GL per-screen weaver: SR placed the panel at (%d, %d) when this weaver was created, the "
+		        "runtime bound it to the screen at (%d, %d) — reporting the binding's origin (window metrics)",
+		        (int)leiasr->display_screen_left, (int)leiasr->display_screen_top, (int)left, (int)top);
+	}
+
 	*out_display_pixel_width = leiasr->display_pixel_width;
 	*out_display_pixel_height = leiasr->display_pixel_height;
-	*out_display_screen_left = leiasr->display_screen_left;
-	*out_display_screen_top = leiasr->display_screen_top;
+	*out_display_screen_left = left;
+	*out_display_screen_top = top;
 	*out_display_width_m = leiasr->display_width_m;
 	*out_display_height_m = leiasr->display_height_m;
 

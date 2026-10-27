@@ -184,6 +184,79 @@ leia_win_sr_plan_pin_simulated_viewer(uint64_t bound_display_id, uint64_t active
 	return bound_display_id != 0 && active_display_id != 0 && bound_display_id != active_display_id;
 }
 
+/*!
+ * The desktop origin a per-screen DP reports (`get_display_pixel_info`, and
+ * on the Vulkan arm its own window metrics). The runtime builds the window
+ * metrics, and so the window-relative Kooima eye offset, from it.
+ *
+ * The runtime's per-screen contract (xrt_plugin.h, create_dp_vk_for_screen,
+ * which the d3d11/d3d12/gl variants inherit) says this origin is the
+ * binding's desktop origin. The SR location read at weaver create is a
+ * snapshot of whatever Windows listed at that moment: on a DS1 HDMI re-seat
+ * Windows briefly lists the panel alone, as primary, at (0, 0), and a weaver
+ * created inside that window kept (0, 0) for its whole life after the panel
+ * was back at (-3840, 0) — the eye offset was off by one panel width for 36 s
+ * (runtime #2311, -0.458 m instead of -0.114 m).
+ *
+ * `bound` is out of band on purpose: (0, 0) is a real origin (a panel that is
+ * the primary display), not "no value".
+ */
+struct leia_win_screen_origin
+{
+	//! A per-screen DP whose binding carried a desktop rect.
+	bool bound;
+	//! The binding's desktop origin (device px, the space windows are placed in).
+	int32_t left;
+	int32_t top;
+};
+
+/*!
+ * Seed from a screen binding (`xrt_screen_binding::desktop_*`). An empty rect
+ * leaves the origin unbound, so the DP keeps reporting the SR location.
+ */
+static inline struct leia_win_screen_origin
+leia_win_screen_origin_from_binding(int32_t desktop_left,
+                                    int32_t desktop_top,
+                                    uint32_t desktop_width,
+                                    uint32_t desktop_height)
+{
+	struct leia_win_screen_origin o = {false, 0, 0};
+	if (desktop_width == 0 || desktop_height == 0) {
+		return o;
+	}
+	o.bound = true;
+	o.left = desktop_left;
+	o.top = desktop_top;
+	return o;
+}
+
+/*!
+ * The origin to report: the binding's for a per-screen DP, else the SR
+ * location (a window-bound DP, or a binding without a rect: unchanged).
+ *
+ * @param o        This DP's origin (NULL = unbound).
+ * @param sr_left  The SR location cached at weaver create.
+ * @param sr_top   ditto.
+ * @return true when the DP is bound and the SR location disagrees with the
+ *         binding (the case this fixes); the caller logs it once.
+ */
+static inline bool
+leia_win_screen_origin_pick(const struct leia_win_screen_origin *o,
+                            int32_t sr_left,
+                            int32_t sr_top,
+                            int32_t *out_left,
+                            int32_t *out_top)
+{
+	if (o == NULL || !o->bound) {
+		*out_left = sr_left;
+		*out_top = sr_top;
+		return false;
+	}
+	*out_left = o->left;
+	*out_top = o->top;
+	return sr_left != o->left || sr_top != o->top;
+}
+
 #ifdef __cplusplus
 }
 #endif

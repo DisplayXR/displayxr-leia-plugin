@@ -15,6 +15,8 @@ extern "C" {
 //! Forward declaration for the SR context holder
 struct leiasr;
 
+struct leia_win_screen_origin; // leia_sr_multi_win.h
+
 /*!
  * Create a leiasr instance with Vulkan weaver support.
  * Used for per-session rendering with SR interlacing.
@@ -56,6 +58,9 @@ leiasr_create(double maxTime,
  * @param windowHandle The session's HWND for the screen holding the majority
  *                     of the window, NULL for every other screen's DP.
  * @param display_id   The SR display to bind (0 = unknown: routing only).
+ * @param origin       The binding's desktop origin (NULL = unbound): what
+ *                     @ref leiasr_get_display_pixel_info and
+ *                     @ref leiasr_get_window_metrics use, not the SR location.
  */
 xrt_result_t
 leiasr_create_for_screen(double maxTime,
@@ -65,6 +70,7 @@ leiasr_create_for_screen(double maxTime,
                          VkCommandPool commandPool,
                          void *windowHandle,
                          uint64_t display_id,
+                         const struct leia_win_screen_origin *origin,
                          struct leiasr **out);
 
 /*!

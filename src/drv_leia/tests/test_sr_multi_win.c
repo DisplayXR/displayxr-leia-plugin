@@ -180,6 +180,60 @@ test_window_handle_on_the_untracked_screen(void)
 	CHECK(!leia_win_sr_plan_pin_simulated_viewer(AL_ID, AL_ID));
 }
 
+static void
+test_screen_origin_binding_wins_over_a_transient_sr_location(void)
+{
+	/*
+	 * runtime #2311, W10-2: the DS1 (3840x2160, non-main at (-3840, 0)) was
+	 * re-seated; its per-screen DP was bound to (-3840, 0), but its SR context
+	 * was created while Windows listed the panel alone at (0, 0). The DP must
+	 * report the binding's origin, and say once that SR disagreed.
+	 */
+	const struct leia_win_screen_origin o = leia_win_screen_origin_from_binding(-3840, 0, 3840, 2160);
+	CHECK(o.bound && o.left == -3840 && o.top == 0);
+	int32_t left = 1, top = 1;
+	CHECK(leia_win_screen_origin_pick(&o, 0, 0, &left, &top));
+	CHECK(left == -3840 && top == 0);
+	// Once SR agrees (a DP created after the panel is back): same answer, no log.
+	CHECK(!leia_win_screen_origin_pick(&o, -3840, 0, &left, &top));
+	CHECK(left == -3840 && top == 0);
+}
+
+static void
+test_screen_origin_zero_is_a_real_origin(void)
+{
+	// A panel that IS the primary display sits at (0, 0): still bound, and it
+	// wins over an SR location elsewhere.
+	const struct leia_win_screen_origin o = leia_win_screen_origin_from_binding(0, 0, 3840, 2160);
+	CHECK(o.bound);
+	int32_t left = 1, top = 1;
+	CHECK(leia_win_screen_origin_pick(&o, -3840, 0, &left, &top));
+	CHECK(left == 0 && top == 0);
+	// Negative top (a panel above the main display).
+	const struct leia_win_screen_origin above = leia_win_screen_origin_from_binding(0, -2160, 3840, 2160);
+	CHECK(!leia_win_screen_origin_pick(&above, 0, -2160, &left, &top));
+	CHECK(left == 0 && top == -2160);
+}
+
+static void
+test_screen_origin_unbound_keeps_the_sr_location(void)
+{
+	int32_t left = 1, top = 1;
+	// A window-bound DP (create_dp_d3d11 etc.) has no binding: unchanged.
+	const struct leia_win_screen_origin none = {0};
+	CHECK(!leia_win_screen_origin_pick(&none, -3840, 0, &left, &top));
+	CHECK(left == -3840 && top == 0);
+	CHECK(!leia_win_screen_origin_pick(NULL, 0, 0, &left, &top));
+	CHECK(left == 0 && top == 0);
+	// A binding without a rect: nothing to trust, keep the SR location.
+	struct leia_win_screen_origin o = leia_win_screen_origin_from_binding(-3840, 0, 0, 2160);
+	CHECK(!o.bound);
+	CHECK(!leia_win_screen_origin_pick(&o, 5, 6, &left, &top));
+	CHECK(left == 5 && top == 6);
+	o = leia_win_screen_origin_from_binding(-3840, 0, 3840, 0);
+	CHECK(!o.bound);
+}
+
 int
 main(void)
 {
@@ -193,6 +247,9 @@ main(void)
 	test_segment_tracked();
 	test_simulated_viewer_pin();
 	test_window_handle_on_the_untracked_screen();
+	test_screen_origin_binding_wins_over_a_transient_sr_location();
+	test_screen_origin_zero_is_a_real_origin();
+	test_screen_origin_unbound_keeps_the_sr_location();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_multi_win: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

@@ -23,6 +23,8 @@ extern "C" {
  */
 struct leiasr_gl;
 
+struct leia_win_screen_origin; // leia_sr_multi_win.h
+
 /*!
  * Create a GL SR weaver instance.
  *
@@ -58,11 +60,17 @@ leiasr_gl_create(double max_time,
  * @ref leiasr_gl_set_present_origin when @p hwnd is NULL, and pins a simulated
  * viewer when the bound display is not the runtime's active one and has no
  * tracker of its own. v2 API only. The compositor's GL context must be current.
+ * @p origin is the binding's desktop origin (NULL = unbound): it is what
+ * @ref leiasr_gl_get_display_pixel_info reports, not the SR location.
  *
  * @ingroup drv_leia
  */
 xrt_result_t
-leiasr_gl_create_for_screen(double max_time, void *hwnd, uint64_t display_id, struct leiasr_gl **out);
+leiasr_gl_create_for_screen(double max_time,
+                            void *hwnd,
+                            uint64_t display_id,
+                            const struct leia_win_screen_origin *origin,
+                            struct leiasr_gl **out);
 
 /*!
  * Multi-screen M6: the window's client-area origin on this weaver's screen

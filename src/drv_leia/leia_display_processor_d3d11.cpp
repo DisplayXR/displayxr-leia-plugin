@@ -22,6 +22,7 @@
 #include "leia_platform_state.h"
 #include "leia_bg_capture_win.h"
 #include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
+#include "leia_sr_multi_win.h"       // multi-screen M6: the per-screen DP's desktop origin
 #include "xrt/xrt_plugin.h"          // xrt_screen_binding
 
 #ifdef XRT_DP_D3D11_HAS_PRESENT_ORIGIN
@@ -4019,11 +4020,16 @@ leia_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
 	        (int)binding->desktop_height, (int)binding->desktop_left, (int)binding->desktop_top, binding->serial,
 	        (unsigned long long)display_id, window_handle);
 
+	// runtime #2311: the DP reports the binding's desktop origin, never the
+	// SR location (a snapshot that can be a Windows display transient's).
+	const struct leia_win_screen_origin origin = leia_win_screen_origin_from_binding(
+	    binding->desktop_left, binding->desktop_top, binding->desktop_width, binding->desktop_height);
+
 	const char *async_env = std::getenv("DXR_LEIA_ASYNC_WEAVER");
 	const bool async_weaver = !(async_env != NULL && async_env[0] == '0');
 	struct leiasr_d3d11 *weaver = NULL;
 	xrt_result_t ret = leiasr_d3d11_create_for_screen(5.0, d3d11_device, d3d11_context, window_handle, display_id,
-	                                                  async_weaver, &weaver);
+	                                                  &origin, async_weaver, &weaver);
 	if (ret != XRT_SUCCESS || weaver == NULL) {
 		U_LOG_W("Failed to create the SR D3D11 per-screen weaver");
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;

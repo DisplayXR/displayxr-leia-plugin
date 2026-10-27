@@ -220,6 +220,11 @@ struct leiasr
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
+	//! The binding's desktop origin: what get_display_pixel_info and the
+	//! window metrics use instead of the SR location (runtime #2311). Set
+	//! before the create.
+	struct leia_win_screen_origin bind_origin = {false, 0, 0};
+	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
 	bool display_bound = false;
@@ -916,6 +921,23 @@ v2_instance_of(const struct leiasr *sr)
 #endif
 }
 
+/*!
+ * runtime #2311: the desktop origin this instance reports — the binding's for
+ * a per-screen weaver, the SR location cached at create otherwise (see
+ * leia_sr_multi_win.h). Logs once when the two disagree.
+ */
+void
+reported_origin(struct leiasr *sr, int32_t *out_left, int32_t *out_top)
+{
+	if (leia_win_screen_origin_pick(&sr->bind_origin, sr->display_screen_left, sr->display_screen_top, out_left,
+	                                out_top) &&
+	    !sr->bind_origin_logged.exchange(true, std::memory_order_relaxed)) {
+		U_LOG_W("SR Vulkan per-screen weaver: SR placed the panel at (%d, %d) when this weaver was created, the "
+		        "runtime bound it to the screen at (%d, %d) — reporting the binding's origin (window metrics)",
+		        (int)sr->display_screen_left, (int)sr->display_screen_top, (int)*out_left, (int)*out_top);
+	}
+}
+
 } // namespace anonymous
 
 extern "C" {
@@ -1018,6 +1040,7 @@ leiasr_create_for_screen(double maxTime,
                          VkCommandPool commandPool,
                          void *windowHandle,
                          uint64_t display_id,
+                         const struct leia_win_screen_origin *origin,
                          struct leiasr **out)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
@@ -1050,6 +1073,9 @@ leiasr_create_for_screen(double maxTime,
 	// The plan inputs, read by create_v2.
 	sr->screen_bound = true;
 	sr->bind_display_id = display_id;
+	if (origin != nullptr) {
+		sr->bind_origin = *origin;
+	}
 
 	bool unsupported = false;
 	if (!create_v2(maxTime, (HWND)windowHandle, device, physicalDevice, graphicsQueue, commandPool, *sr,
@@ -1077,6 +1103,7 @@ leiasr_create_for_screen(double maxTime,
 	(void)graphicsQueue;
 	(void)commandPool;
 	(void)windowHandle;
+	(void)origin;
 	(void)out;
 	U_LOG_W("SR Vulkan per-screen weaver: built without the SR v2 SDK — no per-screen DP for display 0x%016llx",
 	        (unsigned long long)display_id);
@@ -1716,8 +1743,7 @@ leiasr_get_display_pixel_info(struct leiasr *leiasr,
 
 	*out_display_pixel_width = leiasr->display_pixel_width;
 	*out_display_pixel_height = leiasr->display_pixel_height;
-	*out_display_screen_left = leiasr->display_screen_left;
-	*out_display_screen_top = leiasr->display_screen_top;
+	reported_origin(leiasr, out_display_screen_left, out_display_screen_top);
 	*out_display_width_m = leiasr->display_width_m;
 	*out_display_height_m = leiasr->display_height_m;
 
@@ -1764,8 +1790,9 @@ leiasr_get_window_metrics(struct leiasr *leiasr,
 
 	uint32_t disp_px_w = leiasr->display_pixel_width;
 	uint32_t disp_px_h = leiasr->display_pixel_height;
-	int32_t disp_left = leiasr->display_screen_left;
-	int32_t disp_top = leiasr->display_screen_top;
+	int32_t disp_left = 0;
+	int32_t disp_top = 0;
+	reported_origin(leiasr, &disp_left, &disp_top);
 	float disp_w_m = leiasr->display_width_m;
 	float disp_h_m = leiasr->display_height_m;
 

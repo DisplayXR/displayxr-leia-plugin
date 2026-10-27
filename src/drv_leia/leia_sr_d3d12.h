@@ -23,6 +23,8 @@ extern "C" {
  */
 struct leiasr_d3d12;
 
+struct leia_win_screen_origin; // leia_sr_multi_win.h
+
 /*!
  * Create a D3D12 SR weaver instance.
  *
@@ -60,7 +62,9 @@ leiasr_d3d12_create(double max_time,
  * @ref leiasr_d3d12_set_present_origin when @p hwnd is NULL, and pins a
  * simulated viewer when the bound display is not the runtime's active
  * (tracked) one and it has no tracker of its own. Synchronous (this arm has
- * no async create).
+ * no async create). @p origin is the binding's desktop origin (NULL =
+ * unbound): it is what @ref leiasr_d3d12_get_display_pixel_info reports, not
+ * the SR location.
  *
  * @ingroup drv_leia
  */
@@ -70,6 +74,7 @@ leiasr_d3d12_create_for_screen(double max_time,
                                void *d3d12_command_queue,
                                void *hwnd,
                                uint64_t display_id,
+                               const struct leia_win_screen_origin *origin,
                                struct leiasr_d3d12 **out);
 
 /*!
