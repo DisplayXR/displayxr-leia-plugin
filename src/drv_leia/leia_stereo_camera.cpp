@@ -1333,13 +1333,10 @@ cam_decode(xrt_plugin_stereo_camera *c, const leia_scam_header &hdr)
 		}
 		return false;
 	}
-	// opencv_world343 is delay-loaded from the SR bin dir (runtime#2436): no cv
-	// call before the bind that resolves it, or a missing DLL is an SEH fault.
-	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
-		if (!c->warned_decode) {
-			c->warned_decode = true;
-			U_LOG_W("leia stereo camera: the SR client DLLs (incl. OpenCV) are not usable — frame dropped");
-		}
+	// OpenCV is delay-loaded from the SR bin dir (runtime#2436): no cv call
+	// before the bind that resolves it, or a missing DLL is an SEH fault. The
+	// bind logs the expected path once on failure.
+	if (!leia_sr_opencv_bind()) {
 		return false;
 	}
 	try {

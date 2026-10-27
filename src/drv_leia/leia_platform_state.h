@@ -80,6 +80,15 @@ bool
 leia_sr_client_bound(void);
 
 /*!
+ * Bind the delay-loaded OpenCV (the stereo camera's JPEG decode) from the SR
+ * bin dir. OPTIONAL, unlike leia_sr_client_bind(): false only disables that
+ * decode. MUST be true before any cv:: call. Sticky once true; one WARN with
+ * the expected directory on the first failure (runtime#2436).
+ */
+bool
+leia_sr_opencv_bind(void);
+
+/*!
  * Evaluate the state from a FRESH EDID probe result (the caller just ran
  * leia_edid_probe_display), publish it, log a one-shot WARN on a change and
  * invalidate the cached SR geometry when the matched panel changes (P-c).
