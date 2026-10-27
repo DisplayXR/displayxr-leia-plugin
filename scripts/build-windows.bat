@@ -119,7 +119,8 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: pfnDestroyViewerTracker, pfnViewerTrackerGetViewers, pfnViewerTrackerAddCallback,
 :: pfnViewerTrackerRemoveCallback, pfnWeaverGetViewers, pfnWeaverSetMultiViewerMode;
 :: 117-118 pfnGetMultiViewerConfig, pfnSetMultiViewerConfig. New struct tags 33-36 and
-:: SR_ERROR_ACCESS_DENIED (-14). None of the new API is used by this plug-in.
+:: SR_ERROR_ACCESS_DENIED (-14). The plug-in uses pfnWeaverSetMultiViewerMode + the
+:: multi-viewer capability struct (#446, DXR_LEIA_HAS_SR_MULTI_VIEWER); nothing else new.
 set SR_V2_TAG=sr-sdk-v2-1.39.0.2950
 set SR_V2_DIR=LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
 :: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC

@@ -13,6 +13,7 @@
 #include "leia_sr_ready.h"
 #include "leia_sr_predict_trace.h"
 #include "leia_sr_v2_common.h"
+#include "leia_interface.h" // leia_hmd_active_mode_get (#446)
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
 #include "util/u_logging.h"
@@ -312,6 +313,11 @@ struct leiasr_d3d11
 	//! before every weave: once the senses run, the weaver's own tracking
 	//! feed (no face on this display) wins over a one-time pin.
 	bool viewer_pinned = false;
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+	//! #446: the rendering mode's multi-viewer override as applied to this
+	//! weaver (leia_sr_v2_apply_multiviewer). Re-arms on a new weaver handle.
+	struct leia_sr_v2_mv_state mv = {};
+#endif
 	//! lens_v2 is bound to bind_display_id (SR D3): the vote outlives
 	//! srDestroyLens (context-owned), so it is disabled before destroy.
 	bool lens_bound = false;
@@ -1053,6 +1059,18 @@ w_weave(leiasr_d3d11 *sr)
 			viewer.rightEye.y = sr->pin_right_mm[1];
 			viewer.rightEye.z = sr->pin_right_mm[2];
 			srWeaverSetSimulatedViewer(sr->weaver_v2, &viewer);
+		}
+#endif
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+		// #446: the rendering mode's multi-viewer override (mode 2 = ON, mode 1 =
+		// FOLLOW_CONFIG), applied on change only, right before the weave that
+		// uses it. A weaver pinned to a simulated viewer (an untracked secondary
+		// screen) has no tracked viewers to add and is left alone.
+		if (!sr->viewer_pinned) {
+			uint32_t mode_index = 0;
+			if (leia_hmd_active_mode_get(&mode_index)) {
+				leia_sr_v2_apply_multiviewer(sr->weaver_v2, mode_index, &sr->mv, "D3D11");
+			}
 		}
 #endif
 		srWeaverWeave(sr->weaver_v2);

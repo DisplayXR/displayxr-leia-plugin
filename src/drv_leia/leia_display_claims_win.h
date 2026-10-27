@@ -356,6 +356,24 @@ leia_win_sr_enumerate_shutdown(void);
 bool
 leia_win_sr_probe_external_routing(void);
 
+/*!
+ * #446: can the installed SR runtime weave for more than one viewer
+ * (SrMultiViewerCapabilities::multiViewerWeave, chained on the runtime
+ * capabilities in a query of its OWN, so an older runtime cannot cost any
+ * other capability answer)? Runtime-wide: the D3D11 and Vulkan weavers honour
+ * it, the D3D12 and GL weavers refuse the ON override and weave one viewer.
+ *
+ * Asked on the process-wide probe instance (created on demand if
+ * @ref leia_win_sr_enumerate_displays has not run yet); the answer is latched
+ * for the plug-in instance's lifetime once SR has given one. False when
+ * compiled out (SDK predates the feature), when the SR runtime predates it
+ * (it leaves the field untouched), or when no probe instance can be created
+ * right now (not latched, so a later device creation asks again).
+ * Any thread; may block for the probe instance's short create spin.
+ */
+bool
+leia_win_sr_multi_viewer_weave_supported(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -324,6 +324,50 @@ leia_view_scale_get(float *out_scale_x, float *out_scale_y);
 void
 leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source);
 
+/*!
+ * @name Rendering-mode indices of the Leia head device
+ *
+ * The mode table leia_hmd_create() fills. Mode 2 is listed only when the
+ * installed SR runtime reports multi-viewer weaving (#446); apps never know
+ * about it as such — they see one more entry in
+ * xrEnumerateDisplayRenderingModesDXR and select it like any other.
+ * @{
+ */
+#define LEIA_MODE_2D 0u                //!< Flat, one view, lens off.
+#define LEIA_MODE_3D 1u                //!< LeiaSR; multi-viewer follows the SR system setting.
+#define LEIA_MODE_3D_MULTI_VIEWER 2u   //!< LeiaSR with multi-viewer weaving forced on.
+/*! @} */
+
+/*!
+ * The active rendering-mode index of the live Leia head device, for the
+ * display processors (#446).
+ *
+ * Why the DPs read the device instead of being told: the DP vtables only get
+ * `request_display_mode(bool 3d)`, which cannot tell mode 1 from mode 2, and
+ * the runtime writes `xdev->hmd->active_rendering_mode_index` directly from
+ * several places (state tracker, compositor hotkeys, the service). The device
+ * field is therefore the one place the mode is always current; the weave path
+ * reads it each frame and applies only changes.
+ *
+ * "Live" = the most recently created Leia head device that has not been
+ * destroyed. The runtime creates one head device per plug-in instance (one
+ * per process in practice; the multi-screen segments are display processors
+ * of that same device, not further devices), so one pointer is enough. If a
+ * second device were ever created while the first lived, the newer one wins
+ * and destroying the older one does not clear it.
+ *
+ * Thread-safe: the read and the device's destroy are serialised, so a weave
+ * thread never dereferences a freed device. Cheap (one uncontended lock).
+ *
+ * @param[out] out_mode_index The active mode index.
+ * @return false (and @p out_mode_index untouched) when no Leia head device is
+ *         alive in this process — the caller then leaves its weaver alone.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_hmd_active_mode_get(uint32_t *out_mode_index);
+
 #ifdef __cplusplus
 }
 #endif
