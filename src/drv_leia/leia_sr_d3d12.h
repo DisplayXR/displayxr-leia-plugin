@@ -89,6 +89,23 @@ void
 leiasr_d3d12_set_present_origin(struct leiasr_d3d12 *leiasr, int32_t panel_x, int32_t panel_y);
 
 /*!
+ * Drag phase-snap for the runtime-owned window holding this weaver
+ * (runtime#2405): the D3D12 twin of leiasr_d3d11_snap_window_rect. v2 weavers
+ * only; false (the caller keeps its target) on the v1 path, before the weaver
+ * exists, or when SR declines.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d12_snap_window_rect(struct leiasr_d3d12 *leiasr,
+                              int32_t origin_x,
+                              int32_t origin_y,
+                              int32_t target_x,
+                              int32_t target_y,
+                              int32_t *out_x,
+                              int32_t *out_y);
+
+/*!
  * Destroy a D3D12 SR weaver instance.
  *
  * @param leiasr_ptr Pointer to the instance pointer (set to NULL on return).

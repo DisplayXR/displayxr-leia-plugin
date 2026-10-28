@@ -2917,6 +2917,24 @@ leia_dp_d3d12_set_present_origin(struct xrt_display_processor_d3d12 *xdp, int32_
 }
 #endif
 
+#ifdef XRT_DP_D3D12_HAS_SNAP_WINDOW_RECT
+/*!
+ * runtime#2405: phase-snap the runtime-owned window the user is dragging —
+ * the D3D12 twin of the D3D11 slot 18, same body (srWeaverSnapToPhase).
+ */
+static bool
+leia_dp_d3d12_snap_window_rect(struct xrt_display_processor_d3d12 *xdp,
+                               int32_t origin_x,
+                               int32_t origin_y,
+                               int32_t target_x,
+                               int32_t target_y,
+                               int32_t *out_x,
+                               int32_t *out_y)
+{
+	return leiasr_d3d12_snap_window_rect(leia_dp_d3d12(xdp)->leiasr, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+#endif
+
 /*!
  * Fill the vtable and the per-DP state both factories share, around a weaver
  * that already exists. The plain factory and the per-screen one (multi-screen
@@ -2957,6 +2975,9 @@ leia_dp_d3d12_init(struct leia_display_processor_d3d12_impl *ldp,
 #endif
 #ifdef XRT_DP_D3D12_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_d3d12_set_present_origin; // multi-screen M6 (slot 24)
+#endif
+#ifdef XRT_DP_D3D12_HAS_SNAP_WINDOW_RECT
+	ldp->base.snap_window_rect = leia_dp_d3d12_snap_window_rect; // runtime#2405 drag phase-snap (slot 26)
 #endif
 	// #224 / ADR-027 local 2D/3D zones — 1×1 leg (runtime gates on struct_size).
 	ldp->base.get_local_zone_caps = leia_dp_d3d12_get_local_zone_caps;

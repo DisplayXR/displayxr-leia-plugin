@@ -156,6 +156,28 @@ leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *ou
 const char *
 leia_sr_v2_result_str(SrResult r);
 
+/*!
+ * The windowless drag phase-snap (#625 / runtime#2405): srWeaverSnapToPhase
+ * on @p weaver, shared by every Windows backend's snap_window_rect slot. The
+ * query reads the weaver's bound lens and current orientation, so one body is
+ * right for D3D11, D3D12 and GL alike. @p arm names the backend in log lines.
+ *
+ * Returns true with the snapped top-left in @p out_x / @p out_y; false (the
+ * caller keeps its target) when the runtime has no srWeaverSnapToPhase, when
+ * SR declines (nothing to correct, e.g. no viewing distance yet), or on error.
+ * @p weaver must be a live handle: a NULL one is refused before the dispatch
+ * slot is reached, so it is not a capability probe.
+ */
+bool
+leia_sr_v2_snap_to_phase(SrWeaver weaver,
+                         const char *arm,
+                         int32_t origin_x,
+                         int32_t origin_y,
+                         int32_t target_x,
+                         int32_t target_y,
+                         int32_t *out_x,
+                         int32_t *out_y);
+
 /* ------------------------------------------------------------------ *
  * Absolute target time (SR SDK 1584: srGetTimeUs + srWeaverSetTargetTime)
  *

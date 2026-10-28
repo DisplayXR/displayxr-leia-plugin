@@ -956,6 +956,33 @@ leiasr_gl_set_present_origin(struct leiasr_gl *leiasr, int32_t panel_x, int32_t 
 	leiasr->present_origin_y.store(panel_y, std::memory_order_relaxed);
 }
 
+bool
+leiasr_gl_snap_window_rect(struct leiasr_gl *leiasr,
+                           int32_t origin_x,
+                           int32_t origin_y,
+                           int32_t target_x,
+                           int32_t target_y,
+                           int32_t *out_x,
+                           int32_t *out_y)
+{
+	if (leiasr == nullptr || !w_ready(leiasr)) {
+		return false;
+	}
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr->weaver_v2 != nullptr) {
+		return leia_sr_v2_snap_to_phase(leiasr->weaver_v2, "GL", origin_x, origin_y, target_x, target_y, out_x,
+		                                out_y);
+	}
+#endif
+	(void)origin_x;
+	(void)origin_y;
+	(void)target_x;
+	(void)target_y;
+	(void)out_x;
+	(void)out_y;
+	return false;
+}
+
 void
 leiasr_gl_destroy(struct leiasr_gl **leiasr_ptr)
 {

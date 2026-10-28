@@ -2092,6 +2092,24 @@ leia_dp_gl_set_present_origin(struct xrt_display_processor_gl *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
+/*!
+ * runtime#2405: phase-snap the runtime-owned window the user is dragging —
+ * the GL twin of the D3D11 slot 18, same body (srWeaverSnapToPhase).
+ */
+static bool
+leia_dp_gl_snap_window_rect(struct xrt_display_processor_gl *xdp,
+                            int32_t origin_x,
+                            int32_t origin_y,
+                            int32_t target_x,
+                            int32_t target_y,
+                            int32_t *out_x,
+                            int32_t *out_y)
+{
+	return leiasr_gl_snap_window_rect(leia_dp_gl(xdp)->leiasr, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+#endif
+
 static void
 leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 {
@@ -2122,6 +2140,9 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 #endif
 #ifdef XRT_DP_GL_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_gl_set_present_origin; // multi-screen M6 (slot 22)
+#endif
+#ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
+	ldp->base.snap_window_rect = leia_dp_gl_snap_window_rect; // runtime#2405 drag phase-snap (slot 24)
 #endif
 }
 
