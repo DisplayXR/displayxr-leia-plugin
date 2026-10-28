@@ -227,9 +227,11 @@ leiasr_geometry_get_pending(const struct leia_desktop_rect *bound, struct leiasr
  * #469: keep the pending-panel refresher running (start it if it is not), so
  * the attached-panel snapshot stays fresh for the next
  * LEIASR_PENDING_IDLE_STOP_MS. Two atomics on the common path; the first call
- * of an episode starts the thread. Called by the pending DP getters and by the
- * D3D11 create retry worker (which warms the snapshot before the first frame
- * asks, and keeps it fresh through an attempt's SR spin).
+ * of an episode starts the thread. Called by the pending DP getters, whose
+ * per-frame calls keep it warm while a DP waits, and by the D3D11 create retry
+ * worker at each attempt and wait tick, which warms the snapshot before the
+ * first frame asks. An attempt's SR spin outlasts the idle window, so the
+ * worker's pokes alone do not span it.
  *
  * @ingroup drv_leia
  */
