@@ -291,6 +291,10 @@ struct leiasr_d3d11
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
+	//! The binding's desktop origin: what get_display_pixel_info reports
+	//! instead of the SR location (runtime #2311). Set before any create.
+	struct leia_win_screen_origin bind_origin = {false, 0, 0};
+	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
 	bool display_bound = false;
@@ -2196,6 +2200,7 @@ leiasr_d3d11_create_for_screen(double max_time,
                                void *d3d11_context,
                                void *hwnd,
                                uint64_t display_id,
+                               const struct leia_win_screen_origin *origin,
                                bool async,
                                struct leiasr_d3d11 **out)
 {
@@ -2212,6 +2217,9 @@ leiasr_d3d11_create_for_screen(double max_time,
 	// The plan inputs — read by create_v2 on whichever thread creates.
 	sr->screen_bound = true;
 	sr->bind_display_id = display_id;
+	if (origin != nullptr) {
+		sr->bind_origin = *origin;
+	}
 
 	if (!async) {
 		if (!create_weaver_attempt(sr, max_time, hwnd)) {
@@ -3305,10 +3313,23 @@ leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
 		return false;
 	}
 
+	// runtime #2311: a per-screen weaver reports its binding's origin. The SR
+	// location is a snapshot from create, and one taken inside a Windows
+	// display transient stays wrong for the weaver's whole life.
+	int32_t left = 0;
+	int32_t top = 0;
+	if (leia_win_screen_origin_pick(&leiasr->bind_origin, leiasr->display_screen_left, leiasr->display_screen_top,
+	                                &left, &top) &&
+	    !leiasr->bind_origin_logged.exchange(true, std::memory_order_relaxed)) {
+		U_LOG_W("SR D3D11 per-screen weaver: SR placed the panel at (%d, %d) when this weaver was created, the "
+		        "runtime bound it to the screen at (%d, %d) — reporting the binding's origin (window metrics)",
+		        (int)leiasr->display_screen_left, (int)leiasr->display_screen_top, (int)left, (int)top);
+	}
+
 	*out_display_pixel_width = leiasr->display_pixel_width;
 	*out_display_pixel_height = leiasr->display_pixel_height;
-	*out_display_screen_left = leiasr->display_screen_left;
-	*out_display_screen_top = leiasr->display_screen_top;
+	*out_display_screen_left = left;
+	*out_display_screen_top = top;
 	*out_display_width_m = leiasr->display_width_m;
 	*out_display_height_m = leiasr->display_height_m;
 

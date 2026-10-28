@@ -21,6 +21,7 @@
 #include "leia_sr.h"
 #include "leia_platform_state.h"
 #include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
+#include "leia_sr_multi_win.h"       // multi-screen M6: the per-screen DP's desktop origin
 
 #include "xrt/xrt_plugin.h" // struct xrt_screen_binding (create_dp_vk_for_screen)
 
@@ -2237,8 +2238,8 @@ leia_dp_vk_accepts_atlas_encoding(struct xrt_display_processor_vk *xdp, enum xrt
 
 /*!
  * The one creation path. @p for_screen selects the per-screen weaver
- * (multi-screen M6, leiasr_create_for_screen, bound to @p display_id); false is
- * the plain factory, byte-identical to before.
+ * (multi-screen M6, leiasr_create_for_screen, bound to @p display_id and
+ * reporting @p origin); false is the plain factory, byte-identical to before.
  */
 static xrt_result_t
 leia_dp_create_vk(void *vk_bundle_ptr,
@@ -2247,6 +2248,7 @@ leia_dp_create_vk(void *vk_bundle_ptr,
                   int32_t target_format,
                   bool for_screen,
                   uint64_t display_id,
+                  const struct leia_win_screen_origin *origin,
                   struct xrt_display_processor **out_xdp)
 {
 	// Install-order P-a: the SR client DLLs are delay-loaded. Bind them all
@@ -2328,7 +2330,8 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 	xrt_result_t ret =
 	    for_screen
 	        ? leiasr_create_for_screen(5.0, vk->device, vk->physical_device, vk->main_queue->queue,
-	                                   (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, display_id, &leiasr)
+	                                   (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, display_id, origin,
+	                                   &leiasr)
 	        : leiasr_create(5.0, vk->device, vk->physical_device, vk->main_queue->queue,
 	                        (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, &leiasr);
 	if (ret != XRT_SUCCESS || leiasr == NULL) {
@@ -2397,7 +2400,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
                    struct xrt_display_processor **out_xdp)
 {
 	return leia_dp_create_vk(vk_bundle_ptr, vk_cmd_pool, window_handle, target_format, /*for_screen=*/false, 0,
-	                         out_xdp);
+	                         nullptr, out_xdp);
 }
 
 /*
@@ -2438,8 +2441,12 @@ leia_dp_factory_vk_for_screen(struct xrt_plugin_instance *inst,
 	    (unsigned long long)binding->monitor_id, binding->device_name, (int)binding->desktop_width,
 	    (int)binding->desktop_height, (int)binding->desktop_left, (int)binding->desktop_top, binding->serial,
 	    (unsigned long long)display_id, window_handle);
+	// runtime #2311: the DP reports the binding's desktop origin, never the
+	// SR location (a snapshot that can be a Windows display transient's).
+	const struct leia_win_screen_origin origin = leia_win_screen_origin_from_binding(
+	    binding->desktop_left, binding->desktop_top, binding->desktop_width, binding->desktop_height);
 	return leia_dp_create_vk(vk_bundle, vk_cmd_pool, window_handle, target_format, /*for_screen=*/true, display_id,
-	                         out_xdp);
+	                         &origin, out_xdp);
 }
 
 

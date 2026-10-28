@@ -23,6 +23,8 @@ extern "C" {
  */
 struct leiasr_d3d11;
 
+struct leia_win_screen_origin; // leia_sr_multi_win.h
+
 /*!
  * Create a D3D11 SR weaver instance.
  *
@@ -79,7 +81,9 @@ leiasr_d3d11_create_async(double max_time,
  * the SDK's drag snap only when @p hwnd is real, phases from
  * @ref leiasr_d3d11_set_present_origin when @p hwnd is NULL, and pins a
  * simulated viewer when the bound display is not the runtime's active
- * (tracked) one. @p async selects the #144 worker create.
+ * (tracked) one. @p async selects the #144 worker create. @p origin is the
+ * binding's desktop origin (NULL = unbound): it is what
+ * @ref leiasr_d3d11_get_display_pixel_info reports, not the SR location.
  */
 xrt_result_t
 leiasr_d3d11_create_for_screen(double max_time,
@@ -87,6 +91,7 @@ leiasr_d3d11_create_for_screen(double max_time,
                                void *d3d11_context,
                                void *hwnd,
                                uint64_t display_id,
+                               const struct leia_win_screen_origin *origin,
                                bool async,
                                struct leiasr_d3d11 **out);
 
@@ -387,6 +392,8 @@ leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d
 /*!
  * Get display pixel resolution, screen position, and physical size.
  * Used for computing window metrics (adaptive FOV and eye offset).
+ * A per-screen weaver reports its binding's desktop origin; every other
+ * weaver the SR location cached at create.
  *
  * @param leiasr The D3D11 weaver instance.
  * @param[out] out_display_pixel_width Display width in pixels.

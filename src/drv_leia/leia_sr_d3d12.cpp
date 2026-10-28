@@ -167,6 +167,10 @@ struct leiasr_d3d12
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
+	//! The binding's desktop origin: what get_display_pixel_info reports
+	//! instead of the SR location (runtime #2311). Set before the create.
+	struct leia_win_screen_origin bind_origin = {false, 0, 0};
+	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
 	bool display_bound = false;
@@ -1075,8 +1079,9 @@ extern "C" {
 
 /*!
  * The one create both entry points share. @p screen_bound / @p display_id are
- * the multi-screen M6 plan inputs (create_v2 reads them); an unbound create is
- * exactly the pre-M6 one.
+ * the multi-screen M6 plan inputs (create_v2 reads them), @p origin the
+ * binding's desktop origin (NULL = unbound); an unbound create is exactly the
+ * pre-M6 one.
  */
 static xrt_result_t
 leiasr_d3d12_create_impl(double max_time,
@@ -1087,6 +1092,7 @@ leiasr_d3d12_create_impl(double max_time,
                          uint32_t view_height,
                          bool screen_bound,
                          uint64_t display_id,
+                         const struct leia_win_screen_origin *origin,
                          struct leiasr_d3d12 **out)
 {
 	if (d3d12_device == nullptr) {
@@ -1101,6 +1107,9 @@ leiasr_d3d12_create_impl(double max_time,
 	sr->view_height = view_height;
 	sr->screen_bound = screen_bound;
 	sr->bind_display_id = display_id;
+	if (origin != nullptr) {
+		sr->bind_origin = *origin;
+	}
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leia_sr_api_selected() == LEIA_SR_API_V2) {
@@ -1228,7 +1237,7 @@ leiasr_d3d12_create(double max_time,
                     struct leiasr_d3d12 **out)
 {
 	return leiasr_d3d12_create_impl(max_time, d3d12_device, d3d12_command_queue, hwnd, view_width, view_height,
-	                                false, 0, out);
+	                                false, 0, nullptr, out);
 }
 
 xrt_result_t
@@ -1237,10 +1246,11 @@ leiasr_d3d12_create_for_screen(double max_time,
                                void *d3d12_command_queue,
                                void *hwnd,
                                uint64_t display_id,
+                               const struct leia_win_screen_origin *origin,
                                struct leiasr_d3d12 **out)
 {
-	const xrt_result_t ret =
-	    leiasr_d3d12_create_impl(max_time, d3d12_device, d3d12_command_queue, hwnd, 0, 0, true, display_id, out);
+	const xrt_result_t ret = leiasr_d3d12_create_impl(max_time, d3d12_device, d3d12_command_queue, hwnd, 0, 0, true,
+	                                                  display_id, origin, out);
 	if (ret == XRT_SUCCESS) {
 		U_LOG_I("Created D3D12 SR per-screen weaver for display 0x%016llx, HWND %p",
 		        (unsigned long long)display_id, hwnd);
@@ -1717,10 +1727,22 @@ leiasr_d3d12_get_display_pixel_info(struct leiasr_d3d12 *leiasr,
 		return false;
 	}
 
+	// runtime #2311: a per-screen weaver reports its binding's origin, not the
+	// SR location snapshot from create (see leia_sr_multi_win.h).
+	int32_t left = 0;
+	int32_t top = 0;
+	if (leia_win_screen_origin_pick(&leiasr->bind_origin, leiasr->display_screen_left, leiasr->display_screen_top,
+	                                &left, &top) &&
+	    !leiasr->bind_origin_logged.exchange(true, std::memory_order_relaxed)) {
+		U_LOG_W("SR D3D12 per-screen weaver: SR placed the panel at (%d, %d) when this weaver was created, the "
+		        "runtime bound it to the screen at (%d, %d) — reporting the binding's origin (window metrics)",
+		        (int)leiasr->display_screen_left, (int)leiasr->display_screen_top, (int)left, (int)top);
+	}
+
 	*out_display_pixel_width = leiasr->display_pixel_width;
 	*out_display_pixel_height = leiasr->display_pixel_height;
-	*out_display_screen_left = leiasr->display_screen_left;
-	*out_display_screen_top = leiasr->display_screen_top;
+	*out_display_screen_left = left;
+	*out_display_screen_top = top;
 	*out_display_width_m = leiasr->display_width_m;
 	*out_display_height_m = leiasr->display_height_m;
 
