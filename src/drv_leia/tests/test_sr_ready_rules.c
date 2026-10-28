@@ -153,12 +153,38 @@ test_pick(void)
 	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &moved, &no_rect) == LEIASR_PENDING_GEOMETRY_KEPT);
 }
 
+static void
+test_pending_snapshot(void)
+{
+	// The getters trust the refresher's snapshot for 500 ms; none yet, or an
+	// older one (the refresher stalled or idled out), reads as no panel.
+	CHECK(!leiasr_pending_snapshot_fresh(10000, 0));
+	CHECK(leiasr_pending_snapshot_fresh(10000, 10000));
+	CHECK(leiasr_pending_snapshot_fresh(10000, 10000 - LEIASR_PENDING_REFRESH_MS));
+	CHECK(leiasr_pending_snapshot_fresh(10000, 10000 - LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS));
+	CHECK(!leiasr_pending_snapshot_fresh(10000, 10000 - LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS - 1));
+	// Taken by the refresher just after the reader read its clock.
+	CHECK(leiasr_pending_snapshot_fresh(10000, 10001));
+	// A refresh period plus a slow EDID enumeration still fits.
+	CHECK(LEIASR_PENDING_REFRESH_MS < LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS);
+
+	// The refresher runs while asked within the idle period, then stops.
+	CHECK(!leiasr_pending_refresher_wanted(10000, 0));
+	CHECK(leiasr_pending_refresher_wanted(10000, 10000));
+	CHECK(leiasr_pending_refresher_wanted(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS + 1));
+	CHECK(!leiasr_pending_refresher_wanted(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS));
+	CHECK(leiasr_pending_refresher_wanted(10000, 10002)); // asked after the refresher read its clock
+	// It outlives a snapshot: while asked, the snapshot never ages out.
+	CHECK(LEIASR_PENDING_IDLE_STOP_MS > LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS);
+}
+
 int
 main(void)
 {
 	test_wake();
 	test_identity();
 	test_pick();
+	test_pending_snapshot();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_ready_rules: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

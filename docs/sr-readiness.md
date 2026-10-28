@@ -143,6 +143,21 @@ create synchronously and have no pending state):
   "panel alone at (0, 0)" re-seat transient). A panel never verified in this
   process gets nothing, as before. The pick is in the same header and test.
 
+  The getters run on the render thread, every frame while the weaver is
+  pending, so they never refresh the platform state themselves: that takes the
+  platform state's lock exclusively, reads the registry, queries the SR Service
+  status, and re-runs the EDID enumeration whenever the monitor set changed —
+  exactly in the replug window. A **pending-panel refresher** thread does it
+  every 100 ms instead and keeps the attached panel; the getters only read that
+  copy under the readiness module's short mutex. The D3D11 create retry worker
+  starts the refresher (so the snapshot is warm before the first frame asks),
+  every getter call keeps it running, and it exits 2 s after the last ask. A
+  snapshot older than 500 ms, or none yet, reads as "no panel attached", so a
+  stalled refresher means nothing is reported, never a panel that may have
+  gone. Worst case after an unplug: one refresh period plus that refresh's
+  EDID enumeration (bounded at 500 ms by the snapshot age), as when the getter
+  refreshed itself, but off the render thread.
+
   Reporting a size is what the runtime's segments manager reads as "this DP
   can carry the session" (displayxr-runtime ADR-047 A8, `dp_ready`), so a
   pending DP for a panel that is attached again now counts as ready during the

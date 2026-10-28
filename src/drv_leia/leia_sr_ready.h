@@ -207,9 +207,12 @@ struct leiasr_pending_geometry
 
 /*!
  * #469: resolve @ref leiasr_pending_geometry for a DP whose weaver is still
- * being created. Re-evaluates the platform state first (a topology signature;
- * the EDID enumeration re-runs only when the monitor set changed), so a panel
- * that has just gone is not reported. Never queries SR.
+ * being created. Safe on the render thread: it never refreshes the platform
+ * state and never queries SR. It reads the attached panel the pending-panel
+ * refresher keeps (re-read every LEIASR_PENDING_REFRESH_MS on its own thread,
+ * so a panel that has just gone stops being reported within one refresh), and
+ * treats a snapshot older than LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS as no panel.
+ * Each call also asks the refresher to keep going (@ref leiasr_pending_refresh_poke).
  *
  * @param bound A per-screen DP's binding rect (NULL or invalid: not per-screen).
  * @return true when @p out carries a geometry to report.
@@ -220,7 +223,21 @@ bool
 leiasr_geometry_get_pending(const struct leia_desktop_rect *bound, struct leiasr_pending_geometry *out);
 
 /*!
- * Stop the watcher (if running) and wait briefly for it to exit. Idempotent.
+ * #469: keep the pending-panel refresher running (start it if it is not), so
+ * the attached-panel snapshot stays fresh for the next
+ * LEIASR_PENDING_IDLE_STOP_MS. Two atomics on the common path; the first call
+ * of an episode starts the thread. Called by the pending DP getters and by the
+ * D3D11 create retry worker (which warms the snapshot before the first frame
+ * asks, and keeps it fresh through an attempt's SR spin).
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_pending_refresh_poke(void);
+
+/*!
+ * Stop the watcher and the pending-panel refresher (if running) and wait
+ * briefly for them to exit. Idempotent.
  *
  * @ingroup drv_leia
  */

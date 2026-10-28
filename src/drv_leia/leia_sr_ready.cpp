@@ -41,8 +41,6 @@ constexpr DWORD kWaitPollMs = 100;
 constexpr DWORD kWatcherPollMs = 1000;
 //! Floor for an SR-side verification spin once identified (see ready_clamp).
 constexpr double kClampFloorS = 1.0;
-//! #469: how stale the panel state may be when a pending DP reports geometry.
-constexpr uint64_t kPendingRefreshMs = 100;
 
 std::mutex g_mu; // guards everything below except the atomics
 
@@ -66,6 +64,13 @@ xrt_device *g_hmd = nullptr;
 leiasr_geometry g_kept = {};
 leia_panel_identity g_kept_on = {};
 
+// --- #469: the pending-panel refresher's snapshot ----------------------------
+// The panel the platform state matched at the refresher's last pass, and when.
+// The pending DP getters read only this (render thread, every frame); the
+// platform refresh itself runs on the refresher thread.
+leia_panel_identity g_attached = {};
+uint64_t g_attached_ms = 0; //!< 0 = never refreshed
+
 // --- #468: verified-geometry publishes, the retry's second wake signal -------
 std::atomic<uint32_t> g_publish_epoch{0};
 
@@ -78,6 +83,17 @@ std::atomic<bool> g_watcher_shutdown{false};
 std::mutex g_watcher_mu;         // serialises start vs shutdown
 HANDLE g_watcher_stop = nullptr; // manual-reset
 HANDLE g_watcher_done = nullptr; // manual-reset
+
+// --- #469: the pending-panel refresher ---------------------------------------
+// Runs while a pending DP or a create retry asked within
+// LEIASR_PENDING_IDLE_STOP_MS (g_pending_demand_ms), then exits; the next ask
+// starts it again. Detached, like the watcher.
+std::atomic<uint64_t> g_pending_demand_ms{0};
+std::atomic<bool> g_refresher_running{false};
+std::atomic<bool> g_refresher_shutdown{false};
+std::mutex g_refresher_mu;         // serialises start vs shutdown
+HANDLE g_refresher_stop = nullptr; // manual-reset
+HANDLE g_refresher_done = nullptr; // manual-reset
 
 double
 budget_from_env()
@@ -246,6 +262,72 @@ watcher_body()
 	U_LOG_I("Leia SR readiness watcher exiting after %.0f s", (double)(GetTickCount64() - t0) / 1000.0);
 	g_watcher_running.store(false);
 	SetEvent(g_watcher_done);
+}
+
+//! #469: one pass — re-read the platform state, keep the attached panel.
+void
+pending_refresh_once()
+{
+	// The platform state lock is taken before g_mu, never after: its refresh
+	// can call back into leiasr_geometry_invalidate (g_mu) while holding it.
+	// A topology signature; the EDID enumeration re-runs only when the
+	// monitor set changed, and then this is the pass that notices an unplug.
+	(void)leia_platform_state_refresh(UINT32_MAX);
+	leia_panel_identity p = {};
+	(void)leia_platform_matched_panel(&p);
+	const uint64_t now_ms = GetTickCount64();
+	std::lock_guard<std::mutex> lk(g_mu);
+	g_attached = p;
+	g_attached_ms = now_ms != 0 ? now_ms : 1;
+}
+
+void
+refresher_body()
+{
+	for (;;) {
+		pending_refresh_once();
+		if (WaitForSingleObject(g_refresher_stop, LEIASR_PENDING_REFRESH_MS) == WAIT_OBJECT_0) {
+			break;
+		}
+		if (leiasr_pending_refresher_wanted(GetTickCount64(), g_pending_demand_ms.load(std::memory_order_acquire))) {
+			continue;
+		}
+		// Idle: stand down, unless an ask slipped in after the check (it saw
+		// the flag still set and did not start a thread) — then take it back.
+		g_refresher_running.store(false, std::memory_order_release);
+		if (!g_refresher_shutdown.load() &&
+		    leiasr_pending_refresher_wanted(GetTickCount64(),
+		                                    g_pending_demand_ms.load(std::memory_order_acquire)) &&
+		    !g_refresher_running.exchange(true, std::memory_order_acq_rel)) {
+			continue;
+		}
+		SetEvent(g_refresher_done);
+		return;
+	}
+	g_refresher_running.store(false, std::memory_order_release);
+	SetEvent(g_refresher_done);
+}
+
+void
+refresher_start()
+{
+	std::lock_guard<std::mutex> lk(g_refresher_mu);
+	if (g_refresher_shutdown.load() || g_refresher_running.load()) {
+		return;
+	}
+	if (g_refresher_stop == nullptr) {
+		g_refresher_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+		g_refresher_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+		if (g_refresher_stop == nullptr || g_refresher_done == nullptr) {
+			U_LOG_E("Leia pending-panel refresher: CreateEvent failed (%lu) — a pending DP reports no "
+			        "geometry (#469)",
+			        (unsigned long)GetLastError());
+			return;
+		}
+	}
+	ResetEvent(g_refresher_done);
+	g_refresher_running.store(true);
+	std::thread([]() { refresher_body(); }).detach();
 }
 
 } // namespace
@@ -458,19 +540,14 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 		return false;
 	}
 	*out = {};
-	// Fresh panel state first, outside g_mu (lock order: the platform state
-	// lock is taken before g_mu, never after). A topology signature, at most
-	// every 100 ms; the EDID enumeration re-runs only when the monitor set
-	// changed — then this is the call that notices an unplug, so a panel
-	// that has just gone is not reported for long.
-	static std::atomic<uint64_t> s_refresh_ms{0};
+	// Render thread, every frame while the weaver is pending: no platform
+	// refresh here (registry, SR Service status, an EDID enumeration — all
+	// under the platform state's exclusive lock, and exactly in the replug
+	// window). The refresher re-reads it every LEIASR_PENDING_REFRESH_MS on
+	// its own thread; this keeps it going and reads its snapshot. A stale or
+	// missing snapshot leaves `attached` invalid: nothing is reported.
+	leiasr_pending_refresh_poke();
 	const uint64_t now_ms = GetTickCount64();
-	uint64_t last_ms = s_refresh_ms.load(std::memory_order_relaxed);
-	if (now_ms - last_ms >= kPendingRefreshMs &&
-	    s_refresh_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
-		(void)leia_platform_state_refresh(UINT32_MAX);
-	}
-	(void)leia_platform_matched_panel(&out->attached);
 
 	leiasr_geometry verified = {};
 	leiasr_geometry kept = {};
@@ -479,6 +556,9 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 		verified = g_geom;
 		kept = g_kept;
 		out->kept_on = g_kept_on;
+		if (leiasr_pending_snapshot_fresh(now_ms, g_attached_ms)) {
+			out->attached = g_attached;
+		}
 	}
 	out->source = leiasr_pending_geometry_pick(verified.valid, kept.valid, &out->kept_on, &out->attached, bound);
 	switch (out->source) {
@@ -490,8 +570,26 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 }
 
 void
+leiasr_pending_refresh_poke(void)
+{
+	g_pending_demand_ms.store(GetTickCount64(), std::memory_order_release);
+	if (g_refresher_running.load(std::memory_order_acquire) || g_refresher_shutdown.load()) {
+		return;
+	}
+	refresher_start();
+}
+
+void
 leiasr_ready_shutdown(void)
 {
+	{
+		std::lock_guard<std::mutex> lk(g_refresher_mu);
+		g_refresher_shutdown.store(true);
+		if (g_refresher_running.load() && g_refresher_stop != nullptr) {
+			SetEvent(g_refresher_stop);
+			(void)WaitForSingleObject(g_refresher_done, 1000);
+		}
+	}
 	std::lock_guard<std::mutex> lk(g_watcher_mu);
 	g_watcher_shutdown.store(true);
 	if (!g_watcher_running.load() || g_watcher_stop == nullptr) {
@@ -589,6 +687,11 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 		*out = {};
 	}
 	return false;
+}
+
+void
+leiasr_pending_refresh_poke(void)
+{
 }
 
 void

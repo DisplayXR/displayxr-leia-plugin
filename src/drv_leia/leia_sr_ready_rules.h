@@ -186,6 +186,48 @@ leiasr_pending_geometry_source_name(enum leiasr_pending_geometry_source s)
 	}
 }
 
+/*
+ * The attached-panel snapshot a pending DP reads. The DP getters run on the
+ * render thread every frame while the weaver is pending, so they never
+ * refresh the platform state themselves (registry, SR Service status, the
+ * EDID enumeration on a monitor-set change, all under the platform state's
+ * exclusive lock). A refresher thread does it every
+ * LEIASR_PENDING_REFRESH_MS while a pending DP or a create retry asked for it
+ * within LEIASR_PENDING_IDLE_STOP_MS, and keeps the attached panel; the
+ * getters read that copy. A snapshot older than
+ * LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS (or none yet) reads as "no panel
+ * attached": nothing is reported rather than a panel that may have gone.
+ */
+#define LEIASR_PENDING_REFRESH_MS 100
+#define LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS 500
+#define LEIASR_PENDING_IDLE_STOP_MS 2000
+
+//! May a pending DP trust the attached-panel snapshot taken at @p snapshot_ms (0 = none yet)?
+static inline bool
+leiasr_pending_snapshot_fresh(uint64_t now_ms, uint64_t snapshot_ms)
+{
+	if (snapshot_ms == 0) {
+		return false;
+	}
+	if (snapshot_ms >= now_ms) {
+		return true; // taken just after the reader read its clock
+	}
+	return now_ms - snapshot_ms <= LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS;
+}
+
+//! Keep the refresher running? Only while someone asked at @p demand_ms (0 = never) recently.
+static inline bool
+leiasr_pending_refresher_wanted(uint64_t now_ms, uint64_t demand_ms)
+{
+	if (demand_ms == 0) {
+		return false;
+	}
+	if (demand_ms >= now_ms) {
+		return true; // asked just after the refresher read its clock
+	}
+	return now_ms - demand_ms < LEIASR_PENDING_IDLE_STOP_MS;
+}
+
 #ifdef __cplusplus
 }
 #endif

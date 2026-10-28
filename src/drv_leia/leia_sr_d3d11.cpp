@@ -1913,6 +1913,11 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			return;
 		}
 		attempt++;
+		// #469: while this weaver is pending the DP's getters report geometry
+		// from the pending-panel refresher's snapshot. Start it here, so the
+		// snapshot is warm before the first frame asks; the getters keep it
+		// running from then on.
+		leiasr_pending_refresh_poke();
 
 		void *hwnd = reinterpret_cast<void *>(sr->bound_hwnd.load(std::memory_order_relaxed));
 
@@ -2034,6 +2039,7 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 				return;
 			}
 			Sleep(100);
+			leiasr_pending_refresh_poke();
 			const leiasr_identify_wake woke = leiasr_identified_since(&mark);
 			if (woke != LEIASR_IDENTIFY_WAKE_NONE) {
 				identified_ms = GetTickCount64();
