@@ -41,6 +41,8 @@ constexpr DWORD kWaitPollMs = 100;
 constexpr DWORD kWatcherPollMs = 1000;
 //! Floor for an SR-side verification spin once identified (see ready_clamp).
 constexpr double kClampFloorS = 1.0;
+//! #469: how stale the panel state may be when a pending DP reports geometry.
+constexpr uint64_t kPendingRefreshMs = 100;
 
 std::mutex g_mu; // guards everything below except the atomics
 
@@ -56,6 +58,13 @@ bool g_expired_logged = false;
 // --- geometry cache + live head device --------------------------------------
 leiasr_geometry g_geom = {};
 xrt_device *g_hmd = nullptr;
+
+// --- #469: the kept geometry -------------------------------------------------
+// The last verified geometry and the panel it was verified on. Unlike g_geom
+// it survives leiasr_geometry_invalidate: a DP whose weaver is still waiting
+// for SR reports it once the SAME panel is attached again.
+leiasr_geometry g_kept = {};
+leia_panel_identity g_kept_on = {};
 
 // --- #468: verified-geometry publishes, the retry's second wake signal -------
 std::atomic<uint32_t> g_publish_epoch{0};
@@ -134,9 +143,19 @@ watcher_start()
 void
 publish(const leiasr_geometry &g, const char *why)
 {
+	// #469: the panel this geometry belongs to, read before g_mu — the
+	// platform state takes its own lock and calls back into
+	// leiasr_geometry_invalidate (g_mu) while holding it.
+	leia_panel_identity on = {};
+	(void)leia_platform_matched_panel(&on);
+
 	std::lock_guard<std::mutex> lk(g_mu);
 	const bool first = !g_geom.valid;
 	g_geom = g;
+	if (on.valid) {
+		g_kept = g;
+		g_kept_on = on;
+	}
 	g_publish_epoch.fetch_add(1, std::memory_order_release);
 	leia_view_scale_set_from_dims(g.view_w, g.view_h, g.pixel_w, g.pixel_h);
 
@@ -432,6 +451,44 @@ leiasr_identified_since(const leiasr_identify_mark *mark)
 	return leiasr_identify_woke(mark, leiasr_display_identified(), epoch);
 }
 
+bool
+leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geometry *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	*out = {};
+	// Fresh panel state first, outside g_mu (lock order: the platform state
+	// lock is taken before g_mu, never after). A topology signature, at most
+	// every 100 ms; the EDID enumeration re-runs only when the monitor set
+	// changed — then this is the call that notices an unplug, so a panel
+	// that has just gone is not reported for long.
+	static std::atomic<uint64_t> s_refresh_ms{0};
+	const uint64_t now_ms = GetTickCount64();
+	uint64_t last_ms = s_refresh_ms.load(std::memory_order_relaxed);
+	if (now_ms - last_ms >= kPendingRefreshMs &&
+	    s_refresh_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+		(void)leia_platform_state_refresh(UINT32_MAX);
+	}
+	(void)leia_platform_matched_panel(&out->attached);
+
+	leiasr_geometry verified = {};
+	leiasr_geometry kept = {};
+	{
+		std::lock_guard<std::mutex> lk(g_mu);
+		verified = g_geom;
+		kept = g_kept;
+		out->kept_on = g_kept_on;
+	}
+	out->source = leiasr_pending_geometry_pick(verified.valid, kept.valid, &out->kept_on, &out->attached, bound);
+	switch (out->source) {
+	case LEIASR_PENDING_GEOMETRY_VERIFIED: out->geometry = verified; break;
+	case LEIASR_PENDING_GEOMETRY_KEPT: out->geometry = kept; break;
+	default: return false;
+	}
+	return out->geometry.valid && out->geometry.width_m > 0.0f && out->geometry.height_m > 0.0f;
+}
+
 void
 leiasr_ready_shutdown(void)
 {
@@ -522,6 +579,16 @@ leiasr_identified_since(const leiasr_identify_mark *mark)
 {
 	(void)mark;
 	return LEIASR_IDENTIFY_WAKE_NONE;
+}
+
+bool
+leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geometry *out)
+{
+	(void)bound;
+	if (out != nullptr) {
+		*out = {};
+	}
+	return false;
 }
 
 void

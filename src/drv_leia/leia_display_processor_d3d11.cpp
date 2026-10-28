@@ -20,6 +20,7 @@
 #include "leia_display_processor_d3d11.h"
 #include "leia_sr_d3d11.h"
 #include "leia_platform_state.h"
+#include "leia_sr_ready.h" // #469: the geometry a pending weaver's DP reports
 #include "leia_bg_capture_win.h"
 #include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
 #include "xrt/xrt_plugin.h"          // xrt_screen_binding
@@ -517,6 +518,17 @@ struct leia_display_processor_d3d11_impl
 	ID3D11Device *device;              //!< Cached device reference (not owned, for blit init).
 	HWND hwnd;                         //!< Native window handle from factory, used by bg-capture for self-exclusion + window-on-monitor rect.
 	bool screen_bound;                 //!< made by create_dp_d3d11_for_screen (multi-screen M6 / runtime ADR-060 R2)
+
+	//! #469: the binding's desktop rect (per-screen DPs; invalid otherwise). While
+	//! the weaver is pending, the panel's kept geometry is reported only when
+	//! the panel is attached exactly there.
+	struct leia_desktop_rect bound_rect;
+	//! #469: the geometry reported while the weaver was pending (an
+	//! enum leiasr_pending_geometry_source; NONE = none), and since when. The
+	//! getters run on more than one runtime thread, so the edge is taken with
+	//! an interlocked exchange and logged once.
+	volatile LONG pending_geom_source;
+	uint64_t pending_geom_since_ms;
 
 	//! @name 2D blit shader resources (passthrough stretch-blit)
 	//! @{
@@ -3013,6 +3025,60 @@ leia_dp_d3d11_get_hardware_3d_state(struct xrt_display_processor_d3d11 *xdp, boo
 	return leiasr_d3d11_get_hardware_3d_state(ldp->leiasr, out_is_3d);
 }
 
+/*!
+ * #469: the geometry to report while the weaver is still being created (the
+ * flat-blit wait), so the runtime's window-relative Kooima has the panel's
+ * size instead of nothing — without it the app renders a symmetric default
+ * FOV for the whole wait. The verified geometry, else the one SR last verified
+ * on this same panel; nothing for a panel never verified in this process.
+ * false once the weaver is READY: from then on SR answers (or nothing does).
+ */
+static bool
+leia_dp_d3d11_pending_geometry(struct leia_display_processor_d3d11_impl *ldp, struct leiasr_pending_geometry *out)
+{
+	if (leiasr_d3d11_is_ready(ldp->leiasr)) {
+		return false;
+	}
+	const bool have = leiasr_geometry_get_pending(ldp->screen_bound ? &ldp->bound_rect : NULL, out);
+	const enum leiasr_pending_geometry_source src = have ? out->source : LEIASR_PENDING_GEOMETRY_NONE;
+	const enum leiasr_pending_geometry_source prev =
+	    (enum leiasr_pending_geometry_source)InterlockedExchange(&ldp->pending_geom_source, (LONG)src);
+	if (src != prev) {
+		if (src != LEIASR_PENDING_GEOMETRY_NONE) {
+			ldp->pending_geom_since_ms = GetTickCount64();
+			U_LOG_W("Leia D3D11 DP: weaver not ready — reporting the panel's %s geometry (%.4fx%.4f m, "
+			        "%ux%u px @ %d,%d; verified on mfr=0x%04X prod=0x%04X %ux%u) until SR identifies it (#469)",
+			        leiasr_pending_geometry_source_name(src), (double)out->geometry.width_m,
+			        (double)out->geometry.height_m, out->attached.rect.width, out->attached.rect.height,
+			        (int)out->attached.rect.left, (int)out->attached.rect.top, out->kept_on.manufacturer_id,
+			        out->kept_on.product_id, out->kept_on.rect.width, out->kept_on.rect.height);
+		} else {
+			U_LOG_W("Leia D3D11 DP: weaver not ready and the %s geometry no longer applies (the panel is not "
+			        "attached%s) — reporting nothing (#469)",
+			        leiasr_pending_geometry_source_name(prev), ldp->screen_bound ? " at this screen's rect" : "");
+		}
+	}
+	return have;
+}
+
+//! #469: SR answers again — log once that it replaced the pending geometry.
+static void
+leia_dp_d3d11_note_sr_geometry(struct leia_display_processor_d3d11_impl *ldp, float width_m, float height_m)
+{
+	if (ldp->pending_geom_source == LEIASR_PENDING_GEOMETRY_NONE) {
+		return;
+	}
+	const enum leiasr_pending_geometry_source prev = (enum leiasr_pending_geometry_source)InterlockedExchange(
+	    &ldp->pending_geom_source, (LONG)LEIASR_PENDING_GEOMETRY_NONE);
+	if (prev == LEIASR_PENDING_GEOMETRY_NONE) {
+		return; // another thread logged it
+	}
+	U_LOG_W("Leia D3D11 DP: weaver ready — SR's geometry (%.4fx%.4f m) replaces the %s geometry reported for "
+	        "%.1f s (#469)",
+	        (double)width_m, (double)height_m, leiasr_pending_geometry_source_name(prev),
+	        (double)(GetTickCount64() - ldp->pending_geom_since_ms) / 1000.0);
+}
+
 static bool
 leia_dp_d3d11_get_display_dimensions(struct xrt_display_processor_d3d11 *xdp,
                                      float *out_width_m,
@@ -3020,11 +3086,18 @@ leia_dp_d3d11_get_display_dimensions(struct xrt_display_processor_d3d11 *xdp,
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	struct leiasr_display_dimensions dims = {};
-	if (!leiasr_d3d11_get_display_dimensions(ldp->leiasr, &dims) || !dims.valid) {
+	if (leiasr_d3d11_get_display_dimensions(ldp->leiasr, &dims) && dims.valid) {
+		leia_dp_d3d11_note_sr_geometry(ldp, dims.width_m, dims.height_m);
+		*out_width_m = dims.width_m;
+		*out_height_m = dims.height_m;
+		return true;
+	}
+	struct leiasr_pending_geometry pg = {};
+	if (!leia_dp_d3d11_pending_geometry(ldp, &pg)) {
 		return false;
 	}
-	*out_width_m = dims.width_m;
-	*out_height_m = dims.height_m;
+	*out_width_m = pg.geometry.width_m;
+	*out_height_m = pg.geometry.height_m;
 	return true;
 }
 
@@ -3037,8 +3110,22 @@ leia_dp_d3d11_get_display_pixel_info(struct xrt_display_processor_d3d11 *xdp,
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	float w_m, h_m; // unused but required by API
-	return leiasr_d3d11_get_display_pixel_info(ldp->leiasr, out_pixel_width, out_pixel_height, out_screen_left,
-	                                           out_screen_top, &w_m, &h_m);
+	if (leiasr_d3d11_get_display_pixel_info(ldp->leiasr, out_pixel_width, out_pixel_height, out_screen_left,
+	                                        out_screen_top, &w_m, &h_m)) {
+		leia_dp_d3d11_note_sr_geometry(ldp, w_m, h_m);
+		return true;
+	}
+	// #469: the panel's desktop rect as it is attached now (for a per-screen
+	// DP that is its binding's rect — the pick requires them to be equal).
+	struct leiasr_pending_geometry pg = {};
+	if (!leia_dp_d3d11_pending_geometry(ldp, &pg)) {
+		return false;
+	}
+	*out_pixel_width = pg.attached.rect.width;
+	*out_pixel_height = pg.attached.rect.height;
+	*out_screen_left = pg.attached.rect.left;
+	*out_screen_top = pg.attached.rect.top;
+	return true;
 }
 
 static bool
@@ -4045,6 +4132,13 @@ leia_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
 	ldp->hwnd = static_cast<HWND>(window_handle);
 	ldp->screen_bound = true;
+	if (binding->desktop_width != 0 && binding->desktop_height != 0) {
+		ldp->bound_rect.valid = true;
+		ldp->bound_rect.left = binding->desktop_left;
+		ldp->bound_rect.top = binding->desktop_top;
+		ldp->bound_rect.width = binding->desktop_width;
+		ldp->bound_rect.height = binding->desktop_height;
+	}
 	ldp->view_count = 2;
 	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
 	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');

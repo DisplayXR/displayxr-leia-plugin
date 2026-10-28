@@ -195,6 +195,31 @@ enum leiasr_identify_wake
 leiasr_identified_since(const struct leiasr_identify_mark *mark);
 
 /*!
+ * #469: the geometry a DP whose weaver is not ready reports, and where from.
+ */
+struct leiasr_pending_geometry
+{
+	enum leiasr_pending_geometry_source source;
+	struct leiasr_geometry geometry;     //!< valid unless source is NONE
+	struct leia_panel_identity attached; //!< the panel attached now (its desktop rect)
+	struct leia_panel_identity kept_on;  //!< the panel the kept geometry was verified on
+};
+
+/*!
+ * #469: resolve @ref leiasr_pending_geometry for a DP whose weaver is still
+ * being created. Re-evaluates the platform state first (a topology signature;
+ * the EDID enumeration re-runs only when the monitor set changed), so a panel
+ * that has just gone is not reported. Never queries SR.
+ *
+ * @param bound A per-screen DP's binding rect (NULL or invalid: not per-screen).
+ * @return true when @p out carries a geometry to report.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_geometry_get_pending(const struct leia_desktop_rect *bound, struct leiasr_pending_geometry *out);
+
+/*!
  * Stop the watcher (if running) and wait briefly for it to exit. Idempotent.
  *
  * @ingroup drv_leia

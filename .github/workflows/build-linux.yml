@@ -243,7 +243,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_sr_presence
 
-      - name: Unit test — Windows-arm SR-readiness rules (retry wake #468, host-run)
+      - name: Unit test — Windows-arm SR-readiness rules (retry wake #468, pending geometry #469, host-run)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_sr_ready_rules
 

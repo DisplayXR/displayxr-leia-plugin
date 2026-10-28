@@ -40,6 +40,7 @@
 #pragma once
 
 #include "leia_interface.h"
+#include "leia_sr_ready_rules.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -124,6 +125,14 @@ leia_platform_state_name(enum leia_platform_state state);
  */
 bool
 leia_platform_display_absent(void);
+
+/*!
+ * #469: the Leia panel the EDID table matched at the last evaluation (P-c),
+ * with its desktop rect. false (and @p out invalid) while none is attached.
+ * Never probes; call @ref leia_platform_state_refresh first for a fresh answer.
+ */
+bool
+leia_platform_matched_panel(struct leia_panel_identity *out);
 
 #ifdef __cplusplus
 }

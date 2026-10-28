@@ -3,8 +3,9 @@
 /*!
  * @file
  * @brief  Unit test for the SR-readiness rules (leia_sr_ready_rules.h): the
- *         weaver create retry's wake on identification (#468). Hardware-free
- *         and call-free: no SR, no Win32, no panel.
+ *         weaver create retry's wake on identification (#468) and the
+ *         geometry a pending weaver's DP reports (#469). Hardware-free and
+ *         call-free: no SR, no Win32, no panel.
  */
 
 #include "leia_sr_ready_rules.h"
@@ -22,6 +23,35 @@ static int g_failures;
 			g_failures++;                                                                                  \
 		}                                                                                                      \
 	} while (0)
+
+static struct leia_desktop_rect
+rect(int32_t left, int32_t top, uint32_t w, uint32_t h)
+{
+	struct leia_desktop_rect r;
+	memset(&r, 0, sizeof(r));
+	r.valid = true;
+	r.left = left;
+	r.top = top;
+	r.width = w;
+	r.height = h;
+	return r;
+}
+
+static struct leia_panel_identity
+panel(uint16_t mfr, uint16_t prod, struct leia_desktop_rect r)
+{
+	struct leia_panel_identity p;
+	memset(&p, 0, sizeof(p));
+	p.valid = true;
+	p.manufacturer_id = mfr;
+	p.product_id = prod;
+	p.rect = r;
+	return p;
+}
+
+// The 10-28 rig: a DS1 left of the laptop panel.
+#define DS1_MFR 0x7204
+#define DS1_PROD 0x0001
 
 static void
 test_wake(void)
@@ -48,10 +78,87 @@ test_wake(void)
 	CHECK(leiasr_identify_woke(&m, false, 0) == LEIASR_IDENTIFY_WAKE_PUBLISH);
 }
 
+static void
+test_identity(void)
+{
+	const struct leia_panel_identity a = panel(DS1_MFR, DS1_PROD, rect(-3840, 0, 3840, 2160));
+	struct leia_panel_identity b = panel(DS1_MFR, DS1_PROD, rect(0, 1600, 3840, 2160));
+	CHECK(leia_panel_identity_same(&a, &b)); // moved: same panel
+
+	b = panel(DS1_MFR, DS1_PROD, rect(-3840, 0, 1920, 1080));
+	CHECK(!leia_panel_identity_same(&a, &b)); // another desktop mode: as P-c, another panel
+
+	b = panel(DS1_MFR, 0x0002, rect(-3840, 0, 3840, 2160));
+	CHECK(!leia_panel_identity_same(&a, &b)); // another product
+
+	b = a;
+	b.valid = false;
+	CHECK(!leia_panel_identity_same(&a, &b));
+	CHECK(!leia_panel_identity_same(&b, &a));
+}
+
+static void
+test_pick(void)
+{
+	const struct leia_desktop_rect at_home = rect(-3840, 0, 3840, 2160);
+	const struct leia_panel_identity kept_on = panel(DS1_MFR, DS1_PROD, at_home);
+	struct leia_panel_identity none;
+	memset(&none, 0, sizeof(none));
+
+	// The 10-28 case: the same DS1 is back at its place, SR has not identified
+	// it yet (P-c dropped the verified geometry at the unplug). Kept, for the
+	// per-screen DP bound there and for a window-bound DP.
+	struct leia_panel_identity attached = panel(DS1_MFR, DS1_PROD, at_home);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &attached, &at_home) ==
+	      LEIASR_PENDING_GEOMETRY_KEPT);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &attached, NULL) == LEIASR_PENDING_GEOMETRY_KEPT);
+
+	// SR identified it, the weaver is not up yet: the verified geometry.
+	CHECK(leiasr_pending_geometry_pick(true, true, &kept_on, &attached, &at_home) ==
+	      LEIASR_PENDING_GEOMETRY_VERIFIED);
+
+	// Unplugged (no EDID match): nothing, verified or kept.
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &none, &at_home) == LEIASR_PENDING_GEOMETRY_NONE);
+	CHECK(leiasr_pending_geometry_pick(true, true, &kept_on, &none, NULL) == LEIASR_PENDING_GEOMETRY_NONE);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, NULL, NULL) == LEIASR_PENDING_GEOMETRY_NONE);
+
+	// Never verified in this process (boot with the panel asleep): nothing
+	// is invented.
+	CHECK(leiasr_pending_geometry_pick(false, false, &none, &attached, &at_home) == LEIASR_PENDING_GEOMETRY_NONE);
+
+	// Another panel is attached: nothing.
+	struct leia_panel_identity other = panel(DS1_MFR, 0x0002, at_home);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &other, &at_home) == LEIASR_PENDING_GEOMETRY_NONE);
+
+	// The same panel, moved: a window-bound DP reports it (the rect is where
+	// it is now); a per-screen DP bound to the OLD rect does not.
+	struct leia_panel_identity moved = panel(DS1_MFR, DS1_PROD, rect(0, 1600, 3840, 2160));
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &moved, NULL) == LEIASR_PENDING_GEOMETRY_KEPT);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &moved, &at_home) == LEIASR_PENDING_GEOMETRY_NONE);
+
+	// Windows' re-seat transient: the panel listed alone at (0, 0). A DP bound
+	// to the panel's real rect reports nothing while it lasts — not even the
+	// verified geometry.
+	struct leia_panel_identity transient = panel(DS1_MFR, DS1_PROD, rect(0, 0, 3840, 2160));
+	CHECK(leiasr_pending_geometry_pick(true, true, &kept_on, &transient, &at_home) ==
+	      LEIASR_PENDING_GEOMETRY_NONE);
+	// (0, 0) is a real origin: a DP bound there while the panel is there gets it.
+	const struct leia_desktop_rect at_origin = rect(0, 0, 3840, 2160);
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &transient, &at_origin) ==
+	      LEIASR_PENDING_GEOMETRY_KEPT);
+
+	// A per-screen DP whose binding carried no rect is treated as unbound.
+	struct leia_desktop_rect no_rect;
+	memset(&no_rect, 0, sizeof(no_rect));
+	CHECK(leiasr_pending_geometry_pick(false, true, &kept_on, &moved, &no_rect) == LEIASR_PENDING_GEOMETRY_KEPT);
+}
+
 int
 main(void)
 {
 	test_wake();
+	test_identity();
+	test_pick();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_ready_rules: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
