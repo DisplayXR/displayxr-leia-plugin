@@ -55,7 +55,9 @@ extern "C" {
  *
  */
 
-//! What a weaver create retry saw when it started waiting.
+//! What SR had identified when a weaver create attempt started (the retry
+//! wait after a failed attempt compares against it, so an identification
+//! during the attempt wakes the wait at once).
 struct leiasr_identify_mark
 {
 	bool identified;        //!< the SR shared-memory count was >= 1
@@ -70,10 +72,10 @@ enum leiasr_identify_wake
 };
 
 /*!
- * Has SR identified the panel since @p mark was taken? A count that was
- * already >= 1 at the mark is no news (a failed attempt on an identified
- * panel waits its full period), so only the edge counts; a publish always
- * does.
+ * Has SR identified the panel since @p mark was taken (just before the create
+ * attempt)? A count that was already >= 1 at the mark is no news (a failed
+ * attempt on an identified panel waits its full period), so only the edge
+ * counts; a publish always does.
  */
 static inline enum leiasr_identify_wake
 leiasr_identify_woke(const struct leiasr_identify_mark *mark, bool identified_now, uint32_t publish_epoch_now)

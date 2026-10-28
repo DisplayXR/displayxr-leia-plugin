@@ -76,6 +76,15 @@ test_wake(void)
 	// Wrap-around of the publish counter still reads as a change.
 	m.publish_epoch = 0xFFFFFFFFu;
 	CHECK(leiasr_identify_woke(&m, false, 0) == LEIASR_IDENTIFY_WAKE_PUBLISH);
+
+	// SR identifies the panel DURING a create attempt that still fails (the
+	// #471 review case). The mark is taken before the attempt (count 0), so
+	// the wait's first tick sees the edge. A mark taken after the failed
+	// attempt (count already 1) would see nothing and wait for the publish.
+	const struct leiasr_identify_mark before_attempt = {false, 3};
+	CHECK(leiasr_identify_woke(&before_attempt, true, 3) == LEIASR_IDENTIFY_WAKE_COUNT);
+	const struct leiasr_identify_mark after_attempt = {true, 3};
+	CHECK(leiasr_identify_woke(&after_attempt, true, 3) == LEIASR_IDENTIFY_WAKE_NONE);
 }
 
 static void

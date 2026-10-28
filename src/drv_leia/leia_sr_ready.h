@@ -177,8 +177,9 @@ void
 leiasr_ready_note_weaver_ready(void);
 
 /*!
- * #468: what a weaver create retry sees as it starts waiting (the shared-memory
- * count and the verified-geometry publish count). Cheap.
+ * #468: what SR has identified as a weaver create attempt starts (the
+ * shared-memory count and the verified-geometry publish count); the retry
+ * wait after a failed attempt compares against it. Cheap.
  *
  * @ingroup drv_leia
  */

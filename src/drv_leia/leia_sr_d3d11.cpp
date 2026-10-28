@@ -1918,6 +1918,11 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 		// snapshot is warm before the first frame asks; the getters keep it
 		// running from then on.
 		leiasr_pending_refresh_poke();
+		// #468: what SR had identified BEFORE this attempt. Taken after a
+		// failed attempt instead, an identification that landed during the
+		// attempt left no change to wake on, and only the geometry publish
+		// caught it 1-3 s later.
+		const leiasr_identify_mark mark = leiasr_identify_mark_take();
 
 		void *hwnd = reinterpret_cast<void *>(sr->bound_hwnd.load(std::memory_order_relaxed));
 
@@ -2028,8 +2033,9 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 		// #468: after a long unplug SR takes 10-30 s to identify the panel
 		// again; an identification that landed in this wait used to sit out
 		// the rest of it on the flat blit. End the wait on identification
-		// (the shared-memory count edge, or a verified-geometry publish).
-		const leiasr_identify_mark mark = leiasr_identify_mark_take();
+		// since the attempt began (the shared-memory count edge, or a
+		// verified-geometry publish) — at the first tick when it came during
+		// the attempt.
 		const uint64_t wait_start_ms = GetTickCount64();
 		identified_ms = 0;
 		for (int i = 0; i < 50; i++) {

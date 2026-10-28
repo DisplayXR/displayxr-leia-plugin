@@ -126,9 +126,11 @@ create synchronously and have no pending state):
   identification that landed in the wait cost up to 5 s more of flat blit. The
   wait now ends within 100 ms of the shared-memory count going 0 → ≥ 1, or of
   a verified-geometry publish (the watcher's; it covers SR keeping the count
-  across an unplug, where there is no edge). A count that was already ≥ 1 when
-  the wait started is no news, so a failed attempt on an identified panel
-  still waits its period. The rule is pure C in `leia_sr_ready_rules.h`,
+  across an unplug, where there is no edge). Both are compared against a mark
+  taken just before each create attempt, so an identification that lands
+  during the attempt wakes the wait at its first 100 ms tick. A count that was
+  already ≥ 1 when the attempt started is no news, so a failed attempt on an
+  identified panel still waits its period. The rule is pure C in `leia_sr_ready_rules.h`,
   host-tested by `tests/test_sr_ready_rules.c`.
 - **A pending DP reports the panel's kept geometry (#469).** While the weaver
   is pending, `get_display_dimensions` / `get_display_pixel_info` used to
