@@ -489,4 +489,10 @@ leia_win_sr_probe_external_routing(void)
 {
 	return false;
 }
+
+bool
+leia_win_sr_multi_viewer_weave_supported(void)
+{
+	return false;
+}
 #endif

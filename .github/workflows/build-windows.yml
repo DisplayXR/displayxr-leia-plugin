@@ -108,7 +108,8 @@ jobs:
       # CreateViewerTracker, DestroyViewerTracker, ViewerTrackerGetViewers,
       # ViewerTrackerAdd/RemoveCallback, WeaverGetViewers, WeaverSetMultiViewerMode;
       # 117-118 Get/SetMultiViewerConfig. New struct tags 33-36 and
-      # SR_ERROR_ACCESS_DENIED (-14). None of the new API is used here.
+      # SR_ERROR_ACCESS_DENIED (-14). The plug-in uses pfnWeaverSetMultiViewerMode + the
+      # multi-viewer capability struct (#446, DXR_LEIA_HAS_SR_MULTI_VIEWER); nothing else new.
       SR_V2_TAG: sr-sdk-v2-1.39.0.2950
       SR_V2_DIR: LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
       # sha256 of "$SR_V2_DIR.zip"; the download is refused on a mismatch.

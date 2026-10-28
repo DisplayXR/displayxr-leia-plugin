@@ -260,6 +260,33 @@ if(LEIA_SR_V2_AVAILABLE AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_system.h"
     endif()
     unset(_leia_sr_sys_h)
 endif()
+# Multi-viewer weaving (#446, sr-sdk-v2-1.39.0.2950+): srWeaverSetMultiViewerMode
+# (sr_weaver.h) + SrMultiViewerCapabilities (sr_viewer_tracker.h, chained on the
+# runtime capabilities). Same header-grep reasoning as the gates above. Rides
+# the display-enumeration probe instance for its capability query (hence the
+# DISPLAY_ENUM prerequisite) and the M6 weaver fields for "is this weaver
+# pinned to a simulated viewer" (hence MULTI_WIN). Absent => the "LeiaSR
+# multi-viewer" rendering mode is never listed. Present => it is listed only
+# when the installed SR runtime reports multiViewerWeave at run time.
+set(LEIA_SR_MULTI_VIEWER_AVAILABLE FALSE)
+if(LEIA_SR_MULTI_WIN_AVAILABLE
+   AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_viewer_tracker.h"
+   AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h")
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_viewer_tracker.h" _leia_sr_vt_h)
+    file(READ "${LEIASR_V2_SDKROOT}/include/sr/sr_weaver.h" _leia_sr_h)
+    if(_leia_sr_h MATCHES "srWeaverSetMultiViewerMode"
+       AND _leia_sr_vt_h MATCHES "SrMultiViewerCapabilities"
+       AND _leia_sr_vt_h MATCHES "SR_MULTI_VIEWER_MODE_ON")
+        set(LEIA_SR_MULTI_VIEWER_AVAILABLE TRUE)
+    endif()
+    unset(_leia_sr_vt_h)
+    unset(_leia_sr_h)
+endif()
+if(LEIA_SR_MULTI_VIEWER_AVAILABLE)
+    message(STATUS "SR multi-viewer weave (#446): ENABLED - mode 2 'LeiaSR multi-viewer' is listed when the SR runtime reports multiViewerWeave")
+else()
+    message(STATUS "SR multi-viewer weave (#446): DISABLED (SDK predates srWeaverSetMultiViewerMode) - mode 2 is never listed")
+endif()
 if(LEIA_SR_USER_PRESENCE_AVAILABLE)
     message(STATUS "SR per-display user presence (event 20): ENABLED - engages when the SR runtime reports the capability")
 else()
@@ -583,6 +610,9 @@ if(LEIA_SR_V2_AVAILABLE)
     endif()
     if(LEIA_SR_USER_PRESENCE_AVAILABLE)
         target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_USER_PRESENCE=1)
+    endif()
+    if(LEIA_SR_MULTI_VIEWER_AVAILABLE)
+        target_compile_definitions(DisplayXR-LeiaSR PRIVATE DXR_LEIA_HAS_SR_MULTI_VIEWER=1)
     endif()
 endif()
 if(LEIA_SR_COLOR_ENCODING_SDK)

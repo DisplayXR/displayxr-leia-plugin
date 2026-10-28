@@ -21,6 +21,13 @@
  * own probe path and no SR SDK. */
 #include "leia_sr_ready.h"
 #endif
+#ifdef _WIN32
+/* leia_win_sr_multi_viewer_weave_supported() (#446): the SR runtime's
+ * multi-viewer capability, answered by the display-enumeration probe instance
+ * (leia_sr_v2_common.cpp). The Linux and macOS arms reuse this file without
+ * it and never list the multi-viewer mode. */
+#include "leia_display_claims_win.h"
+#endif
 
 #include "xrt/xrt_device.h"
 
@@ -39,6 +46,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 
 /*
@@ -77,6 +96,63 @@ static inline struct leia_hmd *
 leia_hmd(struct xrt_device *xdev)
 {
 	return (struct leia_hmd *)xdev;
+}
+
+
+/*
+ *
+ * The live head device, for the display processors' mode read (#446).
+ *
+ */
+
+#ifdef _WIN32
+static SRWLOCK g_live_hmd_lock = SRWLOCK_INIT;
+#define LIVE_HMD_LOCK() AcquireSRWLockExclusive(&g_live_hmd_lock)
+#define LIVE_HMD_UNLOCK() ReleaseSRWLockExclusive(&g_live_hmd_lock)
+#else
+static pthread_mutex_t g_live_hmd_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LIVE_HMD_LOCK() pthread_mutex_lock(&g_live_hmd_lock)
+#define LIVE_HMD_UNLOCK() pthread_mutex_unlock(&g_live_hmd_lock)
+#endif
+
+//! See leia_hmd_active_mode_get(): the newest live device, NULL when none.
+static struct leia_hmd *g_live_hmd = NULL;
+
+static void
+live_hmd_set(struct leia_hmd *hmd)
+{
+	LIVE_HMD_LOCK();
+	g_live_hmd = hmd;
+	LIVE_HMD_UNLOCK();
+}
+
+static void
+live_hmd_clear(struct leia_hmd *hmd)
+{
+	LIVE_HMD_LOCK();
+	if (g_live_hmd == hmd) {
+		g_live_hmd = NULL;
+	}
+	LIVE_HMD_UNLOCK();
+}
+
+bool
+leia_hmd_active_mode_get(uint32_t *out_mode_index)
+{
+	bool ok = false;
+	LIVE_HMD_LOCK();
+	if (g_live_hmd != NULL && g_live_hmd->base.hmd != NULL) {
+		/* A plain aligned uint32 the runtime stores from other threads: no
+		 * torn read, and a value one frame stale is harmless (the weave path
+		 * applies the change on the next frame). */
+		const uint32_t idx = g_live_hmd->base.hmd->active_rendering_mode_index;
+		if (idx < g_live_hmd->base.rendering_mode_count) {
+			*out_mode_index = idx;
+			ok = true;
+		}
+	}
+	LIVE_HMD_UNLOCK();
+	return ok;
 }
 
 
@@ -128,6 +204,9 @@ static void
 leia_hmd_destroy(struct xrt_device *xdev)
 {
 	struct leia_hmd *hmd = leia_hmd(xdev);
+
+	/* Before the free: a weave thread reading the mode must never see it. */
+	live_hmd_clear(hmd);
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	/* Stop late geometry publishes from reaching a freed device. */
@@ -359,7 +438,9 @@ leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *g
 	const float sx = g_view_scale_x;
 	const float sy = g_view_scale_y;
 
-	struct xrt_rendering_mode *m3d = &hmd->base.rendering_modes[1];
+	/* Every 3D mode carries the same per-view scale: mode 1, and mode 2 when
+	 * listed (#446), which is mode 1 with multi-viewer weaving forced on. */
+	struct xrt_rendering_mode *m3d = &hmd->base.rendering_modes[LEIA_MODE_3D];
 	const bool same_geom = hmd->base.hmd->screens[0].w_pixels == g.pixel_w &&
 	                       hmd->base.hmd->screens[0].h_pixels == g.pixel_h &&
 	                       fabsf(hmd->display_width_m - g.display_w_m) < 1e-6f &&
@@ -374,8 +455,10 @@ leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *g
 		U_LOG_E("Failed to re-apply Leia display geometry to the live device");
 		return false;
 	}
-	m3d->view_scale_x = sx;
-	m3d->view_scale_y = sy;
+	for (uint32_t i = LEIA_MODE_3D; i < hmd->base.rendering_mode_count; i++) {
+		hmd->base.rendering_modes[i].view_scale_x = sx;
+		hmd->base.rendering_modes[i].view_scale_y = sy;
+	}
 	return true;
 }
 
@@ -472,12 +555,25 @@ leia_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Leia 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "leia_display_0");
 
-	// Rendering modes: Leia exposes 2 modes (2D + LeiaSR).
-	hmd->base.rendering_mode_count = 2;
+	// Rendering modes: 2D + LeiaSR, plus "LeiaSR multi-viewer" when the SR
+	// runtime can weave for several viewers (#446).
+	//
+	// Mode 2 is listed only when the installed SR runtime's capabilities say
+	// multi-viewer weaving exists. That answer is runtime-wide, not per
+	// backend: the D3D12 and GL weavers still weave one viewer in mode 2 and
+	// say so once. An SDK that predates the feature compiles the query to
+	// "no", and so does an older SR runtime (it leaves the capability field
+	// untouched). Asked here because the mode table is fixed once the runtime
+	// has read it.
+	bool multi_viewer = false;
+#ifdef _WIN32
+	multi_viewer = leia_win_sr_multi_viewer_weave_supported();
+#endif
+	hmd->base.rendering_mode_count = multi_viewer ? 3 : 2;
 
 	// Mode 0: 2D (mono, full resolution, 1×1 tile). Untracked — mode_flags
 	// stays 0 unless/until a "2D tracked" product mode is added (#29).
-	hmd->base.rendering_modes[0].mode_index = 0;
+	hmd->base.rendering_modes[0].mode_index = LEIA_MODE_2D;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
 	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
@@ -492,7 +588,8 @@ leia_hmd_create(void)
 	// as recommended_view_scale_x/y, never a second hardcoded number).
 	// Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
 	// reserved[] stays zeroed via the calloc'd U_DEVICE_ALLOCATE block.
-	hmd->base.rendering_modes[1].mode_index = 1;
+	// Multi-viewer weaving follows the SR system setting in this mode.
+	hmd->base.rendering_modes[1].mode_index = LEIA_MODE_3D;
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
 	hmd->base.rendering_modes[1].view_count = 2;
 	leia_view_scale_get(&hmd->base.rendering_modes[1].view_scale_x,
@@ -502,7 +599,17 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[1].tile_rows = 1;
 	hmd->base.rendering_modes[1].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
 
-	hmd->base.hmd->active_rendering_mode_index = 1; // Default to LeiaSR (3D)
+	// Mode 2: LeiaSR multi-viewer. Identical to mode 1 for the app (views,
+	// tiles, scale, tracking); the only difference is the weaver's
+	// multi-viewer override, which the display processors apply when they see
+	// this mode active (leia_hmd_active_mode_get + leia_sr_v2_apply_multiviewer).
+	if (multi_viewer) {
+		hmd->base.rendering_modes[2] = hmd->base.rendering_modes[1];
+		hmd->base.rendering_modes[2].mode_index = LEIA_MODE_3D_MULTI_VIEWER;
+		snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR multi-viewer");
+	}
+
+	hmd->base.hmd->active_rendering_mode_index = LEIA_MODE_3D; // Default to LeiaSR (3D)
 
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
@@ -529,6 +636,13 @@ leia_hmd_create(void)
 	        g.pixel_w, g.pixel_h, g.display_w_m, g.display_h_m, g.nominal_z_m, refresh_hz, geom_src);
 
 	(void)refresh_hz; // Logged above; will be used for frame timing later.
+
+	U_LOG_W("Leia rendering modes: %u (%s)", hmd->base.rendering_mode_count,
+	        multi_viewer ? "2D, LeiaSR, LeiaSR multi-viewer"
+	                     : "2D, LeiaSR; multi-viewer weave not offered by this SR runtime/SDK");
+
+	// The display processors read the active mode from here (#446).
+	live_hmd_set(hmd);
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Register as the live head device so a late SR identification (the
