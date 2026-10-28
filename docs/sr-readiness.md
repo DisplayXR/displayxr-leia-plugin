@@ -144,6 +144,11 @@ create synchronously and have no pending state):
   panel is attached exactly at its binding's rect (so not during Windows'
   "panel alone at (0, 0)" re-seat transient). A panel never verified in this
   process gets nothing, as before. The pick is in the same header and test.
+  One panel per process: the identity is P-c's one matched panel, with no
+  serial (the Windows EDID enumeration does not provide it; the DS1 reports
+  0). With two Leia panels of different models attached, the kept geometry
+  could be paired with the wrong one. Rare, documented in
+  `leia_panel_identity`, left as is.
 
   The getters run on the render thread, every frame while the weaver is
   pending, so they never refresh the platform state themselves: that takes the

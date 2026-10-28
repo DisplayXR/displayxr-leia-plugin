@@ -116,7 +116,21 @@ struct leia_desktop_rect
 	uint32_t height;
 };
 
-//! A Leia panel as the EDID table matched it (P-c).
+/*!
+ * A Leia panel as the EDID table matched it (P-c).
+ *
+ * Limitation, one panel per process: P-c tracks ONE matched panel (the first
+ * EDID-table hit), and a publish pairs SR's verified geometry with it. With
+ * two Leia panels of different models attached, the geometry SR verified may
+ * be the other panel's, so the kept pair can name the wrong panel and a
+ * pending DP would report that geometry for this one. Rare (one Leia panel
+ * per machine is the supported setup), so it is left as is. The identity has
+ * no serial either: the Windows EDID enumeration the plug-in builds against
+ * does not fill bytes 12-15 (and the DS1 reports 0), so two panels of the same
+ * model and desktop size are one panel to this check. If either matters, key
+ * the kept geometry by the panel SR verified on, plus the serial once the
+ * enumeration provides it (0 = unknown: match on the rest).
+ */
 struct leia_panel_identity
 {
 	bool valid;

@@ -60,7 +60,9 @@ xrt_device *g_hmd = nullptr;
 // --- #469: the kept geometry -------------------------------------------------
 // The last verified geometry and the panel it was verified on. Unlike g_geom
 // it survives leiasr_geometry_invalidate: a DP whose weaver is still waiting
-// for SR reports it once the SAME panel is attached again.
+// for SR reports it once the SAME panel is attached again. One panel per
+// process: "the panel" is P-c's one matched panel, and with two Leia models
+// attached SR's geometry may be the other one's (see leia_panel_identity).
 leiasr_geometry g_kept = {};
 leia_panel_identity g_kept_on = {};
 
