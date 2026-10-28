@@ -406,6 +406,13 @@ add_executable(test_sr_presence ../drv_leia/tests/test_sr_presence.c)
 target_include_directories(test_sr_presence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_presence COMMAND test_sr_presence)
 
+# Windows-arm SR-readiness rules (leia_sr_ready_rules.h: the weaver retry's
+# wake on identification, #468): header-only plain C, host-tested here for the
+# same reason.
+add_executable(test_sr_ready_rules ../drv_leia/tests/test_sr_ready_rules.c)
+target_include_directories(test_sr_ready_rules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+add_test(NAME test_sr_ready_rules COMMAND test_sr_ready_rules)
+
 # Windows-arm lift viewpoint mapping (leia_lift_viewpoint.c, runtime ADR-048):
 # platform-neutral C (no NeurD / SR / D3D), host-tested here for the same reason.
 add_executable(test_lift_viewpoint

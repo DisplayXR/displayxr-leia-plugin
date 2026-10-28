@@ -74,6 +74,7 @@
 #pragma once
 
 #include "leia_interface.h"
+#include "leia_sr_ready_rules.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -174,6 +175,24 @@ leiasr_ready_hmd_unregister(struct xrt_device *xdev);
  */
 void
 leiasr_ready_note_weaver_ready(void);
+
+/*!
+ * #468: what a weaver create retry sees as it starts waiting (the shared-memory
+ * count and the verified-geometry publish count). Cheap.
+ *
+ * @ingroup drv_leia
+ */
+struct leiasr_identify_mark
+leiasr_identify_mark_take(void);
+
+/*!
+ * #468: has SR identified the panel since @p mark (see
+ * @ref leiasr_identify_woke)? Cheap enough to poll at 10 Hz.
+ *
+ * @ingroup drv_leia
+ */
+enum leiasr_identify_wake
+leiasr_identified_since(const struct leiasr_identify_mark *mark);
 
 /*!
  * Stop the watcher (if running) and wait briefly for it to exit. Idempotent.

@@ -114,6 +114,23 @@ closing the gap when they get there first:
   client compositor create and re-fills its cached info whenever the answer
   changes.
 
+## After a replug: the D3D11 weaver's wait (#468)
+
+After a long unplug SR takes 10–30 s to identify the panel again (a short
+re-seat: well under 1 s). The D3D11 arm is the only one whose weaver is created
+asynchronously (D3D12, GL and Vulkan create synchronously and have no pending
+state):
+
+- **The create retry wakes on identification (#468).** `async_create_worker_body`
+  spins up to 5 s per attempt and then waited a fixed 5 s, so an
+  identification that landed in the wait cost up to 5 s more of flat blit. The
+  wait now ends within 100 ms of the shared-memory count going 0 → ≥ 1, or of
+  a verified-geometry publish (the watcher's; it covers SR keeping the count
+  across an unplug, where there is no edge). A count that was already ≥ 1 when
+  the wait started is no news, so a failed attempt on an identified panel
+  still waits its period. The rule is pure C in `leia_sr_ready_rules.h`,
+  host-tested by `tests/test_sr_ready_rules.c`.
+
 ## Contract with the runtime (plugin_api 5 — no new ABI fields)
 
 1. `get_display_info` is cheap and non-blocking once the startup budget is
@@ -132,7 +149,12 @@ Leia SR readiness budget (20.0 s) expired with the panel unidentified — geomet
 Leia display geometry resolved: 7680x4320 px, 0.6981x0.3927 m, nominal Z=0.60 m, view 3840x2160, 60.0 Hz (create_device)
 Leia display geometry re-derived after late SR identification: 7680x4320 px, ... (late SR identification, watcher; 63012.4 s after first use) — live head device updated in place
 Created Leia 3D display: 3840x2160 px, 0.3440x0.1940 m, ... (geometry from hardcoded defaults — SR has not identified the panel yet; the device will be updated in place once it does)
+Leia D3D11 async weaver: create attempt 3 failed — retrying in 5 s, or as soon as SR identifies the panel
+Leia D3D11 async weaver: SR identified the panel (shared-memory count 0 -> 1) 2.7 s into the retry wait — retrying now (attempt 4) (#468)
+Leia D3D11 async weaver: READY 180 ms after SR identified the panel (#468)
 ```
+
+(The create-retry lines repeat per attempt, as before.)
 
 ## Reproducing / testing
 

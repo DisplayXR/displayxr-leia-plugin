@@ -57,6 +57,9 @@ bool g_expired_logged = false;
 leiasr_geometry g_geom = {};
 xrt_device *g_hmd = nullptr;
 
+// --- #468: verified-geometry publishes, the retry's second wake signal -------
+std::atomic<uint32_t> g_publish_epoch{0};
+
 // --- watcher ----------------------------------------------------------------
 // Restartable since P-c: it exits once geometry is published, and an
 // invalidation (panel unplugged / replaced) starts it again so the geometry is
@@ -134,6 +137,7 @@ publish(const leiasr_geometry &g, const char *why)
 	std::lock_guard<std::mutex> lk(g_mu);
 	const bool first = !g_geom.valid;
 	g_geom = g;
+	g_publish_epoch.fetch_add(1, std::memory_order_release);
 	leia_view_scale_set_from_dims(g.view_w, g.view_h, g.pixel_w, g.pixel_h);
 
 	bool applied = false;
@@ -409,6 +413,25 @@ leiasr_ready_note_weaver_ready(void)
 	}
 }
 
+leiasr_identify_mark
+leiasr_identify_mark_take(void)
+{
+	leiasr_identify_mark m = {};
+	m.publish_epoch = g_publish_epoch.load(std::memory_order_acquire);
+	m.identified = leiasr_display_identified();
+	return m;
+}
+
+leiasr_identify_wake
+leiasr_identified_since(const leiasr_identify_mark *mark)
+{
+	if (mark == nullptr) {
+		return LEIASR_IDENTIFY_WAKE_NONE;
+	}
+	const uint32_t epoch = g_publish_epoch.load(std::memory_order_acquire);
+	return leiasr_identify_woke(mark, leiasr_display_identified(), epoch);
+}
+
 void
 leiasr_ready_shutdown(void)
 {
@@ -485,6 +508,20 @@ leiasr_ready_hmd_unregister(struct xrt_device *xdev)
 void
 leiasr_ready_note_weaver_ready(void)
 {
+}
+
+leiasr_identify_mark
+leiasr_identify_mark_take(void)
+{
+	leiasr_identify_mark m = {};
+	return m;
+}
+
+leiasr_identify_wake
+leiasr_identified_since(const leiasr_identify_mark *mark)
+{
+	(void)mark;
+	return LEIASR_IDENTIFY_WAKE_NONE;
 }
 
 void

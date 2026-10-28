@@ -1900,6 +1900,8 @@ void
 async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint64_t start_ms)
 {
 	uint32_t attempt = 0;
+	//! #468: when the last retry wait was ended by SR identifying the panel (0 = it was not).
+	uint64_t identified_ms = 0;
 	for (;;) {
 		if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
 			// Idempotent, and needed on every path: on the first create
@@ -1980,15 +1982,21 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			int expected = LEIASR_ASYNC_PENDING;
 			if (sr->async_state.compare_exchange_strong(expected, LEIASR_ASYNC_READY,
 			                                            std::memory_order_acq_rel)) {
+				const uint64_t ready_ms = GetTickCount64();
 				if (reconnect) {
 					sr->reconnect_count.fetch_add(1, std::memory_order_relaxed);
 					U_LOG_W("SR weaver reconnected (generation %llu → %llu), "
 					        "%llu ms after trigger, attempt %u",
 					        (unsigned long long)prev_gen,
 					        (unsigned long long)sr->platform_generation,
-					        (unsigned long long)(GetTickCount64() - start_ms), attempt);
+					        (unsigned long long)(ready_ms - start_ms), attempt);
 				} else {
 					U_LOG_W("Leia D3D11 weaver READY (async create, attempt %u)", attempt);
+				}
+				if (identified_ms != 0) {
+					U_LOG_W("Leia D3D11 %s weaver: READY %llu ms after SR identified the panel (#468)",
+					        reconnect ? "reconnect" : "async",
+					        (unsigned long long)(ready_ms - identified_ms));
 				}
 				// A weaver came up, so SR has identified the panel: if the
 				// process-wide geometry (head device, get_display_info) is
@@ -2009,8 +2017,16 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			return;
 		}
 
-		U_LOG_W("Leia D3D11 %s weaver: create attempt %u failed — retrying in 5 s",
+		U_LOG_W("Leia D3D11 %s weaver: create attempt %u failed — retrying in 5 s, or as soon as SR identifies "
+		        "the panel",
 		        reconnect ? "reconnect" : "async", attempt);
+		// #468: after a long unplug SR takes 10-30 s to identify the panel
+		// again; an identification that landed in this wait used to sit out
+		// the rest of it on the flat blit. End the wait on identification
+		// (the shared-memory count edge, or a verified-geometry publish).
+		const leiasr_identify_mark mark = leiasr_identify_mark_take();
+		const uint64_t wait_start_ms = GetTickCount64();
+		identified_ms = 0;
 		for (int i = 0; i < 50; i++) {
 			if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
 				destroy_sdk_objects(sr);
@@ -2018,6 +2034,15 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 				return;
 			}
 			Sleep(100);
+			const leiasr_identify_wake woke = leiasr_identified_since(&mark);
+			if (woke != LEIASR_IDENTIFY_WAKE_NONE) {
+				identified_ms = GetTickCount64();
+				U_LOG_W("Leia D3D11 %s weaver: SR identified the panel (%s) %.1f s into the retry wait — "
+				        "retrying now (attempt %u) (#468)",
+				        reconnect ? "reconnect" : "async", leiasr_identify_wake_name(woke),
+				        (double)(identified_ms - wait_start_ms) / 1000.0, attempt + 1);
+				break;
+			}
 		}
 	}
 }
