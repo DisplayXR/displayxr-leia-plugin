@@ -648,8 +648,12 @@ endif()
 # after an SR install without relying on its PATH snapshot. So every SR client
 # DLL is /DELAYLOAD'ed; leia_sr_delayload_win.c resolves them by full path from
 # HKLM\SOFTWARE\Dimenco\Simulated Reality (falling back to the normal search)
-# and binds every import eagerly behind leia_sr_client_bind(), which gates every
-# SR call. Keep this list equal to k_sr_dlls[] in that file (same gates).
+# and binds every import eagerly before the first call, in two tiers: Core +
+# Displays (REQUIRED, k_sr_dlls[]) behind leia_sr_client_bind(), which gates
+# every SR call; DirectX and OpenGL (PER BACKEND, LEIA_SR_DX_DLL /
+# LEIA_SR_GL_DLL) behind leia_sr_dx_bind() / leia_sr_gl_bind(), which gate only
+# their own DPs, so one backend's export mismatch does not decline the others.
+# Keep this list equal to those names in that file (same gates).
 # opencv_world343 (shipped in the SR bin dir) is on the list too: the stereo
 # camera's cv::imdecode makes it a DIRECT import, and as a static import the OS
 # loader had to find it at plug-in load time — a host without the SR bin dir on
@@ -745,4 +749,50 @@ else()
         "Stamp-aware SimulatedRealityVulkan.dll not found in ${SR_PATH}/bin - "
         "SR 1.36.x machines will fall back to the pre-stamp weaver and show the "
         "coloured-replica artefact. Fetch it from the sr-sdk-v*-vkstamp release.")
+endif()
+
+# --- Test: SR client DLL bind (leia_sr_delayload_win.c) ----------------------
+# Four stub DLLs under the SR client DLL names, each in a FULL and a SHORT (one
+# export fewer) build, delay-loaded exactly like the plug-in's.
+# tests/test_sr_delayload_win.c links the full import libs and runs against a
+# mix: it checks the required (Core, Displays) / per-backend (DirectX, OpenGL)
+# split and that the WARN names the missing DLL or export.
+# Run: ctest --test-dir build/src/drv_leia -C Release -R sr_delayload
+if(MSVC)
+    enable_testing()
+    add_executable(test_sr_delayload_win tests/test_sr_delayload_win.c leia_sr_delayload_win.c)
+    # Its util/u_logging.h captures U_LOG_W; it must win over aux_util's.
+    target_include_directories(test_sr_delayload_win BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/stub_u_logging)
+    target_include_directories(test_sr_delayload_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test_sr_delayload_win PRIVATE XRT_HAVE_LEIA_SR_D3D11 XRT_HAVE_LEIA_SR_GL)
+    target_link_libraries(test_sr_delayload_win PRIVATE xrt-interfaces delayimp)
+    foreach(_stub core:SimulatedRealityCore displays:SimulatedRealityDisplays
+                  dx:SimulatedRealityDirectX gl:SimulatedRealityOpenGL)
+        string(REPLACE ":" ";" _stub "${_stub}")
+        list(GET _stub 0 _prefix)
+        list(GET _stub 1 _dll)
+        foreach(_variant full short)
+            set(_t sr_stub_${_prefix}_${_variant})
+            add_library(${_t} SHARED tests/sr_stub_dll.c)
+            target_compile_definitions(${_t} PRIVATE SR_STUB_NAME=${_prefix})
+            if(_variant STREQUAL "full")
+                target_compile_definitions(${_t} PRIVATE SR_STUB_FULL)
+            endif()
+            set_target_properties(${_t} PROPERTIES
+                OUTPUT_NAME ${_dll}
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sr_stub_${_variant}
+                ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sr_stub_${_variant}/lib)
+            add_dependencies(test_sr_delayload_win ${_t})
+        endforeach()
+        target_link_libraries(test_sr_delayload_win PRIVATE sr_stub_${_prefix}_full)
+        target_link_options(test_sr_delayload_win PRIVATE "/DELAYLOAD:${_dll}.dll")
+    endforeach()
+    foreach(_scenario backend_export required_export backend_absent)
+        add_test(NAME test_sr_delayload_win_${_scenario}
+            COMMAND test_sr_delayload_win ${_scenario}
+                "$<SHELL_PATH:$<TARGET_FILE_DIR:sr_stub_core_full>>"
+                "$<SHELL_PATH:$<TARGET_FILE_DIR:sr_stub_core_short>>"
+                "$<SHELL_PATH:${CMAKE_CURRENT_BINARY_DIR}/sr_delayload_work_${_scenario}>")
+    endforeach()
 endif()

@@ -2196,6 +2196,11 @@ leia_dp_factory_gl(void *window_handle,
 		U_LOG_W("Leia GL DP: SR platform client DLLs not usable — not creating the display processor");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	// Per backend: a broken SR OpenGL DLL declines only this backend's DPs.
+	// The bind logs the DLL and the missing export once.
+	if (!leia_sr_gl_bind()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Populate this module's GLAD table before any GL call (see above). The
 	// compositor has made the GL context current ahead of this call.
 	if (!leia_gl_ensure_glad_loaded()) {
@@ -2266,6 +2271,11 @@ leia_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
 	}
 	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
 		U_LOG_W("Leia GL per-screen DP: SR platform client DLLs not usable — not creating");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	// Per backend: a broken SR OpenGL DLL declines only this backend's DPs.
+	// The bind logs the DLL and the missing export once.
+	if (!leia_sr_gl_bind()) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	if (!leia_gl_ensure_glad_loaded()) {

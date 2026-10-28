@@ -21,11 +21,17 @@
  *     or a miss — returns NULL and the normal search (PATH) still applies.
  *
  *  2. WHEN it is safe to call SR. A missing delay-loaded DLL (or export)
- *     raises an SEH exception at the first call site. So nothing may call SR
- *     before leia_sr_client_bind() has returned LEIA_SR_BIND_OK: it binds
- *     EVERY SR import eagerly, inside __try/__except, so after one successful
- *     bind no later SR call can fault on resolution, and a failed bind is a
- *     clean status (MISSING / INCOMPATIBLE) instead of a crash.
+ *     raises an SEH exception at the first call site. So every import is
+ *     bound eagerly, inside __try/__except, before the first call, and a
+ *     failed bind is a clean status instead of a crash. Two tiers:
+ *      - REQUIRED: Core + Displays, by leia_sr_client_bind(). Nothing may
+ *        call SR before it returned LEIA_SR_BIND_OK; a failure is the
+ *        plug-in-wide MISSING / INCOMPATIBLE platform state.
+ *      - PER BACKEND: DirectX (D3D11 + D3D12 weavers) by leia_sr_dx_bind(),
+ *        OpenGL by leia_sr_gl_bind(). Each gates only its own DPs, so an SR
+ *        runtime whose OpenGL DLL lacks an export still weaves D3D11.
+ *     A failure hook records which DLL and which export failed, so the WARN
+ *     names the symbol instead of only the DLL.
  *
  * `DXR_LEIA_SR_DIR` (testing aid) overrides the DLL directory: it names the
  * directory that holds the client DLLs directly (the `bin` dir), and the
@@ -44,26 +50,28 @@
 #include <windows.h>
 #include <delayimp.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
 /*
- * The SR client DLLs this build delay-loads. Must match the /DELAYLOAD list in
- * src/drv_leia/CMakeLists.txt (same compile gates). Core and Displays are
- * always imported; DirectX / OpenGL only when their weavers are compiled in.
+ * The REQUIRED SR client DLLs, bound together by leia_sr_client_bind(). Must
+ * match the /DELAYLOAD list in src/drv_leia/CMakeLists.txt.
  */
 static const char *const k_sr_dlls[] = {
     "SimulatedRealityCore.dll",
     "SimulatedRealityDisplays.dll",
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-    "SimulatedRealityDirectX.dll",
-#endif
-#ifdef XRT_HAVE_LEIA_SR_GL
-    "SimulatedRealityOpenGL.dll",
-#endif
 };
 #define K_SR_DLL_COUNT (sizeof(k_sr_dlls) / sizeof(k_sr_dlls[0]))
+
+/*
+ * The PER-BACKEND SR client DLLs, each bound on its own (leia_sr_dx_bind /
+ * leia_sr_gl_bind) and imported only when its weavers are compiled in (same
+ * gates as CMakeLists.txt). Resolved from the SR bin dir like the rest.
+ */
+#define LEIA_SR_DX_DLL "SimulatedRealityDirectX.dll"
+#define LEIA_SR_GL_DLL "SimulatedRealityOpenGL.dll"
 
 /*
  * OpenCV, also delay-loaded and resolved from the SR bin dir, but OPTIONAL:
@@ -96,7 +104,8 @@ is_sr_dll(const char *name)
 			return true;
 		}
 	}
-	return _stricmp(name, LEIA_SR_OPENCV_DLL) == 0;
+	return _stricmp(name, LEIA_SR_DX_DLL) == 0 || _stricmp(name, LEIA_SR_GL_DLL) == 0 ||
+	       _stricmp(name, LEIA_SR_OPENCV_DLL) == 0;
 }
 
 //! Read the dir. Caller holds g_dir_lock exclusively.
@@ -192,6 +201,66 @@ leia_sr_dli_hook(unsigned dliNotify, PDelayLoadInfo pdli)
 // The delay-load helper reads this at every notification (delayimp.h).
 const PfnDliHook __pfnDliNotifyHook2 = leia_sr_dli_hook;
 
+/*
+ * First SR delay-load failure on this thread since bind_one() reset it. The
+ * helper calls the failure hook synchronously on the faulting thread, just
+ * before it raises, so thread-local storage needs no lock. The exception code
+ * alone only says "module" or "export"; this names which one.
+ */
+static __declspec(thread) bool t_fail_set;
+static __declspec(thread) DWORD t_fail_err;
+static __declspec(thread) char t_fail_dll[64];
+static __declspec(thread) char t_fail_proc[512]; //!< "" for a module failure
+
+static FARPROC WINAPI
+leia_sr_dli_failure_hook(unsigned dliNotify, PDelayLoadInfo pdli)
+{
+	if (t_fail_set || pdli == NULL || pdli->szDll == NULL || !is_sr_dll(pdli->szDll)) {
+		return NULL;
+	}
+	if (dliNotify == dliFailLoadLib) {
+		t_fail_proc[0] = '\0';
+	} else if (dliNotify == dliFailGetProc) {
+		if (pdli->dlp.fImportByName) {
+			snprintf(t_fail_proc, sizeof(t_fail_proc), "%s",
+			         pdli->dlp.szProcName != NULL ? pdli->dlp.szProcName : "?");
+		} else {
+			snprintf(t_fail_proc, sizeof(t_fail_proc), "#%lu", (unsigned long)pdli->dlp.dwOrdinal);
+		}
+	} else {
+		return NULL;
+	}
+	snprintf(t_fail_dll, sizeof(t_fail_dll), "%s", pdli->szDll);
+	t_fail_err = pdli->dwLastError;
+	t_fail_set = true;
+	// NULL = no substitute: the helper raises exactly as without this hook,
+	// and bind_one() catches it.
+	return NULL;
+}
+
+// The delay-load helper calls this on a failed LoadLibrary / GetProcAddress.
+const PfnDliHook __pfnDliFailureHook2 = leia_sr_dli_failure_hook;
+
+/*!
+ * What the last bind_one() on this thread failed on, for a WARN:
+ * "X.dll is missing export ?Sym@... (SR platform too old/new)" or
+ * "X.dll could not be loaded (error N)". @p name is the DLL being bound.
+ */
+static void
+describe_failure(const char *name, enum leia_sr_bind_result res, char *buf, size_t size)
+{
+	const char *dll = (t_fail_set && t_fail_dll[0] != '\0') ? t_fail_dll : name;
+	if (t_fail_set && t_fail_proc[0] != '\0') {
+		snprintf(buf, size, "%s is missing export %s (SR platform too old/new)", dll, t_fail_proc);
+	} else if (t_fail_set) {
+		snprintf(buf, size, "%s could not be loaded (error %lu)", dll, (unsigned long)t_fail_err);
+	} else {
+		snprintf(buf, size, "%s %s", dll,
+		         res == LEIA_SR_BIND_INCOMPATIBLE ? "is missing an export (SR platform too old/new)"
+		                                          : "could not be loaded");
+	}
+}
+
 //! SEH filter: delay-load failures are VcppException(ERROR_SEVERITY_ERROR, err).
 static int
 bind_filter(DWORD code, DWORD *out_code)
@@ -210,6 +279,7 @@ bind_one(const char *name, DWORD *out_code)
 {
 	HRESULT hr = S_OK;
 	*out_code = 0;
+	t_fail_set = false;
 	__try {
 		hr = __HrLoadAllImportsForDll(name);
 	} __except (bind_filter(GetExceptionCode(), out_code)) {
@@ -233,13 +303,13 @@ leia_sr_client_bind(void)
 
 	AcquireSRWLockExclusive(&g_bind_lock);
 	enum leia_sr_bind_result res = LEIA_SR_BIND_OK;
-	const char *failed = NULL;
+	char failed[640] = "?";
 	DWORD code = 0;
 	if (InterlockedCompareExchange(&g_bound, 0, 0) == 0) {
 		for (size_t i = 0; i < K_SR_DLL_COUNT; i++) {
 			res = bind_one(k_sr_dlls[i], &code);
 			if (res != LEIA_SR_BIND_OK) {
-				failed = k_sr_dlls[i];
+				describe_failure(k_sr_dlls[i], res, failed, sizeof(failed));
 				break;
 			}
 		}
@@ -253,15 +323,13 @@ leia_sr_client_bind(void)
 			g_bind_logged = true;
 			g_bind_logged_result = res;
 			if (res == LEIA_SR_BIND_OK) {
-				U_LOG_W("Leia SR: client DLLs bound (%u DLLs, delay-loaded)", (unsigned)K_SR_DLL_COUNT);
+				U_LOG_W("Leia SR: client DLLs bound (%u required DLLs, delay-loaded)",
+				        (unsigned)K_SR_DLL_COUNT);
 			} else {
 				U_LOG_W(
-				    "Leia SR: client DLLs NOT usable — %s %s (code 0x%08lx); the plug-in stays loaded "
+				    "Leia SR: client DLLs NOT usable — %s (code 0x%08lx); the plug-in stays loaded "
 				    "and declines until the SR platform is installed/updated",
-				    failed != NULL ? failed : "?",
-				    res == LEIA_SR_BIND_INCOMPATIBLE ? "is missing an export (SR platform too old/new)"
-				                                     : "could not be loaded",
-				    (unsigned long)code);
+				    failed, (unsigned long)code);
 			}
 		}
 	}
@@ -306,6 +374,66 @@ leia_sr_opencv_bind(void)
 	return ok;
 }
 
+/*
+ * One weaver backend's DLL, on top of the required ones. Sticky once true;
+ * retried after a failure, so an SR update that lands while this process runs
+ * is picked up; one WARN, on the first failure.
+ */
+static bool
+bind_backend(const char *dll, const char *dps, volatile LONG *bound, volatile LONG *logged)
+{
+	if (InterlockedCompareExchange(bound, 0, 0) != 0) {
+		return true;
+	}
+	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
+		return false; // logs its own outcome
+	}
+	AcquireSRWLockExclusive(&g_bind_lock);
+	enum leia_sr_bind_result res = LEIA_SR_BIND_OK;
+	DWORD code = 0;
+	if (InterlockedCompareExchange(bound, 0, 0) == 0) {
+		res = bind_one(dll, &code);
+		if (res == LEIA_SR_BIND_OK) {
+			InterlockedExchange(bound, 1);
+		}
+	}
+	const bool ok = InterlockedCompareExchange(bound, 0, 0) != 0;
+	if (!ok && InterlockedExchange(logged, 1) == 0) {
+		char what[640];
+		describe_failure(dll, res, what, sizeof(what));
+		U_LOG_W("Leia SR: %s (code 0x%08lx) — the %s display processors decline; the other backends are "
+		        "unaffected",
+		        what, (unsigned long)code, dps);
+	}
+	ReleaseSRWLockExclusive(&g_bind_lock);
+	return ok;
+}
+
+static volatile LONG g_dx_bound = 0;
+static volatile LONG g_dx_logged = 0;
+static volatile LONG g_gl_bound = 0;
+static volatile LONG g_gl_logged = 0;
+
+bool
+leia_sr_dx_bind(void)
+{
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	return bind_backend(LEIA_SR_DX_DLL, "D3D11/D3D12", &g_dx_bound, &g_dx_logged);
+#else
+	return false;
+#endif
+}
+
+bool
+leia_sr_gl_bind(void)
+{
+#ifdef XRT_HAVE_LEIA_SR_GL
+	return bind_backend(LEIA_SR_GL_DLL, "OpenGL", &g_gl_bound, &g_gl_logged);
+#else
+	return false;
+#endif
+}
+
 #else // !_WIN32
 
 enum leia_sr_bind_result
@@ -322,6 +450,18 @@ leia_sr_client_bound(void)
 
 bool
 leia_sr_opencv_bind(void)
+{
+	return false;
+}
+
+bool
+leia_sr_dx_bind(void)
+{
+	return false;
+}
+
+bool
+leia_sr_gl_bind(void)
 {
 	return false;
 }
