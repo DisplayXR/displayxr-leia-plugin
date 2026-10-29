@@ -36,8 +36,9 @@ static const struct leia_win_sr_multi_caps k_caps_unknown = {.known = false};
 static void
 test_unbound_dp_never_changes_routing(void)
 {
-	// The pre-M6 single-screen DP: SDK routing, no binding, whatever the caps.
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, AL_ID);
+	// The pre-M6 single-screen DP with a top-level window: SDK routing, no
+	// binding, whatever the caps.
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, false, AL_ID);
 	CHECK(!p.routing_external);
 	CHECK(!p.keep_drag_snap);
 	CHECK(!p.bind_display);
@@ -47,7 +48,7 @@ test_unbound_dp_never_changes_routing(void)
 static void
 test_majority_segment_keeps_hwnd_and_snap(void)
 {
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, AL_ID);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, false, AL_ID);
 	CHECK(p.routing_external);
 	CHECK(p.keep_drag_snap);
 	CHECK(p.bind_display && p.display_id == AL_ID);
@@ -58,7 +59,7 @@ test_majority_segment_keeps_hwnd_and_snap(void)
 static void
 test_secondary_segment_is_windowless_with_origin(void)
 {
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, DS1_ID);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, false, DS1_ID);
 	CHECK(p.routing_external);
 	CHECK(!p.keep_drag_snap); // no window: nothing to snap
 	CHECK(p.bind_display && p.display_id == DS1_ID);
@@ -68,7 +69,7 @@ test_secondary_segment_is_windowless_with_origin(void)
 static void
 test_unknown_display_binds_nothing(void)
 {
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, 0);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, false, 0);
 	CHECK(p.routing_external);
 	CHECK(!p.bind_display);
 }
@@ -76,20 +77,20 @@ test_unknown_display_binds_nothing(void)
 static void
 test_caps_gate(void)
 {
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_none, true, true, DS1_ID);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_none, true, true, false, DS1_ID);
 	CHECK(!p.routing_external && !p.keep_drag_snap && !p.bind_display);
-	p = leia_win_sr_plan_weaver(&k_caps_unknown, true, true, DS1_ID);
+	p = leia_win_sr_plan_weaver(&k_caps_unknown, true, true, false, DS1_ID);
 	CHECK(!p.routing_external && !p.bind_display);
 	// Routing without binding support: EXTERNAL on the active display only.
 	const struct leia_win_sr_multi_caps routing_only = {.known = true, .external_routing = true};
-	p = leia_win_sr_plan_weaver(&routing_only, true, false, DS1_ID);
+	p = leia_win_sr_plan_weaver(&routing_only, true, false, false, DS1_ID);
 	CHECK(p.routing_external && !p.bind_display && !p.keep_drag_snap);
 }
 
 static void
 test_fallback_order(void)
 {
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, DS1_ID);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, false, DS1_ID);
 	CHECK(leia_win_sr_plan_weaver_fallback(&p));
 	CHECK(p.routing_external && p.keep_drag_snap && !p.bind_display && p.display_id == 0);
 	CHECK(leia_win_sr_plan_weaver_fallback(&p));
@@ -107,17 +108,17 @@ test_bound_lens(void)
 	                                          .display_binding = true,
 	                                          .max_bound_displays = 2,
 	                                          .lens_per_device = true};
-	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&d3, true, false, DS1_ID);
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&d3, true, false, false, DS1_ID);
 	CHECK(leia_win_sr_plan_bind_lens(&d3, &p));
 	// Pre-D3 runtime: never — an unbound lens would switch the active panel.
-	p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, DS1_ID);
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, false, DS1_ID);
 	CHECK(!leia_win_sr_plan_bind_lens(&k_caps_2056, &p));
 	// D3 runtime but the display did not bind (fallback dropped it): no lens.
-	p = leia_win_sr_plan_weaver(&d3, true, false, DS1_ID);
+	p = leia_win_sr_plan_weaver(&d3, true, false, false, DS1_ID);
 	(void)leia_win_sr_plan_weaver_fallback(&p);
 	CHECK(!leia_win_sr_plan_bind_lens(&d3, &p));
 	// An unbound (pre-M6) DP has an empty plan: never a bound lens.
-	p = leia_win_sr_plan_weaver(&d3, false, true, AL_ID);
+	p = leia_win_sr_plan_weaver(&d3, false, true, false, AL_ID);
 	CHECK(!leia_win_sr_plan_bind_lens(&d3, &p));
 }
 
@@ -163,7 +164,7 @@ test_window_handle_on_the_untracked_screen(void)
 	 */
 	// The DS1 DP with the window: EXTERNAL + drag snap, bound, phases from
 	// the window — and still pins its viewer (its display has no tracker).
-	struct leia_win_sr_weaver_plan ds1 = leia_win_sr_plan_weaver(&k_caps_2056, true, true, DS1_ID);
+	struct leia_win_sr_weaver_plan ds1 = leia_win_sr_plan_weaver(&k_caps_2056, true, true, false, DS1_ID);
 	CHECK(ds1.routing_external && ds1.keep_drag_snap);
 	CHECK(ds1.bind_display && ds1.display_id == DS1_ID);
 	CHECK(!leia_win_sr_plan_needs_present_origin(&ds1, true));
@@ -172,7 +173,7 @@ test_window_handle_on_the_untracked_screen(void)
 
 	// The AL's windowless replacement: EXTERNAL, no snap, phase from the
 	// present origin, tracked by the active display's camera — no pin.
-	struct leia_win_sr_weaver_plan al = leia_win_sr_plan_weaver(&k_caps_2056, true, false, AL_ID);
+	struct leia_win_sr_weaver_plan al = leia_win_sr_plan_weaver(&k_caps_2056, true, false, false, AL_ID);
 	CHECK(al.routing_external && !al.keep_drag_snap);
 	CHECK(al.bind_display && al.display_id == AL_ID);
 	CHECK(leia_win_sr_plan_needs_present_origin(&al, false));
@@ -234,10 +235,80 @@ test_screen_origin_unbound_keeps_the_sr_location(void)
 	CHECK(!o.bound);
 }
 
+static void
+test_unbound_child_window_routes_external_without_snap(void)
+{
+	/*
+	 * displayxr-unity #428/#429: the Unity editor's docked Game view hands the
+	 * runtime a child window, and its DP is unbound. SDK routing subclasses
+	 * the editor's main window (GA_ROOT); EXTERNAL without KEEP_DRAG_SNAP
+	 * installs nothing.
+	 */
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, true, AL_ID);
+	CHECK(p.routing_external);
+	CHECK(!p.keep_drag_snap);
+	CHECK(!p.bind_display && p.display_id == 0); // unbound: still no binding
+	// The phase still comes from the window: no present origin, no bound lens.
+	CHECK(!leia_win_sr_plan_needs_present_origin(&p, true));
+	CHECK(!leia_win_sr_plan_bind_lens(&k_caps_2056, &p));
+	// The flag means nothing without a window.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, false, false, true, AL_ID);
+	CHECK(!p.routing_external && !p.keep_drag_snap && !p.bind_display);
+}
+
+static void
+test_bound_child_window_drops_the_snap_only(void)
+{
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, true, DS1_ID);
+	CHECK(p.routing_external);
+	CHECK(!p.keep_drag_snap);
+	CHECK(p.bind_display && p.display_id == DS1_ID);
+	CHECK(!leia_win_sr_plan_needs_present_origin(&p, true));
+	// The same DP with a top-level window keeps the snap, as before.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, false, DS1_ID);
+	CHECK(p.routing_external && p.keep_drag_snap);
+	// A windowless segment is the same with or without the flag.
+	const struct leia_win_sr_weaver_plan a = leia_win_sr_plan_weaver(&k_caps_2056, true, false, true, DS1_ID);
+	const struct leia_win_sr_weaver_plan b = leia_win_sr_plan_weaver(&k_caps_2056, true, false, false, DS1_ID);
+	CHECK(a.routing_external == b.routing_external && a.keep_drag_snap == b.keep_drag_snap &&
+	      a.bind_display == b.bind_display && a.display_id == b.display_id);
+}
+
+static void
+test_child_window_caps_gate_and_fallback(void)
+{
+	// A runtime without EXTERNAL routing (or an unknown one): SDK routing, as today.
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_none, false, true, true, 0);
+	CHECK(!p.routing_external && !p.keep_drag_snap && !p.bind_display);
+	p = leia_win_sr_plan_weaver(&k_caps_unknown, false, true, true, 0);
+	CHECK(!p.routing_external && !p.keep_drag_snap && !p.bind_display);
+	p = leia_win_sr_plan_weaver(&k_caps_unknown, true, true, true, DS1_ID);
+	CHECK(!p.routing_external && !p.bind_display);
+	// EXTERNAL honoured without KEEP_DRAG_SNAP support: still EXTERNAL.
+	const struct leia_win_sr_multi_caps routing_only = {.known = true, .external_routing = true};
+	p = leia_win_sr_plan_weaver(&routing_only, false, true, true, 0);
+	CHECK(p.routing_external && !p.keep_drag_snap);
+	// A refused create drops routing, as today (the SDK then subclasses).
+	p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, true, AL_ID);
+	CHECK(leia_win_sr_plan_weaver_fallback(&p));
+	CHECK(!p.routing_external && !p.keep_drag_snap && !p.bind_display);
+	CHECK(!leia_win_sr_plan_weaver_fallback(&p));
+	// Bound child: the binding goes first, then routing.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, true, DS1_ID);
+	CHECK(leia_win_sr_plan_weaver_fallback(&p));
+	CHECK(p.routing_external && !p.keep_drag_snap && !p.bind_display);
+	CHECK(leia_win_sr_plan_weaver_fallback(&p));
+	CHECK(!p.routing_external && !p.keep_drag_snap);
+	CHECK(!leia_win_sr_plan_weaver_fallback(&p));
+}
+
 int
 main(void)
 {
 	test_unbound_dp_never_changes_routing();
+	test_unbound_child_window_routes_external_without_snap();
+	test_bound_child_window_drops_the_snap_only();
+	test_child_window_caps_gate_and_fallback();
 	test_majority_segment_keeps_hwnd_and_snap();
 	test_secondary_segment_is_windowless_with_origin();
 	test_unknown_display_binds_nothing();

@@ -408,19 +408,33 @@ create_v2(double max_time,
 	}
 
 	// Multi-screen M6: what the runtime can do, and what this DP will ask for.
-	// An unbound DP gets an empty plan (SDK routing, no binding) — today's
-	// single-screen behaviour, byte-identical.
+	// An unbound DP with a top-level window gets an empty plan (SDK routing, no
+	// binding) — today's single-screen behaviour, byte-identical; one with a
+	// child window gets EXTERNAL routing only.
 	struct leia_win_sr_multi_caps mcaps = {};
 	struct leia_win_sr_weaver_plan plan = {};
-	if (sr.screen_bound) {
+	// displayxr-unity #428/#429: a child window (the Unity editor's docked Game
+	// view) keeps the SDK off its top-level ancestor (leia_win_sr_plan_weaver).
+	const HWND root = hwnd != nullptr ? GetAncestor(hwnd, GA_ROOT) : nullptr;
+	const bool is_child = root != nullptr && root != hwnd;
+	if (sr.screen_bound || is_child) {
 		leia_sr_v2_query_multi_caps(sr.instance_v2, &mcaps);
-		plan = leia_win_sr_plan_weaver(&mcaps, true, hwnd != nullptr, sr.bind_display_id);
+		plan = leia_win_sr_plan_weaver(&mcaps, sr.screen_bound, hwnd != nullptr, is_child, sr.bind_display_id);
+	}
+	if (sr.screen_bound) {
 		U_LOG_W(
-		    "SR Vulkan per-screen weaver: display 0x%016llx, window %p, caps{known=%d external=%d snap=%d "
+		    "SR Vulkan per-screen weaver: display 0x%016llx, window %p%s, caps{known=%d external=%d snap=%d "
 		    "binding=%d maxBound=%u} -> plan{external=%d keep_drag_snap=%d bind=%d}",
-		    (unsigned long long)sr.bind_display_id, (void *)hwnd, (int)mcaps.known, (int)mcaps.external_routing,
-		    (int)mcaps.keep_drag_snap, (int)mcaps.display_binding, mcaps.max_bound_displays,
-		    (int)plan.routing_external, (int)plan.keep_drag_snap, (int)plan.bind_display);
+		    (unsigned long long)sr.bind_display_id, (void *)hwnd, is_child ? " (child)" : "", (int)mcaps.known,
+		    (int)mcaps.external_routing, (int)mcaps.keep_drag_snap, (int)mcaps.display_binding,
+		    mcaps.max_bound_displays, (int)plan.routing_external, (int)plan.keep_drag_snap,
+		    (int)plan.bind_display);
+	} else if (is_child) {
+		U_LOG_W("SR Vulkan weaver in a child window %p (top-level %p): caps{known=%d external=%d} -> "
+		        "plan{external=%d keep_drag_snap=%d} — the SDK %s the top-level window",
+		        (void *)hwnd, (void *)root, (int)mcaps.known, (int)mcaps.external_routing,
+		        (int)plan.routing_external, (int)plan.keep_drag_snap,
+		        plan.routing_external ? "does not subclass" : "subclasses");
 	}
 
 	leia_sr_v2_display_info info{};

@@ -8,11 +8,14 @@
  *         types, so the decision is host-testable (tests/test_sr_multi_win.c)
  *         and the SDK-typed chain builder (leia_sr_d3d11.cpp) stays trivial.
  *
- * The Windows twin of drv_leia_linux/leia_sr_routing_linux.h, plus the one
- * Windows-only input: whether this DP holds the session's real HWND. The DP
- * with the HWND (the screen holding the majority of the window) keeps the
- * SDK's drag phase-snap through KEEP_DRAG_SNAP; every other screen's DP is
- * windowless and gets its phase from set_present_origin.
+ * The Windows twin of drv_leia_linux/leia_sr_routing_linux.h, plus two
+ * Windows-only inputs: whether this DP holds the session's real HWND, and
+ * whether that HWND is a child window. The DP with a top-level HWND (the
+ * screen holding the majority of the window) keeps the SDK's drag phase-snap
+ * through KEEP_DRAG_SNAP; every other screen's DP is windowless and gets its
+ * phase from set_present_origin. A DP whose HWND is a child window (the Unity
+ * editor's docked Game view) never lets the SDK subclass: see
+ * leia_win_sr_plan_weaver.
  * @ingroup drv_leia
  */
 #pragma once
@@ -68,29 +71,52 @@ struct leia_win_sr_weaver_plan
 /*!
  * Decide the chain.
  *
+ * A child window (displayxr-unity #428/#429): with SDK routing, or with
+ * KEEP_DRAG_SNAP, the SDK subclasses the window's top-level ancestor
+ * (GA_ROOT), which is the host application's main window: the Unity editor's
+ * docked Game view. That subclass does not chain safely with the host's own
+ * subclasses (SR 1.37-1.39): a crash on the second docked Play, and a lost
+ * File > Exit. EXTERNAL routing without KEEP_DRAG_SNAP installs nothing, so a
+ * child window gets exactly that, bound or not, whenever the runtime honours
+ * EXTERNAL. The cost is the SDK's drag phase-snap while the host's main window
+ * is dragged; the phase at rest still comes from the bound child window. A
+ * top-level window keeps today's plan.
+ *
  * @param caps          The runtime's answer (unknown ⟹ an empty plan: SDK
  *                      routing, no binding — exactly today's single-screen DP).
  * @param screen_bound  This DP was created for one screen
  *                      (create_dp_d3d11_for_screen). An unbound DP — every
- *                      pre-M6 caller — never changes routing: its weaver stays
- *                      in SDK mode so one-screen behaviour is byte-identical.
+ *                      pre-M6 caller — keeps SDK routing unless its window is
+ *                      a child window, so one-screen behaviour with a top-level
+ *                      window is byte-identical.
  * @param has_window    The DP holds the session's real HWND.
+ * @param is_child      That HWND is a child window
+ *                      (GetAncestor(hwnd, GA_ROOT) != hwnd). Ignored without
+ *                      a window.
  * @param display_id    The SR display to bind (0 = none / unknown).
  */
 static inline struct leia_win_sr_weaver_plan
 leia_win_sr_plan_weaver(const struct leia_win_sr_multi_caps *caps,
                         bool screen_bound,
                         bool has_window,
+                        bool is_child,
                         uint64_t display_id)
 {
 	struct leia_win_sr_weaver_plan p = {0};
-	if (caps == NULL || !caps->known || !screen_bound) {
+	if (caps == NULL || !caps->known) {
+		return p;
+	}
+	const bool child_window = has_window && is_child;
+	if (!screen_bound) {
+		// Only to keep the SDK off the host's top-level window; no binding.
+		p.routing_external = child_window && caps->external_routing;
 		return p;
 	}
 	p.routing_external = caps->external_routing;
 	// KEEP_DRAG_SNAP only matters with a real window: the SDK installs its
 	// WndProc phase-snap only there, and a windowless weaver installs nothing.
-	p.keep_drag_snap = p.routing_external && has_window && caps->keep_drag_snap;
+	// Never for a child window: the snap is installed on its GA_ROOT.
+	p.keep_drag_snap = p.routing_external && has_window && !child_window && caps->keep_drag_snap;
 	if (display_id != 0 && caps->display_binding && caps->max_bound_displays >= 1) {
 		p.bind_display = true;
 		p.display_id = display_id;
