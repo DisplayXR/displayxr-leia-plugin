@@ -74,6 +74,7 @@
 #pragma once
 
 #include "leia_interface.h"
+#include "leia_sr_ready_rules.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -176,7 +177,70 @@ void
 leiasr_ready_note_weaver_ready(void);
 
 /*!
- * Stop the watcher (if running) and wait briefly for it to exit. Idempotent.
+ * #468: what SR has identified as a weaver create attempt starts (the
+ * shared-memory count and the verified-geometry publish count); the retry
+ * wait after a failed attempt compares against it. Cheap.
+ *
+ * @ingroup drv_leia
+ */
+struct leiasr_identify_mark
+leiasr_identify_mark_take(void);
+
+/*!
+ * #468: has SR identified the panel since @p mark (see
+ * @ref leiasr_identify_woke)? Cheap enough to poll at 10 Hz.
+ *
+ * @ingroup drv_leia
+ */
+enum leiasr_identify_wake
+leiasr_identified_since(const struct leiasr_identify_mark *mark);
+
+/*!
+ * #469: the geometry a DP whose weaver is not ready reports, and where from.
+ */
+struct leiasr_pending_geometry
+{
+	enum leiasr_pending_geometry_source source;
+	struct leiasr_geometry geometry;     //!< valid unless source is NONE
+	struct leia_panel_identity attached; //!< the panel attached now (its desktop rect)
+	struct leia_panel_identity kept_on;  //!< the panel the kept geometry was verified on
+};
+
+/*!
+ * #469: resolve @ref leiasr_pending_geometry for a DP whose weaver is still
+ * being created. Safe on the render thread: it never refreshes the platform
+ * state and never queries SR. It reads the attached panel the pending-panel
+ * refresher keeps (re-read every LEIASR_PENDING_REFRESH_MS on its own thread,
+ * so a panel that has just gone stops being reported within one refresh), and
+ * treats a snapshot older than LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS as no panel.
+ * Each call also asks the refresher to keep going (@ref leiasr_pending_refresh_poke).
+ *
+ * @param bound A per-screen DP's binding rect (NULL or invalid: not per-screen).
+ * @return true when @p out carries a geometry to report.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_geometry_get_pending(const struct leia_desktop_rect *bound, struct leiasr_pending_geometry *out);
+
+/*!
+ * #469: keep the pending-panel refresher running (start it if it is not), so
+ * the attached-panel snapshot stays fresh for the next
+ * LEIASR_PENDING_IDLE_STOP_MS. Two atomics on the common path; the first call
+ * of an episode starts the thread. Called by the pending DP getters, whose
+ * per-frame calls keep it warm while a DP waits, and by the D3D11 create retry
+ * worker at each attempt and wait tick, which warms the snapshot before the
+ * first frame asks. An attempt's SR spin outlasts the idle window, so the
+ * worker's pokes alone do not span it.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_pending_refresh_poke(void);
+
+/*!
+ * Stop the watcher and the pending-panel refresher (if running) and wait
+ * briefly for them to exit. Idempotent.
  *
  * @ingroup drv_leia
  */

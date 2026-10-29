@@ -46,6 +46,8 @@ static uint16_t g_panel_mfr = 0;
 static uint16_t g_panel_prod = 0;
 static uint32_t g_panel_w = 0;
 static uint32_t g_panel_h = 0;
+static int32_t g_panel_left = 0; //!< #469: where it is now (not part of the identity)
+static int32_t g_panel_top = 0;
 
 static const char *const k_hint_install = "Install the LeiaSR Runtime";
 static const char *const k_hint_reinstall = "LeiaSR Runtime files not found - reinstall the LeiaSR Runtime";
@@ -107,6 +109,8 @@ evaluate_locked(const struct leia_display_probe_result *edid, const char **out_h
 		g_panel_prod = edid->product_id;
 		g_panel_w = edid->pixel_w;
 		g_panel_h = edid->pixel_h;
+		g_panel_left = edid->screen_left;
+		g_panel_top = edid->screen_top;
 		g_hit_seen = true;
 	} else if (g_panel_valid) {
 		g_panel_valid = false;
@@ -232,6 +236,28 @@ leia_platform_display_absent(void)
 	return leia_platform_state_get() == LEIA_PLATFORM_NO_DISPLAY;
 }
 
+bool
+leia_platform_matched_panel(struct leia_panel_identity *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	AcquireSRWLockShared(&g_lock);
+	if (g_panel_valid) {
+		out->valid = true;
+		out->manufacturer_id = g_panel_mfr;
+		out->product_id = g_panel_prod;
+		out->rect.valid = true;
+		out->rect.left = g_panel_left;
+		out->rect.top = g_panel_top;
+		out->rect.width = g_panel_w;
+		out->rect.height = g_panel_h;
+	}
+	ReleaseSRWLockShared(&g_lock);
+	return out->valid;
+}
+
 #else // !_WIN32
 
 // The Linux and Android arms have their own plug-in entry points and do not
@@ -273,6 +299,15 @@ leia_platform_state_get_hint(void)
 bool
 leia_platform_display_absent(void)
 {
+	return false;
+}
+
+bool
+leia_platform_matched_panel(struct leia_panel_identity *out)
+{
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+	}
 	return false;
 }
 

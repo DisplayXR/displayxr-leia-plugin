@@ -114,6 +114,63 @@ closing the gap when they get there first:
   client compositor create and re-fills its cached info whenever the answer
   changes.
 
+## After a replug: the D3D11 weaver's wait (#468, #469)
+
+After a long unplug SR takes 10–30 s to identify the panel again (a short
+re-seat: well under 1 s). Two things make that wait cheaper on the D3D11 arm,
+the only arm whose weaver is created asynchronously (D3D12, GL and Vulkan
+create synchronously and have no pending state):
+
+- **The create retry wakes on identification (#468).** `async_create_worker_body`
+  spins up to 5 s per attempt and then waited a fixed 5 s, so an
+  identification that landed in the wait cost up to 5 s more of flat blit. The
+  wait now ends within 100 ms of the shared-memory count going 0 → ≥ 1, or of
+  a verified-geometry publish (the watcher's; it covers SR keeping the count
+  across an unplug, where there is no edge). Both are compared against a mark
+  taken just before each create attempt, so an identification that lands
+  during the attempt wakes the wait at its first 100 ms tick. A count that was
+  already ≥ 1 when the attempt started is no news, so a failed attempt on an
+  identified panel still waits its period. The rule is pure C in `leia_sr_ready_rules.h`,
+  host-tested by `tests/test_sr_ready_rules.c`.
+- **A pending DP reports the panel's kept geometry (#469).** While the weaver
+  is pending, `get_display_dimensions` / `get_display_pixel_info` used to
+  return false, so the runtime had no screen and the app rendered a symmetric
+  default FOV for the whole wait. Every publish now also KEEPS the geometry
+  with the EDID identity of the panel it was verified on (manufacturer,
+  product, desktop size), and invalidation (P-c) leaves the kept copy alone. A
+  pending DP reports the verified geometry if there is one, else the kept one
+  when the attached panel has the same identity, with the panel's current
+  desktop rect as the pixel info. A per-screen DP reports it only while the
+  panel is attached exactly at its binding's rect (so not during Windows'
+  "panel alone at (0, 0)" re-seat transient). A panel never verified in this
+  process gets nothing, as before. The pick is in the same header and test.
+  One panel per process: the identity is P-c's one matched panel, with no
+  serial (the Windows EDID enumeration does not provide it; the DS1 reports
+  0). With two Leia panels of different models attached, the kept geometry
+  could be paired with the wrong one. Rare, documented in
+  `leia_panel_identity`, left as is.
+
+  The getters run on the render thread, every frame while the weaver is
+  pending, so they never refresh the platform state themselves: that takes the
+  platform state's lock exclusively, reads the registry, queries the SR Service
+  status, and re-runs the EDID enumeration whenever the monitor set changed —
+  exactly in the replug window. A **pending-panel refresher** thread does it
+  every 100 ms instead and keeps the attached panel; the getters only read that
+  copy under the readiness module's short mutex. The D3D11 create retry worker
+  starts the refresher (so the snapshot is warm before the first frame asks),
+  every getter call keeps it running, and it exits 2 s after the last ask. A
+  snapshot older than 500 ms, or none yet, reads as "no panel attached", so a
+  stalled refresher means nothing is reported, never a panel that may have
+  gone. Worst case after an unplug: one refresh period plus that refresh's
+  EDID enumeration (bounded at 500 ms by the snapshot age), as when the getter
+  refreshed itself, but off the render thread.
+
+  Reporting a size is what the runtime's segments manager reads as "this DP
+  can carry the session" (displayxr-runtime ADR-047 A8, `dp_ready`), so a
+  pending DP for a panel that is attached again now counts as ready during the
+  flat-blit wait — which is what it is: the panel is there, and the window is
+  shown flat on it until the weaver is up.
+
 ## Contract with the runtime (plugin_api 5 — no new ABI fields)
 
 1. `get_display_info` is cheap and non-blocking once the startup budget is
@@ -132,7 +189,15 @@ Leia SR readiness budget (20.0 s) expired with the panel unidentified — geomet
 Leia display geometry resolved: 7680x4320 px, 0.6981x0.3927 m, nominal Z=0.60 m, view 3840x2160, 60.0 Hz (create_device)
 Leia display geometry re-derived after late SR identification: 7680x4320 px, ... (late SR identification, watcher; 63012.4 s after first use) — live head device updated in place
 Created Leia 3D display: 3840x2160 px, 0.3440x0.1940 m, ... (geometry from hardcoded defaults — SR has not identified the panel yet; the device will be updated in place once it does)
+Leia D3D11 async weaver: create attempt 3 failed — retrying in 5 s, or as soon as SR identifies the panel
+Leia D3D11 async weaver: SR identified the panel (shared-memory count 0 -> 1) 2.7 s into the retry wait — retrying now (attempt 4) (#468)
+Leia D3D11 async weaver: READY 180 ms after SR identified the panel (#468)
+Leia D3D11 DP: weaver not ready — reporting the panel's kept geometry (0.3442x0.1936 m, 3840x2160 px @ -3840,0; verified on mfr=0x7204 prod=0x0001 3840x2160) until SR identifies it (#469)
+Leia D3D11 DP: weaver ready — SR's geometry (0.3442x0.1936 m) replaces the kept geometry reported for 28.6 s (#469)
 ```
+
+(The two #469 lines are per DP; the create-retry lines repeat per attempt, as
+before.)
 
 ## Reproducing / testing
 
