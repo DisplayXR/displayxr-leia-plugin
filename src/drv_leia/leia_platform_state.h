@@ -13,8 +13,11 @@
  *
  *   PLATFORM_ABSENT       SR registry key missing, or the SR client DLLs
  *                         cannot be resolved/loaded.
- *   INCOMPATIBLE          SR client DLLs load but lack an export this build
- *                         imports (platform too old/new for this plug-in).
+ *   INCOMPATIBLE          the REQUIRED SR client DLLs (Core, Displays) load
+ *                         but lack an export this build imports (platform
+ *                         too old/new for this plug-in). A weaver backend's
+ *                         DLL (DirectX, OpenGL) failing only declines that
+ *                         backend's DPs.
  *   PLATFORM_NOT_RUNNING  key present, and the SCM does not report the
  *                         `SR Service` service SERVICE_RUNNING, or its
  *                         `Global\sharedDeviceSerialMemory` section is
@@ -67,13 +70,31 @@ enum leia_sr_bind_result
 };
 
 /*!
- * Bind every delay-loaded SR import (leia_sr_delayload_win.c). MUST return
+ * Bind the REQUIRED delay-loaded SR imports, SimulatedRealityCore and
+ * SimulatedRealityDisplays (leia_sr_delayload_win.c). MUST return
  * LEIA_SR_BIND_OK before ANY SR SDK call: a missing DLL/export otherwise
  * faults at the call site. Sticky once OK; retried (cheaply) after a failure,
- * so an SR install that lands while this process runs is picked up.
+ * so an SR install that lands while this process runs is picked up. A failure
+ * logs the DLL and the missing export, and is the plug-in-wide platform state.
+ * The weaver backends' DLLs are NOT part of it: see leia_sr_dx_bind() /
+ * leia_sr_gl_bind().
  */
 enum leia_sr_bind_result
 leia_sr_client_bind(void);
+
+/*!
+ * Bind SimulatedRealityDirectX (CreateDX11Weaver / CreateDX12Weaver) on top
+ * of leia_sr_client_bind(). PER BACKEND: false makes only the D3D11 and D3D12
+ * DPs decline; the platform state is unaffected. MUST be true before any
+ * DirectX weaver call. Sticky once true; one WARN naming the DLL and the
+ * missing export on the first failure.
+ */
+bool
+leia_sr_dx_bind(void);
+
+//! As leia_sr_dx_bind(), for SimulatedRealityOpenGL (CreateGLWeaver) and the GL DPs.
+bool
+leia_sr_gl_bind(void);
 
 //! true once leia_sr_client_bind() has succeeded. Lock-free.
 bool

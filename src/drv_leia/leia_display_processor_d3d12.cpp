@@ -3028,6 +3028,11 @@ leia_dp_factory_d3d12(void *d3d12_device,
 		U_LOG_W("Leia D3D12 DP: SR platform client DLLs not usable — not creating the display processor");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	// Per backend: a broken SR DirectX DLL declines only this backend's DPs.
+	// The bind logs the DLL and the missing export once.
+	if (!leia_sr_dx_bind()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
 	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
 	// so we pass 0,0 here.
 	struct leiasr_d3d12 *weaver = NULL;
@@ -3079,6 +3084,11 @@ leia_dp_factory_d3d12_for_screen(struct xrt_plugin_instance *inst,
 	}
 	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
 		U_LOG_W("Leia D3D12 per-screen DP: SR platform client DLLs not usable — not creating");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	// Per backend: a broken SR DirectX DLL declines only this backend's DPs.
+	// The bind logs the DLL and the missing export once.
+	if (!leia_sr_dx_bind()) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 

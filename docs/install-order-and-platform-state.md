@@ -31,11 +31,24 @@ attempt, so an install that lands later is still found.
 
 **When it is safe to call SR.** If a delay-loaded DLL or export is missing, the
 first call into it raises an SEH exception at the call site. To prevent that,
-`leia_sr_client_bind()` binds every SR import up front (SEH-guarded). Every
-path that can reach the SR SDK checks this bind before making any SR call:
-`create_device`, the geometry resolver behind `get_display_info`, and all four
-DP factories. After one successful bind, no later SR call can fail on symbol
-resolution.
+the plug-in binds every SR import up front (SEH-guarded), in two tiers:
+
+- **Required:** `leia_sr_client_bind()` binds `SimulatedRealityCore` and
+  `SimulatedRealityDisplays`. Every path that can reach the SR SDK checks this
+  bind before making any SR call: `create_device`, the geometry resolver behind
+  `get_display_info`, and all four DP factories. A failure here is the
+  plug-in-wide `PLATFORM_ABSENT` / `INCOMPATIBLE` state.
+- **Per backend:** `leia_sr_dx_bind()` binds `SimulatedRealityDirectX`
+  (`CreateDX11Weaver`, `CreateDX12Weaver`) and `leia_sr_gl_bind()` binds
+  `SimulatedRealityOpenGL` (`CreateGLWeaver`). The D3D11/D3D12 DP factories
+  also require the DirectX bind, and the GL DP factories the OpenGL bind. A
+  failure declines only that backend's DPs; the platform state stays `READY`,
+  so an SR runtime version whose OpenGL DLL lacks an export still weaves
+  D3D11. The VK DP loads its weaver DLL itself and needs neither.
+
+After a successful bind, no later SR call on that path can fail on symbol
+resolution. A delay-load failure hook records which DLL and which export
+(by name, or `#ordinal`) failed, and the bind's WARN names it.
 
 **Testing aid:** `DXR_LEIA_SR_DIR=<dir>` replaces the registry value for DLL
 resolution. `<dir>` is the folder that holds the client DLLs, i.e. the `bin`
@@ -79,7 +92,7 @@ not reported.
 |---|---|---|
 | `PLATFORM_ABSENT` | SR registry key missing | `Install the LeiaSR Runtime` |
 | `PLATFORM_ABSENT` | key present, SR client DLLs cannot be loaded | `LeiaSR Runtime files not found - reinstall the LeiaSR Runtime` |
-| `INCOMPATIBLE` | SR DLLs load but lack an export this build imports | `The installed LeiaSR Runtime is not compatible with this plug-in - update the LeiaSR Runtime` |
+| `INCOMPATIBLE` | SR Core/Displays DLLs load but lack an export this build imports (a DirectX/OpenGL mismatch declines only that backend's DPs) | `The installed LeiaSR Runtime is not compatible with this plug-in - update the LeiaSR Runtime` |
 | `PLATFORM_NOT_RUNNING` | key present, and the SCM does not report the `SR Service` service as `SERVICE_RUNNING`, or its `Global\sharedDeviceSerialMemory` section is absent | `The SR Service is not running` |
 | `NO_DISPLAY` | SR running, no Leia panel attached: no EDID match, and either a table-known panel was seen earlier in this process (an unplug) or SR has identified no device | `No Leia 3D display detected` |
 | `READY` | SR running and a panel is attached (EDID match, or SR has identified a panel the frozen EDID table does not know) | (empty) |
@@ -122,8 +135,9 @@ All of these are one-shot `WARN`s, logged when the value changes:
 
 ```
 Leia SR: client DLL directory resolved to 'C:\Program Files\LeiaSR\Platform\bin\' (HKLM\SOFTWARE\Dimenco\Simulated Reality)
-Leia SR: client DLLs bound (4 DLLs, delay-loaded)
-Leia SR: client DLLs NOT usable — SimulatedRealityCore.dll could not be loaded (code 0xc06d007e); ...
+Leia SR: client DLLs bound (2 required DLLs, delay-loaded)
+Leia SR: client DLLs NOT usable — SimulatedRealityCore.dll could not be loaded (error 126) (code 0xc06d007e); ...
+Leia SR: SimulatedRealityOpenGL.dll is missing export ?CreateGLWeaver@SR@@... (SR platform too old/new) (code 0xc06d007f) — the OpenGL display processors decline; the other backends are unaffected
 Leia SR platform state: READY (was UNKNOWN; key=1 service=1 scm_running=1 edid_match=1 dlls_bound=1)
 Leia SR platform state: PLATFORM_NOT_RUNNING - The SR Service is not running (was READY; key=1 service=0 scm_running=0 ...)
 Leia SR platform state: PLATFORM_ABSENT - Install the LeiaSR Runtime (was UNKNOWN; key=0 ...)

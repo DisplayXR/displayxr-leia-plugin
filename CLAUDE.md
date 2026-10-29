@@ -45,7 +45,8 @@ box. Details: [`docs/installer.md`](docs/installer.md).
 The plug-in itself loads WITHOUT the LeiaSR platform (SR client DLLs are `/DELAYLOAD`ed and
 resolved from the SR install dir) and reports a platform state —
 [`docs/install-order-and-platform-state.md`](docs/install-order-and-platform-state.md).
-**No SR SDK call may run before `leia_sr_client_bind()` returned OK** — a missing delay-loaded
+**No SR SDK call may run before `leia_sr_client_bind()` returned OK**, and no DirectX / OpenGL
+weaver call before `leia_sr_dx_bind()` / `leia_sr_gl_bind()` returned true — a missing delay-loaded
 DLL faults at the call site.
 
 ## Where this fits in DisplayXR
