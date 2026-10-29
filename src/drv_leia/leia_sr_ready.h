@@ -227,16 +227,34 @@ leiasr_geometry_get_pending(const struct leia_desktop_rect *bound, struct leiasr
  * #469: keep the pending-panel refresher running (start it if it is not), so
  * the attached-panel snapshot stays fresh for the next
  * LEIASR_PENDING_IDLE_STOP_MS. Two atomics on the common path; the first call
- * of an episode starts the thread. Called by the pending DP getters, whose
- * per-frame calls keep it warm while a DP waits, and by the D3D11 create retry
- * worker at each attempt and wait tick, which warms the snapshot before the
- * first frame asks. An attempt's SR spin outlasts the idle window, so the
- * worker's pokes alone do not span it.
+ * of an episode starts the thread, or (#475) wakes it when the DPs' heartbeat
+ * alone kept it running at its slower cadence. Called by the pending DP
+ * getters, whose per-frame calls keep it warm while a DP waits, and by the
+ * D3D11 create retry worker at each attempt and wait tick, which warms the
+ * snapshot before the first frame asks. An attempt's SR spin outlasts the idle
+ * window, so the worker's pokes alone do not span it.
  *
  * @ingroup drv_leia
  */
 void
 leiasr_pending_refresh_poke(void);
+
+/*!
+ * #475: the display processors' P-c hot-plug heartbeat, called about once a
+ * second from their per-frame path. Asks the refresher for a platform-state
+ * pass (registry, SR Service status, the EDID enumeration when the monitor set
+ * changed) every LEIASR_HEARTBEAT_REFRESH_MS, so none of that runs on the
+ * render thread; the DP reads the state the pass publishes
+ * (leia_platform_display_absent). Two atomics on the common path; the first
+ * call starts the refresher. Where the refresher cannot run (a configure
+ * without the SR D3D11 bits, after @ref leiasr_ready_shutdown, an event or a
+ * thread that cannot be created) it refreshes on the caller's thread, as the
+ * DPs did before.
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_platform_heartbeat(void);
 
 /*!
  * Stop the watcher and the pending-panel refresher (if running) and wait

@@ -88,14 +88,17 @@ HANDLE g_watcher_done = nullptr; // manual-reset
 
 // --- #469: the pending-panel refresher ---------------------------------------
 // Runs while a pending DP or a create retry asked within
-// LEIASR_PENDING_IDLE_STOP_MS (g_pending_demand_ms), then exits; the next ask
-// starts it again. Detached, like the watcher.
+// LEIASR_PENDING_IDLE_STOP_MS (g_pending_demand_ms), or (#475) a DP heartbeat
+// within LEIASR_HEARTBEAT_IDLE_STOP_MS (g_heartbeat_demand_ms), then exits;
+// the next ask starts it again. Detached, like the watcher.
 std::atomic<uint64_t> g_pending_demand_ms{0};
+std::atomic<uint64_t> g_heartbeat_demand_ms{0};
 std::atomic<bool> g_refresher_running{false};
 std::atomic<bool> g_refresher_shutdown{false};
 std::mutex g_refresher_mu;         // serialises start vs shutdown
 HANDLE g_refresher_stop = nullptr; // manual-reset
 HANDLE g_refresher_done = nullptr; // manual-reset
+HANDLE g_refresher_wake = nullptr; // auto-reset: a pending episode starts (#475)
 
 double
 budget_from_env()
@@ -283,53 +286,104 @@ pending_refresh_once()
 	g_attached_ms = now_ms != 0 ? now_ms : 1;
 }
 
+//! The demand loads are sequentially consistent: see the stand-down in refresher_body.
+bool
+refresher_wanted_now()
+{
+	return leiasr_refresher_wanted(GetTickCount64(), g_pending_demand_ms.load(), g_heartbeat_demand_ms.load());
+}
+
 void
 refresher_body()
 {
+	const HANDLE waits[2] = {g_refresher_stop, g_refresher_wake};
 	for (;;) {
 		pending_refresh_once();
-		if (WaitForSingleObject(g_refresher_stop, LEIASR_PENDING_REFRESH_MS) == WAIT_OBJECT_0) {
+		// #475: every LEIASR_PENDING_REFRESH_MS while a pending DP or a create
+		// retry asks, else every LEIASR_HEARTBEAT_REFRESH_MS for the DPs'
+		// heartbeat. A pending episode that starts meanwhile wakes it.
+		const DWORD period = leiasr_refresher_period_ms(GetTickCount64(), g_pending_demand_ms.load());
+		if (WaitForMultipleObjects(2, waits, FALSE, period) == WAIT_OBJECT_0) {
 			break;
 		}
-		if (leiasr_pending_refresher_wanted(GetTickCount64(), g_pending_demand_ms.load(std::memory_order_acquire))) {
+		if (refresher_wanted_now()) {
 			continue;
 		}
-		// Idle: stand down, unless an ask slipped in after the check (it saw
-		// the flag still set and did not start a thread) — then take it back.
-		g_refresher_running.store(false, std::memory_order_release);
-		if (!g_refresher_shutdown.load() &&
-		    leiasr_pending_refresher_wanted(GetTickCount64(),
-		                                    g_pending_demand_ms.load(std::memory_order_acquire)) &&
-		    !g_refresher_running.exchange(true, std::memory_order_acq_rel)) {
+		// Idle: stand down under the start/shutdown lock, so a start never
+		// sees a refresher half-way out (two threads, or `done` set while one
+		// runs) and a shutdown never misses one taking itself back. The flag
+		// is cleared BEFORE the demand is read again, and an asker stores its
+		// demand before it reads the flag, both sequentially consistent: an
+		// ask that saw the flag still set is seen here, and one that saw it
+		// cleared starts a refresher itself once this releases the lock.
+		std::lock_guard<std::mutex> lk(g_refresher_mu);
+		g_refresher_running.store(false);
+		if (!g_refresher_shutdown.load() && refresher_wanted_now()) {
+			g_refresher_running.store(true);
 			continue;
 		}
 		SetEvent(g_refresher_done);
 		return;
 	}
-	g_refresher_running.store(false, std::memory_order_release);
+	// Stopped: only leiasr_ready_shutdown sets the stop event, and after it
+	// nothing starts a refresher again.
+	g_refresher_running.store(false);
 	SetEvent(g_refresher_done);
 }
 
-void
+//! Start the refresher unless it runs. false when it cannot run: shut down, an
+//! event could not be created, or the thread could not be started (#475: the
+//! DP heartbeat then refreshes inline). Never throws: the askers are extern "C"
+//! and run on render threads.
+bool
 refresher_start()
 {
 	std::lock_guard<std::mutex> lk(g_refresher_mu);
-	if (g_refresher_shutdown.load() || g_refresher_running.load()) {
-		return;
+	if (g_refresher_shutdown.load()) {
+		return false;
+	}
+	if (g_refresher_running.load()) {
+		return true;
 	}
 	if (g_refresher_stop == nullptr) {
 		g_refresher_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+	}
+	if (g_refresher_done == nullptr) {
 		g_refresher_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-		if (g_refresher_stop == nullptr || g_refresher_done == nullptr) {
+	}
+	if (g_refresher_wake == nullptr) {
+		g_refresher_wake = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+	}
+	if (g_refresher_stop == nullptr || g_refresher_done == nullptr || g_refresher_wake == nullptr) {
+		static bool s_logged = false; // under g_refresher_mu
+		if (!s_logged) {
+			s_logged = true;
 			U_LOG_E("Leia pending-panel refresher: CreateEvent failed (%lu) — a pending DP reports no "
-			        "geometry (#469)",
+			        "geometry (#469), and the DPs' hot-plug heartbeat refreshes the platform state on the "
+			        "render thread (#475)",
 			        (unsigned long)GetLastError());
-			return;
 		}
+		return false;
 	}
 	ResetEvent(g_refresher_done);
 	g_refresher_running.store(true);
-	std::thread([]() { refresher_body(); }).detach();
+	try {
+		std::thread([]() { refresher_body(); }).detach();
+	} catch (...) {
+		// std::system_error (no thread or memory left): leave the flag clear,
+		// so the next ask tries again and the heartbeat refreshes inline.
+		g_refresher_running.store(false);
+		SetEvent(g_refresher_done);
+		static bool s_thread_logged = false; // under g_refresher_mu
+		if (!s_thread_logged) {
+			s_thread_logged = true;
+			U_LOG_E("Leia pending-panel refresher: the thread could not be started — a pending DP reports "
+			        "no geometry (#469), and the DPs' hot-plug heartbeat refreshes the platform state on "
+			        "the render thread (#475)");
+		}
+		return false;
+	}
+	return true;
 }
 
 } // namespace
@@ -574,23 +628,59 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 void
 leiasr_pending_refresh_poke(void)
 {
-	g_pending_demand_ms.store(GetTickCount64(), std::memory_order_release);
-	if (g_refresher_running.load(std::memory_order_acquire) || g_refresher_shutdown.load()) {
+	// Demand, then the flag, both sequentially consistent (the refresher's
+	// stand-down does the reverse, see refresher_body).
+	const uint64_t now_ms = GetTickCount64();
+	const uint64_t prev_ms = g_pending_demand_ms.exchange(now_ms);
+	if (g_refresher_shutdown.load()) {
 		return;
 	}
-	refresher_start();
+	if (g_refresher_running.load()) {
+		// #475: a refresher kept up by the DPs' heartbeat alone may be waiting
+		// out a LEIASR_HEARTBEAT_REFRESH_MS period. Cut it short once per
+		// episode, so the pass runs now, as a refresher started by this ask
+		// would. The event exists: it is created before the flag is first set.
+		if (leiasr_pending_episode_starts(now_ms, prev_ms)) {
+			SetEvent(g_refresher_wake);
+		}
+		return;
+	}
+	(void)refresher_start();
+}
+
+void
+leiasr_platform_heartbeat(void)
+{
+	// Demand, then the flag, as in leiasr_pending_refresh_poke.
+	g_heartbeat_demand_ms.store(GetTickCount64());
+	if (g_refresher_running.load()) {
+		return;
+	}
+	if (!refresher_start()) {
+		// No refresher (shut down, or it could not be started): refresh here,
+		// as the DPs did before #475.
+		(void)leia_platform_state_refresh(UINT32_MAX);
+	}
 }
 
 void
 leiasr_ready_shutdown(void)
 {
+	// #475: the DPs' heartbeat keeps the refresher up for the whole session,
+	// so it is usually running here. Stop it under the lock (nothing starts or
+	// takes one back after the flag), then wait outside it, as long as for the
+	// watcher: a pass may be in an EDID enumeration.
+	bool wait_refresher = false;
 	{
 		std::lock_guard<std::mutex> lk(g_refresher_mu);
 		g_refresher_shutdown.store(true);
-		if (g_refresher_running.load() && g_refresher_stop != nullptr) {
+		if (g_refresher_stop != nullptr) {
 			SetEvent(g_refresher_stop);
-			(void)WaitForSingleObject(g_refresher_done, 1000);
 		}
+		wait_refresher = g_refresher_running.load() && g_refresher_done != nullptr;
+	}
+	if (wait_refresher) {
+		(void)WaitForSingleObject(g_refresher_done, 2500);
 	}
 	std::lock_guard<std::mutex> lk(g_watcher_mu);
 	g_watcher_shutdown.store(true);
@@ -694,6 +784,14 @@ leiasr_geometry_get_pending(const leia_desktop_rect *bound, leiasr_pending_geome
 void
 leiasr_pending_refresh_poke(void)
 {
+}
+
+void
+leiasr_platform_heartbeat(void)
+{
+	// No refresher in this configure: the heartbeat refreshes on its caller's
+	// thread, as before #475.
+	(void)leia_platform_state_refresh(UINT32_MAX);
 }
 
 void

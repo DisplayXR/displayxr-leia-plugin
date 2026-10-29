@@ -20,6 +20,7 @@
 #include "leia_display_processor.h"
 #include "leia_sr.h"
 #include "leia_platform_state.h"
+#include "leia_sr_ready.h" // #475: the hot-plug heartbeat runs on the refresher
 #include "leia_display_claims_win.h" // multi-screen M6: monitor -> SR display id
 #include "leia_sr_multi_win.h"       // multi-screen M6: the per-screen DP's desktop origin
 
@@ -1651,16 +1652,17 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	// centering below.
 	ldp->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1;
 
-	// P-c display hot-plug (same contract as the D3D11/D3D12 DPs): ~1 Hz cheap
-	// platform-state poll — the EDID enumeration re-runs only on a monitor
-	// topology change — and, while the panel is gone (NO_DISPLAY; the runtime
-	// keeps the vendor DP, no live swap), pass view 0 through unwoven with the
+	// P-c display hot-plug (same contract as the D3D11/D3D12 DPs): a ~1 Hz
+	// heartbeat asks the refresher thread to re-read the platform state (#475;
+	// the EDID enumeration re-runs only on a monitor topology change), so none
+	// of it runs here. While the panel is gone (NO_DISPLAY; the runtime keeps
+	// the vendor DP, no live swap), pass view 0 through unwoven with the
 	// single-view blit below instead of weaving for a lens that is not there.
 	{
 		const uint64_t now_ns = os_monotonic_get_ns();
 		if (ldp->display_poll_ns == 0 || (now_ns - ldp->display_poll_ns) > 1000000000ull) {
 			ldp->display_poll_ns = now_ns;
-			(void)leia_platform_state_refresh(UINT32_MAX);
+			leiasr_platform_heartbeat();
 		}
 	}
 	const bool display_absent = leia_platform_display_absent();

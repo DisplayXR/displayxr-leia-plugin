@@ -2299,11 +2299,13 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		if (ldp->backend_poll_ms == 0 || (now_ms - ldp->backend_poll_ms) > 1000) {
 			ldp->backend_poll_ms = now_ms;
 			ldp->backend_state = leiasr_d3d11_poll_backend_state(ldp->leiasr);
-			// P-c display hot-plug, same 1 Hz heartbeat. Cheap: a monitor
-			// topology signature; the EDID enumeration re-runs only when
-			// the monitor set changed. Publishes NO_DISPLAY on an unplug
-			// (and invalidates the cached geometry), READY on a re-plug.
-			(void)leia_platform_state_refresh(UINT32_MAX);
+			// P-c display hot-plug, same 1 Hz heartbeat: asks the refresher
+			// thread to re-read the platform state (#475; the EDID
+			// enumeration re-runs only when the monitor set changed), so
+			// none of it runs here. That pass publishes NO_DISPLAY on an
+			// unplug (and invalidates the cached geometry), READY on a
+			// re-plug; display_absent below reads what it published.
+			leiasr_platform_heartbeat();
 		}
 	}
 
