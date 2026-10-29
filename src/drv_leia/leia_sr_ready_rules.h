@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  The pure decisions behind two SR-readiness behaviours of the Windows
- *         arm: when a weaver create retry stops waiting (#468), and which
+ * @brief  The pure decisions behind three SR-readiness behaviours of the
+ *         Windows arm: when a weaver create retry stops waiting (#468), which
  *         geometry a display processor reports while its weaver is not up yet
- *         (#469). Plain C, no SDK or Win32 types, so the rules are
- *         host-testable (tests/test_sr_ready_rules.c); leia_sr_ready.cpp feeds
- *         them.
+ *         (#469), and when the refresher that re-reads the platform state off
+ *         the render thread runs (#469, #475). Plain C, no SDK or Win32
+ *         types, so the rules are host-testable (tests/test_sr_ready_rules.c);
+ *         leia_sr_ready.cpp feeds them.
  *
  * ## #468: wake the retry on identification
  *
@@ -35,6 +36,12 @@
  *   verified on (manufacturer, product, desktop size);
  * - nothing otherwise: a panel never verified in this process gets no
  *   invented geometry.
+ *
+ * ## #475: the DPs' hot-plug heartbeat runs on the refresher too
+ *
+ * When the refresher runs, and at which cadence, for the pending getters and
+ * for the DPs' 1 Hz platform-state heartbeat (see the block before
+ * LEIASR_HEARTBEAT_REFRESH_MS).
  *
  * @ingroup drv_leia
  */
@@ -242,6 +249,60 @@ leiasr_pending_refresher_wanted(uint64_t now_ms, uint64_t demand_ms)
 		return true; // asked just after the refresher read its clock
 	}
 	return now_ms - demand_ms < LEIASR_PENDING_IDLE_STOP_MS;
+}
+
+/*
+ * #475: the DPs' P-c hot-plug heartbeat does not refresh the platform state on
+ * the render thread either. Every LEIASR_HEARTBEAT_REFRESH_MS it asks the same
+ * refresher for a pass and reads the state that pass publishes. While only the
+ * heartbeat asks, the refresher runs at that cadence (the heartbeat's own
+ * before #475); while a pending DP or a create retry asks, at
+ * LEIASR_PENDING_REFRESH_MS. It stops once neither has asked within its idle
+ * period.
+ */
+#define LEIASR_HEARTBEAT_REFRESH_MS 1000
+#define LEIASR_HEARTBEAT_IDLE_STOP_MS 3000
+
+//! Is a DP heartbeat that asked at @p demand_ms (0 = never) still asking?
+static inline bool
+leiasr_heartbeat_wanted(uint64_t now_ms, uint64_t demand_ms)
+{
+	if (demand_ms == 0) {
+		return false;
+	}
+	if (demand_ms >= now_ms) {
+		return true; // asked just after the refresher read its clock
+	}
+	return now_ms - demand_ms < LEIASR_HEARTBEAT_IDLE_STOP_MS;
+}
+
+//! Keep the refresher running? While a pending DP, a create retry or a DP heartbeat asked recently.
+static inline bool
+leiasr_refresher_wanted(uint64_t now_ms, uint64_t pending_demand_ms, uint64_t heartbeat_demand_ms)
+{
+	return leiasr_pending_refresher_wanted(now_ms, pending_demand_ms) ||
+	       leiasr_heartbeat_wanted(now_ms, heartbeat_demand_ms);
+}
+
+//! The refresher's wait after a pass: the pending cadence while one asks, else the heartbeat's.
+static inline uint32_t
+leiasr_refresher_period_ms(uint64_t now_ms, uint64_t pending_demand_ms)
+{
+	return leiasr_pending_refresher_wanted(now_ms, pending_demand_ms) ? LEIASR_PENDING_REFRESH_MS
+	                                                                  : LEIASR_HEARTBEAT_REFRESH_MS;
+}
+
+/*!
+ * Does an ask at @p now_ms start a pending episode, given the previous ask at
+ * @p prev_demand_ms (0 = never)? A refresher kept up by the heartbeat alone may
+ * then be waiting out a LEIASR_HEARTBEAT_REFRESH_MS period; it is woken, so
+ * the pass runs now, as one started by that ask would, and not up to a
+ * heartbeat period later.
+ */
+static inline bool
+leiasr_pending_episode_starts(uint64_t now_ms, uint64_t prev_demand_ms)
+{
+	return !leiasr_pending_refresher_wanted(now_ms, prev_demand_ms);
 }
 
 #ifdef __cplusplus

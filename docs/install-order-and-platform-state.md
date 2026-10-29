@@ -126,8 +126,10 @@ adopts this plug-in once the service is back. The plug-in never sets
   change, an unplug led to weaving on an ordinary monitor.
 - The DPs detect the change with a 1 Hz check of the monitor-topology
   signature (`EnumDisplayMonitors`) and run the EDID enumeration again only when
-  that signature changes. The runtime's re-probes run a full EDID probe on
-  every call.
+  that signature changes. The check runs on the readiness module's refresher
+  thread, never on the render thread: the DP's heartbeat only asks for it and
+  reads the published state (#475, see [sr-readiness.md](sr-readiness.md)).
+  The runtime's re-probes run a full EDID probe on every call.
 
 ## Log lines
 

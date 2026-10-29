@@ -187,6 +187,49 @@ test_pending_snapshot(void)
 	CHECK(LEIASR_PENDING_IDLE_STOP_MS > LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS);
 }
 
+static void
+test_heartbeat(void)
+{
+	// #475: a DP heartbeat keeps the refresher running for its idle period.
+	CHECK(!leiasr_heartbeat_wanted(10000, 0));
+	CHECK(leiasr_heartbeat_wanted(10000, 10000));
+	CHECK(leiasr_heartbeat_wanted(10000, 10000 - LEIASR_HEARTBEAT_IDLE_STOP_MS + 1));
+	CHECK(!leiasr_heartbeat_wanted(10000, 10000 - LEIASR_HEARTBEAT_IDLE_STOP_MS));
+	CHECK(leiasr_heartbeat_wanted(10000, 10002)); // asked after the refresher read its clock
+	// A DP asks once a heartbeat period: a late frame must not stop the
+	// refresher between two asks.
+	CHECK(LEIASR_HEARTBEAT_IDLE_STOP_MS >= 2 * LEIASR_HEARTBEAT_REFRESH_MS);
+
+	// Either kind of ask keeps it running; neither stops it.
+	CHECK(!leiasr_refresher_wanted(10000, 0, 0));
+	CHECK(leiasr_refresher_wanted(10000, 10000, 0));
+	CHECK(leiasr_refresher_wanted(10000, 0, 10000));
+	CHECK(!leiasr_refresher_wanted(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS,
+	                               10000 - LEIASR_HEARTBEAT_IDLE_STOP_MS));
+	// The heartbeat holds it after the pending episode ended.
+	CHECK(leiasr_refresher_wanted(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS, 10000 - 1));
+
+	// Its cadence: the pending one while a pending DP or a create retry asks,
+	// the heartbeat's (the DPs' own before #475) otherwise.
+	CHECK(leiasr_refresher_period_ms(10000, 10000) == LEIASR_PENDING_REFRESH_MS);
+	CHECK(leiasr_refresher_period_ms(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS + 1) ==
+	      LEIASR_PENDING_REFRESH_MS);
+	CHECK(leiasr_refresher_period_ms(10000, 0) == LEIASR_HEARTBEAT_REFRESH_MS);
+	CHECK(leiasr_refresher_period_ms(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS) == LEIASR_HEARTBEAT_REFRESH_MS);
+	CHECK(LEIASR_PENDING_REFRESH_MS < LEIASR_HEARTBEAT_REFRESH_MS);
+
+	// A pending episode starts with the first ask, or the first after the
+	// previous episode idled out; asks inside an episode do not start one
+	// (the wake is once per episode, not once per frame).
+	CHECK(leiasr_pending_episode_starts(10000, 0));
+	CHECK(leiasr_pending_episode_starts(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS));
+	CHECK(!leiasr_pending_episode_starts(10000, 10000 - 16));
+	CHECK(!leiasr_pending_episode_starts(10000, 10000 - LEIASR_PENDING_IDLE_STOP_MS + 1));
+	// Why the wake: at the heartbeat's period the snapshot can be older than a
+	// pending DP trusts.
+	CHECK(LEIASR_HEARTBEAT_REFRESH_MS > LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS);
+}
+
 int
 main(void)
 {
@@ -194,6 +237,7 @@ main(void)
 	test_identity();
 	test_pick();
 	test_pending_snapshot();
+	test_heartbeat();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_ready_rules: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

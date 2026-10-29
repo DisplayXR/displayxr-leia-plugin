@@ -158,12 +158,34 @@ create synchronously and have no pending state):
   every 100 ms instead and keeps the attached panel; the getters only read that
   copy under the readiness module's short mutex. The D3D11 create retry worker
   starts the refresher (so the snapshot is warm before the first frame asks),
-  every getter call keeps it running, and it exits 2 s after the last ask. A
+  every getter call keeps it running, and it exits 2 s after the last ask
+  (unless DP heartbeats keep it running, below). A
   snapshot older than 500 ms, or none yet, reads as "no panel attached", so a
   stalled refresher means nothing is reported, never a panel that may have
   gone. Worst case after an unplug: one refresh period plus that refresh's
   EDID enumeration (bounded at 500 ms by the snapshot age), as when the getter
   refreshed itself, but off the render thread.
+
+  The DPs' P-c hot-plug heartbeat (#475) was the same work on the same
+  thread: once a second, each Windows DP (D3D11, D3D12, GL, VK) refreshed the
+  platform state from its per-frame path, so the EDID enumeration of a
+  hot-plug ran on the render thread, and since the refresher could hold the
+  platform state's lock for its own enumeration, the heartbeat could wait for
+  it there. The heartbeat now only asks the same refresher for a pass
+  (`leiasr_platform_heartbeat`) and reads the state the pass publishes; a DP's
+  first frame, and the first after a pause of more than 3 s, read the state
+  from before that pass. While only heartbeats ask, the refresher runs every
+  1 s, the heartbeat's own cadence; while a pending DP or a create retry asks,
+  every 100 ms. It exits 3 s after the last heartbeat, so it is usually up for
+  the whole session, and shutdown stops it and waits up to 2.5 s, as for the
+  watcher. A pending episode that starts while it waits out a 1 s period
+  wakes it, so that pass runs at once, as when the episode's first ask started
+  a refresher before #475. It stands down under the same lock its start and
+  shutdown take, so neither sees it half-way out. Where the refresher cannot
+  run (a configure without the SR D3D11 bits, after shutdown, an event or a
+  thread that cannot be created) the heartbeat refreshes on its caller's
+  thread, as before. The cadence rules are in `leia_sr_ready_rules.h` and
+  host-tested with the others.
 
   Reporting a size is what the runtime's segments manager reads as "this DP
   can carry the session" (displayxr-runtime ADR-047 A8, `dp_ready`), so a
