@@ -164,7 +164,9 @@ struct leiasr_d3d12
 	// The D3D12 twin of the D3D11 arm's fields of the same names; see
 	// leia_sr_d3d11.cpp for the full rationale of each.
 	//! Created for ONE screen: plan EXTERNAL routing + display binding.
-	//! The unbound DP (every pre-M6 caller) keeps SDK routing, byte-identical.
+	//! The unbound DP (every pre-M6 caller) keeps SDK routing, byte-identical,
+	//! unless its window is a child window of this process (EXTERNAL routing
+	//! only, displayxr-unity #428/#429; leia_win_sr_plan_weaver).
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
@@ -327,13 +329,15 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	// Multi-screen M6: what the runtime can do, and what this DP will ask for.
 	// An unbound DP with a top-level window gets an empty plan (SDK routing, no
 	// binding) — today's single-screen behaviour, byte-identical; one with a
-	// child window gets EXTERNAL routing only. Same plan as the D3D11 arm.
+	// child window of this process gets EXTERNAL routing only. Same plan as the
+	// D3D11 arm.
 	struct leia_win_sr_multi_caps mcaps = {};
 	leia_sr_v2_query_multi_caps(sr.instance_v2, &mcaps);
-	// displayxr-unity #428/#429: a child window (the Unity editor's docked Game
-	// view) keeps the SDK off its top-level ancestor (leia_win_sr_plan_weaver).
-	const HWND root = hwnd != nullptr ? GetAncestor((HWND)hwnd, GA_ROOT) : nullptr;
-	const bool is_child = root != nullptr && root != (HWND)hwnd;
+	// displayxr-unity #428/#429: a child window whose top-level window this
+	// process owns (the Unity editor's docked Game view) keeps the SDK off that
+	// top-level window (leia_win_sr_plan_weaver).
+	void *root = nullptr;
+	const bool is_child = leia_sr_v2_hwnd_is_own_child((void *)hwnd, &root);
 	struct leia_win_sr_weaver_plan plan =
 	    leia_win_sr_plan_weaver(&mcaps, sr.screen_bound, hwnd != nullptr, is_child, sr.bind_display_id);
 	if (sr.screen_bound) {
@@ -345,11 +349,12 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 		    mcaps.max_bound_displays, (int)plan.routing_external, (int)plan.keep_drag_snap,
 		    (int)plan.bind_display);
 	} else if (is_child) {
-		U_LOG_W("SR D3D12 weaver in a child window %p (top-level %p): caps{known=%d external=%d} -> "
-		        "plan{external=%d keep_drag_snap=%d} — the SDK %s the top-level window",
-		        (void *)hwnd, (void *)root, (int)mcaps.known, (int)mcaps.external_routing,
-		        (int)plan.routing_external, (int)plan.keep_drag_snap,
-		        plan.routing_external ? "does not subclass" : "subclasses");
+		U_LOG_W("SR D3D12 weaver in a child window %p of this process (top-level %p): caps{known=%d "
+		        "external=%d} -> plan{external=%d keep_drag_snap=%d} — %s",
+		        (void *)hwnd, root, (int)mcaps.known, (int)mcaps.external_routing, (int)plan.routing_external,
+		        (int)plan.keep_drag_snap,
+		        plan.routing_external ? "EXTERNAL: the SDK is not to subclass the top-level window"
+		                              : "SDK routing: the SDK subclasses the top-level window, as before");
 	}
 
 	leia_sr_v2_display_info info{};

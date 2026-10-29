@@ -34,7 +34,7 @@ static const struct leia_win_sr_multi_caps k_caps_none = {.known = true};
 static const struct leia_win_sr_multi_caps k_caps_unknown = {.known = false};
 
 static void
-test_unbound_dp_never_changes_routing(void)
+test_unbound_top_level_dp_keeps_sdk_routing(void)
 {
 	// The pre-M6 single-screen DP with a top-level window: SDK routing, no
 	// binding, whatever the caps.
@@ -302,13 +302,86 @@ test_child_window_caps_gate_and_fallback(void)
 	CHECK(!leia_win_sr_plan_weaver_fallback(&p));
 }
 
+/*
+ * The plan before displayxr-unity #428/#429, verbatim apart from the name: the
+ * reference for "nothing but a child window changes".
+ */
+static struct leia_win_sr_weaver_plan
+plan_before_child_input(const struct leia_win_sr_multi_caps *caps,
+                        bool screen_bound,
+                        bool has_window,
+                        uint64_t display_id)
+{
+	struct leia_win_sr_weaver_plan p = {0};
+	if (caps == NULL || !caps->known || !screen_bound) {
+		return p;
+	}
+	p.routing_external = caps->external_routing;
+	p.keep_drag_snap = p.routing_external && has_window && caps->keep_drag_snap;
+	if (display_id != 0 && caps->display_binding && caps->max_bound_displays >= 1) {
+		p.bind_display = true;
+		p.display_id = display_id;
+	}
+	return p;
+}
+
+static bool
+plans_equal(struct leia_win_sr_weaver_plan a, struct leia_win_sr_weaver_plan b)
+{
+	return a.routing_external == b.routing_external && a.keep_drag_snap == b.keep_drag_snap &&
+	       a.bind_display == b.bind_display && a.display_id == b.display_id;
+}
+
+static void
+test_only_a_child_window_changes_the_plan(void)
+{
+	static const uint32_t max_bound[] = {0, 1, 2};
+	static const uint64_t ids[] = {0, DS1_ID};
+	int combos = 0;
+	for (int bits = 0; bits < 32; bits++) {
+		for (size_t m = 0; m < sizeof(max_bound) / sizeof(max_bound[0]); m++) {
+			const struct leia_win_sr_multi_caps caps = {.known = (bits & 1) != 0,
+			                                            .external_routing = (bits & 2) != 0,
+			                                            .keep_drag_snap = (bits & 4) != 0,
+			                                            .display_binding = (bits & 8) != 0,
+			                                            .max_bound_displays = max_bound[m],
+			                                            .lens_per_device = (bits & 16) != 0};
+			for (int in = 0; in < 8; in++) {
+				const bool screen_bound = (in & 1) != 0;
+				const bool has_window = (in & 2) != 0;
+				const bool is_child = (in & 4) != 0;
+				for (size_t d = 0; d < sizeof(ids) / sizeof(ids[0]); d++) {
+					const struct leia_win_sr_weaver_plan now =
+					    leia_win_sr_plan_weaver(&caps, screen_bound, has_window, is_child, ids[d]);
+					const struct leia_win_sr_weaver_plan before =
+					    plan_before_child_input(&caps, screen_bound, has_window, ids[d]);
+					combos++;
+					if (!is_child || !has_window) {
+						// A top-level window, or none: exactly the old plan.
+						CHECK(plans_equal(now, before));
+						continue;
+					}
+					// A child window: EXTERNAL whenever honoured, never the
+					// snap; the binding exactly as before.
+					CHECK(now.routing_external == (caps.known && caps.external_routing));
+					CHECK(!now.keep_drag_snap);
+					CHECK(now.bind_display == before.bind_display);
+					CHECK(now.display_id == before.display_id);
+				}
+			}
+		}
+	}
+	CHECK(combos == 32 * 3 * 8 * 2);
+}
+
 int
 main(void)
 {
-	test_unbound_dp_never_changes_routing();
+	test_unbound_top_level_dp_keeps_sdk_routing();
 	test_unbound_child_window_routes_external_without_snap();
 	test_bound_child_window_drops_the_snap_only();
 	test_child_window_caps_gate_and_fallback();
+	test_only_a_child_window_changes_the_plan();
 	test_majority_segment_keeps_hwnd_and_snap();
 	test_secondary_segment_is_windowless_with_origin();
 	test_unknown_display_binds_nothing();

@@ -132,6 +132,21 @@ void
 leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *out);
 
 /*!
+ * displayxr-unity #428/#429: the weaver plan's `is_child` input
+ * (leia_win_sr_plan_weaver). True when @p hwnd is a child window and its
+ * top-level ancestor (GA_ROOT), the window the SDK subclasses, belongs to this
+ * process: the Unity editor's docked Game view. False for a top-level window,
+ * for NULL or a destroyed window, and when the top-level window belongs to
+ * another process (the service weaving a client's window): SetWindowLongPtr
+ * cannot subclass another process's window, so the SDK never did, and that
+ * plan stays as it was.
+ *
+ * @param out_root  Optional: receives GA_ROOT of @p hwnd (NULL if none), for logs.
+ */
+bool
+leia_sr_v2_hwnd_is_own_child(void *hwnd, void **out_root);
+
+/*!
  * Create the lens handle used for 2D/3D switching.
  *
  * A display with no switchable lens is not an error: `*out_lens` is set to NULL

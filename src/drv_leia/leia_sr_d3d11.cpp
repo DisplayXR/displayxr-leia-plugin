@@ -288,7 +288,9 @@ struct leiasr_d3d11
 
 	// --- Multi-screen M6: per-screen weaver (create_dp_d3d11_for_screen) ---
 	//! Created for ONE screen: plan EXTERNAL routing + display binding.
-	//! The unbound DP (every pre-M6 caller) keeps SDK routing, byte-identical.
+	//! The unbound DP (every pre-M6 caller) keeps SDK routing, byte-identical,
+	//! unless its window is a child window of this process (EXTERNAL routing
+	//! only, displayxr-unity #428/#429; leia_win_sr_plan_weaver).
 	bool screen_bound = false;
 	//! The SR display to bind (0 = unknown ⟹ routing only).
 	uint64_t bind_display_id = 0;
@@ -303,6 +305,11 @@ struct leiasr_d3d11
 	//! The weaver reads its phase from the present origin + viewport only
 	//! (EXTERNAL without a window). Applied before every weave.
 	bool needs_present_origin = false;
+	//! The v2 weaver was planned for a child window of this process
+	//! (leia_sr_v2_hwnd_is_own_child). srWeaverSetWindowHandle keeps the
+	//! routing chosen at create, so w_set_window refuses a window that would
+	//! be planned the other way, and the runtime recreates (runtime#1008).
+	bool own_child = false;
 	std::atomic<int32_t> present_origin_x{0};
 	std::atomic<int32_t> present_origin_y{0};
 	//! The runtime's active (tracked) display id, 0 = unknown.
@@ -518,13 +525,14 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	// Multi-screen M6: what the runtime can do, and what this DP will ask for.
 	// An unbound DP with a top-level window gets an empty plan (SDK routing, no
 	// binding) — today's single-screen behaviour, byte-identical; one with a
-	// child window gets EXTERNAL routing only.
+	// child window of this process gets EXTERNAL routing only.
 	struct leia_win_sr_multi_caps mcaps = {};
 	leia_sr_v2_query_multi_caps(sr.instance_v2, &mcaps);
-	// displayxr-unity #428/#429: a child window (the Unity editor's docked Game
-	// view) keeps the SDK off its top-level ancestor (leia_win_sr_plan_weaver).
-	const HWND root = hwnd != nullptr ? GetAncestor((HWND)hwnd, GA_ROOT) : nullptr;
-	const bool is_child = root != nullptr && root != (HWND)hwnd;
+	// displayxr-unity #428/#429: a child window whose top-level window this
+	// process owns (the Unity editor's docked Game view) keeps the SDK off that
+	// top-level window (leia_win_sr_plan_weaver).
+	void *root = nullptr;
+	const bool is_child = leia_sr_v2_hwnd_is_own_child((void *)hwnd, &root);
 	struct leia_win_sr_weaver_plan plan =
 	    leia_win_sr_plan_weaver(&mcaps, sr.screen_bound, hwnd != nullptr, is_child, sr.bind_display_id);
 	if (sr.screen_bound) {
@@ -535,11 +543,12 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 		        mcaps.max_bound_displays, (int)plan.routing_external, (int)plan.keep_drag_snap,
 		        (int)plan.bind_display);
 	} else if (is_child) {
-		U_LOG_W("SR D3D11 weaver in a child window %p (top-level %p): caps{known=%d external=%d} -> "
-		        "plan{external=%d keep_drag_snap=%d} — the SDK %s the top-level window",
-		        (void *)hwnd, (void *)root, (int)mcaps.known, (int)mcaps.external_routing,
-		        (int)plan.routing_external, (int)plan.keep_drag_snap,
-		        plan.routing_external ? "does not subclass" : "subclasses");
+		U_LOG_W("SR D3D11 weaver in a child window %p of this process (top-level %p): caps{known=%d "
+		        "external=%d} -> plan{external=%d keep_drag_snap=%d} — %s",
+		        (void *)hwnd, root, (int)mcaps.known, (int)mcaps.external_routing, (int)plan.routing_external,
+		        (int)plan.keep_drag_snap,
+		        plan.routing_external ? "EXTERNAL: the SDK is not to subclass the top-level window"
+		                              : "SDK routing: the SDK subclasses the top-level window, as before");
 	}
 
 	leia_sr_v2_display_info info{};
@@ -629,6 +638,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	sr.external_routed = plan.routing_external;
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
+	sr.own_child = is_child;
 	if (sr.screen_bound && hwnd == nullptr && !sr.needs_present_origin) {
 		// runtime ADR-060 R2: the DP may already have told the runtime (predicted
 		// from the probe's caps) that it phases from the present origin. SR
@@ -1590,6 +1600,15 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
+		// displayxr-unity #428/#429: the routing was planned at create from the
+		// window (leia_win_sr_plan_weaver), and the SDK keeps it across this
+		// call. A window that would be planned the other way needs a new weaver.
+		if (leia_sr_v2_hwnd_is_own_child((void *)hwnd, nullptr) != sr->own_child) {
+			U_LOG_W("SR D3D11 window re-bind (hwnd=%p): a %s window needs the other weaver routing "
+			        "(displayxr-unity #428) — refusing, so the runtime recreates the weaver",
+			        (void *)hwnd, sr->own_child ? "top-level or foreign" : "child");
+			return false;
+		}
 		const SrResult r = srWeaverSetWindowHandle(sr->weaver_v2, (SrNativeWindowHandle)hwnd);
 		if (!SR_SUCCEEDED(r)) {
 			U_LOG_W("SR v2 srWeaverSetWindowHandle failed: %s (%d)", leia_sr_v2_result_str(r), (int)r);
@@ -2832,6 +2851,20 @@ leiasr_d3d11_set_window(struct leiasr_d3d11 *leiasr, void *hwnd)
 	// creation completed between the store and the worker's own consume, apply
 	// it here (the exchange makes application happen exactly once).
 	if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+#ifdef DXR_LEIA_HAS_SR_V2
+		// displayxr-unity #428/#429: the weaver being created is planned from the
+		// window it was asked for (bound_hwnd). A window that would be planned
+		// the other way cannot be applied at publish (w_set_window refuses it):
+		// refuse now, so the runtime recreates instead of keeping the old window.
+		const uintptr_t creating = leiasr->bound_hwnd.load(std::memory_order_relaxed);
+		if (leia_sr_v2_hwnd_is_own_child(hwnd, nullptr) !=
+		    leia_sr_v2_hwnd_is_own_child(reinterpret_cast<void *>(creating), nullptr)) {
+			U_LOG_W("SR D3D11 window re-bind (hwnd=%p) while creating for %p: the two need different "
+			        "weaver routing (displayxr-unity #428) — refusing, so the runtime recreates it",
+			        hwnd, (void *)creating);
+			return false;
+		}
+#endif
 		leiasr->pending_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_release);
 		if (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_READY) {
 			uintptr_t want = leiasr->pending_hwnd.exchange(0, std::memory_order_acq_rel);

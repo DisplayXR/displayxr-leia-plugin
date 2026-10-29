@@ -636,6 +636,26 @@ query_user_presence_cap(SrInstance instance)
 }
 #endif
 
+bool
+leia_sr_v2_hwnd_is_own_child(void *hwnd, void **out_root)
+{
+	if (out_root != nullptr) {
+		*out_root = nullptr;
+	}
+	if (hwnd == nullptr) {
+		return false;
+	}
+	const HWND root = GetAncestor(static_cast<HWND>(hwnd), GA_ROOT);
+	if (out_root != nullptr) {
+		*out_root = static_cast<void *>(root);
+	}
+	if (root == nullptr || root == static_cast<HWND>(hwnd)) {
+		return false; // a top-level window, or not a window (any more)
+	}
+	DWORD pid = 0;
+	return GetWindowThreadProcessId(root, &pid) != 0 && pid == GetCurrentProcessId();
+}
+
 void
 leia_sr_v2_query_multi_caps(SrInstance instance, struct leia_win_sr_multi_caps *out)
 {

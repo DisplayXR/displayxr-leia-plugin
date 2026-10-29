@@ -73,14 +73,25 @@ struct leia_win_sr_weaver_plan
  *
  * A child window (displayxr-unity #428/#429): with SDK routing, or with
  * KEEP_DRAG_SNAP, the SDK subclasses the window's top-level ancestor
- * (GA_ROOT), which is the host application's main window: the Unity editor's
- * docked Game view. That subclass does not chain safely with the host's own
- * subclasses (SR 1.37-1.39): a crash on the second docked Play, and a lost
- * File > Exit. EXTERNAL routing without KEEP_DRAG_SNAP installs nothing, so a
- * child window gets exactly that, bound or not, whenever the runtime honours
- * EXTERNAL. The cost is the SDK's drag phase-snap while the host's main window
- * is dragged; the phase at rest still comes from the bound child window. A
- * top-level window keeps today's plan.
+ * (GA_ROOT), i.e. the host application's main window. For the Unity editor's
+ * docked Game view that is the editor's main window. That subclass does not
+ * chain safely with the host's own subclasses (SR 1.37-1.39): a crash on the
+ * second docked Play, and a lost File > Exit. EXTERNAL routing without
+ * KEEP_DRAG_SNAP installs nothing, so such a window gets exactly that, on an
+ * unbound or a screen-bound DP, whenever the runtime honours EXTERNAL.
+ *
+ * What the weaver then no longer does for that window (sr_weaver.h, "External
+ * display routing"): the drag phase-snap while the host's main window is
+ * dragged, the on-panel gate and per-monitor 2D/3D split (the runtime's
+ * per-screen segments split a canvas that spans screens), and the lens vote
+ * (the DP drives the lens from the runtime's 2D/3D requests). The phase at
+ * rest is unchanged: every v2 backend still reads the window term from the
+ * window it was given and lets a present origin replace it only when the
+ * caller set one (dx11weaver2.cpp, dx12weaver2.cpp, glweaver2.cpp,
+ * vkweaver.cpp: getUserPresentOrigin), which this DP does not do with a window
+ * (leia_win_sr_plan_needs_present_origin). sr_weaver.h's "phase from the
+ * present origin only" describes the windowless case. A top-level window keeps
+ * today's plan.
  *
  * @param caps          The runtime's answer (unknown ⟹ an empty plan: SDK
  *                      routing, no binding — exactly today's single-screen DP).
@@ -90,9 +101,10 @@ struct leia_win_sr_weaver_plan
  *                      a child window, so one-screen behaviour with a top-level
  *                      window is byte-identical.
  * @param has_window    The DP holds the session's real HWND.
- * @param is_child      That HWND is a child window
- *                      (GetAncestor(hwnd, GA_ROOT) != hwnd). Ignored without
- *                      a window.
+ * @param is_child      That HWND is a child window whose top-level window
+ *                      (GA_ROOT) this process owns: the one the SDK would
+ *                      subclass (leia_sr_v2_hwnd_is_own_child). Ignored
+ *                      without a window.
  * @param display_id    The SR display to bind (0 = none / unknown).
  */
 static inline struct leia_win_sr_weaver_plan
