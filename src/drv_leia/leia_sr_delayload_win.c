@@ -187,9 +187,46 @@ load_from_sr_dir(const char *name)
 	return LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
 
+/*
+ * System graphics DLLs (displayxr-runtime#2461). d3d11.dll / dxgi.dll /
+ * d3d12.dll are delay-loaded and always come from System32: a host process
+ * may ship its own copies (DXVK), and a by-name load would bind the plug-in
+ * to them. The runtime's resolver also repoints the system d3d11.dll's own
+ * dxgi.dll import when the host's dxgi.dll is loaded, so it is used when the
+ * runtime exports it; an older runtime gets the plain System32 load.
+ */
+static bool
+is_system_graphics_dll(const char *name)
+{
+	return _stricmp(name, "d3d11.dll") == 0 || _stricmp(name, "dxgi.dll") == 0 || _stricmp(name, "d3d12.dll") == 0;
+}
+
+static HMODULE
+load_system_graphics_dll(const char *name)
+{
+	typedef HMODULE(__cdecl * resolver_fn)(const char *);
+	HMODULE runtime = GetModuleHandleW(L"DisplayXRClient.dll");
+	resolver_fn resolver =
+	    runtime != NULL ? (resolver_fn)(void *)GetProcAddress(runtime, "displayxr_load_system_graphics_dll") : NULL;
+	if (resolver != NULL) {
+		return resolver(name);
+	}
+
+	wchar_t path[MAX_PATH];
+	UINT length = GetSystemDirectoryW(path, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH || swprintf_s(path + length, MAX_PATH - length, L"\\%S", name) <= 0) {
+		return NULL;
+	}
+	return LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
 static FARPROC WINAPI
 leia_sr_dli_hook(unsigned dliNotify, PDelayLoadInfo pdli)
 {
+	if (dliNotify == dliNotePreLoadLibrary && pdli != NULL && pdli->szDll != NULL &&
+	    is_system_graphics_dll(pdli->szDll)) {
+		return (FARPROC)load_system_graphics_dll(pdli->szDll);
+	}
 	if (dliNotify == dliNotePreLoadLibrary && pdli != NULL && pdli->szDll != NULL && is_sr_dll(pdli->szDll)) {
 		// NULL => the delay helper falls back to LoadLibraryExA(name) = the
 		// normal search, so a PATH-only install keeps working.

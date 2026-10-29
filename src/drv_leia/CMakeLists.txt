@@ -670,6 +670,11 @@ endif()
 foreach(_dll IN LISTS LEIA_SR_DELAYLOAD_DLLS)
     target_link_options(DisplayXR-LeiaSR PRIVATE "/DELAYLOAD:${_dll}")
 endforeach()
+# The system graphics DLLs too (displayxr-runtime#2461): a host process that
+# ships its own d3d11.dll / dxgi.dll (DXVK) would otherwise bind the plug-in
+# to them. leia_sr_delayload_win.c resolves them from System32, through the
+# runtime's resolver when it has one.
+target_link_options(DisplayXR-LeiaSR PRIVATE "/DELAYLOAD:d3d11.dll" "/DELAYLOAD:dxgi.dll" "/DELAYLOAD:d3d12.dll")
 target_link_libraries(DisplayXR-LeiaSR PRIVATE delayimp)
 
 if(LEIA_SR_D3D11_AVAILABLE)
