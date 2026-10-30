@@ -191,7 +191,14 @@ env:
   # the watchdog stays as the backstop). Also CNSDK#757: a tracking-camera override now uses
   # that camera's camera->display pose (it always used entry 0). No API, loader or
   # INTRODUCED_IN change. (v0.10.84 is a version tag with #757 only and no release.)
-  CNSDK_TAG: v0.10.85
+  #
+  # 0.10.87 (cnsdk-android-0.10.87+211.ec09441): CNSDK#761 — the display service sends one
+  # lens command at a time, at least 100 ms apart (a burst after a service restart left the
+  # panel in 3D while everything reported 2D), and the SPR wake guard is keyed on the phone's
+  # product name instead of the model string (it no longer enables on the Lume Pad 2).
+  # CNSDK#759 — the lls_gyro weave predictor is the default with a 40 ms weave horizon on
+  # every device. No loader API or INTRODUCED_IN change. (v0.10.86 = #761 only, no release.)
+  CNSDK_TAG: v0.10.87
 
 jobs:
   Android:
