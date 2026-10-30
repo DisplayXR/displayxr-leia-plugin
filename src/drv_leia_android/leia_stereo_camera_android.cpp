@@ -90,6 +90,7 @@ constexpr int64_t kNsPerMs = 1000000;
 constexpr int64_t kStallNs = 1500 * kNsPerMs;      //!< no pair for this long = stalled
 constexpr int64_t kReopenFirstNs = 500 * kNsPerMs;  //!< first reopen delay
 constexpr int64_t kReopenMaxNs = 4000 * kNsPerMs;   //!< back-off cap
+constexpr int64_t kReopenFastMaxNs = 1000 * kNsPerMs; //!< back-off cap for the first 10 s down
 constexpr int64_t kGiveUpNs = 15000 * kNsPerMs;     //!< device gone this long -> ERROR
 constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;  //!< measured skew is 0; be lenient
 constexpr uint32_t kTrackW = 640, kTrackH = 480;    //!< the in-app detector accepts only this
@@ -1140,7 +1141,13 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 			c->down_since_ns = 0;
 			return false; // frames resume shortly
 		}
-		c->backoff_ns = std::min(c->backoff_ns * 2, kReopenMaxNs);
+		// Retry at most every second for the first 10 s: right after the
+		// consumer's app comes to the foreground the camera service refuses the
+		// runtime ("disabled by policy" / "access restricted") until the
+		// satellite inherits the while-in-use camera capability, which takes a
+		// few seconds (measured 1.8-8 s on a Lume Pad 2). Back off further after.
+		const int64_t cap = now - c->down_since_ns < 10000 * kNsPerMs ? kReopenFastMaxNs : kReopenMaxNs;
+		c->backoff_ns = std::min(c->backoff_ns * 2, cap);
 		c->next_reopen_ns = now + c->backoff_ns;
 	}
 	return false;
