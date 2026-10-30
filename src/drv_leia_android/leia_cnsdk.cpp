@@ -870,13 +870,10 @@ ext_attach_listener(struct leia_cnsdk *cnsdk)
 void
 ext_on_core_started(struct leia_cnsdk *cnsdk)
 {
-	bool want;
-	{
-		std::lock_guard<std::mutex> lk(g_ext_mu);
-		want = g_ext_depth > 0;
-	}
-	if (want) {
-		std::lock_guard<std::mutex> lk(cnsdk->ext_mu);
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	const bool registered = std::find(g_ext_cores.begin(), g_ext_cores.end(), cnsdk) != g_ext_cores.end();
+	if (g_ext_depth > 0 && registered) { // unregistered = being destroyed
+		std::lock_guard<std::mutex> lk2(cnsdk->ext_mu);
 		ext_switch_locked(cnsdk, true);
 	}
 }
@@ -2103,20 +2100,19 @@ leia_cnsdk_get_android_panel_px(uint32_t *out_w, uint32_t *out_h, float *out_w_m
 extern "C" uint32_t
 leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr)
 {
-	std::vector<struct leia_cnsdk *> cores;
-	{
-		std::lock_guard<std::mutex> lk(g_ext_mu);
-		if (intr != nullptr) {
-			g_ext_intr = *intr;
-		}
-		if (g_ext_depth++ > 0) {
-			return 0;
-		}
-		cores = g_ext_cores;
+	// The registry lock is held across the switches (lock order: g_ext_mu ->
+	// cnsdk->ext_mu, as in the worker and the feed), so leia_cnsdk_destroy,
+	// which unregisters under it, can never free a core mid-switch.
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	if (intr != nullptr) {
+		g_ext_intr = *intr;
+	}
+	if (g_ext_depth++ > 0) {
+		return 0;
 	}
 	uint32_t n = 0;
-	for (struct leia_cnsdk *c : cores) {
-		std::lock_guard<std::mutex> lk(c->ext_mu);
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		std::lock_guard<std::mutex> lk2(c->ext_mu);
 		ext_switch_locked(c, true);
 		n += c->ext_in_app ? 1u : 0u;
 	}
@@ -2126,16 +2122,12 @@ leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr)
 extern "C" void
 leia_cnsdk_ext_tracking_end(void)
 {
-	std::vector<struct leia_cnsdk *> cores;
-	{
-		std::lock_guard<std::mutex> lk(g_ext_mu);
-		if (g_ext_depth == 0 || --g_ext_depth > 0) {
-			return;
-		}
-		cores = g_ext_cores;
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	if (g_ext_depth == 0 || --g_ext_depth > 0) {
+		return;
 	}
-	for (struct leia_cnsdk *c : cores) {
-		std::lock_guard<std::mutex> lk(c->ext_mu);
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		std::lock_guard<std::mutex> lk2(c->ext_mu);
 		ext_switch_locked(c, false);
 	}
 }
