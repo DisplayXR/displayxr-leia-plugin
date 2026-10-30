@@ -126,14 +126,22 @@ leia_sr_v2_query_display(SrInstance instance,
  * #480: the SR display id a screen-bound weaver should bind on this create
  * attempt: @p bound, unless SR has re-keyed the panel at @p origin since (an
  * EDID_ONLY id is replaced when the FPC pairs). Logs a change. Reads the
- * probe enumeration (2 s cache), so it is cheap; returns @p bound when it
- * cannot tell. See @ref leia_win_sr_rebind_display_id.
+ * probe enumeration (2 s cache, re-read at once when @p bound is missing), so
+ * it is cheap; returns @p bound when it cannot tell. See
+ * @ref leia_win_sr_rebind_display_id.
  *
+ * @param io_edid_manufacturer, io_edid_product The weaver's memo of its panel's
+ *        EDID: updated while SR lists @p bound, and required to match when
+ *        re-keying (0 = not seen yet: the origin alone decides).
  * @param api "D3D11" / "D3D12" / "GL" / "Vulkan", for the log line.
  */
 struct leia_win_screen_origin;
 uint64_t
-leia_sr_v2_current_display_id(uint64_t bound, const struct leia_win_screen_origin *origin, const char *api);
+leia_sr_v2_current_display_id(uint64_t bound,
+                              const struct leia_win_screen_origin *origin,
+                              uint16_t *io_edid_manufacturer,
+                              uint16_t *io_edid_product,
+                              const char *api);
 
 /*!
  * Multi-screen M6: srGetRuntimeCapabilities with the routing + binding

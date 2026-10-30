@@ -312,6 +312,12 @@ leia_win_claims_generation(void);
  * - else the SR display whose desktop-global location is that origin;
  * - else @p bound: nothing better is known, and the caller retries as before.
  *
+ * The origin alone could pick another Leia panel moved there before the runtime
+ * rebuilt its screens. So when the panel's EDID is known (@p edid_manufacturer
+ * non-zero, noted by @ref leia_win_sr_note_display_edid while SR listed the
+ * bound id), the monitor's or display's EDID manufacturer and product must match
+ * too; a monitor or display with no EDID then never matches.
+ *
  * Pure: the caller passes SR's enumerations. A count < 0 means that
  * enumeration is unavailable.
  */
@@ -320,10 +326,29 @@ leia_win_sr_rebind_display_id(uint64_t bound,
                               bool has_origin,
                               int32_t left,
                               int32_t top,
+                              uint16_t edid_manufacturer,
+                              uint16_t edid_product,
                               const struct leia_win_sr_display *displays,
                               int32_t display_count,
                               const struct leia_win_sr_monitor *monitors,
                               int32_t monitor_count);
+
+//! #480: does SR's display list (@p count < 0 = unavailable) hold @p id?
+bool
+leia_win_sr_display_listed(uint64_t id, const struct leia_win_sr_display *displays, int32_t count);
+
+/*!
+ * #480: while SR lists @p id, note its EDID manufacturer and product into
+ * @p io_manufacturer / @p io_product, for @ref leia_win_sr_rebind_display_id
+ * once SR has re-keyed the panel. Leaves them as they were when SR does not
+ * list @p id or gives no EDID.
+ */
+void
+leia_win_sr_note_display_edid(uint64_t id,
+                              const struct leia_win_sr_display *displays,
+                              int32_t count,
+                              uint16_t *io_manufacturer,
+                              uint16_t *io_product);
 
 
 /*
@@ -372,6 +397,14 @@ leia_win_monitor_at(int32_t left, int32_t top);
 //! Destroy the probe instance, if one exists. Plug-in destroy.
 void
 leia_win_sr_enumerate_shutdown(void);
+
+/*!
+ * #480: the next @ref leia_win_sr_enumerate_displays and
+ * @ref leia_win_sr_enumerate_monitors re-read SR even inside the cache TTL.
+ * A failed re-read keeps the cached list, as an expired one does. Any thread.
+ */
+void
+leia_win_sr_enumerate_refresh_next(void);
 
 /*!
  * runtime ADR-060 R2 (L4): does the installed SR runtime support EXTERNAL

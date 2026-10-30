@@ -609,26 +609,44 @@ leia_sr_v2_query_display(SrInstance instance,
 }
 
 uint64_t
-leia_sr_v2_current_display_id(uint64_t bound, const struct leia_win_screen_origin *origin, const char *api)
+leia_sr_v2_current_display_id(uint64_t bound,
+                              const struct leia_win_screen_origin *origin,
+                              uint16_t *io_edid_manufacturer,
+                              uint16_t *io_edid_product,
+                              const char *api)
 {
 	if (bound == 0) {
 		return bound;
 	}
 	// The enumerations return -1 when the SDK or the installed SR runtime lacks them.
 	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
-	const int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	if (display_count >= 0 && !leia_win_sr_display_listed(bound, displays, display_count)) {
+		// The FPC may have paired inside the 2 s cache: read SR's list as it is now.
+		leia_win_sr_enumerate_refresh_next();
+		display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	}
+	uint16_t edid_manufacturer = io_edid_manufacturer != nullptr ? *io_edid_manufacturer : 0;
+	uint16_t edid_product = io_edid_product != nullptr ? *io_edid_product : 0;
+	leia_win_sr_note_display_edid(bound, displays, display_count, &edid_manufacturer, &edid_product);
+	if (io_edid_manufacturer != nullptr && io_edid_product != nullptr) {
+		*io_edid_manufacturer = edid_manufacturer;
+		*io_edid_product = edid_product;
+	}
 	struct leia_win_sr_monitor monitors[LEIA_WIN_SR_MAX_MONITORS];
 	const int32_t monitor_count =
 	    display_count >= 0 ? leia_win_sr_enumerate_monitors(monitors, LEIA_WIN_SR_MAX_MONITORS) : -1;
 	const bool has_origin = origin != nullptr && origin->bound;
 	const int32_t left = has_origin ? origin->left : 0;
 	const int32_t top = has_origin ? origin->top : 0;
-	const uint64_t id = leia_win_sr_rebind_display_id(bound, has_origin, left, top, displays, display_count,
-	                                                  monitors, monitor_count);
+	const uint64_t id = leia_win_sr_rebind_display_id(bound, has_origin, left, top, edid_manufacturer, edid_product,
+	                                                  displays, display_count, monitors, monitor_count);
 	if (id != bound) {
-		U_LOG_W("SR %s per-screen weaver: SR no longer lists display 0x%016llx; the panel at (%d,%d) is now SR "
-		        "display 0x%016llx (SR re-keys a panel when its FPC pairs) — binding that (#480)",
-		        api, (unsigned long long)bound, left, top, (unsigned long long)id);
+		U_LOG_W("SR %s per-screen weaver: SR no longer lists display 0x%016llx; the panel at (%d,%d) "
+		        "(edid=0x%04X/0x%04X) is now SR display 0x%016llx (SR re-keys a panel when its FPC pairs) — "
+		        "binding that (#480)",
+		        api, (unsigned long long)bound, left, top, edid_manufacturer, edid_product,
+		        (unsigned long long)id);
 	}
 	return id;
 }
@@ -805,6 +823,8 @@ uint64_t g_last_create_fail_ns = 0;
 struct leia_win_sr_display g_cache[LEIA_WIN_SR_MAX_DISPLAYS];
 int32_t g_cache_count = -1;
 uint64_t g_cache_ns = 0;
+//! #480: the next read refreshes even inside the TTL (leia_win_sr_enumerate_refresh_next).
+bool g_force_refresh = false;
 uint64_t g_logged_fingerprint = 0;
 
 constexpr uint64_t CACHE_TTL_NS = 2000000000ull;        // 2 s
@@ -1104,8 +1124,9 @@ leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
 	AcquireSRWLockExclusive(&g_enum_lock);
 	if (!g_enum_unsupported) {
 		const uint64_t now_ns = os_monotonic_get_ns();
-		const bool fresh = g_cache_count >= 0 && now_ns - g_cache_ns < CACHE_TTL_NS;
+		const bool fresh = !g_force_refresh && g_cache_count >= 0 && now_ns - g_cache_ns < CACHE_TTL_NS;
 		if (!fresh && probe_instance_ensure_locked(now_ns)) {
+			g_force_refresh = false;
 			log_caps_once_locked();
 			(void)refresh_locked(now_ns);
 		}
@@ -1138,6 +1159,8 @@ bool g_mon_unsupported = false; // installed SR runtime predates slot 108: final
 struct leia_win_sr_monitor g_mon_cache[LEIA_WIN_SR_MAX_MONITORS];
 int32_t g_mon_cache_count = -1;
 uint64_t g_mon_cache_ns = 0;
+//! #480: as g_force_refresh, for the monitor list.
+bool g_mon_force_refresh = false;
 uint64_t g_mon_logged_fingerprint = 0;
 
 void
@@ -1239,8 +1262,10 @@ leia_win_sr_enumerate_monitors(struct leia_win_sr_monitor *out, uint32_t cap)
 	AcquireSRWLockExclusive(&g_enum_lock);
 	if (!g_enum_unsupported && !g_mon_unsupported) {
 		const uint64_t now_ns = os_monotonic_get_ns();
-		const bool fresh = g_mon_cache_count >= 0 && now_ns - g_mon_cache_ns < CACHE_TTL_NS;
+		const bool fresh =
+		    !g_mon_force_refresh && g_mon_cache_count >= 0 && now_ns - g_mon_cache_ns < CACHE_TTL_NS;
 		if (!fresh && probe_instance_ensure_locked(now_ns)) {
+			g_mon_force_refresh = false;
 			(void)refresh_monitors_locked(now_ns);
 		}
 		if (g_mon_cache_count >= 0 && now_ns - g_mon_cache_ns < CACHE_TTL_NS) {
@@ -1265,6 +1290,17 @@ leia_win_sr_enumerate_shutdown(void)
 	g_multi_viewer_weave = -1;
 #ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
 	g_mon_cache_count = -1;
+#endif
+	ReleaseSRWLockExclusive(&g_enum_lock);
+}
+
+extern "C" void
+leia_win_sr_enumerate_refresh_next(void)
+{
+	AcquireSRWLockExclusive(&g_enum_lock);
+	g_force_refresh = true;
+#ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
+	g_mon_force_refresh = true;
 #endif
 	ReleaseSRWLockExclusive(&g_enum_lock);
 }
