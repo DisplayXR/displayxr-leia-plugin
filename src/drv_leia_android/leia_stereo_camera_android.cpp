@@ -558,6 +558,9 @@ struct xrt_plugin_stereo_camera
 	//! (begun right before openCamera, ended on a failed start, a source loss
 	//! or close), so a camera that cannot open never leaves the cores untracked.
 	bool handed{false};
+	//! SBS eye (0 = left, 1 = right) whose lens feeds the tracker, and its id.
+	int trk_eye{1};
+	char trk_lens[16]{};
 	struct leia_cnsdk_ext_intrinsics trk_intr{};
 	uint32_t w{0}, h{0};         //!< per-eye output
 	uint32_t cap_w{0}, cap_h{0}; //!< per-lens capture
@@ -808,7 +811,7 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 		// independent of pairing: CNSDK resets its predictor on a >70 ms gap,
 		// so one lost pair must never become a lost tracking frame. Only this
 		// reader's thread touches trk_scratch.
-		if (c->track && eye == (c->lsub ? 1 : 0) && !c->closing.load()) {
+		if (c->track && eye == c->trk_eye && !c->closing.load()) {
 			yuv_view vm;
 			if (yuv_view_of(img, &vm)) {
 				c->trk_scratch.resize((size_t)kTrackW * kTrackH);
@@ -1013,7 +1016,7 @@ handover_locked(xrt_plugin_stereo_camera *c, bool on)
 		const uint32_t cores = leia_cnsdk_ext_tracking_begin(&c->trk_intr);
 		SCAM_LOG_W("leia stereo camera (android): tracking handed to %u in-process core(s) (in-app, fed from lens %s, "
 		           "fx %.1f fy %.1f cx %.1f cy %.1f at 640x480)",
-		           cores, c->desc.main_id, c->trk_intr.fx, c->trk_intr.fy, c->trk_intr.cx, c->trk_intr.cy);
+		           cores, c->trk_lens, c->trk_intr.fx, c->trk_intr.fy, c->trk_intr.cx, c->trk_intr.cy);
 	} else {
 		leia_cnsdk_ext_tracking_end();
 		SCAM_LOG_W("leia stereo camera (android): tracking handed back to the tracking service");
@@ -1086,7 +1089,7 @@ start_locked(xrt_plugin_stereo_camera *c)
 	SCAM_LOG_W("leia stereo camera (android): %s pair streaming: logical %s, L=%s R=%s, %ux%u YUV per lens -> %ux%u "
 	           "eyes, tracking %s",
 	           c->desc.front ? "front" : "rear", c->desc.logical_id, left, right, c->cap_w, c->cap_h, c->w, c->h,
-	           c->track ? "640x480 from the main lens" : "not handed over");
+	           c->track ? "640x480 from the tracking lens" : "not handed over");
 	return true;
 }
 
@@ -1287,8 +1290,25 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		// The main lens's capture, then crop_track_from_eye's centre 4:3 region
 		// scaled to 640x480. With a 4:3 capture that is the whole array, i.e.
 		// the tracking service's own 640x480 intrinsics.
+		// Which lens feeds the tracker: the one the vendor device config names
+		// as the tracking camera (its pose is what the in-app engine applies),
+		// else the factory block's main lens. A Lume Pad 2's config names none
+		// and its service tracks from the main lens; a nubia Pad 3D II's service
+		// tracks from the sub lens. debug.dxr.leia.scam_track_lens=<id> forces it.
+		char cfg_id[16] = {0};
+		std::string forced = prop_str("debug.dxr.leia.scam_track_lens", "");
+		const bool have_cfg = leia_cnsdk_get_tracking_camera_id(cfg_id, sizeof(cfg_id));
+		const char *want = !forced.empty() ? forced.c_str() : (have_cfg ? cfg_id : c->desc.main_id);
+		const bool use_sub = strcmp(want, c->desc.sub_id) == 0;
+		snprintf(c->trk_lens, sizeof(c->trk_lens), "%s", use_sub ? c->desc.sub_id : c->desc.main_id);
+		// SBS left eye = sub when lsub; the tracking eye is the one showing trk_lens.
+		c->trk_eye = (use_sub == c->lsub) ? 0 : 1;
+		SCAM_LOG_W("leia stereo camera (android): tracking lens %s (%s; device config names \"%s\")", c->trk_lens,
+		           !forced.empty() ? "forced" : (have_cfg && strcmp(want, c->trk_lens) == 0 ? "device config" : "factory main"),
+		           have_cfg ? cfg_id : "");
 		leia_scam_lens tl{};
-		leia_scam_lens_for_stream(&c->desc.factory.main, c->desc.array_w, c->desc.array_h, c->cap_w, c->cap_h, &tl);
+		leia_scam_lens_for_stream(use_sub ? &c->desc.factory.sub : &c->desc.factory.main, c->desc.array_w,
+		                          c->desc.array_h, c->cap_w, c->cap_h, &tl);
 		{
 			const double cw = std::min<double>(c->cap_w, c->cap_h * 4.0 / 3.0);
 			const double ch = std::min<double>(c->cap_h, cw * 0.75);

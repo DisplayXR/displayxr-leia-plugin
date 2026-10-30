@@ -136,6 +136,7 @@ static const uint64_t kDropVerboseRuns = 32;
 #include <cstdint>
 #include <memory>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -254,6 +255,8 @@ struct leia_cnsdk
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
 	bool camera_extrinsics_ok{false};
+	//! Device-config camera 0 `id` (the tracker's Camera2 id; may be empty).
+	char tracking_camera_id[16]{};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -984,6 +987,7 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 			cnsdk->camera_center_x_m = cam.translation_mm.x / 1000.0f;
 			cnsdk->camera_center_y_m = cam.translation_mm.y / 1000.0f;
 			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
+			snprintf(cnsdk->tracking_camera_id, sizeof(cnsdk->tracking_camera_id), "%.15s", cam.id);
 			cnsdk->camera_extrinsics_ok = true;
 			U_LOG_W("CNSDK camera extrinsics: translation=(%.1f,%.1f,%.1f) mm "
 			        "rotation=(%.1f,%.1f,%.1f) deg sensorOri=%d frontFacing=%d",
@@ -2199,6 +2203,22 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 		}
 		leia_shared_camera_sink_release(f.sink);
 	}
+}
+
+extern "C" bool
+leia_cnsdk_get_tracking_camera_id(char *out, size_t cap)
+{
+	if (out == nullptr || cap == 0) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_id[0] != '\0') {
+			snprintf(out, cap, "%s", c->tracking_camera_id);
+			return true;
+		}
+	}
+	return false;
 }
 
 extern "C" bool

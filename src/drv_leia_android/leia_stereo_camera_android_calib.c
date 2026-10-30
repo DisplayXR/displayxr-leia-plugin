@@ -12,8 +12,10 @@
 #include <string.h>
 
 /*
- * Block layout (version 1). Every value is an IEEE-754 double, little-endian,
- * starting at byte 1 (byte 0 is the version):
+ * Block layout. Every value is an IEEE-754 double, little-endian, starting at
+ * byte 1. Byte 0 is NOT a version: it reads 1 on a Lume Pad 2 and 128 / 27 on a
+ * nubia Pad 3D II (front / rear) with the same layout after it, so it is
+ * ignored and the plausibility checks below decide.
  *
  *   1   + 8*i, i = 0..15   main lens: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6 s1..s4
  *   129 + 8*i, i = 0..15   sub lens, same order
@@ -65,7 +67,7 @@ lens_parse(const uint8_t *b, size_t off, struct leia_scam_lens *l)
 bool
 leia_scam_factory_calib_parse(const uint8_t *bytes, size_t len, struct leia_scam_factory_calib *out)
 {
-	if (bytes == NULL || out == NULL || len < LEIA_SCAM_FACTORY_BLOCK_MIN_BYTES || bytes[0] != 1) {
+	if (bytes == NULL || out == NULL || len < LEIA_SCAM_FACTORY_BLOCK_MIN_BYTES) {
 		return false;
 	}
 	struct leia_scam_factory_calib c;

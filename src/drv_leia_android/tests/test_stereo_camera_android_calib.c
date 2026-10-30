@@ -77,9 +77,11 @@ main(void)
 	// Rejections.
 	CHECK(!leia_scam_factory_calib_parse(blk, 352, &f));
 	uint8_t bad[690];
+	// Byte 0 differs per device (1 on Lume Pad 2, 128/27 on nubia Pad 3D II):
+	// it must not decide.
 	memcpy(bad, blk, sizeof(bad));
-	bad[0] = 2;
-	CHECK(!leia_scam_factory_calib_parse(bad, sizeof(bad), &f));
+	bad[0] = 128;
+	CHECK(leia_scam_factory_calib_parse(bad, sizeof(bad), &f));
 	memcpy(bad, blk, sizeof(bad));
 	wd(bad, 1, 0.0); // fx = 0
 	CHECK(!leia_scam_factory_calib_parse(bad, sizeof(bad), &f));

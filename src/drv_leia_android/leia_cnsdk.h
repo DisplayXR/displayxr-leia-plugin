@@ -16,6 +16,7 @@
 #include "xrt/xrt_results.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "xrt/xrt_vulkan_includes.h"
 
@@ -532,6 +533,14 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 //! Hand tracking back to the vendor service (outermost end only).
 void
 leia_cnsdk_ext_tracking_end(void);
+
+/*!
+ * The Camera2 id of the camera the vendor device config says the tracker
+ * uses (device-config camera 0 `id`), from any live core of this process that
+ * has read its config. False when no core has, or the config leaves it empty.
+ */
+bool
+leia_cnsdk_get_tracking_camera_id(char *out, size_t cap);
 
 /*!
  * The JavaVM and an Android Context of the hosting process (the class-host

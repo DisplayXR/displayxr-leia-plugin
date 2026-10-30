@@ -45,12 +45,12 @@ struct leia_scam_factory_calib
 	double T[3];
 };
 
-//! Smallest block the parser accepts (version byte + main + sub + R + T).
+//! Smallest block the parser accepts (leading byte + main + sub + R + T).
 #define LEIA_SCAM_FACTORY_BLOCK_MIN_BYTES 353u
 
 /*!
- * Parse the block. Returns false when it is too short, has an unknown
- * version byte, or holds values no real calibration can have (non-finite,
+ * Parse the block (byte 0 is ignored: it differs per device). Returns false
+ * when it is too short or holds values no real calibration can have (non-finite,
  * non-positive focal length, a rotation that is not close to orthonormal, a
  * baseline outside 1..200 mm).
  */
