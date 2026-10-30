@@ -125,9 +125,9 @@ leia_sr_v2_query_display(SrInstance instance,
 /*!
  * #480: the SR display id a screen-bound weaver should bind on this create
  * attempt: @p bound, unless SR has re-keyed the panel at @p origin since (an
- * EDID_ONLY id is replaced when the FPC pairs). Logs a change. Reads the
- * probe enumeration (2 s cache, re-read at once when @p bound is missing), so
- * it is cheap; returns @p bound when it cannot tell. See
+ * EDID_ONLY id is replaced when the FPC pairs). Logs a change. Re-reads SR's
+ * display and monitor lists (past their 2 s cache) on every call, which is once
+ * per create attempt; returns @p bound when it cannot tell. See
  * @ref leia_win_sr_rebind_display_id.
  *
  * @param io_edid_manufacturer, io_edid_product The weaver's memo of its panel's

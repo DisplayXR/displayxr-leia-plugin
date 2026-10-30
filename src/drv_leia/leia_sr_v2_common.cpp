@@ -618,14 +618,13 @@ leia_sr_v2_current_display_id(uint64_t bound,
 	if (bound == 0) {
 		return bound;
 	}
-	// The enumerations return -1 when the SDK or the installed SR runtime lacks them.
+	// Read SR as it is now, not up to 2 s ago: when the FPC pairs, the #468 wake can come
+	// while the cache still holds the list with the old id. This runs once per create
+	// attempt (a 5 s retry or a wake), so the extra read is cheap. The enumerations
+	// return -1 when the SDK or the installed SR runtime lacks them.
+	leia_win_sr_enumerate_refresh_next();
 	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
-	int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
-	if (display_count >= 0 && !leia_win_sr_display_listed(bound, displays, display_count)) {
-		// The FPC may have paired inside the 2 s cache: read SR's list as it is now.
-		leia_win_sr_enumerate_refresh_next();
-		display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
-	}
+	const int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
 	uint16_t edid_manufacturer = io_edid_manufacturer != nullptr ? *io_edid_manufacturer : 0;
 	uint16_t edid_product = io_edid_product != nullptr ? *io_edid_product : 0;
 	leia_win_sr_note_display_edid(bound, displays, display_count, &edid_manufacturer, &edid_product);
