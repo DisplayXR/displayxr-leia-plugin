@@ -298,6 +298,62 @@ leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *o
 uint64_t
 leia_win_claims_generation(void);
 
+/*!
+ * #480: the SR display a screen-bound weaver should bind on this create attempt.
+ *
+ * SR re-keys a panel when its FPC pairs: an EDID_ONLY displayId is a hash until
+ * then. A per-screen DP made while SR knew its panel by EDID only keeps an id SR
+ * drops once the FPC authenticates, and every srCreateDisplay with it fails
+ * (SR_ERROR_DISPLAY_NOT_FOUND) until the app restarts. So the weaver re-resolves
+ * its id before each attempt instead of remembering it:
+ * - @p bound while SR still lists it, or when SR's list is unavailable;
+ * - else the SR display of the monitor at the DP's desktop origin (SR's own
+ *   monitor join, srEnumerateMonitors);
+ * - else the SR display whose desktop-global location is that origin;
+ * - else @p bound: nothing better is known, and the caller retries as before.
+ *
+ * The origin alone could pick another Leia panel moved there before the runtime
+ * rebuilt its screens. So when the panel's EDID is known (@p edid_manufacturer
+ * non-zero, noted by @ref leia_win_sr_note_display_edid while SR listed the
+ * bound id), the monitor's or display's EDID manufacturer and product must match
+ * too, and the EDID serial number when both sides have one (twins of one model);
+ * a monitor or display with no EDID then never matches. A candidate that is
+ * @p bound itself (SR's monitor join lagging its display list) is skipped.
+ *
+ * Pure: the caller passes SR's enumerations. A count < 0 means that
+ * enumeration is unavailable.
+ */
+uint64_t
+leia_win_sr_rebind_display_id(uint64_t bound,
+                              bool has_origin,
+                              int32_t left,
+                              int32_t top,
+                              uint16_t edid_manufacturer,
+                              uint16_t edid_product,
+                              uint32_t edid_serial,
+                              const struct leia_win_sr_display *displays,
+                              int32_t display_count,
+                              const struct leia_win_sr_monitor *monitors,
+                              int32_t monitor_count);
+
+//! #480: does SR's display list (@p count < 0 = unavailable) hold @p id?
+bool
+leia_win_sr_display_listed(uint64_t id, const struct leia_win_sr_display *displays, int32_t count);
+
+/*!
+ * #480: while SR lists @p id, note its EDID manufacturer, product and serial
+ * number into @p io_manufacturer / @p io_product / @p io_serial, for
+ * @ref leia_win_sr_rebind_display_id once SR has re-keyed the panel. Leaves them
+ * as they were when SR does not list @p id or gives no EDID.
+ */
+void
+leia_win_sr_note_display_edid(uint64_t id,
+                              const struct leia_win_sr_display *displays,
+                              int32_t count,
+                              uint16_t *io_manufacturer,
+                              uint16_t *io_product,
+                              uint32_t *io_serial);
+
 
 /*
  *
@@ -345,6 +401,16 @@ leia_win_monitor_at(int32_t left, int32_t top);
 //! Destroy the probe instance, if one exists. Plug-in destroy.
 void
 leia_win_sr_enumerate_shutdown(void);
+
+/*!
+ * #480: the next @ref leia_win_sr_enumerate_displays and
+ * @ref leia_win_sr_enumerate_monitors re-read SR even inside the cache TTL,
+ * exactly as an expired cache would: a re-read that cannot reach SR (no probe
+ * instance) keeps the cached list, and one SR fails drops it. The caches are
+ * the ones probe_displays reads too. Any thread.
+ */
+void
+leia_win_sr_enumerate_refresh_next(void);
 
 /*!
  * runtime ADR-060 R2 (L4): does the installed SR runtime support EXTERNAL

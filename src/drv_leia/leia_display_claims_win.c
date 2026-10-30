@@ -428,6 +428,104 @@ leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *o
 	return found;
 }
 
+bool
+leia_win_sr_display_listed(uint64_t id, const struct leia_win_sr_display *displays, int32_t count)
+{
+	if (displays == NULL) {
+		return false;
+	}
+	for (int32_t i = 0; i < count; i++) {
+		if (displays[i].display_id == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void
+leia_win_sr_note_display_edid(uint64_t id,
+                              const struct leia_win_sr_display *displays,
+                              int32_t count,
+                              uint16_t *io_manufacturer,
+                              uint16_t *io_product,
+                              uint32_t *io_serial)
+{
+	if (id == 0 || displays == NULL || io_manufacturer == NULL || io_product == NULL || io_serial == NULL) {
+		return;
+	}
+	for (int32_t i = 0; i < count; i++) {
+		if (displays[i].display_id == id && displays[i].manufacturer_id != 0) {
+			*io_manufacturer = displays[i].manufacturer_id;
+			*io_product = displays[i].product_id;
+			*io_serial = displays[i].edid_serial;
+			return;
+		}
+	}
+}
+
+//! #480: an unknown wanted EDID (manufacturer 0) matches anything. A known one needs the same
+//! manufacturer and product, and the same serial number when both sides have one (twins).
+static bool
+same_panel_edid(uint16_t manufacturer,
+                uint16_t product,
+                uint32_t serial,
+                uint16_t want_manufacturer,
+                uint16_t want_product,
+                uint32_t want_serial)
+{
+	if (want_manufacturer == 0) {
+		return true;
+	}
+	if (manufacturer != want_manufacturer || product != want_product) {
+		return false;
+	}
+	return want_serial == 0 || serial == 0 || serial == want_serial;
+}
+
+uint64_t
+leia_win_sr_rebind_display_id(uint64_t bound,
+                              bool has_origin,
+                              int32_t left,
+                              int32_t top,
+                              uint16_t edid_manufacturer,
+                              uint16_t edid_product,
+                              uint32_t edid_serial,
+                              const struct leia_win_sr_display *displays,
+                              int32_t display_count,
+                              const struct leia_win_sr_monitor *monitors,
+                              int32_t monitor_count)
+{
+	if (bound == 0 || displays == NULL || display_count < 0) {
+		return bound;
+	}
+	if (leia_win_sr_display_listed(bound, displays, display_count)) {
+		return bound;
+	}
+	if (!has_origin) {
+		return bound;
+	}
+	// SR's monitor join first: it is how SR itself says which display a monitor is.
+	if (monitors != NULL) {
+		for (int32_t i = 0; i < monitor_count; i++) {
+			const struct leia_win_sr_monitor *m = &monitors[i];
+			if (m->sr_display_id != 0 && m->sr_display_id != bound && m->x == left && m->y == top &&
+			    same_panel_edid(m->edid_manufacturer, m->edid_product, m->edid_serial, edid_manufacturer,
+			                    edid_product, edid_serial)) {
+				return m->sr_display_id;
+			}
+		}
+	}
+	for (int32_t i = 0; i < display_count; i++) {
+		const struct leia_win_sr_display *d = &displays[i];
+		if (d->display_id != 0 && d->location_is_desktop_global && d->left == left && d->top == top &&
+		    same_panel_edid(d->manufacturer_id, d->product_id, d->edid_serial, edid_manufacturer, edid_product,
+		                    edid_serial)) {
+			return d->display_id;
+		}
+	}
+	return bound;
+}
+
 uint64_t
 leia_win_claims_generation(void)
 {
@@ -481,6 +579,11 @@ leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
 
 void
 leia_win_sr_enumerate_shutdown(void)
+{
+}
+
+void
+leia_win_sr_enumerate_refresh_next(void)
 {
 }
 
