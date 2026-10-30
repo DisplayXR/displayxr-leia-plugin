@@ -15,6 +15,7 @@
 
 #include "xrt/xrt_results.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "xrt/xrt_vulkan_includes.h"
 
@@ -487,6 +488,59 @@ leia_cnsdk_set_overlay_2d(struct leia_cnsdk *cnsdk,
                           uint32_t height,
                           float strength,
                           bool layer_unchanged);
+
+/*
+ *
+ * External tracking camera (stereo camera source, leia_stereo_camera_android).
+ *
+ * While the plug-in holds the FRONT stereo pair, the vendor tracking service
+ * has no camera. Every CNSDK core of this process then tracks IN-APP from
+ * frames the camera source feeds through a shared-camera sink, and goes back
+ * to the service on end. Cores created while it is active start in-app too.
+ *
+ */
+
+//! Intrinsics of the lens the feed comes from, at the fed size.
+struct leia_cnsdk_ext_intrinsics
+{
+	int32_t width, height;
+	float fx, fy, cx, cy;
+	double d[8];
+	bool mirrored;
+	//! false = no factory calibration: the core keeps its own default.
+	bool valid;
+};
+
+/*!
+ * Switch every live core of this process to in-app tracking fed by
+ * @ref leia_cnsdk_ext_tracking_feed. Returns how many cores were switched
+ * (0 = none yet; one created later switches as it starts). Nests: only the
+ * outermost begin/end pair switches.
+ */
+uint32_t
+leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr);
+
+/*!
+ * Push one Y8 frame (tight stride = @p width) to every in-app core.
+ * @p ts_boottime_ns is the sensor timestamp (CLOCK_BOOTTIME, the clock CNSDK's
+ * "system" timestamps use). Runs detection on the caller's thread: call it
+ * from a dedicated thread, never a camera callback.
+ */
+void
+leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, int64_t ts_boottime_ns);
+
+//! Hand tracking back to the vendor service (outermost end only).
+void
+leia_cnsdk_ext_tracking_end(void);
+
+/*!
+ * The JavaVM and an Android Context of the hosting process (the class-host
+ * Context when the runtime provides one, else the Activity/Service), for
+ * plug-in code that needs framework Java APIs.
+ */
+bool
+leia_cnsdk_get_jni(void **out_vm, void **out_ctx);
+
 
 #ifdef __cplusplus
 }

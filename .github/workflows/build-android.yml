@@ -11,7 +11,7 @@
 #      runtime APK itself uses (r26d / 26.3.11579264).
 #   2. Single-export discipline: exactly xrtPluginNegotiate in .dynsym
 #      (llvm twin of build-linux.yml's `nm -D` assertion, ADR-019).
-#   3. Load-closure discipline: DT_NEEDED is exactly the 7 expected entries.
+#   3. Load-closure discipline: DT_NEEDED is exactly the 9 expected entries.
 #      The NEGATIVE matters most -- libleiaSDK-jni.so must NOT be DT_NEEDED
 #      (it is dlopen'd from the Java/service side; a hard link-time dependency
 #      makes the plug-in unloadable in-process).
@@ -353,14 +353,17 @@ jobs:
           SO=build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
           got=$("$NDK_BIN/llvm-readelf" -d "$SO" \
                  | awk -F'[][]' '/\(NEEDED\)/ {print $2}' | sort)
+          # libcamera2ndk + libmediandk: the stereo camera source (NDK Camera2 +
+          # AImageReader). Public NDK libraries, present on every device >= 24.
           want=$(printf '%s\n' liblog.so libandroid.so libvulkan.so \
+                   libcamera2ndk.so libmediandk.so \
                    libleiaCore-loader.so libm.so libdl.so libc.so | sort)
           if [ "$got" != "$want" ]; then
             echo "::error::DT_NEEDED closure drift."
             diff <(echo "$want") <(echo "$got") || true
             exit 1
           fi
-          echo "OK: DT_NEEDED == liblog libandroid libvulkan libleiaCore-loader libm libdl libc"
+          echo "OK: DT_NEEDED == liblog libandroid libvulkan libcamera2ndk libmediandk libleiaCore-loader libm libdl libc"
 
       - name: Assert compiled-in ABI (artifact-level)
         if: steps.cnsdk.outputs.have_sdk == 'yes'
@@ -426,7 +429,7 @@ jobs:
             echo "cnsdk_build_dependency=${CNSDK_VERSION}"
             echo "ndk=${NDK_VERSION}"
             echo "abi=${ANDROID_ABI}  min_sdk=${ANDROID_PLATFORM}"
-            echo "dt_needed=liblog,libandroid,libvulkan,libleiaCore-loader,libm,libdl,libc"
+            echo "dt_needed=liblog,libandroid,libvulkan,libcamera2ndk,libmediandk,libleiaCore-loader,libm,libdl,libc"
             echo ""
             echo "Drop ${ANDROID_ABI}/libdxrp050_leia_cnsdk.so into the runtime APK's"
             echo "src/xrt/targets/openxr_android/src/main/jniLibs/${ANDROID_ABI}/."

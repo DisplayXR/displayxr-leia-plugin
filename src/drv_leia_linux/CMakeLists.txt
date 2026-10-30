@@ -377,6 +377,16 @@ target_include_directories(test_stereo_camera_parse PRIVATE ${CMAKE_CURRENT_SOUR
 target_link_libraries(test_stereo_camera_parse PRIVATE m)
 add_test(NAME test_stereo_camera_parse COMMAND test_stereo_camera_parse)
 
+# --- Host unit test: Android stereo camera factory calibration (ADR-043) ---
+# The Android provider's platform-neutral half (factory block parse, stream
+# rescale/crop, eye order). Pure C, so the Linux job runs it for the Android arm.
+add_executable(test_stereo_camera_android_calib
+    ../drv_leia_android/tests/test_stereo_camera_android_calib.c
+    ../drv_leia_android/leia_stereo_camera_android_calib.c)
+target_include_directories(test_stereo_camera_android_calib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_android)
+target_link_libraries(test_stereo_camera_android_calib PRIVATE m)
+add_test(NAME test_stereo_camera_android_calib COMMAND test_stereo_camera_android_calib)
+
 # macOS-arm SR display readiness (leia_sr_readiness.c): platform-neutral C,
 # host-tested here because the macOS arm has no CI ctest lane.
 add_executable(test_sr_readiness
