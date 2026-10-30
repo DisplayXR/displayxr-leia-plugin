@@ -209,7 +209,8 @@ struct leia_cnsdk
 	// worker's first enable; ext_sink is our own reference (the core holds
 	// another).
 	std::mutex ext_mu;
-	bool ext_in_app{false};
+	//! Atomic: the frame listener reads it to stay quiet in-app.
+	std::atomic<bool> ext_in_app{false};
 	struct leia_shared_camera_sink *ext_sink{nullptr};
 	uint32_t ext_frames{0};
 
@@ -709,7 +710,11 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 	            px < -800.0f || px > 800.0f ||
 	            py < -800.0f || py > 800.0f)) {
 		static int rej = 0;
-		if ((rej++ % 60) == 0) {
+		// In-app (the stereo camera feeds tracking) the listener's frames carry no
+		// pose at all (0,0,0 every frame, measured): the core's own eyes drive the
+		// weave then, so this fallback is expected to miss. Stay quiet.
+		const bool in_app = cnsdk != nullptr && cnsdk->ext_in_app.load(std::memory_order_relaxed);
+		if (!in_app && (rej++ % 60) == 0) {
 			U_LOG_W("HW_FACE: rejected implausible face (%.0f,%.0f,%.0f) mm", px, py, pz);
 		}
 		got = false;
@@ -847,7 +852,14 @@ ext_switch_locked(struct leia_cnsdk *cnsdk, bool in_app)
 	ext_attach_listener(cnsdk);
 	const enum leia_face_tracking_runtime_type got = leia_core_get_face_tracking_runtime(core);
 	cnsdk->ext_in_app = in_app && got == LEIA_FACE_TRACKING_RUNTIME_IN_APP && cnsdk->ext_sink != nullptr;
-	apply_eye_tracking_mode(cnsdk);
+	// NEVER touch the backlight here (no apply_eye_tracking_mode, no
+	// enable_3d, no enable_no_face_mode). The lens vote belongs to the
+	// presenting session alone: the panel may be 3D only while a client weaves.
+	// A hand-back that runs after that client paused re-voted 3D through
+	// leia_core_enable_3d(want_3d) and left the panel stuck in 3D with no client
+	// (measured on a Lume Pad 2, 2026-10-30: "NoFaceMode ForceSetBacklight
+	// forced on" 0.5 s after the pause's "forced off"). NoFaceMode and the 3D
+	// vote are core settings that survive a face-tracking disable/enable.
 	cnsdk->tracking_cycling.store(false, std::memory_order_release);
 	U_LOG_W("leia ext tracking: core %p -> %s (runtime=%d enable=%d sink_active=%d) in %.1f ms", (void *)cnsdk,
 	        in_app ? "IN-APP (stereo camera feed)" : "IN-SERVICE", (int)got, (int)en,
@@ -2114,7 +2126,7 @@ leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr)
 	for (struct leia_cnsdk *c : g_ext_cores) {
 		std::lock_guard<std::mutex> lk2(c->ext_mu);
 		ext_switch_locked(c, true);
-		n += c->ext_in_app ? 1u : 0u;
+		n += c->ext_in_app.load() ? 1u : 0u;
 	}
 	return n;
 }

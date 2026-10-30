@@ -553,6 +553,11 @@ struct xrt_plugin_stereo_camera
 	pair_desc desc;
 	bool lsub{true};
 	bool track{false};
+	//! Tracking is handed to the in-app runtime only while the camera is open
+	//! (begun right before openCamera, ended on a failed start, a source loss
+	//! or close), so a camera that cannot open never leaves the cores untracked.
+	bool handed{false};
+	struct leia_cnsdk_ext_intrinsics trk_intr{};
 	uint32_t w{0}, h{0};         //!< per-eye output
 	uint32_t cap_w{0}, cap_h{0}; //!< per-lens capture
 
@@ -995,6 +1000,25 @@ add_output(xrt_plugin_stereo_camera *c, AImageReader *rd, const char *phys, ACap
 	return ACaptureRequest_addTarget(c->req, *tgt) == ACAMERA_OK;
 }
 
+//! Under cam_mu. Hand head tracking to / back from this process's cores.
+void
+handover_locked(xrt_plugin_stereo_camera *c, bool on)
+{
+	if (!c->track || c->handed == on) {
+		return;
+	}
+	c->handed = on;
+	if (on) {
+		const uint32_t cores = leia_cnsdk_ext_tracking_begin(&c->trk_intr);
+		SCAM_LOG_W("leia stereo camera (android): tracking handed to %u in-process core(s) (in-app, fed from lens %s, "
+		           "fx %.1f fy %.1f cx %.1f cy %.1f at 640x480)",
+		           cores, c->desc.main_id, c->trk_intr.fx, c->trk_intr.fy, c->trk_intr.cx, c->trk_intr.cy);
+	} else {
+		leia_cnsdk_ext_tracking_end();
+		SCAM_LOG_W("leia stereo camera (android): tracking handed back to the tracking service");
+	}
+}
+
 //! Under cam_mu: open the device and start the repeating request.
 bool
 start_locked(xrt_plugin_stereo_camera *c)
@@ -1011,17 +1035,22 @@ start_locked(xrt_plugin_stereo_camera *c)
 		return false;
 	}
 
+	// Into in-app tracking BEFORE the camera service evicts the tracking
+	// service's camera; back out if the open does not get through.
+	handover_locked(c, true);
 	c->dev_cb = {c, dev_disconnected, dev_error};
 	camera_status_t st = ACameraManager_openCamera(mgr(), c->desc.logical_id, &c->dev_cb, &c->dev);
 	if (st != ACAMERA_OK || c->dev == nullptr) {
 		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) failed (%d)", c->desc.logical_id, (int)st);
 		c->dev = nullptr;
 		teardown_locked(c);
+		handover_locked(c, false);
 		return false;
 	}
 	if (ACaptureSessionOutputContainer_create(&c->outputs) != ACAMERA_OK ||
 	    ACameraDevice_createCaptureRequest(c->dev, TEMPLATE_PREVIEW, &c->req) != ACAMERA_OK) {
 		teardown_locked(c);
+		handover_locked(c, false);
 		return false;
 	}
 	const bool ok =
@@ -1029,6 +1058,7 @@ start_locked(xrt_plugin_stereo_camera *c)
 	if (!ok) {
 		SCAM_LOG_W("leia stereo camera (android): could not build the outputs");
 		teardown_locked(c);
+		handover_locked(c, false);
 		return false;
 	}
 	const int32_t fps[2] = {30, 30};
@@ -1040,12 +1070,14 @@ start_locked(xrt_plugin_stereo_camera *c)
 		SCAM_LOG_W("leia stereo camera (android): createCaptureSession failed (%d)", (int)st);
 		c->session = nullptr;
 		teardown_locked(c);
+		handover_locked(c, false);
 		return false;
 	}
 	st = ACameraCaptureSession_setRepeatingRequest(c->session, nullptr, 1, &c->req, nullptr);
 	if (st != ACAMERA_OK) {
 		SCAM_LOG_W("leia stereo camera (android): setRepeatingRequest failed (%d)", (int)st);
 		teardown_locked(c);
+		handover_locked(c, false);
 		return false;
 	}
 	c->opened_ns = clock_ns(CLOCK_MONOTONIC);
@@ -1094,6 +1126,7 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 		           stalled ? "no frames" : "device failed", c->device_error.load());
 		std::lock_guard<std::mutex> lk(c->cam_mu);
 		teardown_locked(c);
+		handover_locked(c, false);
 	}
 	if (now - c->down_since_ns > kGiveUpNs) {
 		*out_gave_up = true;
@@ -1241,8 +1274,9 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	c->track = c->desc.front && prop_bool("debug.dxr.leia.scam_track", true);
 
 	if (c->track) {
-		// Hand tracking to this process's cores BEFORE taking the camera from
-		// the tracking service, with the intrinsics of the lens we feed.
+		// The intrinsics of the lens fed to this process's cores once tracking is
+		// handed over (start_locked, right before the camera is taken from the
+		// tracking service).
 		// The main lens's capture, then crop_track_from_eye's centre 4:3 region
 		// scaled to 640x480. With a 4:3 capture that is the whole array, i.e.
 		// the tracking service's own 640x480 intrinsics.
@@ -1270,10 +1304,7 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		}
 		ei.mirrored = true;
 		ei.valid = c->desc.calibrated;
-		const uint32_t cores = leia_cnsdk_ext_tracking_begin(&ei);
-		SCAM_LOG_W("leia stereo camera (android): tracking handed to %u in-process core(s) (in-app, fed from lens "
-		           "%s, fx %.1f fy %.1f cx %.1f cy %.1f at 640x480)",
-		           cores, c->desc.main_id, ei.fx, ei.fy, ei.cx, ei.cy);
+		c->trk_intr = ei; // handed over by start_locked, around the actual open
 		c->trk_thread = std::thread(tracking_feeder, c);
 	}
 
@@ -1370,8 +1401,9 @@ leia_stereo_camera_android_close(struct xrt_plugin_stereo_camera *c)
 		c->trk_cv.notify_all();
 		c->trk_thread.join();
 	}
-	if (c->track) {
-		leia_cnsdk_ext_tracking_end();
+	{
+		std::lock_guard<std::mutex> lk(c->cam_mu);
+		handover_locked(c, false);
 	}
 	const int64_t t2 = clock_ns(CLOCK_MONOTONIC);
 	SCAM_LOG_W("leia stereo camera (android): closed %s pair after %llu pairs (camera close %.1f ms, tracking "
