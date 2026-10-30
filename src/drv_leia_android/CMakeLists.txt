@@ -91,6 +91,13 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_display_processor_cnsdk.cpp
     leia_display_processor_cnsdk.h
     leia_plugin_android.c
+    # Stereo camera source (runtime ADR-043, XR_DXR_stereo_camera): the
+    # tablet's logical stereo pair over NDK Camera2. The calib half is pure C
+    # and host-tested (tests/test_stereo_camera_android_calib.c, Linux CI).
+    leia_stereo_camera_android.cpp
+    leia_stereo_camera_android.h
+    leia_stereo_camera_android_calib.c
+    leia_stereo_camera_android_calib.h
 )
 
 # Post-weave alpha-gate (#568) + pre-weave compose-under-bg (runtime#1073 T0)
@@ -133,10 +140,14 @@ target_link_libraries(dxrp050_leia_cnsdk
         # CNSDK 0.10.54 is what makes the service connection actually work
         # (0.7.28 mismatched: "Missing required service: InterlacingService").
         CNSDK::leiaCore
-        # Android system libs.
+        # Android system libs. camera2ndk + mediandk: the stereo camera source
+        # (NDK Camera2 + AImageReader); both are in every system image >= 24 and
+        # the vendor core links them too.
         log
         android
         vulkan
+        camera2ndk
+        mediandk
 )
 
 # Debug-log + ATrace gating: when XRT_DEBUG_ANDROID_VERBOSE is defined,

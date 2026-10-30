@@ -1,0 +1,163 @@
+# Android stereo camera source
+
+The Android arm fills the runtime's stereo-camera slots (runtime ADR-043,
+`XR_DXR_stereo_camera`) from the tablet's own stereo camera pair. The runtime
+stays vendor-neutral. It rectifies, converts, transports, applies consent and
+fans frames out. Everything Leia- or OEM-specific lives here:
+
+- the logical camera ids,
+- the factory calibration block,
+- the hand-over of head tracking.
+
+Code:
+
+- `src/drv_leia_android/leia_stereo_camera_android.{h,cpp}`: NDK Camera2 source and the six slots.
+- `src/drv_leia_android/leia_stereo_camera_android_calib.{h,c}`: factory-block parse and stream conversion. Pure C, host-tested by `tests/test_stereo_camera_android_calib.c` (Linux CI).
+- `leia_cnsdk_ext_tracking_*` in `leia_cnsdk.cpp`: in-app tracking hand-over.
+
+Design and the measurements behind it: runtime
+`docs/roadmap/stereo-camera-android.md` (§11 A0 results, §12 plan).
+
+## Cameras
+
+| Index | Camera | Flags | Frames |
+|---|---|---|---|
+| 0 | front pair ("3D Camera") | `USER_FACING`, `SHARED_WITH_EYE_TRACKING`, `CALIBRATED` when the block parses | 2 × 1280×720, SBS NV12 (2560×720) |
+| 1 | rear pair ("3D Camera, rear") | `CALIBRATED` when the block parses | same |
+
+**Discovery.** The pairs are Camera2 *logical* multi-cameras that are hidden
+from the camera id list. The source probes ids 0–15 and keeps the first logical
+camera with two physical lenses per facing:
+
+- Lume Pad 2 / nubia Pad 3D II: front = 5 (lenses 1, 3), rear = 4 (lenses 0, 2).
+- Phone-class panels expose a different id; the scan finds it.
+
+No id is hard-coded.
+
+**Streams.** The source configures one `YUV_420_888` output per physical lens
+at the sensor's 4:3 aspect, 1280×960 for a 1280×720 eye, and nothing else:
+
+- **Eyes:** each eye is the centre 1280×720 crop of its lens's image.
+- **Tracking frame:** the main lens's image, 2×2-box-decimated to 640×480. That
+  is the whole sensor field of view, which is what the vendor tracking service
+  feeds its own detector, at the same intrinsics.
+
+This configuration is forced by two measured constraints:
+
+- **No CPU-readable PRIVATE reader.** The NDK refuses one:
+  `AImageReader_newWithUsage(PRIVATE, CPU_READ_OFTEN)` returns
+  `AMEDIA_ERROR_INVALID_PARAMETER`. So a CPU NV12 path needs YUV eyes.
+- **No second YUV output on a lens.** It aborts the camera HAL; the A0 probe
+  measured this with 1280×720 + 640×480.
+
+The vendor camera app's configuration (GPU preview eyes plus a 640×480 YUV
+tracking stream) suits the GPU / AHardwareBuffer path (runtime phase A4), not
+this one.
+
+**Timestamps.** The sensor clock is `CLOCK_BOOTTIME` (timestamp source
+`REALTIME`). Published frames carry the start-of-exposure time converted to
+`CLOCK_MONOTONIC` per frame (`time_is_exposure = true`). CNSDK gets BOOTTIME,
+which is the clock its "system" timestamps use.
+
+## Factory calibration block
+
+The OEM publishes the stereo calibration as a vendor characteristics key. It
+sits on the logical camera and on the **main** lens only: `…eeprom3d_front`
+for the front pair, `…eeprom3d_rear` for the rear. The prefix is overridable
+with `debug.dxr.leia.scam_calib_key_prefix`.
+
+Vendor keys are not listed by `CameraCharacteristics.getKeys()`. The source
+therefore builds the key by name over JNI, the same way an app would.
+
+Layout, version 1. Byte 0 is the version. Every value after it is a
+little-endian IEEE-754 double:
+
+| Bytes | Content |
+|---|---|
+| 1–128 | main lens: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6 s1–s4, pixels at the full active array |
+| 129–256 | sub lens, same order |
+| 257–328 | R (3×3, row-major) |
+| 329–352 | T (mm) |
+| 353– | (optional) a precomputed rectification, ignored |
+
+**Convention.** `x_sub = R · x_main + T`, as in OpenCV `stereoCalibrate` with
+camera 1 = main.
+
+**Eye order.** The lens whose centre lies at −x of the other, i.e. on the
+camera's own left, is the SBS left eye. On the front pair that is the sub lens
+(T = (+15, 0, 0) mm). The source hands the runtime `R_rl`/`T_rl` in its
+`x_right = R_rl · x_left + T_rl` convention. `debug.dxr.leia.scam_swap=0|1`
+forces the order.
+
+**Main lens.** The main lens is the one the vendor tracking service tracks
+from: its intrinsics match the service's logged 640×480 values (fx 338.6,
+fy 345.6).
+
+**Stream conversion.** A 16:9 stream from the 4:3 array is the array scaled to
+the stream width, with the rows centre-cropped:
+`cy' = (cy − H/2)·s + h/2`.
+
+Measured on a Lume Pad 2:
+
+| Pair | Baseline | f at 1280×720 | Rotation between lenses |
+|---|---|---|---|
+| Front | 14.99 mm | ≈ 676 / 690 px | ≈ 0.46° (mostly roll) |
+| Rear | 30.03 mm | — | ≈ 0.3° |
+
+## Head tracking while the front pair is open
+
+Opening the front pair takes the tracking service's camera away, because both
+use the same lens. While a front stream is open, every CNSDK core in this
+process tracks **in-app**. `leia_cnsdk_ext_tracking_begin` performs the switch
+on each core:
+
+1. Stop and disable face tracking.
+2. Attach a fresh shared-camera sink.
+3. Set the in-app runtime.
+4. Re-enable and restart tracking, re-attach the frame listener, and re-apply
+   the eye-tracking mode.
+
+The weave is gated (`tracking_cycling`) for those few milliseconds. A core
+created while a stream is open joins in-app when its worker first starts
+tracking. On close, `leia_cnsdk_ext_tracking_end` switches every core back to
+in-service.
+
+**Feeding.** A feeder thread pushes each 640×480 Y8 frame through the C API:
+
+1. `leia_shared_camera_sink_on_intrinsics_change` with the main lens's
+   intrinsics at 640×480, mirrored. It runs first, then every 60 frames.
+2. `leia_shared_camera_sink_on_image` with a tight 640 stride, rotation 0, and
+   a BOOTTIME timestamp.
+
+Detection runs on the caller's thread and can stall for 500 ms with no face in
+view, so frames are latest-wins and never queued. The tracking frame is cut
+from every main-lens image *before* pairing. CNSDK resets its predictor on a
+gap above 70 ms, so a lost pair must not become a lost tracking frame.
+
+**CNSDK #762.** The Java/JNI `SharedCameraSink.onImage` bugs it fixes (padded
+Y stride, non-zero rotation) are not on this path. Nothing here changes when
+the pin moves to CNSDK ≥ 0.10.88.
+
+## Watchdog
+
+The pair counts as stalled when no frame pair has arrived for 1.5 s. A stall
+can be silent: CRC recovery reports nothing. The device callbacks
+(`onDisconnected`, `onError`) cover eviction and HAL restarts.
+
+On either, the source:
+
+1. Tears the session down.
+2. Reopens with a 0.5 s → 4 s back-off.
+3. Reports `SUSPENDED` from `wait_frame` meanwhile.
+4. Reports `ERROR` after 15 s.
+
+## Knobs (system properties, read by the process that loads the plug-in)
+
+| Property | Effect |
+|---|---|
+| `debug.dxr.leia.scam=0` | advertise no camera |
+| `debug.dxr.leia.scam_rear=0` | front pair only |
+| `debug.dxr.leia.scam_size=WxH` | per-eye size (default 1280x720; captured at W×(3W/4) when the lenses list it) |
+| `debug.dxr.leia.scam_track=0` | do not hand tracking over (the service then loses its camera) |
+| `debug.dxr.leia.scam_swap=auto\|0\|1` | SBS eye order |
+| `debug.dxr.leia.scam_calib_key_prefix` | vendor key prefix of the factory block |

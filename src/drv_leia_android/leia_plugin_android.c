@@ -32,6 +32,7 @@
 
 #include "leia_cnsdk.h"
 #include "leia_display_processor_cnsdk.h"
+#include "leia_stereo_camera_android.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -393,6 +394,23 @@ static struct xrt_plugin_iface g_leia_android_iface = {
     // falls back to query_source_claims()'s synthesized primary claim off a
     // successful binary probe(). Validated end-to-end via android-smoketest.sh.
     .probe_displays = NULL,
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
+    /*
+     * Stereo camera source (runtime ADR-043, XR_DXR_stereo_camera): the front
+     * (and rear) logical stereo pair over NDK Camera2, SBS NV12, factory
+     * calibration from the camera characteristics. Opening the front pair
+     * hands this process's head tracking to the in-app runtime fed from the
+     * same camera, and back on close. See leia_stereo_camera_android.cpp.
+     * All six or none (the runtime checks).
+     */
+    .stereo_camera_enumerate = leia_stereo_camera_android_enumerate,
+    .stereo_camera_get_calibration = leia_stereo_camera_android_get_calibration,
+    .stereo_camera_open = leia_stereo_camera_android_open,
+    .stereo_camera_wait_frame = leia_stereo_camera_android_wait_frame,
+    .stereo_camera_release_frame = leia_stereo_camera_android_release_frame,
+    .stereo_camera_close = leia_stereo_camera_android_close,
+#endif
 };
 
 

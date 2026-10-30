@@ -25,6 +25,7 @@
 #include <leia/core/interlacer.vulkan.h>
 #include <leia/core/library.h>
 #include <leia/core/deviceConfig.h>
+#include <leia/core/sharedCameraSink.h>
 #include <leia/headTracking/common/types.h>
 #include <leia/common/version.h>
 
@@ -135,7 +136,10 @@ static const uint64_t kDropVerboseRuns = 32;
 #include <cstdint>
 #include <memory>
 #include <cmath>
+#include <cstdio>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 
 // Hardware-bring-up debug logging. Gated by XRT_DEBUG_ANDROID_VERBOSE
@@ -200,6 +204,17 @@ struct leia_cnsdk
 	std::atomic<bool> shutting_down{false};
 	std::thread worker;
 
+	// External tracking camera (leia_cnsdk_ext_tracking_*): while the plug-in's
+	// stereo camera holds the front pair, this core tracks IN-APP from frames
+	// pushed into ext_sink. ext_mu serialises the runtime switch against the
+	// worker's first enable; ext_sink is our own reference (the core holds
+	// another).
+	std::mutex ext_mu;
+	//! Atomic: the frame listener reads it to stay quiet in-app.
+	std::atomic<bool> ext_in_app{false};
+	struct leia_shared_camera_sink *ext_sink{nullptr};
+	uint32_t ext_frames{0};
+
 	// Eye-tracking control mode (#522): 0 = MANAGED (CNSDK owns the
 	// tracking-loss lifecycle — grace + auto-2D via NoFaceMode), 1 = MANUAL
 	// (CNSDK stands down; the app drives 2D⇄3D). Set by the runtime via
@@ -240,6 +255,8 @@ struct leia_cnsdk
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
 	bool camera_extrinsics_ok{false};
+	//! Device-config camera 0 `id` (the tracker's Camera2 id; may be empty).
+	char tracking_camera_id[16]{};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -696,7 +713,11 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 	            px < -800.0f || px > 800.0f ||
 	            py < -800.0f || py > 800.0f)) {
 		static int rej = 0;
-		if ((rej++ % 60) == 0) {
+		// In-app (the stereo camera feeds tracking) the listener's frames carry no
+		// pose at all (0,0,0 every frame, measured): the core's own eyes drive the
+		// weave then, so this fallback is expected to miss. Stay quiet.
+		const bool in_app = cnsdk != nullptr && cnsdk->ext_in_app.load(std::memory_order_relaxed);
+		if (!in_app && (rej++ % 60) == 0) {
 			U_LOG_W("HW_FACE: rejected implausible face (%.0f,%.0f,%.0f) mm", px, py, pz);
 		}
 		got = false;
@@ -764,6 +785,114 @@ apply_eye_tracking_mode(struct leia_cnsdk *cnsdk)
 	DXR_HW_DBG("apply_eye_tracking_mode: mode=%u tracking_available=%d -> no_face_mode=%d",
 	           mode, (int)tracking_available, (int)managed_auto_2d);
 }
+
+/*
+ *
+ * External tracking camera (see leia_cnsdk.h). Process-wide: every live core
+ * is registered, and all of them follow the begin/end state.
+ *
+ */
+
+std::mutex g_ext_mu;                       // guards the three below
+std::vector<struct leia_cnsdk *> g_ext_cores;
+int g_ext_depth = 0;
+struct leia_cnsdk_ext_intrinsics g_ext_intr = {};
+
+void
+ext_register(struct leia_cnsdk *cnsdk)
+{
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	g_ext_cores.push_back(cnsdk);
+}
+
+void
+ext_unregister(struct leia_cnsdk *cnsdk)
+{
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	g_ext_cores.erase(std::remove(g_ext_cores.begin(), g_ext_cores.end(), cnsdk), g_ext_cores.end());
+}
+
+void
+ext_attach_listener(struct leia_cnsdk *cnsdk);
+
+/*!
+ * Under cnsdk->ext_mu. Re-runs the worker's enable with the other runtime.
+ * The weave is gated (tracking_cycling) for the few ms the core is between
+ * disable and enable, the same gate the #201 watchdog uses.
+ */
+void
+ext_switch_locked(struct leia_cnsdk *cnsdk, bool in_app)
+{
+	if (!cnsdk->face_tracking_started.load(std::memory_order_acquire) || cnsdk->ext_in_app == in_app) {
+		return; // not started yet: the worker switches when it is
+	}
+	struct leia_core *core = cnsdk->core;
+	const int64_t t0 = os_monotonic_get_ns();
+	cnsdk->tracking_cycling.store(true, std::memory_order_release);
+	std::this_thread::sleep_for(std::chrono::milliseconds(30)); // let an in-flight weave drain
+	leia_core_start_face_tracking(core, false);
+	leia_core_enable_face_tracking(core, false);
+	if (in_app) {
+		struct leia_shared_camera_sink *sink = leia_shared_camera_sink_alloc(cnsdk->lib);
+		if (sink == nullptr) {
+			U_LOG_W("leia ext tracking: shared camera sink alloc failed; staying in-service");
+		} else {
+			leia_shared_camera_sink_retain(sink); // ours; the core takes the allocation's reference
+			leia_core_set_face_tracking_shared_camera_sink(core, sink);
+			leia_core_set_face_tracking_runtime(core, LEIA_FACE_TRACKING_RUNTIME_IN_APP);
+			cnsdk->ext_sink = sink;
+			cnsdk->ext_frames = 0;
+		}
+	} else {
+		leia_core_set_face_tracking_runtime(core, LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE);
+		if (cnsdk->ext_sink != nullptr) {
+			leia_shared_camera_sink_release(cnsdk->ext_sink);
+			cnsdk->ext_sink = nullptr;
+		}
+	}
+	const bool en = leia_core_enable_face_tracking(core, true);
+	leia_core_start_face_tracking(core, true);
+	ext_attach_listener(cnsdk);
+	const enum leia_face_tracking_runtime_type got = leia_core_get_face_tracking_runtime(core);
+	cnsdk->ext_in_app = in_app && got == LEIA_FACE_TRACKING_RUNTIME_IN_APP && cnsdk->ext_sink != nullptr;
+	// NEVER touch the backlight here (no apply_eye_tracking_mode, no
+	// enable_3d, no enable_no_face_mode). The lens vote belongs to the
+	// presenting session alone: the panel may be 3D only while a client weaves.
+	// A hand-back that runs after that client paused re-voted 3D through
+	// leia_core_enable_3d(want_3d) and left the panel stuck in 3D with no client
+	// (measured on a Lume Pad 2, 2026-10-30: "NoFaceMode ForceSetBacklight
+	// forced on" 0.5 s after the pause's "forced off"). NoFaceMode and the 3D
+	// vote are core settings that survive a face-tracking disable/enable.
+	cnsdk->tracking_cycling.store(false, std::memory_order_release);
+	U_LOG_W("leia ext tracking: core %p -> %s (runtime=%d enable=%d sink_active=%d) in %.1f ms", (void *)cnsdk,
+	        in_app ? "IN-APP (stereo camera feed)" : "IN-SERVICE", (int)got, (int)en,
+	        cnsdk->ext_sink != nullptr ? (int)leia_shared_camera_sink_is_active(cnsdk->ext_sink) : -1,
+	        (double)(os_monotonic_get_ns() - t0) / 1e6);
+}
+
+void
+ext_attach_listener(struct leia_cnsdk *cnsdk)
+{
+	struct leia_headtracking_frame_listener *l =
+	    leia_headtracking_frame_listener_alloc(cnsdk->lib, on_headtracking_frame, cnsdk, nullptr);
+	if (l != nullptr) {
+		leia_core_set_face_tracking_frame_listener(cnsdk->core, l); // the core owns it (and drops the old one)
+		cnsdk->frame_listener = l;
+	}
+}
+
+//! The worker, once tracking first started: join an active external feed.
+void
+ext_on_core_started(struct leia_cnsdk *cnsdk)
+{
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	const bool registered = std::find(g_ext_cores.begin(), g_ext_cores.end(), cnsdk) != g_ext_cores.end();
+	if (g_ext_depth > 0 && registered) { // unregistered = being destroyed
+		std::lock_guard<std::mutex> lk2(cnsdk->ext_mu);
+		ext_switch_locked(cnsdk, true);
+	}
+}
+
 
 void
 face_tracking_worker(struct leia_cnsdk *cnsdk)
@@ -858,6 +987,7 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 			cnsdk->camera_center_x_m = cam.translation_mm.x / 1000.0f;
 			cnsdk->camera_center_y_m = cam.translation_mm.y / 1000.0f;
 			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
+			snprintf(cnsdk->tracking_camera_id, sizeof(cnsdk->tracking_camera_id), "%.15s", cam.id);
 			cnsdk->camera_extrinsics_ok = true;
 			U_LOG_W("CNSDK camera extrinsics: translation=(%.1f,%.1f,%.1f) mm "
 			        "rotation=(%.1f,%.1f,%.1f) deg sensorOri=%d frontFacing=%d",
@@ -902,6 +1032,9 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 
 	cnsdk->face_tracking_started.store(true, std::memory_order_release);
 	U_LOG_W("CNSDK face tracking started (worker)");
+
+	// A stereo-camera session that began before this core was up.
+	ext_on_core_started(cnsdk);
 
 	// Tracking is now available (licensed): apply the eye-tracking-mode policy
 	// (#522). If the runtime already selected MANUAL, or selected MANAGED, this
@@ -1200,9 +1333,13 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	leia_core_init_configuration_set_enable_validation(config, true);
 
 	// HW-2c: use the in-SERVICE face-tracking runtime — it delegates tracking
-	// to the device's licensed Leia system service. The in-app runtime failed
-	// to license on the Lume Pad ("Invalid Device"). IN_SERVICE is the enum
-	// default (0), set explicitly so it's unambiguous.
+	// to the device's Leia head-tracking service, which every 3D app shares.
+	// (The old "in-app fails to license: Invalid Device" rationale is stale:
+	// at CNSDK 0.10.85+ in-app initialises with no license gate, measured on a
+	// Lume Pad 2 — runtime docs/roadmap/stereo-camera-android.md §11.3. The
+	// stereo camera source switches a core to in-app while it holds the front
+	// camera; leia_cnsdk_ext_tracking_*.) IN_SERVICE is the enum default (0),
+	// set explicitly so it's unambiguous.
 	leia_core_init_configuration_set_face_tracking_runtime(
 	    config, LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE);
 
@@ -1260,6 +1397,7 @@ leia_cnsdk_create(struct leia_cnsdk **out_cnsdk)
 	cnsdk->host_is_activity =
 	    activity != NULL && android_globals_is_instance_of_activity((struct _JavaVM *)vm, activity);
 #endif
+	ext_register(cnsdk);
 	cnsdk->worker = std::thread(face_tracking_worker, cnsdk);
 
 	DXR_HW_DBG("leia_cnsdk_create: core=%p, worker thread spawned", (void *)core);
@@ -1276,6 +1414,17 @@ leia_cnsdk_destroy(struct leia_cnsdk **cnsdk_ptr)
 
 	struct leia_cnsdk *cnsdk = *cnsdk_ptr;
 	DXR_HW_DBG("leia_cnsdk_destroy: entering, core=%p", (void *)cnsdk->core);
+
+	// No more external-tracking switches or feeds for this core.
+	ext_unregister(cnsdk);
+	{
+		std::lock_guard<std::mutex> lk(cnsdk->ext_mu);
+		if (cnsdk->ext_sink != nullptr) {
+			leia_shared_camera_sink_release(cnsdk->ext_sink);
+			cnsdk->ext_sink = nullptr;
+		}
+		cnsdk->ext_in_app = false;
+	}
 
 	// Signal the worker, then join with a watchdog: if it doesn't finish
 	// within kWorkerJoinTimeoutMs, detach instead so destroy can return.
@@ -1955,6 +2104,138 @@ leia_cnsdk_get_android_panel_px(uint32_t *out_w, uint32_t *out_h, float *out_w_m
 	void *ctx = g_host_get_android_activity != nullptr ? g_host_get_android_activity()
 	                                                   : android_globals_get_activity();
 	return android_panel_px((JavaVM *)vm, (jobject)ctx, out_w, out_h, out_w_m, out_h_m);
+}
+
+
+/*
+ *
+ * External tracking camera — public half.
+ *
+ */
+
+extern "C" uint32_t
+leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr)
+{
+	// The registry lock is held across the switches (lock order: g_ext_mu ->
+	// cnsdk->ext_mu, as in the worker and the feed), so leia_cnsdk_destroy,
+	// which unregisters under it, can never free a core mid-switch.
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	if (intr != nullptr) {
+		g_ext_intr = *intr;
+	}
+	if (g_ext_depth++ > 0) {
+		return 0;
+	}
+	uint32_t n = 0;
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		std::lock_guard<std::mutex> lk2(c->ext_mu);
+		ext_switch_locked(c, true);
+		n += c->ext_in_app.load() ? 1u : 0u;
+	}
+	return n;
+}
+
+extern "C" void
+leia_cnsdk_ext_tracking_end(void)
+{
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	if (g_ext_depth == 0 || --g_ext_depth > 0) {
+		return;
+	}
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		std::lock_guard<std::mutex> lk2(c->ext_mu);
+		ext_switch_locked(c, false);
+	}
+}
+
+extern "C" void
+leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, int64_t ts_boottime_ns)
+{
+	if (y == nullptr || width <= 0 || height <= 0) {
+		return;
+	}
+	// Snapshot the sinks (retained), then feed without any lock: detection
+	// runs inside on_image and can take hundreds of ms.
+	struct fed
+	{
+		struct leia_shared_camera_sink *sink;
+		bool push_intr;
+	};
+	std::vector<fed> sinks;
+	struct leia_cnsdk_ext_intrinsics intr;
+	{
+		std::lock_guard<std::mutex> lk(g_ext_mu);
+		intr = g_ext_intr;
+		for (struct leia_cnsdk *c : g_ext_cores) {
+			std::lock_guard<std::mutex> lk2(c->ext_mu);
+			if (c->ext_in_app && c->ext_sink != nullptr) {
+				leia_shared_camera_sink_retain(c->ext_sink);
+				// Intrinsics first, then every 60 frames: the sink only accepts
+				// them while active, so a single early push can be lost.
+				sinks.push_back({c->ext_sink, intr.valid && (c->ext_frames++ % 60u) == 0});
+			}
+		}
+	}
+	struct leia_camera_intrinsics ci = {};
+	ci.width = intr.width;
+	ci.height = intr.height;
+	ci.fx = intr.fx;
+	ci.fy = intr.fy;
+	ci.ppx = intr.cx;
+	ci.ppy = intr.cy;
+	for (int i = 0; i < 8; i++) {
+		ci.distortionCoeffs[i] = intr.d[i];
+	}
+	ci.isMirrored = intr.mirrored ? 1 : 0;
+	struct leia_image_desc d = {};
+	d.data = y;
+	d.width = width;
+	d.height = height;
+	struct leia_timestamp ts = {};
+	ts.ms = (double)ts_boottime_ns / 1e6;
+	ts.space = LEIA_TIMESTAMP_SPACE_SYSTEM;
+	for (const fed &f : sinks) {
+		if (leia_shared_camera_sink_is_active(f.sink)) {
+			if (f.push_intr) {
+				leia_shared_camera_sink_on_intrinsics_change(f.sink, &ci);
+			}
+			leia_shared_camera_sink_on_image(f.sink, &d, ts);
+		}
+		leia_shared_camera_sink_release(f.sink);
+	}
+}
+
+extern "C" bool
+leia_cnsdk_get_tracking_camera_id(char *out, size_t cap)
+{
+	if (out == nullptr || cap == 0) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_id[0] != '\0') {
+			snprintf(out, cap, "%s", c->tracking_camera_id);
+			return true;
+		}
+	}
+	return false;
+}
+
+extern "C" bool
+leia_cnsdk_get_jni(void **out_vm, void **out_ctx)
+{
+	if (out_vm == nullptr || out_ctx == nullptr) {
+		return false;
+	}
+	void *vm = g_host_get_android_vm != nullptr ? g_host_get_android_vm() : (void *)android_globals_get_vm();
+	void *ctx = g_host_get_class_host_context != nullptr ? g_host_get_class_host_context() : nullptr;
+	if (ctx == nullptr) {
+		ctx = g_host_get_android_activity != nullptr ? g_host_get_android_activity()
+		                                             : android_globals_get_activity();
+	}
+	*out_vm = vm;
+	*out_ctx = ctx;
+	return vm != nullptr && ctx != nullptr;
 }
 
 /*!
