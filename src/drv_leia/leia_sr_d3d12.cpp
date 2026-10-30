@@ -174,6 +174,7 @@ struct leiasr_d3d12
 	//! #480: the bound panel's EDID while SR listed its id (0 = not seen), for a re-key.
 	uint16_t bind_edid_manufacturer = 0;
 	uint16_t bind_edid_product = 0;
+	uint32_t bind_edid_serial = 0;
 	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
@@ -330,8 +331,9 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	// #480: SR re-keys a panel when its FPC pairs (an EDID_ONLY id is a hash until
 	// then), so a bound weaver binds the id SR lists now, not the one it was made for.
 	if (sr.screen_bound) {
-		sr.bind_display_id = leia_sr_v2_current_display_id(
-		    sr.bind_display_id, &sr.bind_origin, &sr.bind_edid_manufacturer, &sr.bind_edid_product, "D3D12");
+		sr.bind_display_id = leia_sr_v2_current_display_id(sr.bind_display_id, &sr.bind_origin,
+		                                                   &sr.bind_edid_manufacturer, &sr.bind_edid_product,
+		                                                   &sr.bind_edid_serial, "D3D12");
 	}
 
 	// Multi-screen M6: what the runtime can do, and what this DP will ask for.

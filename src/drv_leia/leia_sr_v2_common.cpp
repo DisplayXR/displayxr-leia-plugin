@@ -613,6 +613,7 @@ leia_sr_v2_current_display_id(uint64_t bound,
                               const struct leia_win_screen_origin *origin,
                               uint16_t *io_edid_manufacturer,
                               uint16_t *io_edid_product,
+                              uint32_t *io_edid_serial,
                               const char *api)
 {
 	if (bound == 0) {
@@ -625,12 +626,15 @@ leia_sr_v2_current_display_id(uint64_t bound,
 	leia_win_sr_enumerate_refresh_next();
 	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
 	const int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
-	uint16_t edid_manufacturer = io_edid_manufacturer != nullptr ? *io_edid_manufacturer : 0;
-	uint16_t edid_product = io_edid_product != nullptr ? *io_edid_product : 0;
-	leia_win_sr_note_display_edid(bound, displays, display_count, &edid_manufacturer, &edid_product);
-	if (io_edid_manufacturer != nullptr && io_edid_product != nullptr) {
+	const bool has_memo = io_edid_manufacturer != nullptr && io_edid_product != nullptr && io_edid_serial != nullptr;
+	uint16_t edid_manufacturer = has_memo ? *io_edid_manufacturer : 0;
+	uint16_t edid_product = has_memo ? *io_edid_product : 0;
+	uint32_t edid_serial = has_memo ? *io_edid_serial : 0;
+	leia_win_sr_note_display_edid(bound, displays, display_count, &edid_manufacturer, &edid_product, &edid_serial);
+	if (has_memo) {
 		*io_edid_manufacturer = edid_manufacturer;
 		*io_edid_product = edid_product;
+		*io_edid_serial = edid_serial;
 	}
 	struct leia_win_sr_monitor monitors[LEIA_WIN_SR_MAX_MONITORS];
 	const int32_t monitor_count =
@@ -639,7 +643,7 @@ leia_sr_v2_current_display_id(uint64_t bound,
 	const int32_t left = has_origin ? origin->left : 0;
 	const int32_t top = has_origin ? origin->top : 0;
 	const uint64_t id = leia_win_sr_rebind_display_id(bound, has_origin, left, top, edid_manufacturer, edid_product,
-	                                                  displays, display_count, monitors, monitor_count);
+	                                                  edid_serial, displays, display_count, monitors, monitor_count);
 	if (id != bound) {
 		U_LOG_W("SR %s per-screen weaver: SR no longer lists display 0x%016llx; the panel at (%d,%d) "
 		        "(edid=0x%04X/0x%04X) is now SR display 0x%016llx (SR re-keys a panel when its FPC pairs) — "
