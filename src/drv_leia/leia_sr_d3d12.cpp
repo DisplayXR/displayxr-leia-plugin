@@ -324,6 +324,12 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 		return false;
 	}
 
+	// #480: SR re-keys a panel when its FPC pairs (an EDID_ONLY id is a hash until
+	// then), so a bound weaver binds the id SR lists now, not the one it was made for.
+	if (sr.screen_bound) {
+		sr.bind_display_id = leia_sr_v2_current_display_id(sr.bind_display_id, &sr.bind_origin, "D3D12");
+	}
+
 	// Multi-screen M6: what the runtime can do, and what this DP will ask for.
 	// An unbound DP gets an empty plan (SDK routing, no binding) — today's
 	// single-screen behaviour, byte-identical. Same plan as the D3D11 arm.

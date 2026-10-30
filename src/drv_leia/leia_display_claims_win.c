@@ -429,6 +429,44 @@ leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *o
 }
 
 uint64_t
+leia_win_sr_rebind_display_id(uint64_t bound,
+                              bool has_origin,
+                              int32_t left,
+                              int32_t top,
+                              const struct leia_win_sr_display *displays,
+                              int32_t display_count,
+                              const struct leia_win_sr_monitor *monitors,
+                              int32_t monitor_count)
+{
+	if (bound == 0 || displays == NULL || display_count < 0) {
+		return bound;
+	}
+	for (int32_t i = 0; i < display_count; i++) {
+		if (displays[i].display_id == bound) {
+			return bound;
+		}
+	}
+	if (!has_origin) {
+		return bound;
+	}
+	// SR's monitor join first: it is how SR itself says which display a monitor is.
+	if (monitors != NULL) {
+		for (int32_t i = 0; i < monitor_count; i++) {
+			if (monitors[i].sr_display_id != 0 && monitors[i].x == left && monitors[i].y == top) {
+				return monitors[i].sr_display_id;
+			}
+		}
+	}
+	for (int32_t i = 0; i < display_count; i++) {
+		if (displays[i].display_id != 0 && displays[i].location_is_desktop_global && displays[i].left == left &&
+		    displays[i].top == top) {
+			return displays[i].display_id;
+		}
+	}
+	return bound;
+}
+
+uint64_t
 leia_win_claims_generation(void)
 {
 	BIND_LOCK();

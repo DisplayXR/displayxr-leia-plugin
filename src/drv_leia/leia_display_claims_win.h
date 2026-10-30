@@ -298,6 +298,33 @@ leia_win_claims_find_serial(const char *serial, struct leia_win_claim_binding *o
 uint64_t
 leia_win_claims_generation(void);
 
+/*!
+ * #480: the SR display a screen-bound weaver should bind on this create attempt.
+ *
+ * SR re-keys a panel when its FPC pairs: an EDID_ONLY displayId is a hash until
+ * then. A per-screen DP made while SR knew its panel by EDID only keeps an id SR
+ * drops once the FPC authenticates, and every srCreateDisplay with it fails
+ * (SR_ERROR_DISPLAY_NOT_FOUND) until the app restarts. So the weaver re-resolves
+ * its id before each attempt instead of remembering it:
+ * - @p bound while SR still lists it, or when SR's list is unavailable;
+ * - else the SR display of the monitor at the DP's desktop origin (SR's own
+ *   monitor join, srEnumerateMonitors);
+ * - else the SR display whose desktop-global location is that origin;
+ * - else @p bound: nothing better is known, and the caller retries as before.
+ *
+ * Pure: the caller passes SR's enumerations. A count < 0 means that
+ * enumeration is unavailable.
+ */
+uint64_t
+leia_win_sr_rebind_display_id(uint64_t bound,
+                              bool has_origin,
+                              int32_t left,
+                              int32_t top,
+                              const struct leia_win_sr_display *displays,
+                              int32_t display_count,
+                              const struct leia_win_sr_monitor *monitors,
+                              int32_t monitor_count);
+
 
 /*
  *

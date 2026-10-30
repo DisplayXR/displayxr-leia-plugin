@@ -7,6 +7,7 @@
  */
 
 #include "leia_sr_v2_common.h"
+#include "leia_display_claims_win.h" // #480: SR display / monitor enumeration (plain C)
 #include "leia_interface.h"    // LEIA_MODE_* (#446)
 #include "leia_sr_multi_win.h" // multi-screen M6 caps (plain C)
 #include "leia_sr_presence.h"  // per-display user presence values (plain C)
@@ -605,6 +606,31 @@ leia_sr_v2_query_display(SrInstance instance,
 	// benefit — v1 did not hold one either.
 	srDestroyDisplay(display);
 	return true;
+}
+
+uint64_t
+leia_sr_v2_current_display_id(uint64_t bound, const struct leia_win_screen_origin *origin, const char *api)
+{
+	if (bound == 0) {
+		return bound;
+	}
+	// The enumerations return -1 when the SDK or the installed SR runtime lacks them.
+	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
+	const int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	struct leia_win_sr_monitor monitors[LEIA_WIN_SR_MAX_MONITORS];
+	const int32_t monitor_count =
+	    display_count >= 0 ? leia_win_sr_enumerate_monitors(monitors, LEIA_WIN_SR_MAX_MONITORS) : -1;
+	const bool has_origin = origin != nullptr && origin->bound;
+	const int32_t left = has_origin ? origin->left : 0;
+	const int32_t top = has_origin ? origin->top : 0;
+	const uint64_t id = leia_win_sr_rebind_display_id(bound, has_origin, left, top, displays, display_count,
+	                                                  monitors, monitor_count);
+	if (id != bound) {
+		U_LOG_W("SR %s per-screen weaver: SR no longer lists display 0x%016llx; the panel at (%d,%d) is now SR "
+		        "display 0x%016llx (SR re-keys a panel when its FPC pairs) — binding that (#480)",
+		        api, (unsigned long long)bound, left, top, (unsigned long long)id);
+	}
+	return id;
 }
 
 #ifdef DXR_LEIA_HAS_SR_MULTI_WIN

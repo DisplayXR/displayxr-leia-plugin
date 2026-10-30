@@ -616,6 +616,79 @@ static void test_panel_pick_rules(void) {
         CHECK(!leia_win_claims_pick_panel(NULL, 0, 3840, 2160, &out));
 }
 
+/*!
+ * #480, the G16 replug of 2026-10-30: SR first listed the DS1 (at -3840,0) EDID_ONLY
+ * under a hash id, the per-screen DP was made for it, then the FPC paired and SR
+ * re-keyed the panel. The DP must follow the panel, not the id.
+ */
+static void
+test_rebind_display_id(void)
+{
+	const uint64_t edid_id = 0x4a3069e5e4f6985eull;
+	const uint64_t fpc_id = 0x1;
+	const uint64_t hmon_ds1 = 0x30151u;
+
+	// EDID-only phase: SR still lists the id the DP has -> keep it.
+	struct leia_win_sr_display edid_only[1] = {srd(edid_id, "ACR", DS1_PROD, false, NULL, -3840, 0, true)};
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, edid_only, 1, NULL, -1) == edid_id);
+
+	// The FPC paired: SR lists the panel under its new id only.
+	struct leia_win_sr_display paired[1] = {srd(fpc_id, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true)};
+	struct leia_win_sr_monitor mons[2] = {
+	    srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, fpc_id),
+	    srm(0x10002u, 0, LGD_ID, 0x1234, 0),
+	};
+	// ...found through SR's monitor join,
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired, 1, mons, 2) == fpc_id);
+	// ...or through the display's own location when the monitor join is unavailable,
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired, 1, NULL, -1) == fpc_id);
+	// ...but not from a location SR says is not desktop-global,
+	struct leia_win_sr_display paired_local[1] = {
+	    srd(fpc_id, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, false)};
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired_local, 1, NULL, -1) == edid_id);
+	// ...and not from a monitor at another origin in the same column.
+	struct leia_win_sr_monitor below[1] = {srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, fpc_id)};
+	below[0].y = 2160;
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired_local, 1, below, 1) == edid_id);
+
+	// An id SR still lists is kept, even where its monitor join or location
+	// disagrees with the binding's origin for a moment (a Windows transient).
+	struct leia_win_sr_display listed[2] = {
+	    srd(0x5, "ACR", DS1_PROD, true, "QI0000000000005", -3840, 0, true),
+	    srd(0x6, "ACR", DS1_PROD, true, "QI0000000000006", 0, 0, true),
+	};
+	struct leia_win_sr_monitor listed_mons[1] = {srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, 0x5)};
+	CHECK(leia_win_sr_rebind_display_id(0x6, true, -3840, 0, listed, 2, listed_mons, 1) == 0x6);
+	// The re-resolved id is then kept on the next attempt.
+	CHECK(leia_win_sr_rebind_display_id(fpc_id, true, -3840, 0, paired, 1, mons, 2) == fpc_id);
+
+	// Another SR panel elsewhere never captures the DP.
+	struct leia_win_sr_display two[2] = {
+	    srd(0x7, "AUO", B194_PROD, true, "QALA2137AL0011", 0, 0, true),
+	    srd(fpc_id, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true),
+	};
+	struct leia_win_sr_monitor two_mons[2] = {
+	    srm(0x10001u, 0, AUO_ID, B194_PROD, 0x7),
+	    srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, fpc_id),
+	};
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, two, 2, two_mons, 2) == fpc_id);
+	// A monitor SR does not call an SR display falls through to the display list.
+	struct leia_win_sr_monitor not_sr[1] = {srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, 0)};
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired, 1, not_sr, 1) == fpc_id);
+
+	// Nothing better known -> the bound id, unchanged:
+	// the panel is unplugged (SR lists nothing at that origin),
+	struct leia_win_sr_monitor laptop_only[1] = {srm(0x10002u, 0, LGD_ID, 0x1234, 0)};
+	CHECK(leia_win_sr_rebind_display_id(fpc_id, true, -3840, 0, paired, 0, laptop_only, 1) == fpc_id);
+	// SR's list is unavailable,
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, NULL, -1, mons, 2) == edid_id);
+	CHECK(leia_win_sr_rebind_display_id(edid_id, true, -3840, 0, paired, -1, mons, 2) == edid_id);
+	// the binding carried no origin (whatever the coordinates say),
+	CHECK(leia_win_sr_rebind_display_id(edid_id, false, -3840, 0, paired, 1, mons, 2) == edid_id);
+	// or the DP was never bound to a display.
+	CHECK(leia_win_sr_rebind_display_id(0, true, -3840, 0, paired, 1, mons, 2) == 0);
+}
+
 int
 main(void)
 {
@@ -634,6 +707,7 @@ main(void)
 	test_find_serial();
         test_panel_from_claim();
         test_panel_pick_rules();
+	test_rebind_display_id();
         if (g_failures != 0) {
 		fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;
