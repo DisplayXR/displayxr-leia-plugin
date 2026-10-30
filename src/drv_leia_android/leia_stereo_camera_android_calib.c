@@ -137,10 +137,24 @@ leia_scam_lens_for_stream(const struct leia_scam_lens *l,
 	}
 }
 
+//! Step 2: the plug-in's centre crop of a cap_w x cap_h image to width x height.
+static void
+lens_crop(struct leia_scam_lens *l, uint32_t cap_w, uint32_t cap_h, uint32_t width, uint32_t height)
+{
+	if (cap_w > width) {
+		l->cx -= (double)(((cap_w - width) / 2u) & ~1u);
+	}
+	if (cap_h > height) {
+		l->cy -= (double)(((cap_h - height) / 2u) & ~1u);
+	}
+}
+
 bool
 leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
                                     uint32_t array_w,
                                     uint32_t array_h,
+                                    uint32_t cap_w,
+                                    uint32_t cap_h,
                                     uint32_t width,
                                     uint32_t height,
                                     struct leia_scam_stream_calib *out)
@@ -159,9 +173,15 @@ leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
 	}
 	out->left_is_sub = c_sub_x < 0.0;
 
+	if (cap_w == 0 || cap_h == 0) {
+		cap_w = width;
+		cap_h = height;
+	}
 	struct leia_scam_lens main_s, sub_s;
-	leia_scam_lens_for_stream(&f->main, array_w, array_h, width, height, &main_s);
-	leia_scam_lens_for_stream(&f->sub, array_w, array_h, width, height, &sub_s);
+	leia_scam_lens_for_stream(&f->main, array_w, array_h, cap_w, cap_h, &main_s);
+	leia_scam_lens_for_stream(&f->sub, array_w, array_h, cap_w, cap_h, &sub_s);
+	lens_crop(&main_s, cap_w, cap_h, width, height);
+	lens_crop(&sub_s, cap_w, cap_h, width, height);
 	const struct leia_scam_lens *L = out->left_is_sub ? &sub_s : &main_s;
 	const struct leia_scam_lens *Rt = out->left_is_sub ? &main_s : &sub_s;
 	const struct leia_scam_lens *eyes[2] = {L, Rt};

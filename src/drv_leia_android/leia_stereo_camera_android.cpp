@@ -452,11 +452,13 @@ scan_locked()
 		std::string key;
 		bool have = read_vendor_block(p.logical_id, full.c_str(), suffix, blk, &key);
 		std::vector<uint8_t> tmp;
-		const bool a_has = read_vendor_block(a.c_str(), full.c_str(), suffix, tmp, nullptr);
-		const bool b_has = !a_has && read_vendor_block(b.c_str(), full.c_str(), suffix, tmp, nullptr);
+		std::string lens_key;
+		const bool a_has = read_vendor_block(a.c_str(), full.c_str(), suffix, tmp, &lens_key);
+		const bool b_has = !a_has && read_vendor_block(b.c_str(), full.c_str(), suffix, tmp, &lens_key);
 		const std::string main_id = b_has ? b : a, sub_id = b_has ? a : b;
 		if (!have && (a_has || b_has)) {
 			blk = tmp;
+			key = lens_key;
 			have = true;
 		}
 		snprintf(p.main_id, sizeof(p.main_id), "%s", main_id.c_str());
@@ -491,7 +493,8 @@ scan_locked()
 		}
 
 		if (have && leia_scam_factory_calib_parse(blk.data(), blk.size(), &p.factory) && p.array_w > 0) {
-			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.eye_w,
+			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w,
+			                                                   p.cap_h, p.eye_w,
 			                                                   p.eye_h, &p.stream);
 			p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
 		}
@@ -1228,7 +1231,7 @@ leia_stereo_camera_android_get_calibration(struct xrt_plugin_instance *inst,
 			f.T[i] = -f.T[i];
 		}
 		leia_scam_stream_calib alt;
-		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.eye_w, p.eye_h, &alt);
+		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.cap_w, p.cap_h, p.eye_w, p.eye_h, &alt);
 		s = alt;
 	}
 	const uint32_t sz = out->struct_size;

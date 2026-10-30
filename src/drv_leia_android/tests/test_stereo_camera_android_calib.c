@@ -96,7 +96,7 @@ main(void)
 
 	// 1280x720 from the 4:3 3264x2448 array: scale 1280/3264, centre-crop rows.
 	struct leia_scam_stream_calib s;
-	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 1280, 720, &s));
+	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 0, 0, 1280, 720, &s));
 	const double sc = 1280.0 / 3264.0;
 	// T = (+15,0,0) puts the sub lens at -x of main: sub = SBS left.
 	CHECK(s.left_is_sub);
@@ -114,11 +114,38 @@ main(void)
 	// R_rl = R^T.
 	NEAR(s.R_rl[0][1], f.R[1][0], 1e-15);
 
+	// The same with the plug-in's real pipeline on a 4:3 sensor: capture
+	// 1280x960, crop the centre 1280x720. Must equal the direct 16:9 stream.
+	{
+		struct leia_scam_stream_calib d, two;
+		CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 0, 0, 1280, 720, &d));
+		CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 1280, 960, 1280, 720, &two));
+		for (int e = 0; e < 2; e++) {
+			for (int k = 0; k < 4; k++) {
+				NEAR(two.k[e][k], d.k[e][k], 1e-9);
+			}
+		}
+	}
+	// A non-4:3 sensor (phone-class panel, 4576x3168): the 1280x960 capture
+	// is the centred 4:3 region scaled to the height (crop columns), then the
+	// plug-in crops rows to 720. Not the same as 1280x720 straight from the
+	// array (scale to the width).
+	{
+		struct leia_scam_stream_calib two;
+		CHECK(leia_scam_stream_calib_from_factory(&f, 4576, 3168, 1280, 960, 1280, 720, &two));
+		const double s43 = 960.0 / 3168.0;
+		const double main_cx = (1624.2 - 4576.0 / 2.0) * s43 + 640.0; // column crop in step 1
+		const double main_cy = 1204.5 * s43 - 120.0;                  // row crop in step 2
+		NEAR(two.k[two.left_is_sub ? 1 : 0][0], 1726.8 * s43, 1e-9);
+		NEAR(two.k[two.left_is_sub ? 1 : 0][2], main_cx, 1e-9);
+		NEAR(two.k[two.left_is_sub ? 1 : 0][3], main_cy, 1e-9);
+	}
+
 	// Flipped baseline sign: main is then the left eye and R/T pass through.
 	memcpy(bad, blk, sizeof(bad));
 	wd(bad, 329, -14.989);
 	CHECK(leia_scam_factory_calib_parse(bad, sizeof(bad), &f));
-	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 1280, 720, &s));
+	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 0, 0, 1280, 720, &s));
 	CHECK(!s.left_is_sub);
 	NEAR(s.T_rl_mm[0], -14.989, 1e-12);
 

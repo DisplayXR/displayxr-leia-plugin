@@ -74,18 +74,30 @@ struct leia_scam_stream_calib
 };
 
 /*!
- * Rescale the block from the full active array (@p array_w x @p array_h) to a
- * stream of @p width x @p height that the HAL produces by scaling the array to
- * the stream width and centre-cropping the height (the default crop for a
- * wider-aspect output, e.g. 16:9 from a 4:3 sensor) — or, for a narrower
- * aspect, by scaling to the height and centre-cropping the width. Then
- * orient the pair: the lens whose centre lies at -x of the other (the
+ * Rescale the block from the full active array (@p array_w x @p array_h) to
+ * the per-eye output the plug-in publishes, in two steps that mirror the
+ * pipeline:
+ *  1. array -> capture (@p cap_w x @p cap_h): the HAL produces a stream of a
+ *     different aspect from the largest centred region of the array with the
+ *     stream's aspect (scale to the width and crop rows when the stream is
+ *     wider, scale to the height and crop columns when it is narrower);
+ *  2. capture -> output (@p width x @p height): the plug-in's own centre crop,
+ *     at even offsets (pack_eye).
+ * @p cap_w / @p cap_h 0 = the output is captured directly (step 2 is a no-op).
+ * Then orient the pair: the lens whose centre lies at -x of the other (the
  * camera's own left) becomes the left eye.
+ *
+ * The two steps matter on a sensor that is not 4:3: a phone-class panel's
+ * 4576x3168 array captured at 1280x960 and cropped to 1280x720 differs from
+ * "1280x720 straight from the array" by 8 % in focal length and ~53 px in the
+ * principal point.
  */
 bool
 leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
                                     uint32_t array_w,
                                     uint32_t array_h,
+                                    uint32_t cap_w,
+                                    uint32_t cap_h,
                                     uint32_t width,
                                     uint32_t height,
                                     struct leia_scam_stream_calib *out);
