@@ -25,6 +25,12 @@
  *   debug.dxr.leia.scam_calib_key_prefix=…  vendor key prefix of the factory block
  *   debug.dxr.leia.scam_rotate=auto|0|90|180|270  clockwise turn of each eye
  *   debug.dxr.leia.scam_calib_ref=auto|array|WxH  size the factory block is expressed at
+ *   debug.dxr.leia.scam_user_calib=0        ignore the calibration app's user rotation
+ *                                           (factory R only; re-read on enumerate)
+ *
+ * The user rotation's last accepted record is cached in the host process's
+ * files dir (leia_scam_user_calib_<pair>_<block sha>.json) and used, through
+ * the same gate, while the calibration app's provider is unreachable.
  *
  * @ingroup drv_leia_android
  */
