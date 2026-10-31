@@ -278,6 +278,87 @@ leia_scam_factory_is_vertical(const struct leia_scam_factory_calib *f)
 	return fabs(f->T[1]) > fabs(f->T[0]);
 }
 
+void
+leia_scam_factory_swap_convention(struct leia_scam_factory_calib *f)
+{
+	double Rt[3][3], Tn[3];
+	for (int i = 0; i < 3; i++) {
+		Tn[i] = 0.0;
+		for (int j = 0; j < 3; j++) {
+			Rt[i][j] = f->R[j][i];
+			Tn[i] -= f->R[j][i] * f->T[j];
+		}
+	}
+	memcpy(f->R, Rt, sizeof(Rt));
+	memcpy(f->T, Tn, sizeof(Tn));
+}
+
+//! (x, y) turned clockwise by @p deg (a multiple of 90), camera axes as extr_rot90cw: (x, y) -> (-y, x) per step.
+static void
+vec2_rot_cw(double v[2], int32_t deg)
+{
+	const int steps = (int)(((deg % 360) + 360) % 360) / 90;
+	for (int s = 0; s < steps; s++) {
+		const double x = v[0];
+		v[0] = -v[1];
+		v[1] = x;
+	}
+}
+
+int
+leia_scam_pose_sub_side(const double main_t[3],
+                        const double sub_t[3],
+                        bool front,
+                        int32_t sensor_orientation,
+                        uint32_t rot_cw)
+{
+	if (main_t == NULL || sub_t == NULL || sensor_orientation < 0 || sensor_orientation % 90 != 0 ||
+	    rot_cw % 90 != 0) {
+		return 0;
+	}
+	const double dx = sub_t[0] - main_t[0], dy = sub_t[1] - main_t[1];
+	if (!isfinite(dx) || !isfinite(dy)) {
+		return 0;
+	}
+	// Upright camera image (y down); a front lens sees the scene mirrored left/right
+	// relative to the user facing the screen.
+	double v[2] = {front ? -dx : dx, -dy};
+	vec2_rot_cw(v, (int32_t)rot_cw - sensor_orientation);
+	const double len_mm = 1000.0 * sqrt(v[0] * v[0] + v[1] * v[1]);
+	if (!(len_mm >= 1.0 && len_mm <= 200.0) || fabs(v[0]) < fabs(v[1])) {
+		return 0;
+	}
+	return v[0] > 0.0 ? 1 : -1;
+}
+
+int
+leia_scam_factory_orient_by_pose(struct leia_scam_factory_calib *f,
+                                 const double main_t[3],
+                                 const double sub_t[3],
+                                 bool front,
+                                 int32_t sensor_orientation,
+                                 uint32_t rot_cw)
+{
+	const int pose = leia_scam_pose_sub_side(main_t, sub_t, front, sensor_orientation, rot_cw);
+	if (f == NULL || pose == 0) {
+		return -1;
+	}
+	// The block's sub centre in the main frame, c = -R^T T, turned with the image.
+	double c[3] = {0.0, 0.0, 0.0};
+	for (int i = 0; i < 3; i++) {
+		for (int k = 0; k < 3; k++) {
+			c[i] -= f->R[k][i] * f->T[k];
+		}
+	}
+	vec2_rot_cw(c, (int32_t)rot_cw);
+	const int block = c[0] > 0.0 ? 1 : -1;
+	if (block == pose) {
+		return 0;
+	}
+	leia_scam_factory_swap_convention(f);
+	return 1;
+}
+
 int32_t
 leia_scam_frame_orientation_deg(bool have_sensor_orientation, int32_t sensor_orientation, uint32_t rot)
 {

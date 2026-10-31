@@ -535,9 +535,11 @@ void
 leia_cnsdk_ext_tracking_end(void);
 
 /*!
- * The Camera2 id of the camera the vendor device config says the tracker
- * uses (device-config camera 0 `id`), from any live core of this process that
- * has read its config. False when no core has, or the config leaves it empty.
+ * The Camera2 id of the head tracker's camera, from any live core of this
+ * process that has read its config and KNOWS it: CNSDK's
+ * leia_device_config_get_tracking_camera_data (>= 0.10.89), or the factory
+ * stereo main lens found in the config's cameras[]. False otherwise; never the
+ * config's cameras[0] guess, which is not the tracker on every device.
  */
 bool
 leia_cnsdk_get_tracking_camera_id(char *out, size_t cap);
