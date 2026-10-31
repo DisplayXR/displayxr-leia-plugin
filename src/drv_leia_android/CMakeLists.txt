@@ -98,6 +98,11 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_stereo_camera_android.h
     leia_stereo_camera_android_calib.c
     leia_stereo_camera_android_calib.h
+    # The calibration app's user rotation (schema-1 record): parse, SHA-256 of
+    # the factory block, checks. Pure C, host-tested
+    # (tests/test_stereo_camera_android_user_calib.c, Linux CI).
+    leia_stereo_camera_android_user_calib.c
+    leia_stereo_camera_android_user_calib.h
 )
 
 # Post-weave alpha-gate (#568) + pre-weave compose-under-bg (runtime#1073 T0)
