@@ -278,6 +278,19 @@ leia_scam_factory_is_vertical(const struct leia_scam_factory_calib *f)
 	return fabs(f->T[1]) > fabs(f->T[0]);
 }
 
+int32_t
+leia_scam_frame_orientation_deg(bool have_sensor_orientation, int32_t sensor_orientation, uint32_t rot)
+{
+	if (!have_sensor_orientation || sensor_orientation < 0 || sensor_orientation >= 360 ||
+	    sensor_orientation % 90 != 0) {
+		return -1;
+	}
+	if (rot != 0 && rot != 90 && rot != 180 && rot != 270) {
+		return -1;
+	}
+	return (sensor_orientation - (int32_t)rot + 360) % 360;
+}
+
 //! Worst relative principal-point offset of both lenses from the centre of w x h.
 static double
 pp_offset(const struct leia_scam_factory_calib *f, double w, double h)

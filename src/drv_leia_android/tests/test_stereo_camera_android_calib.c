@@ -270,6 +270,19 @@ main(void)
 		CHECK(rw == 3264 && rh == 2448);
 	}
 
+	// Frame orientation (runtime XR_DXR_stereo_camera v7): what remains after the turn.
+	CHECK(leia_scam_frame_orientation_deg(true, 270, 0) == 270); // tablet front, unturned
+	CHECK(leia_scam_frame_orientation_deg(true, 90, 0) == 90);   // tablet rear, unturned
+	CHECK(leia_scam_frame_orientation_deg(true, 270, 270) == 0); // phone-class front, turned upright
+	CHECK(leia_scam_frame_orientation_deg(true, 90, 90) == 0);
+	CHECK(leia_scam_frame_orientation_deg(true, 0, 90) == 270); // vertical pair, no usable mounting
+	CHECK(leia_scam_frame_orientation_deg(true, 270, 90) == 180);
+	CHECK(leia_scam_frame_orientation_deg(true, 0, 0) == 0); // landscape-natural, unturned
+	CHECK(leia_scam_frame_orientation_deg(false, 0, 0) == -1);
+	CHECK(leia_scam_frame_orientation_deg(true, 45, 0) == -1);
+	CHECK(leia_scam_frame_orientation_deg(true, 360, 0) == -1);
+	CHECK(leia_scam_frame_orientation_deg(true, 270, 45) == -1);
+
 	CHECK(leia_scam_block_hash(blk, sizeof(blk)) == leia_scam_block_hash(blk, sizeof(blk)));
 	CHECK(leia_scam_block_hash(blk, sizeof(blk)) != leia_scam_block_hash(bad, sizeof(bad)));
 

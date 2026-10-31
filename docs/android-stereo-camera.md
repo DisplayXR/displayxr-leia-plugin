@@ -124,6 +124,20 @@ order is then decided on the turned geometry. The 640×480 tracking frame is
 cut from the unturned capture, so the in-app tracker's intrinsics do not
 change.
 
+**Frame orientation (runtime `XR_DXR_stereo_camera` v7).** Each camera
+reports how its published frame is turned, so a consumer (the DisplayXR
+Browser) does not stack its own turn on top of ours:
+`info.frame_orientation` = the clockwise turn that makes the published frame
+upright in the device's natural orientation (Camera2 `SENSOR_ORIENTATION`
+semantics), i.e. `(sensor orientation − turn) mod 360`
+(`leia_scam_frame_orientation_deg`). Portrait-natural tablets publish unturned
+frames and report their sensors' **270** (front) and **90** (rear), exactly the
+Android CDD fallback the browser used before; the phone-class front pair, turned
+by its sensor's 270, reports **0**. Without `ACAMERA_SENSOR_ORIENTATION` the
+value is left UNKNOWN. Compiled only against runtime headers that define
+`XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`; built against older ones
+the field is absent and the runtime reports UNKNOWN.
+
 Measured on a Lume Pad 2:
 
 | Pair | Baseline | f at 1280×720 | Rotation between lenses |

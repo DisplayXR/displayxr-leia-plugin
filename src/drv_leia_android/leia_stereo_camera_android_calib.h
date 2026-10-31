@@ -168,6 +168,19 @@ leia_scam_lens_for_stream(const struct leia_scam_lens *l,
                           uint32_t height,
                           struct leia_scam_lens *out);
 
+/*!
+ * The published frame's orientation (runtime XR_DXR_stereo_camera v7): the
+ * clockwise turn that makes the frame upright in the device's natural
+ * orientation, Camera2 SENSOR_ORIENTATION semantics, once each eye was turned
+ * by @p rot clockwise. That is (sensor orientation - rot) mod 360: unturned
+ * tablet frames keep their sensor's 270 (front) / 90 (rear); a phone-class
+ * pair turned by its sensor's 270 reports 0. -1 when the sensor orientation
+ * is not known (@p have_sensor_orientation false) or is not a multiple of 90,
+ * or @p rot is not one of 0 / 90 / 180 / 270.
+ */
+int32_t
+leia_scam_frame_orientation_deg(bool have_sensor_orientation, int32_t sensor_orientation, uint32_t rot);
+
 //! |T| in mm.
 double
 leia_scam_factory_baseline_mm(const struct leia_scam_factory_calib *f);
