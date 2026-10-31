@@ -47,6 +47,11 @@
 
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
 
+// THROWAWAY e2e branch only: prove the artifact carries the frame orientation.
+#ifndef XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION
+#error "e2e: runtime headers lack XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION"
+#endif
+
 #include "leia_stereo_camera_android_calib.h"
 #include "leia_cnsdk.h"
 
