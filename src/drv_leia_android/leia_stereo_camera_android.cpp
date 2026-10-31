@@ -1078,6 +1078,10 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_b
 }
 
 void
+fov_write_pgm(const char *name, const uint8_t *y, int32_t stride, int32_t w, int32_t h);
+extern std::atomic<int> g_fov_state;
+
+void
 on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 {
 	for (;;) {
@@ -1096,6 +1100,16 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 			if (yuv_view_of(img, &vm)) {
 				c->trk_scratch.resize((size_t)kTrackW * kTrackH);
 				crop_track_from_eye(vm, c->trk_scratch.data());
+				static int fov_n = 0;
+				if (g_fov_state.load() == 1 && ++fov_n == 30) {
+					char name[64];
+					snprintf(name, sizeof(name), "fov_ours_%s.pgm", c->trk_lens);
+					fov_write_pgm(name, c->trk_scratch.data(), (int32_t)kTrackW, (int32_t)kTrackW,
+					              (int32_t)kTrackH);
+					snprintf(name, sizeof(name), "fov_ours_full_%s.pgm", c->trk_lens);
+					fov_write_pgm(name, vm.y, vm.y_stride, vm.w, vm.h);
+					g_fov_state.store(2);
+				}
 				push_tracking(c, c->trk_scratch.data(), kTrackW, ts, true);
 			}
 		}
@@ -1284,6 +1298,181 @@ add_output(xrt_plugin_stereo_camera *c, AImageReader *rd, const char *phys, ACap
 	return ACaptureRequest_addTarget(c->req, *tgt) == ACAMERA_OK;
 }
 
+/*
+ * TMP (never merge): field-of-view measurement, debug.dxr.leia.scam_fov_dump=1.
+ * Once per process, right after the tracking hand-over and before the logical
+ * pair opens, the tracking lens is opened STANDALONE with one 640x480 YUV
+ * stream at debug.dxr.leia.scam_fov_fps (default 90, the tracking service's
+ * config), and its 30th frame's Y plane is written as fov_native_<id>.pgm. The
+ * first tracking frames of the logical pair then go out as fov_ours_<id>.pgm
+ * (the 640x480 we feed CNSDK) and fov_ours_full_<id>.pgm (the 1280x960 it is
+ * cut from). Directory: the app's external files dir.
+ */
+std::string
+fov_dump_dir()
+{
+	jni_env j;
+	if (!j.acquire()) {
+		return "";
+	}
+	jclass cc = j.env->GetObjectClass(j.ctx);
+	jmethodID m = j.env->GetMethodID(cc, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;");
+	if (!j.ok() || m == nullptr) {
+		return "";
+	}
+	jobject file = j.env->CallObjectMethod(j.ctx, m, (jstring) nullptr);
+	if (!j.ok() || file == nullptr) {
+		return "";
+	}
+	jclass fc = j.env->GetObjectClass(file);
+	jmethodID gp = j.env->GetMethodID(fc, "getAbsolutePath", "()Ljava/lang/String;");
+	jstring js = gp != nullptr ? (jstring)j.env->CallObjectMethod(file, gp) : nullptr;
+	if (!j.ok() || js == nullptr) {
+		return "";
+	}
+	const char *c = j.env->GetStringUTFChars(js, nullptr);
+	std::string out = c != nullptr ? c : "";
+	if (c != nullptr) {
+		j.env->ReleaseStringUTFChars(js, c);
+	}
+	return out;
+}
+
+void
+fov_write_pgm(const char *name, const uint8_t *y, int32_t stride, int32_t w, int32_t h)
+{
+	static std::string dir = fov_dump_dir();
+	if (dir.empty()) {
+		SCAM_LOG_W("leia stereo camera (android): fov dump: no external files dir");
+		return;
+	}
+	const std::string path = dir + "/" + name;
+	FILE *f = fopen(path.c_str(), "wb");
+	if (f == nullptr) {
+		SCAM_LOG_W("leia stereo camera (android): fov dump: cannot write %s", path.c_str());
+		return;
+	}
+	fprintf(f, "P5\n%d %d\n255\n", w, h);
+	for (int32_t r = 0; r < h; r++) {
+		fwrite(y + (size_t)r * stride, 1, (size_t)w, f);
+	}
+	fclose(f);
+	SCAM_LOG_W("leia stereo camera (android): fov dump: wrote %s (%dx%d)", path.c_str(), w, h);
+}
+
+struct fov_grab
+{
+	std::mutex mu;
+	std::condition_variable cv;
+	int n{0};
+	bool done{false};
+	std::vector<uint8_t> y;
+	int32_t w{0}, h{0};
+};
+
+void
+fov_on_image(void *ctx, AImageReader *r)
+{
+	fov_grab *g = (fov_grab *)ctx;
+	AImage *img = nullptr;
+	if (AImageReader_acquireLatestImage(r, &img) != AMEDIA_OK || img == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(g->mu);
+	if (!g->done && ++g->n >= 30) {
+		yuv_view v;
+		if (yuv_view_of(img, &v)) {
+			g->w = v.w;
+			g->h = v.h;
+			g->y.resize((size_t)v.w * v.h);
+			for (int32_t row = 0; row < v.h; row++) {
+				memcpy(g->y.data() + (size_t)row * v.w, v.y + (size_t)row * v.y_stride, (size_t)v.w);
+			}
+		}
+		g->done = true;
+		g->cv.notify_all();
+	}
+	AImage_delete(img);
+}
+
+void
+fov_dev_noop(void *, ACameraDevice *)
+{}
+void
+fov_dev_err(void *, ACameraDevice *, int)
+{}
+void
+fov_ses_noop(void *, ACameraCaptureSession *)
+{}
+
+void
+fov_dump_native(const char *cam_id)
+{
+	const int32_t fps = (int32_t)atoi(prop_str("debug.dxr.leia.scam_fov_fps", "90").c_str());
+	fov_grab g;
+	ACameraDevice_StateCallbacks dcb{nullptr, fov_dev_noop, fov_dev_err};
+	ACameraDevice *dev = nullptr;
+	AImageReader *rd = nullptr;
+	ANativeWindow *win = nullptr;
+	ACaptureSessionOutputContainer *outs = nullptr;
+	ACaptureSessionOutput *out = nullptr;
+	ACameraOutputTarget *tgt = nullptr;
+	ACaptureRequest *req = nullptr;
+	ACameraCaptureSession *ses = nullptr;
+	ACameraCaptureSession_stateCallbacks scb{nullptr, fov_ses_noop, fov_ses_noop, fov_ses_noop};
+	AImageReader_ImageListener l{&g, fov_on_image};
+	bool ok = ACameraManager_openCamera(mgr(), cam_id, &dcb, &dev) == ACAMERA_OK && dev != nullptr &&
+	          AImageReader_new(640, 480, AIMAGE_FORMAT_YUV_420_888, 4, &rd) == AMEDIA_OK &&
+	          AImageReader_setImageListener(rd, &l) == AMEDIA_OK && AImageReader_getWindow(rd, &win) == AMEDIA_OK &&
+	          ACaptureSessionOutputContainer_create(&outs) == ACAMERA_OK &&
+	          ACaptureSessionOutput_create(win, &out) == ACAMERA_OK &&
+	          ACaptureSessionOutputContainer_add(outs, out) == ACAMERA_OK &&
+	          ACameraOutputTarget_create(win, &tgt) == ACAMERA_OK &&
+	          ACameraDevice_createCaptureRequest(dev, TEMPLATE_PREVIEW, &req) == ACAMERA_OK &&
+	          ACaptureRequest_addTarget(req, tgt) == ACAMERA_OK;
+	if (ok) {
+		const int32_t range[2] = {fps, fps};
+		ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, range);
+		ok = ACameraDevice_createCaptureSession(dev, outs, &scb, &ses) == ACAMERA_OK &&
+		     ACameraCaptureSession_setRepeatingRequest(ses, nullptr, 1, &req, nullptr) == ACAMERA_OK;
+	}
+	if (ok) {
+		std::unique_lock<std::mutex> lk(g.mu);
+		g.cv.wait_for(lk, std::chrono::seconds(4), [&] { return g.done; });
+	}
+	SCAM_LOG_W("leia stereo camera (android): fov dump: native 640x480@%d on lens %s: %s (%d frames)", fps, cam_id,
+	           ok && !g.y.empty() ? "captured" : "FAILED", g.n);
+	if (ses != nullptr) {
+		ACameraCaptureSession_stopRepeating(ses);
+		ACameraCaptureSession_close(ses);
+	}
+	if (dev != nullptr) {
+		ACameraDevice_close(dev);
+	}
+	if (req != nullptr) {
+		ACaptureRequest_free(req);
+	}
+	if (tgt != nullptr) {
+		ACameraOutputTarget_free(tgt);
+	}
+	if (out != nullptr) {
+		ACaptureSessionOutput_free(out);
+	}
+	if (outs != nullptr) {
+		ACaptureSessionOutputContainer_free(outs);
+	}
+	if (rd != nullptr) {
+		AImageReader_delete(rd);
+	}
+	if (!g.y.empty()) {
+		char name[64];
+		snprintf(name, sizeof(name), "fov_native_%s.pgm", cam_id);
+		fov_write_pgm(name, g.y.data(), g.w, g.w, g.h);
+	}
+}
+
+std::atomic<int> g_fov_state{0}; //!< 0 idle, 1 native done (dump ours next), 2 all done
+
 //! Under cam_mu. Hand head tracking to / back from this process's cores.
 void
 handover_locked(xrt_plugin_stereo_camera *c, bool on)
@@ -1322,6 +1511,10 @@ start_locked(xrt_plugin_stereo_camera *c)
 	// Into in-app tracking BEFORE the camera service evicts the tracking
 	// service's camera; back out if the open does not get through.
 	handover_locked(c, true);
+	if (c->track && g_fov_state.load() == 0 && prop_bool("debug.dxr.leia.scam_fov_dump", false)) {
+		fov_dump_native(c->trk_lens);
+		g_fov_state.store(1);
+	}
 	c->dev_cb = {c, dev_disconnected, dev_error};
 	camera_status_t st = ACameraManager_openCamera(mgr(), c->desc.logical_id, &c->dev_cb, &c->dev);
 	if (st != ACAMERA_OK || c->dev == nullptr) {
