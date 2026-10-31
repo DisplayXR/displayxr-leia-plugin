@@ -127,6 +127,26 @@ at run time, CNSDK PR #763); else the `cameras[]` entry of the factory main lens
 (WARN); else `cameras[0]` (WARN), with the in-app feed then on the factory main
 lens. `debug.dxr.leia.scam_track_lens=<id>` forces the feed.
 
+**In-app tracking intrinsics.** The vendor tracking service is calibrated on
+its OWN capture of the tracking camera (the config's `calibResolution`, e.g.
+640×480 at 90 fps), and that capture can be a narrower cut of the sensor than
+ours: on the phone-class front lens the 90 fps mode is 2288×1284 (2×2-binned
+4576×2568), so its 4:3 640×480 spans 3424 sensor columns, while our 1280×960 at
+30 fps spans 4192 (mode 4192×3144). Our 640×480 then sees a field 1.224× wider.
+So each core feeds its in-app tracker the tracking camera's CONFIGURED
+intrinsics re-expressed for our frame (`leia_scam_track_intrinsics_from_config`:
+f / ratio, principal point scaled about the centre; phone: fx 350 → 285.9),
+whenever the core knows that camera's intrinsics and it is the lens we feed.
+Otherwise it falls back to the factory block's values, with a WARN. The ratio
+(`leia_scam_track_fov_ratio`) comes from the HAL's sensor-mode table
+(`org.quic.camera2.sensormode.info.SensorModeTable`): each stream is served by
+the largest mode that runs at its rate, at the largest integer bin that fits
+the array, and the stream is the largest centred cut of its aspect. With no
+table the ratio is 1, because Camera2 promises every stream the same field.
+`debug.dxr.leia.scam_track_fps` (default 90) is the tracker's rate, and
+`debug.dxr.leia.scam_track_fov_ratio` overrides the ratio. Each choice is
+logged as one WARN.
+
 **Stream conversion.** A 16:9 stream from the 4:3 array is the array scaled to
 the stream width, with the rows centre-cropped:
 `cy' = (cy − H/2)·s + h/2`.
@@ -235,6 +255,8 @@ On either, the source:
 | `debug.dxr.leia.scam_size=WxH` | per-eye size (default 1280x720; captured at W×(3W/4) when the lenses list it) |
 | `debug.dxr.leia.scam_track=0` | do not hand tracking over (the service then loses its camera) |
 | `debug.dxr.leia.scam_swap=auto\|0\|1` | SBS eye order |
+| `debug.dxr.leia.scam_track_fov_ratio=<r>` | our tracking frame's field / the tracker's own capture field (default: from the sensor-mode table, else 1) |
+| `debug.dxr.leia.scam_track_fps=<n>` | the tracking service's capture rate, used to pick its sensor mode (default 90) |
 | `debug.dxr.leia.scam_pose=0` | ignore the HAL's lens poses for the eye order (the block decides alone) |
 | `debug.dxr.leia.scam_calib_key_prefix` | vendor key prefix of the factory block |
 | `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |

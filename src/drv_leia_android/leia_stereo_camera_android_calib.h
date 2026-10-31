@@ -159,6 +159,79 @@ leia_scam_pose_sub_side(const double main_t[3],
                         int32_t sensor_orientation,
                         uint32_t rot_cw);
 
+//! One sensor readout mode: its output size and its frame rate.
+struct leia_scam_sensor_mode
+{
+	uint32_t w, h, fps;
+};
+
+/*!
+ * Parse a vendor sensor-mode table as int32 [count, fields, w, h, fps, ...]
+ * (Qualcomm HALs publish one: "org.quic.camera2.sensormode.info.SensorModeTable",
+ * e.g. [2, 3, 4192, 3144, 30, 2288, 1284, 90]). Fields beyond the third are
+ * skipped. Returns the number of modes written (at most @p cap), 0 when the
+ * table is malformed.
+ */
+size_t
+leia_scam_parse_sensor_modes(const int32_t *v, size_t n, struct leia_scam_sensor_mode *out, size_t cap);
+
+/*!
+ * The width, in active-array pixels, of the field a @p sw x @p sh stream sees
+ * when the HAL serves it at @p fps: the largest mode (by area) that runs at
+ * @p fps or faster (else the fastest mode) covers the array at the largest
+ * integer bin k with k * mode <= array (a 2288x1284 mode of a 4576x3168 array
+ * is 2x2-binned 4576x2568), and the stream is the largest centred region of
+ * its aspect within that. 0 when there are no modes.
+ */
+double
+leia_scam_stream_field_width(uint32_t array_w,
+                             uint32_t array_h,
+                             const struct leia_scam_sensor_mode *modes,
+                             size_t n,
+                             uint32_t fps,
+                             uint32_t sw,
+                             uint32_t sh);
+
+/*!
+ * How much wider our tracking frame's field is than the head tracker's own
+ * capture: field(our stream at @p our_fps) / field(@p trk_w x @p trk_h at
+ * @p trk_fps). 0 when the modes do not tell (no table). On a phone-class
+ * front lens, our 1280x960@30 (mode 4192x3144) against the tracker's
+ * 640x480@90 (mode 2288x1284 = 4576x2568 binned, 4:3 cut 3424 wide) gives
+ * 4192 / 3424 = 1.224.
+ */
+double
+leia_scam_track_fov_ratio(uint32_t array_w,
+                          uint32_t array_h,
+                          const struct leia_scam_sensor_mode *modes,
+                          size_t n,
+                          uint32_t our_w,
+                          uint32_t our_h,
+                          uint32_t our_fps,
+                          uint32_t trk_w,
+                          uint32_t trk_h,
+                          uint32_t trk_fps);
+
+/*!
+ * The tracker's configured intrinsics (@p fx @p fy @p ppx @p ppy at
+ * @p cfg_w x @p cfg_h, its own capture) re-expressed for our @p w x @p h
+ * frame whose field is @p ratio times wider, both centred on the same
+ * optical axis: f' = f * (w / cfg_w) / ratio, pp' = centre + (pp - cfg
+ * centre) * (w / cfg_w) / ratio. Distortion is in normalised coordinates and
+ * carries over unchanged. Returns false on a degenerate input.
+ */
+bool
+leia_scam_track_intrinsics_from_config(double fx,
+                                       double fy,
+                                       double ppx,
+                                       double ppy,
+                                       uint32_t cfg_w,
+                                       uint32_t cfg_h,
+                                       double ratio,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       double out[4]);
+
 /*!
  * Make the block agree with the HAL's lens poses: when
  * leia_scam_pose_sub_side() decides and the block, read in this file's

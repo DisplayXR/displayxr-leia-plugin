@@ -307,6 +307,63 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 	return found;
 }
 
+/*!
+ * An int32[] characteristics key of @p cam_id by its full name (vendor keys
+ * included), over JNI as read_vendor_block. False when absent.
+ */
+bool
+read_vendor_i32(const char *cam_id, const char *full_name, std::vector<int32_t> &out)
+{
+	jni_env j;
+	if (!j.acquire()) {
+		return false;
+	}
+	JNIEnv *env = j.env;
+	bool found = false;
+	env->PushLocalFrame(32);
+	do {
+		jclass ctx_cls = env->FindClass("android/content/Context");
+		jmethodID get_service = ctx_cls != nullptr ? env->GetMethodID(ctx_cls, "getSystemService",
+		                                                              "(Ljava/lang/String;)Ljava/lang/Object;")
+		                                           : nullptr;
+		if (!j.ok() || get_service == nullptr) {
+			break;
+		}
+		jobject cm = env->CallObjectMethod(j.ctx, get_service, env->NewStringUTF("camera"));
+		jclass cm_cls = env->FindClass("android/hardware/camera2/CameraManager");
+		if (!j.ok() || cm == nullptr || cm_cls == nullptr) {
+			break;
+		}
+		jmethodID get_cc = env->GetMethodID(cm_cls, "getCameraCharacteristics",
+		                                    "(Ljava/lang/String;)Landroid/hardware/camera2/CameraCharacteristics;");
+		jobject cc = j.ok() ? env->CallObjectMethod(cm, get_cc, env->NewStringUTF(cam_id)) : nullptr;
+		jclass cc_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics");
+		jclass key_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics$Key");
+		jclass ints_cls = env->FindClass("[I");
+		if (!j.ok() || cc == nullptr || cc_cls == nullptr || key_cls == nullptr || ints_cls == nullptr) {
+			break;
+		}
+		jmethodID get = env->GetMethodID(cc_cls, "get",
+		                                 "(Landroid/hardware/camera2/CameraCharacteristics$Key;)Ljava/lang/Object;");
+		jmethodID key_ctor = env->GetMethodID(key_cls, "<init>", "(Ljava/lang/String;Ljava/lang/Class;)V");
+		if (!j.ok() || get == nullptr || key_ctor == nullptr) {
+			break;
+		}
+		jobject key = env->NewObject(key_cls, key_ctor, env->NewStringUTF(full_name), ints_cls);
+		jobject v = j.ok() && key != nullptr ? env->CallObjectMethod(cc, get, key) : nullptr;
+		if (j.ok() && v != nullptr && env->IsInstanceOf(v, ints_cls)) {
+			jintArray arr = (jintArray)v;
+			const jsize len = env->GetArrayLength(arr);
+			out.resize((size_t)len);
+			env->GetIntArrayRegion(arr, 0, len, (jint *)out.data());
+			found = j.ok() && len > 0;
+		}
+	} while (false);
+	j.ok();
+	env->PopLocalFrame(nullptr);
+	return found;
+}
+
 /*
  *
  * Discovery.
@@ -1560,6 +1617,43 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		}
 		ei.mirrored = true;
 		ei.valid = c->desc.calibrated;
+		// The head tracker's configured intrinsics describe ITS capture (e.g.
+		// 640x480 at 90 fps), which on some modules is a narrower cut of the
+		// sensor than our 640x480: the cores prefer those values, re-expressed
+		// for our field, over the factory block's (leia_cnsdk_ext_tracking_feed).
+		// The field ratio comes from the HAL's sensor-mode table when it has one
+		// (leia_scam_track_fov_ratio), else 1 (Camera2: every stream sees the
+		// same field); debug.dxr.leia.scam_track_fov_ratio overrides it.
+		{
+			const uint32_t trk_fps = (uint32_t)std::max(1, atoi(prop_str("debug.dxr.leia.scam_track_fps", "90").c_str()));
+			std::vector<int32_t> tbl;
+			leia_scam_sensor_mode modes[8];
+			size_t nm = 0;
+			if (read_vendor_i32(c->trk_lens, "org.quic.camera2.sensormode.info.SensorModeTable", tbl)) {
+				nm = leia_scam_parse_sensor_modes(tbl.data(), tbl.size(), modes, 8);
+			}
+			double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->cap_w, c->cap_h,
+			                                     30, kTrackW, kTrackH, trk_fps);
+			const char *src = "sensor-mode table";
+			if (r > 0.0 && c->cap_w * 3 > c->cap_h * 4) {
+				r *= (double)c->cap_h * 4.0 / (3.0 * (double)c->cap_w); // our 4:3 cut of a wider capture
+			}
+			if (!(r > 0.0)) {
+				r = 1.0;
+				src = "no sensor-mode table: same field assumed";
+			}
+			const std::string ov = prop_str("debug.dxr.leia.scam_track_fov_ratio", "");
+			const double ovr = ov.empty() ? 0.0 : atof(ov.c_str());
+			if (ovr > 0.1 && ovr < 10.0) {
+				r = ovr;
+				src = "forced by debug.dxr.leia.scam_track_fov_ratio";
+			}
+			ei.fov_ratio = r;
+			snprintf(ei.lens, sizeof(ei.lens), "%s", c->trk_lens);
+			SCAM_LOG_W("leia stereo camera (android): tracking frame field = %.4f x the tracker's own %ux%u@%u "
+			           "capture (%s; %zu sensor mode(s); our %ux%u@30 cut to 640x480); block-derived fx %.1f",
+			           r, kTrackW, kTrackH, trk_fps, src, nm, c->cap_w, c->cap_h, tl.fx);
+		}
 		c->trk_intr = ei; // handed over by start_locked, around the actual open
 		c->trk_thread = std::thread(tracking_feeder, c);
 	}

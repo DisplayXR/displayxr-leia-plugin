@@ -510,6 +510,13 @@ struct leia_cnsdk_ext_intrinsics
 	bool mirrored;
 	//! false = no factory calibration: the core keeps its own default.
 	bool valid;
+	//! How much wider this frame's field is than the head tracker's own
+	//! capture; 0 = unknown. With it, a core that knows its tracking camera's
+	//! configured intrinsics and that camera is @ref lens uses those,
+	//! re-expressed for this frame, instead of fx..cy above.
+	double fov_ratio;
+	//! Camera2 id of the lens this frame comes from.
+	char lens[16];
 };
 
 /*!
