@@ -123,6 +123,59 @@ bool
 leia_scam_factory_is_vertical(const struct leia_scam_factory_calib *f);
 
 /*!
+ * Re-read the block's extrinsics in the opposite convention: R <- R^T,
+ * T <- -R^T T. A block written as x_main = R * x_sub + T (the "sub" lens as
+ * stereoCalibrate's first camera) becomes the x_sub = R * x_main + T this file
+ * assumes. Applying it twice is the identity. Intrinsics are untouched.
+ */
+void
+leia_scam_factory_swap_convention(struct leia_scam_factory_calib *f);
+
+/*!
+ * Which side of the main lens the sub lens sits on along the PUBLISHED x axis,
+ * from the HAL's own lens poses (ACAMERA_LENS_POSE_TRANSLATION of each
+ * physical lens, @p main_t / @p sub_t). Those are in the Android sensor
+ * coordinate axes: x right, y up, z out of the screen, the device in its
+ * natural orientation, as the user sees it. Only the difference of the two is
+ * used, so either pose reference (primary camera or gyroscope) works.
+ *
+ * The device-frame offset d = sub - main is taken to the upright camera image
+ * (x' = d.x for a rear lens, -d.x for a front one, which sees the user from
+ * the other side; y' = -d.y because image y points down), then by
+ * (@p rot_cw - @p sensor_orientation) clockwise: the published frame is the
+ * sensor image turned by @p rot_cw, and the sensor image is the upright image
+ * turned back by @p sensor_orientation.
+ *
+ * Returns +1 when the sub lens is at +x (main is then the camera's own left,
+ * the SBS left eye), -1 when it is at -x, and 0 when the poses decide nothing:
+ * a sensor orientation that is not a multiple of 90, a baseline outside
+ * 1..200 mm (both lenses at the origin is the usual "not published"), or an
+ * offset less than ~45 degrees from the published x axis.
+ */
+int
+leia_scam_pose_sub_side(const double main_t[3],
+                        const double sub_t[3],
+                        bool front,
+                        int32_t sensor_orientation,
+                        uint32_t rot_cw);
+
+/*!
+ * Make the block agree with the HAL's lens poses: when
+ * leia_scam_pose_sub_side() decides and the block, read in this file's
+ * convention and turned by @p rot_cw, puts the sub lens on the other side,
+ * swap the block's convention (leia_scam_factory_swap_convention) in place.
+ * Returns 1 when it swapped, 0 when the poses agree, -1 when the poses decide
+ * nothing (the block is then left as it is).
+ */
+int
+leia_scam_factory_orient_by_pose(struct leia_scam_factory_calib *f,
+                                 const double main_t[3],
+                                 const double sub_t[3],
+                                 bool front,
+                                 int32_t sensor_orientation,
+                                 uint32_t rot_cw);
+
+/*!
  * The size the factory block's intrinsics are expressed at. Usually the
  * active array; on some modules a listed output size instead (a phone-class
  * module's block centres on its largest 4:3 output 4192x3144, not on its

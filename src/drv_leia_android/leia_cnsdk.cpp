@@ -9,6 +9,7 @@
  */
 
 #include "leia_cnsdk.h"
+#include "leia_stereo_camera_android.h"
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -64,6 +65,7 @@ leia_interlacer_vulkan_initialize_with_queue(struct leia_core *,
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
 #include <sys/system_properties.h>
+#include <dlfcn.h>
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 #include <android/trace.h>
 #endif
@@ -255,8 +257,11 @@ struct leia_cnsdk
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
 	bool camera_extrinsics_ok{false};
-	//! Device-config camera 0 `id` (the tracker's Camera2 id; may be empty).
+	//! The tracking camera's device-config `id` (its Camera2 id; may be empty).
 	char tracking_camera_id[16]{};
+	//! tracking_camera_id names the tracker's camera for sure: CNSDK's own
+	//! accessor, or the factory stereo main lens. False = the cameras[0] guess.
+	bool tracking_camera_known{false};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -982,8 +987,65 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		// the display center; rotation_deg is logged (not applied) so a device
 		// whose camera is NOT display-plane-aligned shows up in triage instead
 		// of silently skewing the fallback face.
+		// The tracking camera: CNSDK tracks from the display config's
+		// trackingCameras[0] (or debug.cnsdk.cam). get_camera_data indexes
+		// cameras[], whose order differs on a phone-class config (cameras[0] =
+		// "0", trackingCameras[0] = "1"), so cameras[0] is NOT the tracker.
+		//  1. CNSDK >= 0.10.89 (CNSDK PR #763) answers it directly:
+		//     leia_device_config_get_tracking_camera_data. The pinned headers
+		//     predate it, so it is looked up at run time; an older loader has no
+		//     such symbol, a newer loader over an older impl returns false.
+		//  2. Else the cameras[] entry of the factory stereo "main" lens (WARN).
+		//  3. Else cameras[0], as before (WARN).
 		struct leia_camera cam = {};
-		if (leia_device_config_get_camera_data(cfg, &cam, 0)) {
+		bool cam_ok = false;
+		using get_tracking_camera_fn = leia_bool (*)(struct leia_device_config *, struct leia_camera *);
+		// The plug-in is dlopen'ed RTLD_LOCAL, so ask the loader shim it links
+		// (already mapped: NOLOAD) rather than the global scope.
+		static const auto get_tracking_camera = []() -> get_tracking_camera_fn {
+			const char *sym = "leia_device_config_get_tracking_camera_data";
+			void *h = dlopen("libleiaCore-loader.so", RTLD_NOW | RTLD_NOLOAD);
+			void *fn = h != nullptr ? dlsym(h, sym) : nullptr;
+			if (h != nullptr) {
+				dlclose(h); // drops the NOLOAD reference only; our DT_NEEDED keeps it mapped
+			}
+			return reinterpret_cast<get_tracking_camera_fn>(fn != nullptr ? fn : dlsym(RTLD_DEFAULT, sym));
+		}();
+		if (get_tracking_camera != nullptr && get_tracking_camera(cfg, &cam)) {
+			cam_ok = true;
+			cnsdk->tracking_camera_known = true;
+			U_LOG_W("CNSDK tracking camera: id \"%.15s\" (leia_device_config_get_tracking_camera_data)", cam.id);
+		} else {
+			char want_id[16] = {0};
+			bool have_want = false;
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
+			have_want = leia_stereo_camera_android_tracking_lens(want_id, sizeof(want_id));
+#endif
+			int cam_index = -1;
+			for (int i = 0; i < 8; i++) {
+				struct leia_camera ci = {};
+				if (!leia_device_config_get_camera_data(cfg, &ci, i)) {
+					break;
+				}
+				if (i == 0 || (have_want && strncmp(ci.id, want_id, sizeof(ci.id)) == 0)) {
+					cam = ci;
+					cam_index = i;
+				}
+				if (have_want && strncmp(ci.id, want_id, sizeof(ci.id)) == 0) {
+					break;
+				}
+			}
+			cam_ok = cam_index >= 0;
+			if (cam_ok) {
+				const bool matched = have_want && strncmp(cam.id, want_id, sizeof(cam.id)) == 0;
+				cnsdk->tracking_camera_known = matched;
+				U_LOG_W("CNSDK tracking camera: device-config cameras[%d] id \"%.15s\": %s%s (CNSDK exposes no "
+				        "tracking-camera accessor before 0.10.89; verify against the config's trackingCameras[0])",
+				        cam_index, cam.id, matched ? "the factory stereo main lens " : "cameras[0], factory main lens ",
+				        have_want ? want_id : "unknown");
+			}
+		}
+		if (cam_ok) {
 			cnsdk->camera_center_x_m = cam.translation_mm.x / 1000.0f;
 			cnsdk->camera_center_y_m = cam.translation_mm.y / 1000.0f;
 			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
@@ -2213,7 +2275,8 @@ leia_cnsdk_get_tracking_camera_id(char *out, size_t cap)
 	}
 	std::lock_guard<std::mutex> lk(g_ext_mu);
 	for (struct leia_cnsdk *c : g_ext_cores) {
-		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_id[0] != '\0') {
+		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_known &&
+		    c->tracking_camera_id[0] != '\0') {
 			snprintf(out, cap, "%s", c->tracking_camera_id);
 			return true;
 		}
