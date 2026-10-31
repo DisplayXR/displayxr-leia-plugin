@@ -403,8 +403,10 @@ struct pair_desc
 	uint32_t cap_w{1280}, cap_h{720};
 	bool swap_override{false}, swap_value{false};
 	//! What decided the eye order (leia_scam_factory_orient_by_pose): 1 = the
-	//! HAL's lens poses disagreed with the block, whose convention was swapped;
-	//! 0 = they agreed; -1 = no usable poses (the block decides alone).
+	//! HAL's lens poses disagreed with the block, which is then READ in the
+	//! other convention (oriented_factory); 0 = they agreed; -1 = no usable
+	//! poses (the block decides alone). `factory` itself stays as stored, so a
+	//! later R from another source (same convention as the block) composes.
 	int pose_orient{-1};
 	double pose_main[3]{}, pose_sub[3]{}; //!< ACAMERA_LENS_POSE_TRANSLATION, metres
 	bool have_pose{false};
@@ -503,6 +505,17 @@ parse_size(const std::string &s, uint32_t *w, uint32_t *h)
 
 bool
 left_is_sub(const pair_desc &p);
+
+//! The factory block in the convention the HAL's lens poses chose (pose_orient).
+leia_scam_factory_calib
+oriented_factory(const pair_desc &p)
+{
+	leia_scam_factory_calib f = p.factory;
+	if (p.pose_orient == 1) {
+		leia_scam_factory_swap_convention(&f);
+	}
+	return f;
+}
 
 void
 scan_locked()
@@ -664,7 +677,8 @@ scan_locked()
 		}
 		if (p.ref_w != 0 && p.have_pose && p.have_sensor_orientation &&
 		    prop_bool("debug.dxr.leia.scam_pose", true)) {
-			p.pose_orient = leia_scam_factory_orient_by_pose(&p.factory, p.pose_main, p.pose_sub, p.front,
+			leia_scam_factory_calib probe = p.factory;
+			p.pose_orient = leia_scam_factory_orient_by_pose(&probe, p.pose_main, p.pose_sub, p.front,
 			                                                 p.sensor_orientation, p.rot);
 			if (p.pose_orient == 1) {
 				SCAM_LOG_W("leia stereo camera (android): %s pair: the HAL's lens poses (main %s at "
@@ -676,7 +690,8 @@ scan_locked()
 			}
 		}
 		if (p.ref_w != 0) {
-			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w, p.cap_h,
+			const leia_scam_factory_calib of = oriented_factory(p);
+			p.calibrated = leia_scam_stream_calib_from_factory(&of, p.array_w, p.array_h, p.cap_w, p.cap_h,
 			                                                   p.crop_w, p.crop_h, p.rot, &p.stream);
 			p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
 		}
@@ -1501,7 +1516,7 @@ leia_stereo_camera_android_get_calibration(struct xrt_plugin_instance *inst,
 	if (left_is_sub(p) != s.left_is_sub) {
 		// A forced swap: read the block in the other convention, so the halves
 		// and R/T still agree exactly.
-		leia_scam_factory_calib f = p.factory;
+		leia_scam_factory_calib f = oriented_factory(p);
 		leia_scam_factory_swap_convention(&f);
 		leia_scam_stream_calib alt;
 		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot,
