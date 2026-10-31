@@ -25,6 +25,8 @@
  *   debug.dxr.leia.scam_calib_key_prefix=…  vendor key prefix of the factory block
  *   debug.dxr.leia.scam_rotate=auto|0|90|180|270  clockwise turn of each eye
  *   debug.dxr.leia.scam_calib_ref=auto|array|WxH  size the factory block is expressed at
+ *   debug.dxr.leia.scam_user_calib=0        ignore the calibration app's user rotation
+ *                                           (factory R only; re-read on enumerate)
  *
  * @ingroup drv_leia_android
  */
