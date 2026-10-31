@@ -329,6 +329,8 @@ struct pair_desc
 	//! centres on a listed output size, leia_scam_pick_calib_reference).
 	uint32_t ref_w{0}, ref_h{0};
 	int32_t sensor_orientation{0};
+	//! ACAMERA_SENSOR_ORIENTATION was read (the frame orientation is unknown otherwise).
+	bool have_sensor_orientation{false};
 	//! Clockwise turn applied to each eye after the crop: 90 / 270 when the
 	//! lenses are stacked along the sensor's y axis (a phone held upright), so
 	//! the published pair is side by side and upright in the device's natural
@@ -508,6 +510,7 @@ scan_locked()
 			std::vector<int32_t> so;
 			if (get_i32(mm, ACAMERA_SENSOR_ORIENTATION, so)) {
 				p.sensor_orientation = so[0];
+				p.have_sensor_orientation = true;
 			}
 			// Candidate calibration reference sizes: every listed YUV / JPEG output.
 			std::vector<int32_t> cfg;
@@ -1341,6 +1344,18 @@ leia_stereo_camera_android_enumerate(struct xrt_plugin_instance *inst,
 		info.eye_height = p.eye_h;
 		info.max_frame_rate = p.measured_rate; // 0 until an open measured it
 		info.native_format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION
+		// Runtime XR_DXR_stereo_camera v7: how the published frame is turned, so
+		// a consumer does not add its own guess on top of our turn. Tablets keep
+		// the sensor's 270 (front) / 90 (rear); a pair we turn upright reports 0.
+		switch (leia_scam_frame_orientation_deg(p.have_sensor_orientation, p.sensor_orientation, p.rot)) {
+		case 0: info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0; break;
+		case 90: info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90; break;
+		case 180: info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_180; break;
+		case 270: info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_270; break;
+		default: info.frame_orientation = XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN; break;
+		}
+#endif
 		auto *dst = reinterpret_cast<xrt_plugin_stereo_camera_info *>(reinterpret_cast<uint8_t *>(out) + (size_t)i * sz);
 		memcpy(dst, &info, std::min<size_t>(sz, sizeof(info)));
 		dst->struct_size = sz;
