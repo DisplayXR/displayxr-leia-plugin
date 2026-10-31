@@ -28,6 +28,10 @@
  *   debug.dxr.leia.scam_user_calib=0        ignore the calibration app's user rotation
  *                                           (factory R only; re-read on enumerate)
  *
+ * The user rotation's last accepted record is cached in the host process's
+ * files dir (leia_scam_user_calib_<pair>_<block sha>.json) and used, through
+ * the same gate, while the calibration app's provider is unreachable.
+ *
  * @ingroup drv_leia_android
  */
 
