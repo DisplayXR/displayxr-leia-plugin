@@ -445,6 +445,61 @@ leia_scam_user_calib_check(const struct leia_scam_user_calib *u,
 	return LEIA_SCAM_USER_CALIB_OK;
 }
 
+static bool
+consider(const char *json,
+         size_t len,
+         const char *logical_id,
+         const char *main_id,
+         const char *sub_id,
+         const uint8_t block_sha256[32],
+         const double R_factory[3][3],
+         struct leia_scam_user_calib_choice *out)
+{
+	out->considered = true;
+	if (!leia_scam_user_calib_parse(json, len, &out->rec)) {
+		out->parse_failed = true;
+		return false;
+	}
+	out->verdict = leia_scam_user_calib_check(&out->rec, logical_id, main_id, sub_id, block_sha256, R_factory,
+	                                          &out->delta_deg);
+	return out->verdict == LEIA_SCAM_USER_CALIB_OK;
+}
+
+void
+leia_scam_user_calib_choose(enum leia_scam_user_calib_provider provider,
+                            const char *provider_json,
+                            size_t provider_len,
+                            const char *cache_json,
+                            size_t cache_len,
+                            const char *logical_id,
+                            const char *main_id,
+                            const char *sub_id,
+                            const uint8_t block_sha256[32],
+                            const double R_factory[3][3],
+                            struct leia_scam_user_calib_choice *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->source = LEIA_SCAM_USER_CALIB_SRC_FACTORY;
+	switch (provider) {
+	case LEIA_SCAM_PROVIDER_RECORD:
+		if (provider_json != NULL &&
+		    consider(provider_json, provider_len, logical_id, main_id, sub_id, block_sha256, R_factory, out)) {
+			out->source = LEIA_SCAM_USER_CALIB_SRC_PROVIDER;
+			out->cache_write = true;
+		} else {
+			out->cache_drop = true;
+		}
+		break;
+	case LEIA_SCAM_PROVIDER_NO_RECORD: out->cache_drop = true; break;
+	case LEIA_SCAM_PROVIDER_UNAVAILABLE:
+		if (cache_json != NULL && cache_len > 0 &&
+		    consider(cache_json, cache_len, logical_id, main_id, sub_id, block_sha256, R_factory, out)) {
+			out->source = LEIA_SCAM_USER_CALIB_SRC_CACHE;
+		}
+		break;
+	}
+}
+
 /*
  *
  * SHA-256 (FIPS 180-4).
