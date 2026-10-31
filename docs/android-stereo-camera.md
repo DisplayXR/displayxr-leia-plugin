@@ -83,15 +83,49 @@ little-endian IEEE-754 double:
 **Convention.** `x_sub = R · x_main + T`, as in OpenCV `stereoCalibrate` with
 camera 1 = main.
 
-**Eye order.** The lens whose centre lies at −x of the other, i.e. on the
-camera's own left, is the SBS left eye. On the front pair that is the sub lens
-(T = (+15, 0, 0) mm). The source hands the runtime `R_rl`/`T_rl` in its
-`x_right = R_rl · x_left + T_rl` convention. `debug.dxr.leia.scam_swap=0|1`
-forces the order.
+**Eye order.** In the PUBLISHED frame (after any turn), the lens whose
+centre lies at −x of the other, i.e. on the camera's own left, is the SBS left
+eye. On the tablets' front pair that is the sub lens (T = (+15, 0, 0) mm). The
+source hands the runtime `R_rl`/`T_rl` in its `x_right = R_rl · x_left + T_rl`
+convention.
 
-**Main lens.** The main lens is the one the vendor tracking service tracks
-from: its intrinsics match the service's logged 640×480 values (fx 338.6,
-fy 345.6).
+The block's convention is not the same on every module: a tablet's block is
+`x_sub = R · x_main + T`, a phone-class front module's is
+`x_main = R · x_sub + T` (its factory tool took the sub lens as stereoCalibrate's
+first camera). The block cannot tell the two apart, so the HAL's own lens
+poses decide when both lenses publish them (`ACAMERA_LENS_POSE_TRANSLATION`,
+Android sensor-coordinate axes: x right as the user sees the screen, y up). The
+device-frame offset sub − main goes to the upright camera image (x mirrored for
+a front lens, which faces the user; y flipped because image y points down), then
+by (turn − sensor orientation) clockwise into the published frame
+(`leia_scam_pose_sub_side`). When that puts the sub lens on the other side from
+the block, the block is re-read in the other convention (R ← Rᵀ, T ← −Rᵀ T,
+`leia_scam_factory_orient_by_pose`) before anything is derived from it, and one
+WARN says so. No poses, poses at the origin, a reference that cannot be
+compared (UNDEFINED / AUTOMOTIVE), or an offset more than 45° off the published
+x axis: the block decides alone, as before.
+
+Measured on the phone-class device: lens 0 (sub) sits at (−15.3, −0.75) mm of
+lens 1 (main), i.e. on the user's left, the front camera's own right, so main
+is the left eye. The block read as `x_sub = R · x_main + T` said the opposite,
+and the depth was inverted. The scan log prints the EFFECTIVE order and what
+decided it (`SBS left = main lens 1 (HAL lens poses; block convention
+swapped)`). `debug.dxr.leia.scam_swap=0|1` still forces the order;
+`debug.dxr.leia.scam_pose=0` ignores the poses.
+
+**Main lens.** On the tablets the main lens is the one the vendor tracking
+service tracks from: its intrinsics match the service's logged 640×480 values
+(fx 338.6, fy 345.6).
+
+**Tracking lens.** CNSDK tracks from the display config's `trackingCameras[0]`
+(or `debug.cnsdk.cam`). Its C API before 0.10.89 only indexes `cameras[]`,
+whose order is not the tracker's (phone-class: `cameras[0]` = "0",
+`trackingCameras[0]` = "1"). So the in-app tracking lens, and the cores' camera
+offset for the frame-listener face fallback, are: CNSDK's
+`leia_device_config_get_tracking_camera_data` when the loader has it (looked up
+at run time, CNSDK PR #763); else the `cameras[]` entry of the factory main lens
+(WARN); else `cameras[0]` (WARN), with the in-app feed then on the factory main
+lens. `debug.dxr.leia.scam_track_lens=<id>` forces the feed.
 
 **Stream conversion.** A 16:9 stream from the 4:3 array is the array scaled to
 the stream width, with the rows centre-cropped:
@@ -201,6 +235,7 @@ On either, the source:
 | `debug.dxr.leia.scam_size=WxH` | per-eye size (default 1280x720; captured at W×(3W/4) when the lenses list it) |
 | `debug.dxr.leia.scam_track=0` | do not hand tracking over (the service then loses its camera) |
 | `debug.dxr.leia.scam_swap=auto\|0\|1` | SBS eye order |
+| `debug.dxr.leia.scam_pose=0` | ignore the HAL's lens poses for the eye order (the block decides alone) |
 | `debug.dxr.leia.scam_calib_key_prefix` | vendor key prefix of the factory block |
 | `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |
 | `debug.dxr.leia.scam_calib_ref=auto\|array\|WxH` | the size the factory block's intrinsics are expressed at (auto: see *Reference size*) |
