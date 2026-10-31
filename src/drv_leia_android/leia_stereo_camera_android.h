@@ -23,6 +23,8 @@
  *   debug.dxr.leia.scam_track=0             do not hand tracking over (front)
  *   debug.dxr.leia.scam_swap=auto|0|1       which lens is the SBS left eye
  *   debug.dxr.leia.scam_calib_key_prefix=…  vendor key prefix of the factory block
+ *   debug.dxr.leia.scam_rotate=auto|0|90|180|270  clockwise turn of each eye
+ *   debug.dxr.leia.scam_calib_ref=auto|array|WxH  size the factory block is expressed at
  *
  * @ingroup drv_leia_android
  */
