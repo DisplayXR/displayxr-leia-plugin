@@ -307,6 +307,73 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 	return found;
 }
 
+/*!
+ * An int32[] characteristics key of @p cam_id by its full name (vendor keys
+ * included), over JNI as read_vendor_block. False when absent.
+ */
+bool
+read_vendor_i32(const char *cam_id, const char *full_name, std::vector<int32_t> &out)
+{
+	jni_env j;
+	if (!j.acquire()) {
+		return false;
+	}
+	JNIEnv *env = j.env;
+	bool found = false;
+	env->PushLocalFrame(32);
+	do {
+		jclass ctx_cls = env->FindClass("android/content/Context");
+		jmethodID get_service = ctx_cls != nullptr ? env->GetMethodID(ctx_cls, "getSystemService",
+		                                                              "(Ljava/lang/String;)Ljava/lang/Object;")
+		                                           : nullptr;
+		if (!j.ok() || get_service == nullptr) {
+			break;
+		}
+		// Every call that can throw is checked before the next JNI call: with
+		// an exception pending, CheckJNI aborts the whole process. A provider
+		// that has just died throws from getCameraCharacteristics ("unknown
+		// device"), which took the service down here once.
+		jobject cm = env->CallObjectMethod(j.ctx, get_service, env->NewStringUTF("camera"));
+		if (!j.ok() || cm == nullptr) {
+			break;
+		}
+		jclass cm_cls = env->FindClass("android/hardware/camera2/CameraManager");
+		if (!j.ok() || cm_cls == nullptr) {
+			break;
+		}
+		jmethodID get_cc = env->GetMethodID(cm_cls, "getCameraCharacteristics",
+		                                    "(Ljava/lang/String;)Landroid/hardware/camera2/CameraCharacteristics;");
+		jobject cc = j.ok() ? env->CallObjectMethod(cm, get_cc, env->NewStringUTF(cam_id)) : nullptr;
+		if (!j.ok() || cc == nullptr) {
+			break;
+		}
+		jclass cc_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics");
+		jclass key_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics$Key");
+		jclass ints_cls = env->FindClass("[I");
+		if (!j.ok() || cc == nullptr || cc_cls == nullptr || key_cls == nullptr || ints_cls == nullptr) {
+			break;
+		}
+		jmethodID get = env->GetMethodID(cc_cls, "get",
+		                                 "(Landroid/hardware/camera2/CameraCharacteristics$Key;)Ljava/lang/Object;");
+		jmethodID key_ctor = env->GetMethodID(key_cls, "<init>", "(Ljava/lang/String;Ljava/lang/Class;)V");
+		if (!j.ok() || get == nullptr || key_ctor == nullptr) {
+			break;
+		}
+		jobject key = env->NewObject(key_cls, key_ctor, env->NewStringUTF(full_name), ints_cls);
+		jobject v = j.ok() && key != nullptr ? env->CallObjectMethod(cc, get, key) : nullptr;
+		if (j.ok() && v != nullptr && env->IsInstanceOf(v, ints_cls)) {
+			jintArray arr = (jintArray)v;
+			const jsize len = env->GetArrayLength(arr);
+			out.resize((size_t)len);
+			env->GetIntArrayRegion(arr, 0, len, (jint *)out.data());
+			found = j.ok() && len > 0;
+		}
+	} while (false);
+	j.ok();
+	env->PopLocalFrame(nullptr);
+	return found;
+}
+
 /*
  *
  * Discovery.
@@ -345,6 +412,14 @@ struct pair_desc
 	//! field of view), else the eye size itself.
 	uint32_t cap_w{1280}, cap_h{720};
 	bool swap_override{false}, swap_value{false};
+	//! What decided the eye order (leia_scam_factory_orient_by_pose): 1 = the
+	//! HAL's lens poses disagreed with the block, which is then READ in the
+	//! other convention (oriented_factory); 0 = they agreed; -1 = no usable
+	//! poses (the block decides alone). `factory` itself stays as stored, so a
+	//! later R from another source (same convention as the block) composes.
+	int pose_orient{-1};
+	double pose_main[3]{}, pose_sub[3]{}; //!< ACAMERA_LENS_POSE_TRANSLATION, metres
+	bool have_pose{false};
 	float measured_rate{0.0f};
 };
 
@@ -384,6 +459,34 @@ get_u8(const ACameraMetadata *m, uint32_t tag, uint8_t *out)
 	return true;
 }
 
+/*!
+ * One physical lens's ACAMERA_LENS_POSE_TRANSLATION (Android sensor-coordinate
+ * axes, metres). False when it is absent or its reference cannot be compared
+ * (UNDEFINED / AUTOMOTIVE); @p ref gets the reference (0 = primary camera,
+ * the pre-P meaning when the tag is missing).
+ */
+bool
+read_lens_pose(const char *cam_id, double out[3], uint8_t *ref)
+{
+	ACameraMetadata *m = nullptr;
+	if (ACameraManager_getCameraCharacteristics(mgr(), cam_id, &m) != ACAMERA_OK || m == nullptr) {
+		return false;
+	}
+	*ref = ACAMERA_LENS_POSE_REFERENCE_PRIMARY_CAMERA;
+	get_u8(m, ACAMERA_LENS_POSE_REFERENCE, ref);
+	ACameraMetadata_const_entry e{};
+	const bool ok = ACameraMetadata_getConstEntry(m, ACAMERA_LENS_POSE_TRANSLATION, &e) == ACAMERA_OK &&
+	                e.count >= 3 &&
+	                (*ref == ACAMERA_LENS_POSE_REFERENCE_PRIMARY_CAMERA || *ref == ACAMERA_LENS_POSE_REFERENCE_GYROSCOPE);
+	if (ok) {
+		for (int i = 0; i < 3; i++) {
+			out[i] = (double)e.data.f[i];
+		}
+	}
+	ACameraMetadata_free(m);
+	return ok;
+}
+
 bool
 stream_supported(const ACameraMetadata *m, int32_t format, uint32_t w, uint32_t h)
 {
@@ -408,6 +511,20 @@ parse_size(const std::string &s, uint32_t *w, uint32_t *h)
 		*w = a & ~1u;
 		*h = b & ~1u;
 	}
+}
+
+bool
+left_is_sub(const pair_desc &p);
+
+//! The factory block in the convention the HAL's lens poses chose (pose_orient).
+leia_scam_factory_calib
+oriented_factory(const pair_desc &p)
+{
+	leia_scam_factory_calib f = p.factory;
+	if (p.pose_orient == 1) {
+		leia_scam_factory_swap_convention(&f);
+	}
+	return f;
 }
 
 void
@@ -559,8 +676,32 @@ scan_locked()
 			p.eye_w = p.crop_h;
 			p.eye_h = p.crop_w;
 		}
+		// 3. Eye order: the HAL's own lens poses say which lens is on the camera's
+		// left. A block written in the other convention (x_main = R x_sub + T, as
+		// on a phone-class front module) disagrees with them and is swapped here,
+		// before anything is derived from it. No poses: the block decides alone.
+		{
+			uint8_t ref_m = 0, ref_s = 0;
+			p.have_pose = read_lens_pose(p.main_id, p.pose_main, &ref_m) &&
+			              read_lens_pose(p.sub_id, p.pose_sub, &ref_s) && ref_m == ref_s;
+		}
+		if (p.ref_w != 0 && p.have_pose && p.have_sensor_orientation &&
+		    prop_bool("debug.dxr.leia.scam_pose", true)) {
+			leia_scam_factory_calib probe = p.factory;
+			p.pose_orient = leia_scam_factory_orient_by_pose(&probe, p.pose_main, p.pose_sub, p.front,
+			                                                 p.sensor_orientation, p.rot);
+			if (p.pose_orient == 1) {
+				SCAM_LOG_W("leia stereo camera (android): %s pair: the HAL's lens poses (main %s at "
+				           "(%.1f, %.1f, %.1f) mm, sub %s at (%.1f, %.1f, %.1f) mm) disagree with the factory "
+				           "block's eye order; reading the block as x_main = R x_sub + T",
+				           p.front ? "front" : "rear", p.main_id, p.pose_main[0] * 1e3, p.pose_main[1] * 1e3,
+				           p.pose_main[2] * 1e3, p.sub_id, p.pose_sub[0] * 1e3, p.pose_sub[1] * 1e3,
+				           p.pose_sub[2] * 1e3);
+			}
+		}
 		if (p.ref_w != 0) {
-			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w, p.cap_h,
+			const leia_scam_factory_calib of = oriented_factory(p);
+			p.calibrated = leia_scam_stream_calib_from_factory(&of, p.array_w, p.array_h, p.cap_w, p.cap_h,
 			                                                   p.crop_w, p.crop_h, p.rot, &p.stream);
 			p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
 		}
@@ -568,17 +709,23 @@ scan_locked()
 			p.swap_override = true;
 			p.swap_value = swap == "1";
 		}
+		const bool eff_sub = left_is_sub(p);
+		const char *order_src = p.swap_override ? "forced by debug.dxr.leia.scam_swap"
+		                        : !p.calibrated  ? "assumed, no calibration"
+		                        : p.pose_orient == 1 ? "HAL lens poses; block convention swapped"
+		                        : p.pose_orient == 0 ? "HAL lens poses agree with the block"
+		                                             : "factory block; no usable lens poses";
 		SCAM_LOG_W(
 		    "leia stereo camera (android): %s pair = logical %s, main lens %s, sub lens %s, array %ux%u, eye "
 		    "%ux%u (captured %ux%u, cropped %ux%u, turned %u deg cw, sensor orientation %d), factory block %s "
 		    "(%zu bytes, %s, expressed at %ux%u, principal points %.1f %% off its centre) -> %s, baseline %.2f mm, "
-		    "SBS left = %s lens",
+		    "SBS left = %s lens %s (%s)",
 		    p.front ? "front" : "rear", p.logical_id, p.main_id, p.sub_id, p.array_w, p.array_h, p.eye_w, p.eye_h,
 		    p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot, p.sensor_orientation, have ? "found" : "MISSING",
 		    blk.size(), have ? key.c_str() : suffix, p.ref_w, p.ref_h, ref_off * 100.0,
 		    p.calibrated ? "CALIBRATED" : "raw only",
 		    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
-		    p.calibrated ? (p.stream.left_is_sub ? "sub" : "main") : "sub (assumed)");
+		    eff_sub ? "sub" : "main", eff_sub ? p.sub_id : p.main_id, order_src);
 		if (p.front) {
 			g_pairs.insert(g_pairs.begin(), p);
 		} else if (prop_bool("debug.dxr.leia.scam_rear", true)) {
@@ -1377,11 +1524,10 @@ leia_stereo_camera_android_get_calibration(struct xrt_plugin_instance *inst,
 	const pair_desc &p = g_pairs[index];
 	leia_scam_stream_calib s = p.stream;
 	if (left_is_sub(p) != s.left_is_sub) {
-		// A forced swap: invert the pair so the halves and R/T still agree.
-		leia_scam_factory_calib f = p.factory;
-		for (int i = 0; i < 3; i++) {
-			f.T[i] = -f.T[i];
-		}
+		// A forced swap: read the block in the other convention, so the halves
+		// and R/T still agree exactly.
+		leia_scam_factory_calib f = oriented_factory(p);
+		leia_scam_factory_swap_convention(&f);
 		leia_scam_stream_calib alt;
 		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot,
 		                                    &alt);
@@ -1457,14 +1603,20 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		char cfg_id[16] = {0};
 		std::string forced = prop_str("debug.dxr.leia.scam_track_lens", "");
 		const bool have_cfg = leia_cnsdk_get_tracking_camera_id(cfg_id, sizeof(cfg_id));
+		// The cores' tracking camera when they know it for sure (CNSDK's own
+		// accessor, or the factory main lens matched in the device config;
+		// face_tracking_worker), else the factory main lens. Never the device
+		// config's cameras[0]: a phone-class config lists camera 0 first while
+		// its trackingCameras[0] is camera 1.
 		const char *want = !forced.empty() ? forced.c_str() : (have_cfg ? cfg_id : c->desc.main_id);
 		const bool use_sub = strcmp(want, c->desc.sub_id) == 0;
 		snprintf(c->trk_lens, sizeof(c->trk_lens), "%s", use_sub ? c->desc.sub_id : c->desc.main_id);
 		// SBS left eye = sub when lsub; the tracking eye is the one showing trk_lens.
 		c->trk_eye = (use_sub == c->lsub) ? 0 : 1;
-		SCAM_LOG_W("leia stereo camera (android): tracking lens %s (%s; device config names \"%s\")", c->trk_lens,
-		           !forced.empty() ? "forced" : (have_cfg && strcmp(want, c->trk_lens) == 0 ? "device config" : "factory main"),
-		           have_cfg ? cfg_id : "");
+		SCAM_LOG_W("leia stereo camera (android): tracking lens %s (%s)", c->trk_lens,
+		           !forced.empty() ? "forced by debug.dxr.leia.scam_track_lens"
+		           : have_cfg      ? "the cores' tracking camera"
+		                           : "factory main lens; no core knows the tracking camera yet");
 		leia_scam_lens tl{};
 		leia_scam_lens_for_stream(use_sub ? &c->desc.factory.sub : &c->desc.factory.main, c->desc.array_w,
 		                          c->desc.array_h, c->cap_w, c->cap_h, &tl);
@@ -1490,6 +1642,43 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		}
 		ei.mirrored = true;
 		ei.valid = c->desc.calibrated;
+		// The head tracker's configured intrinsics describe ITS capture (e.g.
+		// 640x480 at 90 fps), which on some modules is a narrower cut of the
+		// sensor than our 640x480: the cores prefer those values, re-expressed
+		// for our field, over the factory block's (leia_cnsdk_ext_tracking_feed).
+		// The field ratio comes from the HAL's sensor-mode table when it has one
+		// (leia_scam_track_fov_ratio), else 1 (Camera2: every stream sees the
+		// same field); debug.dxr.leia.scam_track_fov_ratio overrides it.
+		{
+			const uint32_t trk_fps = (uint32_t)std::max(1, atoi(prop_str("debug.dxr.leia.scam_track_fps", "90").c_str()));
+			std::vector<int32_t> tbl;
+			leia_scam_sensor_mode modes[8];
+			size_t nm = 0;
+			if (read_vendor_i32(c->trk_lens, "org.quic.camera2.sensormode.info.SensorModeTable", tbl)) {
+				nm = leia_scam_parse_sensor_modes(tbl.data(), tbl.size(), modes, 8);
+			}
+			double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->cap_w, c->cap_h,
+			                                     30, kTrackW, kTrackH, trk_fps);
+			const char *src = "sensor-mode table";
+			if (r > 0.0 && c->cap_w * 3 > c->cap_h * 4) {
+				r *= (double)c->cap_h * 4.0 / (3.0 * (double)c->cap_w); // our 4:3 cut of a wider capture
+			}
+			if (!(r > 0.0)) {
+				r = 1.0;
+				src = "no sensor-mode table: same field assumed";
+			}
+			const std::string ov = prop_str("debug.dxr.leia.scam_track_fov_ratio", "");
+			const double ovr = ov.empty() ? 0.0 : atof(ov.c_str());
+			if (ovr > 0.1 && ovr < 10.0) {
+				r = ovr;
+				src = "forced by debug.dxr.leia.scam_track_fov_ratio";
+			}
+			ei.fov_ratio = r;
+			snprintf(ei.lens, sizeof(ei.lens), "%s", c->trk_lens);
+			SCAM_LOG_W("leia stereo camera (android): tracking frame field = %.4f x the tracker's own %ux%u@%u "
+			           "capture (%s; %zu sensor mode(s); our %ux%u@30 cut to 640x480); block-derived fx %.1f",
+			           r, kTrackW, kTrackH, trk_fps, src, nm, c->cap_w, c->cap_h, tl.fx);
+		}
 		c->trk_intr = ei; // handed over by start_locked, around the actual open
 		c->trk_thread = std::thread(tracking_feeder, c);
 	}
@@ -1597,6 +1786,21 @@ leia_stereo_camera_android_close(struct xrt_plugin_stereo_camera *c)
 	           c->desc.front ? "front" : "rear", (unsigned long long)c->pairs.load(), (double)(t1 - t0) / 1e6,
 	           (double)(t2 - t1) / 1e6);
 	delete c;
+}
+
+extern "C" bool
+leia_stereo_camera_android_tracking_lens(char *out, size_t cap)
+{
+	if (out == nullptr || cap == 0) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lk(g_mu);
+	scan_locked();
+	if (g_pairs.empty() || !g_pairs[0].front) {
+		return false;
+	}
+	snprintf(out, cap, "%s", g_pairs[0].main_id);
+	return true;
 }
 
 #endif // XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA

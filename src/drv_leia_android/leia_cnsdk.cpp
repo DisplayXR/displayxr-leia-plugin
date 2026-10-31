@@ -9,6 +9,8 @@
  */
 
 #include "leia_cnsdk.h"
+#include "leia_stereo_camera_android.h"
+#include "leia_stereo_camera_android_calib.h"
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -64,6 +66,7 @@ leia_interlacer_vulkan_initialize_with_queue(struct leia_core *,
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
 #include <sys/system_properties.h>
+#include <dlfcn.h>
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 #include <android/trace.h>
 #endif
@@ -255,8 +258,17 @@ struct leia_cnsdk
 	float camera_center_y_m{0.0f};
 	float camera_center_z_m{0.0f};
 	bool camera_extrinsics_ok{false};
-	//! Device-config camera 0 `id` (the tracker's Camera2 id; may be empty).
+	//! The tracking camera's device-config `id` (its Camera2 id; may be empty).
 	char tracking_camera_id[16]{};
+	//! tracking_camera_id names the tracker's camera for sure: CNSDK's own
+	//! accessor, or the factory stereo main lens. False = the cameras[0] guess.
+	bool tracking_camera_known{false};
+	//! That camera's configured intrinsics (at its calibResolution, i.e. the
+	//! tracker's own capture), when tracking_camera_known and they are sane.
+	struct leia_camera_intrinsics tracking_cam_intr {};
+	bool tracking_cam_intr_ok{false};
+	//! Which intrinsics the in-app feed last pushed (1 config, 2 block): logged on change.
+	int ext_intr_src{0};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -982,13 +994,74 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 		// the display center; rotation_deg is logged (not applied) so a device
 		// whose camera is NOT display-plane-aligned shows up in triage instead
 		// of silently skewing the fallback face.
+		// The tracking camera: CNSDK tracks from the display config's
+		// trackingCameras[0] (or debug.cnsdk.cam). get_camera_data indexes
+		// cameras[], whose order differs on a phone-class config (cameras[0] =
+		// "0", trackingCameras[0] = "1"), so cameras[0] is NOT the tracker.
+		//  1. CNSDK >= 0.10.89 (CNSDK PR #763) answers it directly:
+		//     leia_device_config_get_tracking_camera_data. The pinned headers
+		//     predate it, so it is looked up at run time; an older loader has no
+		//     such symbol, a newer loader over an older impl returns false.
+		//  2. Else the cameras[] entry of the factory stereo "main" lens (WARN).
+		//  3. Else cameras[0], as before (WARN).
 		struct leia_camera cam = {};
-		if (leia_device_config_get_camera_data(cfg, &cam, 0)) {
+		bool cam_ok = false;
+		using get_tracking_camera_fn = leia_bool (*)(struct leia_device_config *, struct leia_camera *);
+		// The plug-in is dlopen'ed RTLD_LOCAL, so ask the loader shim it links
+		// (already mapped: NOLOAD) rather than the global scope.
+		static const auto get_tracking_camera = []() -> get_tracking_camera_fn {
+			const char *sym = "leia_device_config_get_tracking_camera_data";
+			void *h = dlopen("libleiaCore-loader.so", RTLD_NOW | RTLD_NOLOAD);
+			void *fn = h != nullptr ? dlsym(h, sym) : nullptr;
+			if (h != nullptr) {
+				dlclose(h); // drops the NOLOAD reference only; our DT_NEEDED keeps it mapped
+			}
+			return reinterpret_cast<get_tracking_camera_fn>(fn != nullptr ? fn : dlsym(RTLD_DEFAULT, sym));
+		}();
+		if (get_tracking_camera != nullptr && get_tracking_camera(cfg, &cam)) {
+			cam_ok = true;
+			cnsdk->tracking_camera_known = true;
+			U_LOG_W("CNSDK tracking camera: id \"%.15s\" (leia_device_config_get_tracking_camera_data)", cam.id);
+		} else {
+			char want_id[16] = {0};
+			bool have_want = false;
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
+			have_want = leia_stereo_camera_android_tracking_lens(want_id, sizeof(want_id));
+#endif
+			int cam_index = -1;
+			for (int i = 0; i < 8; i++) {
+				struct leia_camera ci = {};
+				if (!leia_device_config_get_camera_data(cfg, &ci, i)) {
+					break;
+				}
+				if (i == 0 || (have_want && strncmp(ci.id, want_id, sizeof(ci.id)) == 0)) {
+					cam = ci;
+					cam_index = i;
+				}
+				if (have_want && strncmp(ci.id, want_id, sizeof(ci.id)) == 0) {
+					break;
+				}
+			}
+			cam_ok = cam_index >= 0;
+			if (cam_ok) {
+				const bool matched = have_want && strncmp(cam.id, want_id, sizeof(cam.id)) == 0;
+				cnsdk->tracking_camera_known = matched;
+				U_LOG_W("CNSDK tracking camera: device-config cameras[%d] id \"%.15s\": %s%s (CNSDK exposes no "
+				        "tracking-camera accessor before 0.10.89; verify against the config's trackingCameras[0])",
+				        cam_index, cam.id, matched ? "the factory stereo main lens " : "cameras[0], factory main lens ",
+				        have_want ? want_id : "unknown");
+			}
+		}
+		if (cam_ok) {
 			cnsdk->camera_center_x_m = cam.translation_mm.x / 1000.0f;
 			cnsdk->camera_center_y_m = cam.translation_mm.y / 1000.0f;
 			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
 			snprintf(cnsdk->tracking_camera_id, sizeof(cnsdk->tracking_camera_id), "%.15s", cam.id);
 			cnsdk->camera_extrinsics_ok = true;
+			cnsdk->tracking_cam_intr = cam.intrinsics;
+			cnsdk->tracking_cam_intr_ok = cnsdk->tracking_camera_known && cam.intrinsics.width > 0 &&
+			                              cam.intrinsics.height > 0 && cam.intrinsics.fx > 1.0f &&
+			                              cam.intrinsics.fy > 1.0f;
 			U_LOG_W("CNSDK camera extrinsics: translation=(%.1f,%.1f,%.1f) mm "
 			        "rotation=(%.1f,%.1f,%.1f) deg sensorOri=%d frontFacing=%d",
 			        cam.translation_mm.x, cam.translation_mm.y, cam.translation_mm.z,
@@ -2148,6 +2221,70 @@ leia_cnsdk_ext_tracking_end(void)
 	}
 }
 
+/*!
+ * Under g_ext_mu + c->ext_mu: the intrinsics @p c's in-app tracker gets for
+ * the fed frame. Preferred: the core's tracking camera's CONFIGURED
+ * intrinsics, the ones the vendor tracking service is calibrated with, at the
+ * tracker's own capture, re-expressed for our frame's field (intr.fov_ratio,
+ * leia_scam_track_intrinsics_from_config); only when that camera is the lens
+ * we feed. Else the factory block's values from the stereo camera source.
+ * Returns true when the config path was taken. Logs a change of source.
+ */
+static bool
+ext_intrinsics_for_core(struct leia_cnsdk *c,
+                        const struct leia_cnsdk_ext_intrinsics &intr,
+                        int32_t width,
+                        int32_t height,
+                        struct leia_camera_intrinsics *ci)
+{
+	ci->width = intr.width;
+	ci->height = intr.height;
+	ci->fx = intr.fx;
+	ci->fy = intr.fy;
+	ci->ppx = intr.cx;
+	ci->ppy = intr.cy;
+	for (int i = 0; i < 8; i++) {
+		ci->distortionCoeffs[i] = intr.d[i];
+	}
+	ci->isMirrored = intr.mirrored ? 1 : 0;
+	double k[4];
+	const struct leia_camera_intrinsics &t = c->tracking_cam_intr;
+	const bool cfg = intr.fov_ratio > 0.0 && c->tracking_cam_intr_ok &&
+	                 strncmp(c->tracking_camera_id, intr.lens, sizeof(c->tracking_camera_id)) == 0 &&
+	                 leia_scam_track_intrinsics_from_config(t.fx, t.fy, t.ppx, t.ppy, (uint32_t)t.width,
+	                                                        (uint32_t)t.height, intr.fov_ratio, (uint32_t)width,
+	                                                        (uint32_t)height, k);
+	if (cfg) {
+		ci->width = width;
+		ci->height = height;
+		ci->fx = (float)k[0];
+		ci->fy = (float)k[1];
+		ci->ppx = (float)k[2];
+		ci->ppy = (float)k[3];
+		for (int i = 0; i < 8; i++) {
+			ci->distortionCoeffs[i] = t.distortionCoeffs[i];
+		}
+	}
+	const int src = cfg ? 1 : 2;
+	if (src != c->ext_intr_src) {
+		c->ext_intr_src = src;
+		if (cfg) {
+			U_LOG_W("leia ext tracking: core %p in-app intrinsics from the device config's camera \"%.15s\" "
+			        "(fx %.1f fy %.1f pp %.1f,%.1f at %dx%d) / field ratio %.4f -> fx %.1f fy %.1f pp %.1f,%.1f at "
+			        "%dx%d (factory block said fx %.1f)",
+			        (void *)c, c->tracking_camera_id, t.fx, t.fy, t.ppx, t.ppy, t.width, t.height, intr.fov_ratio,
+			        ci->fx, ci->fy, ci->ppx, ci->ppy, width, height, intr.fx);
+		} else {
+			U_LOG_W("leia ext tracking: core %p in-app intrinsics from the FACTORY BLOCK (fx %.1f fy %.1f pp "
+			        "%.1f,%.1f): no configured intrinsics for the fed lens \"%.15s\" (core's tracking camera "
+			        "\"%.15s\", known=%d, intrinsics=%d, field ratio %.4f)",
+			        (void *)c, intr.fx, intr.fy, intr.cx, intr.cy, intr.lens, c->tracking_camera_id,
+			        (int)c->tracking_camera_known, (int)c->tracking_cam_intr_ok, intr.fov_ratio);
+		}
+	}
+	return cfg;
+}
+
 extern "C" void
 leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, int64_t ts_boottime_ns)
 {
@@ -2160,6 +2297,7 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 	{
 		struct leia_shared_camera_sink *sink;
 		bool push_intr;
+		struct leia_camera_intrinsics ci;
 	};
 	std::vector<fed> sinks;
 	struct leia_cnsdk_ext_intrinsics intr;
@@ -2172,21 +2310,12 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 				leia_shared_camera_sink_retain(c->ext_sink);
 				// Intrinsics first, then every 60 frames: the sink only accepts
 				// them while active, so a single early push can be lost.
-				sinks.push_back({c->ext_sink, intr.valid && (c->ext_frames++ % 60u) == 0});
+				struct leia_camera_intrinsics ci = {};
+				const bool cfg = ext_intrinsics_for_core(c, intr, width, height, &ci);
+				sinks.push_back({c->ext_sink, (cfg || intr.valid) && (c->ext_frames++ % 60u) == 0, ci});
 			}
 		}
 	}
-	struct leia_camera_intrinsics ci = {};
-	ci.width = intr.width;
-	ci.height = intr.height;
-	ci.fx = intr.fx;
-	ci.fy = intr.fy;
-	ci.ppx = intr.cx;
-	ci.ppy = intr.cy;
-	for (int i = 0; i < 8; i++) {
-		ci.distortionCoeffs[i] = intr.d[i];
-	}
-	ci.isMirrored = intr.mirrored ? 1 : 0;
 	struct leia_image_desc d = {};
 	d.data = y;
 	d.width = width;
@@ -2197,7 +2326,7 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 	for (const fed &f : sinks) {
 		if (leia_shared_camera_sink_is_active(f.sink)) {
 			if (f.push_intr) {
-				leia_shared_camera_sink_on_intrinsics_change(f.sink, &ci);
+				leia_shared_camera_sink_on_intrinsics_change(f.sink, &f.ci);
 			}
 			leia_shared_camera_sink_on_image(f.sink, &d, ts);
 		}
@@ -2213,7 +2342,8 @@ leia_cnsdk_get_tracking_camera_id(char *out, size_t cap)
 	}
 	std::lock_guard<std::mutex> lk(g_ext_mu);
 	for (struct leia_cnsdk *c : g_ext_cores) {
-		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_id[0] != '\0') {
+		if (c->display_metrics_cached.load(std::memory_order_acquire) && c->tracking_camera_known &&
+		    c->tracking_camera_id[0] != '\0') {
 			snprintf(out, cap, "%s", c->tracking_camera_id);
 			return true;
 		}

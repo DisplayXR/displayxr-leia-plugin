@@ -123,6 +123,132 @@ bool
 leia_scam_factory_is_vertical(const struct leia_scam_factory_calib *f);
 
 /*!
+ * Re-read the block's extrinsics in the opposite convention: R <- R^T,
+ * T <- -R^T T. A block written as x_main = R * x_sub + T (the "sub" lens as
+ * stereoCalibrate's first camera) becomes the x_sub = R * x_main + T this file
+ * assumes. Applying it twice is the identity. Intrinsics are untouched.
+ */
+void
+leia_scam_factory_swap_convention(struct leia_scam_factory_calib *f);
+
+/*!
+ * Which side of the main lens the sub lens sits on along the PUBLISHED x axis,
+ * from the HAL's own lens poses (ACAMERA_LENS_POSE_TRANSLATION of each
+ * physical lens, @p main_t / @p sub_t). Those are in the Android sensor
+ * coordinate axes: x right, y up, z out of the screen, the device in its
+ * natural orientation, as the user sees it. Only the difference of the two is
+ * used, so either pose reference (primary camera or gyroscope) works.
+ *
+ * The device-frame offset d = sub - main is taken to the upright camera image
+ * (x' = d.x for a rear lens, -d.x for a front one, which sees the user from
+ * the other side; y' = -d.y because image y points down), then by
+ * (@p rot_cw - @p sensor_orientation) clockwise: the published frame is the
+ * sensor image turned by @p rot_cw, and the sensor image is the upright image
+ * turned back by @p sensor_orientation.
+ *
+ * Returns +1 when the sub lens is at +x (main is then the camera's own left,
+ * the SBS left eye), -1 when it is at -x, and 0 when the poses decide nothing:
+ * a sensor orientation that is not a multiple of 90, a baseline outside
+ * 1..200 mm (both lenses at the origin is the usual "not published"), or an
+ * offset less than ~45 degrees from the published x axis.
+ */
+int
+leia_scam_pose_sub_side(const double main_t[3],
+                        const double sub_t[3],
+                        bool front,
+                        int32_t sensor_orientation,
+                        uint32_t rot_cw);
+
+//! One sensor readout mode: its output size and its frame rate.
+struct leia_scam_sensor_mode
+{
+	uint32_t w, h, fps;
+};
+
+/*!
+ * Parse a vendor sensor-mode table as int32 [count, fields, w, h, fps, ...]
+ * (Qualcomm HALs publish one: "org.quic.camera2.sensormode.info.SensorModeTable",
+ * e.g. [2, 3, 4192, 3144, 30, 2288, 1284, 90]). Fields beyond the third are
+ * skipped. Returns the number of modes written (at most @p cap), 0 when the
+ * table is malformed.
+ */
+size_t
+leia_scam_parse_sensor_modes(const int32_t *v, size_t n, struct leia_scam_sensor_mode *out, size_t cap);
+
+/*!
+ * The width, in active-array pixels, of the field a @p sw x @p sh stream sees
+ * when the HAL serves it at @p fps: the largest mode (by area) that runs at
+ * @p fps or faster (else the fastest mode) covers the array at the largest
+ * integer bin k with k * mode <= array (a 2288x1284 mode of a 4576x3168 array
+ * is 2x2-binned 4576x2568), and the stream is the largest centred region of
+ * its aspect within that. 0 when there are no modes.
+ */
+double
+leia_scam_stream_field_width(uint32_t array_w,
+                             uint32_t array_h,
+                             const struct leia_scam_sensor_mode *modes,
+                             size_t n,
+                             uint32_t fps,
+                             uint32_t sw,
+                             uint32_t sh);
+
+/*!
+ * How much wider our tracking frame's field is than the head tracker's own
+ * capture: field(our stream at @p our_fps) / field(@p trk_w x @p trk_h at
+ * @p trk_fps). 0 when the modes do not tell (no table). On a phone-class
+ * front lens, our 1280x960@30 (mode 4192x3144) against the tracker's
+ * 640x480@90 (mode 2288x1284 = 4576x2568 binned, 4:3 cut 3424 wide) gives
+ * 4192 / 3424 = 1.224.
+ */
+double
+leia_scam_track_fov_ratio(uint32_t array_w,
+                          uint32_t array_h,
+                          const struct leia_scam_sensor_mode *modes,
+                          size_t n,
+                          uint32_t our_w,
+                          uint32_t our_h,
+                          uint32_t our_fps,
+                          uint32_t trk_w,
+                          uint32_t trk_h,
+                          uint32_t trk_fps);
+
+/*!
+ * The tracker's configured intrinsics (@p fx @p fy @p ppx @p ppy at
+ * @p cfg_w x @p cfg_h, its own capture) re-expressed for our @p w x @p h
+ * frame whose field is @p ratio times wider, both centred on the same
+ * optical axis: f' = f * (w / cfg_w) / ratio, pp' = centre + (pp - cfg
+ * centre) * (w / cfg_w) / ratio. Distortion is in normalised coordinates and
+ * carries over unchanged. Returns false on a degenerate input.
+ */
+bool
+leia_scam_track_intrinsics_from_config(double fx,
+                                       double fy,
+                                       double ppx,
+                                       double ppy,
+                                       uint32_t cfg_w,
+                                       uint32_t cfg_h,
+                                       double ratio,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       double out[4]);
+
+/*!
+ * Make the block agree with the HAL's lens poses: when
+ * leia_scam_pose_sub_side() decides and the block, read in this file's
+ * convention and turned by @p rot_cw, puts the sub lens on the other side,
+ * swap the block's convention (leia_scam_factory_swap_convention) in place.
+ * Returns 1 when it swapped, 0 when the poses agree, -1 when the poses decide
+ * nothing (the block is then left as it is).
+ */
+int
+leia_scam_factory_orient_by_pose(struct leia_scam_factory_calib *f,
+                                 const double main_t[3],
+                                 const double sub_t[3],
+                                 bool front,
+                                 int32_t sensor_orientation,
+                                 uint32_t rot_cw);
+
+/*!
  * The size the factory block's intrinsics are expressed at. Usually the
  * active array; on some modules a listed output size instead (a phone-class
  * module's block centres on its largest 4:3 output 4192x3144, not on its
