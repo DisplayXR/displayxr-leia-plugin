@@ -59,6 +59,7 @@
 #include <jni.h>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
 
@@ -447,6 +448,99 @@ query_user_calib(const char *logical_id, std::string &json, std::string &detail)
 	return res;
 }
 
+/*!
+ * The host process's own files directory (Context.getFilesDir()), where the
+ * last accepted user calibration is kept. Resolved once; empty when unknown.
+ */
+const std::string &
+files_dir()
+{
+	static std::string dir;
+	static bool tried = false;
+	if (tried) {
+		return dir;
+	}
+	tried = true;
+	jni_env j;
+	if (!j.acquire()) {
+		return dir;
+	}
+	JNIEnv *env = j.env;
+	env->PushLocalFrame(16);
+	jclass ctx_cls = env->FindClass("android/content/Context");
+	jclass file_cls = env->FindClass("java/io/File");
+	jmethodID get_files = ctx_cls != nullptr ? env->GetMethodID(ctx_cls, "getFilesDir", "()Ljava/io/File;") : nullptr;
+	jmethodID get_path =
+	    file_cls != nullptr ? env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;") : nullptr;
+	jobject f = j.ok() && get_files != nullptr ? env->CallObjectMethod(j.ctx, get_files) : nullptr;
+	jstring s = j.ok() && f != nullptr && get_path != nullptr ? (jstring)env->CallObjectMethod(f, get_path) : nullptr;
+	if (j.ok() && s != nullptr) {
+		const char *c = env->GetStringUTFChars(s, nullptr);
+		if (c != nullptr) {
+			dir = c;
+			env->ReleaseStringUTFChars(s, c);
+		}
+	}
+	j.ok();
+	env->PopLocalFrame(nullptr);
+	return dir;
+}
+
+//! Cache file of one pair, keyed by the pair and the factory block's SHA-256.
+std::string
+user_calib_cache_path(const char *logical_id, const uint8_t block_sha256[32])
+{
+	const std::string &dir = files_dir();
+	if (dir.empty()) {
+		return std::string();
+	}
+	char hex[65];
+	leia_scam_sha256_hex(block_sha256, hex);
+	hex[16] = '\0';
+	return dir + "/leia_scam_user_calib_" + logical_id + "_" + hex + ".json";
+}
+
+bool
+read_small_file(const std::string &path, std::string &out, int64_t *out_mtime_s)
+{
+	FILE *f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+	if (f == nullptr) {
+		return false;
+	}
+	struct stat st;
+	if (fstat(fileno(f), &st) != 0 || st.st_size <= 0 || st.st_size > 64 * 1024) {
+		fclose(f);
+		return false;
+	}
+	out.resize((size_t)st.st_size);
+	const bool ok = fread(&out[0], 1, out.size(), f) == out.size();
+	fclose(f);
+	if (out_mtime_s != nullptr) {
+		*out_mtime_s = (int64_t)st.st_mtime;
+	}
+	return ok;
+}
+
+//! Write via a temporary file and rename, so a reader never sees half a record.
+bool
+write_small_file(const std::string &path, const std::string &data)
+{
+	if (path.empty()) {
+		return false;
+	}
+	const std::string tmp = path + ".tmp";
+	FILE *f = fopen(tmp.c_str(), "wb");
+	if (f == nullptr) {
+		return false;
+	}
+	const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+	if (fclose(f) != 0 || !ok || rename(tmp.c_str(), path.c_str()) != 0) {
+		remove(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+
 /*
  *
  * Discovery.
@@ -494,6 +588,12 @@ struct pair_desc
 	double factory_R[3][3]{};
 	//! Outcome of the last user-calibration read, logged only when it changes.
 	std::string user_calib_state;
+	//! Provider back-off: after an unreachable provider, no query before this
+	//! (CLOCK_MONOTONIC). Each blocked query costs the OEM policy log lines.
+	int64_t user_calib_next_query_ns{0};
+	bool user_calib_disabled{false};
+	//! The record last written to the cache file (skip rewriting it).
+	std::string user_calib_cached;
 };
 
 std::mutex g_mu;
@@ -502,6 +602,7 @@ std::vector<pair_desc> g_pairs; //!< index 0 = front when present
 ACameraManager *g_mgr = nullptr;
 int64_t g_user_calib_read_ns = 0; //!< CLOCK_MONOTONIC of the last user-calibration read
 constexpr int64_t kUserCalibRereadNs = 1000 * kNsPerMs;
+constexpr int64_t kUserCalibUnreachableRetryNs = 30000 * kNsPerMs;
 
 /*!
  * Put the calibration app's rotation for @p p into p.factory.R when a valid
@@ -509,6 +610,16 @@ constexpr int64_t kUserCalibRereadNs = 1000 * kNsPerMs;
  * calibration. The record replaces R ONLY: intrinsics, T and the reference
  * size stay the plug-in's. R is in the sensors' native frame, so it goes in
  * before the eye turn (leia_scam_stream_calib_from_factory turns last).
+ *
+ * The provider is authoritative when it answers. When it does not (the
+ * calibration app's process is not running and an OEM auto-start policy
+ * refuses to start it for a provider query: measured on the phone-class
+ * device, AutoLaunchManagerService "Provider RelatedStart BlockResult = true"
+ * for the runtime's own uid), the last accepted record is used from a copy in
+ * this process's files directory, keyed by the pair and the block's SHA-256,
+ * through the same gate. After an unreachable answer the provider is not
+ * asked again for kUserCalibUnreachableRetryNs.
+ *
  * One WARN whenever the outcome changes.
  */
 void
@@ -517,62 +628,107 @@ apply_user_calib_locked(pair_desc &p)
 	if (!p.have_block || p.ref_w == 0) {
 		return; // no factory block: nothing a rotation could complete
 	}
+	const bool disabled = !prop_bool("debug.dxr.leia.scam_user_calib", true);
+	const int64_t now = clock_ns(CLOCK_MONOTONIC);
+	if (!disabled && !p.user_calib_disabled && now < p.user_calib_next_query_ns) {
+		return; // backing off an unreachable provider: keep the current source
+	}
+	p.user_calib_disabled = disabled;
 	memcpy(p.factory.R, p.factory_R, sizeof(p.factory.R));
 	std::string state;
-	char buf[320];
-	if (!prop_bool("debug.dxr.leia.scam_user_calib", true)) {
+	std::string age;
+	char buf[400];
+	if (disabled) {
 		state = "source=factory (user calibration disabled by debug.dxr.leia.scam_user_calib=0)";
 	} else {
 		std::string json, detail;
 		const user_calib_query q = query_user_calib(p.logical_id, json, detail);
+		std::string why; // the provider's answer, when it gave no record
+		leia_scam_user_calib_provider prov = LEIA_SCAM_PROVIDER_UNAVAILABLE;
 		switch (q) {
-		case user_calib_query::NO_ROW: state = "source=factory (no user calibration saved for this pair)"; break;
+		case user_calib_query::ROW: prov = LEIA_SCAM_PROVIDER_RECORD; break;
+		case user_calib_query::NO_ROW:
+			prov = LEIA_SCAM_PROVIDER_NO_RECORD;
+			why = "no user calibration saved for this pair";
+			break;
 		case user_calib_query::NOT_INSTALLED:
-			state = std::string("source=factory (calibration app not installed or not visible: content://") +
-			        kUserCalibAuthority + " does not resolve)";
+			prov = LEIA_SCAM_PROVIDER_NO_RECORD;
+			why = std::string("calibration app not installed or not visible: content://") + kUserCalibAuthority +
+			      " does not resolve";
 			break;
 		case user_calib_query::UNREACHABLE:
-			// Measured on the phone-class device: the OEM's auto-launch policy
-			// (AutoLaunchManagerService "SelfStart BlockResult = true") refuses
-			// to start a stopped app's process for a provider query, and query()
-			// returns null.
-			state = std::string("source=factory (content://") + kUserCalibAuthority +
-			        " unreachable: query returned null; the calibration app's process is not running and an "
-			        "OEM self-start policy may block starting it for a provider query)";
+			why = std::string("content://") + kUserCalibAuthority +
+			      " unreachable: query returned null; the calibration app's process is not running and an OEM "
+			      "self-start policy may block starting it for a provider query; next try in 30 s";
+			p.user_calib_next_query_ns = now + kUserCalibUnreachableRetryNs;
 			break;
-		case user_calib_query::NO_JNI: state = "source=factory (no JNI context to query the calibration app)"; break;
-		case user_calib_query::FAILED:
-			state = "source=factory (user calibration query failed: " + (detail.empty() ? "?" : detail) + ")";
-			break;
-		case user_calib_query::ROW: {
-			leia_scam_user_calib u;
-			if (!leia_scam_user_calib_parse(json.data(), json.size(), &u)) {
-				state = "source=factory (user calibration record does not parse)";
-				break;
+		case user_calib_query::NO_JNI: why = "no JNI context to query the calibration app"; break;
+		case user_calib_query::FAILED: why = "user calibration query failed: " + (detail.empty() ? "?" : detail); break;
+		}
+		const std::string cache_path = user_calib_cache_path(p.logical_id, p.block_sha256);
+		std::string cached;
+		int64_t cached_mtime = 0;
+		const bool have_cache = prov == LEIA_SCAM_PROVIDER_UNAVAILABLE &&
+		                        read_small_file(cache_path, cached, &cached_mtime);
+		leia_scam_user_calib_choice c;
+		leia_scam_user_calib_choose(prov, json.data(), json.size(), have_cache ? cached.data() : nullptr,
+		                            have_cache ? cached.size() : 0, p.logical_id, p.main_id, p.sub_id,
+		                            p.block_sha256, p.factory_R, &c);
+		if (c.cache_write && json != p.user_calib_cached) {
+			if (write_small_file(cache_path, json)) {
+				p.user_calib_cached = json;
+			} else {
+				SCAM_LOG_I("leia stereo camera (android): could not cache the user calibration at %s",
+				           cache_path.empty() ? "(no files dir)" : cache_path.c_str());
 			}
-			double delta = 0.0;
-			const leia_scam_user_calib_verdict v = leia_scam_user_calib_check(
-			    &u, p.logical_id, p.main_id, p.sub_id, p.block_sha256, p.factory_R, &delta);
-			if (v != LEIA_SCAM_USER_CALIB_OK) {
-				snprintf(buf, sizeof(buf), "source=factory (user calibration of %s ignored: %s)", u.timestamp,
-				         leia_scam_user_calib_verdict_str(v));
-				state = buf;
-				break;
-			}
-			memcpy(p.factory.R, u.R, sizeof(p.factory.R));
+		}
+		if (c.cache_drop && !cache_path.empty() && remove(cache_path.c_str()) == 0) {
+			p.user_calib_cached.clear();
+		}
+		const char *ts = c.rec.timestamp[0] != '\0' ? c.rec.timestamp : "?";
+		const char *method = c.rec.method[0] != '\0' ? c.rec.method : "?";
+		switch (c.source) {
+		case LEIA_SCAM_USER_CALIB_SRC_PROVIDER:
+			memcpy(p.factory.R, c.rec.R, sizeof(p.factory.R));
 			snprintf(buf, sizeof(buf),
-			         "source=user-calibration (saved %s, method %s, R differs from the factory R by %.3f deg)",
-			         u.timestamp[0] != '\0' ? u.timestamp : "?", u.method[0] != '\0' ? u.method : "?", delta);
+			         "source=user-calibration (saved %s, method %s, R differs from the factory R by %.3f deg)", ts,
+			         method, c.delta_deg);
 			state = buf;
+			break;
+		case LEIA_SCAM_USER_CALIB_SRC_CACHE: {
+			memcpy(p.factory.R, c.rec.R, sizeof(p.factory.R));
+			snprintf(buf, sizeof(buf),
+			         "source=user-calibration, cached copy (saved %s, method %s, R differs from the factory R by "
+			         "%.3f deg; provider: %s)",
+			         ts, method, c.delta_deg, why.c_str());
+			state = buf;
+			const int64_t age_s = (int64_t)time(nullptr) - cached_mtime;
+			snprintf(buf, sizeof(buf), "; cache written %lld s ago", (long long)(age_s > 0 ? age_s : 0));
+			age = buf;
 		} break;
+		case LEIA_SCAM_USER_CALIB_SRC_FACTORY:
+			if (c.considered) {
+				const char *what = prov == LEIA_SCAM_PROVIDER_RECORD ? "user calibration" : "cached user calibration";
+				if (c.parse_failed) {
+					snprintf(buf, sizeof(buf), "source=factory (%s record does not parse)", what);
+				} else {
+					snprintf(buf, sizeof(buf), "source=factory (%s of %s ignored: %s%s%s)", what, ts,
+					         leia_scam_user_calib_verdict_str(c.verdict), why.empty() ? "" : "; provider: ",
+					         why.c_str());
+				}
+				state = buf;
+			} else {
+				state = "source=factory (" + why + ")";
+			}
+			break;
 		}
 	}
 	p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w,
 	                                                   p.crop_h, p.rot, &p.stream);
 	if (state != p.user_calib_state) {
 		p.user_calib_state = state;
-		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) rotation %s", p.front ? "front" : "rear",
-		           p.logical_id, state.c_str());
+		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) rotation %s%s", p.front ? "front" : "rear",
+		           p.logical_id, state.c_str(), age.c_str());
 	}
 }
 
