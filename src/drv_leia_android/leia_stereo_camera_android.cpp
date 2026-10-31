@@ -38,7 +38,12 @@
  * - Watchdog: a pair that stops for kStallNs is treated like a device error
  *   (the HAL's silent-stall recovery reports nothing): the session is torn
  *   down and reopened with back-off, wait_frame reports SUSPENDED meanwhile and
- *   ERROR when the device stays gone.
+ *   ERROR when the device stays gone. Losing the device right after opening
+ *   it twice in a row is also terminal: that is a HAL failing the open, and
+ *   reopening into it only crashes it again.
+ * - The pair is opened only once the camera service reports both lenses free,
+ *   after tracking has been handed in-app (so the tracking service has
+ *   released its lens), never by evicting a client that still streams one.
  *
  * @ingroup drv_leia_android
  */
@@ -99,6 +104,9 @@ constexpr int64_t kReopenFirstNs = 500 * kNsPerMs;  //!< first reopen delay
 constexpr int64_t kReopenMaxNs = 4000 * kNsPerMs;   //!< back-off cap
 constexpr int64_t kReopenFastMaxNs = 1000 * kNsPerMs; //!< back-off cap for the first 10 s down
 constexpr int64_t kGiveUpNs = 15000 * kNsPerMs;     //!< device gone this long -> ERROR
+constexpr int64_t kEarlyFailNs = 3000 * kNsPerMs;   //!< a loss this soon after open counts as an open failure
+constexpr int kEarlyFailMax = 2;                    //!< consecutive open failures -> ERROR, no more reopens
+constexpr int64_t kLensFreeNs = 3000 * kNsPerMs;    //!< how long the tracking service gets to release its lens
 constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;  //!< measured skew is 0; be lenient
 constexpr uint32_t kTrackW = 640, kTrackH = 480;    //!< the in-app detector accepts only this
 constexpr int kEyeMaxImages = 4;
@@ -806,13 +814,79 @@ apply_user_calib_locked(pair_desc &p)
 	}
 }
 
+/*
+ * Which camera ids the camera service reports in use, from its own
+ * availability callbacks. Opening the logical pair while another client (the
+ * tracking service) still streams one of its lenses makes the camera service
+ * evict that client inside the vendor HAL, and on a phone-class device that
+ * aborted the camera provider (SIGABRT in the CHI multicamera notify path)
+ * every time, taking the tracking camera down with it. So the pair is opened
+ * only once both lenses are free.
+ */
+std::mutex g_avail_mu;
+std::condition_variable g_avail_cv;
+std::vector<std::string> g_in_use;
+
+void
+avail_on(void *, const char *id)
+{
+	std::lock_guard<std::mutex> lk(g_avail_mu);
+	g_in_use.erase(std::remove(g_in_use.begin(), g_in_use.end(), std::string(id)), g_in_use.end());
+	g_avail_cv.notify_all();
+}
+
+void
+avail_off(void *, const char *id)
+{
+	std::lock_guard<std::mutex> lk(g_avail_mu);
+	if (std::find(g_in_use.begin(), g_in_use.end(), std::string(id)) == g_in_use.end()) {
+		g_in_use.emplace_back(id);
+	}
+	g_avail_cv.notify_all();
+}
+
+ACameraManager_AvailabilityCallbacks g_avail_cb{nullptr, avail_on, avail_off};
+
 ACameraManager *
 mgr()
 {
 	if (g_mgr == nullptr) {
 		g_mgr = ACameraManager_create();
+		// Registered once, long before any open (enumerate scans first), so the
+		// initial status of every camera has arrived by the time it is needed.
+		if (g_mgr != nullptr && ACameraManager_registerAvailabilityCallback(g_mgr, &g_avail_cb) != ACAMERA_OK) {
+			SCAM_LOG_W("leia stereo camera (android): no camera availability callback; lenses are not checked "
+			           "before an open");
+		}
 	}
 	return g_mgr;
+}
+
+/*!
+ * Wait until neither lens of @p d is in use, or @p timeout_ns, or @p abort.
+ * Returns the id still in use ("" = both free).
+ */
+std::string
+wait_lenses_free(const pair_desc &d, int64_t timeout_ns, const std::atomic<bool> &abort)
+{
+	auto busy = [&]() -> std::string {
+		for (const char *id : {d.main_id, d.sub_id}) {
+			if (std::find(g_in_use.begin(), g_in_use.end(), std::string(id)) != g_in_use.end()) {
+				return id;
+			}
+		}
+		return "";
+	};
+	const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + timeout_ns;
+	std::unique_lock<std::mutex> lk(g_avail_mu);
+	for (;;) {
+		std::string b = busy();
+		const int64_t now = clock_ns(CLOCK_MONOTONIC);
+		if (b.empty() || abort.load() || now >= deadline) {
+			return b;
+		}
+		g_avail_cv.wait_for(lk, std::chrono::nanoseconds(std::min<int64_t>(deadline - now, 100 * kNsPerMs)));
+	}
 }
 
 bool
@@ -1234,6 +1308,11 @@ struct xrt_plugin_stereo_camera
 	int64_t next_reopen_ns{0};
 	int64_t backoff_ns{0};
 	int reopens{0};
+	//! Consecutive opens the device was lost within kEarlyFailNs of (a HAL that
+	//! aborts on the open looks exactly like this).
+	int early_fails{0};
+	//! Terminal: wait_frame reports ERROR and nothing reopens.
+	bool gave_up{false};
 	int64_t stats_ns{0};
 	uint64_t stats_pairs{0};
 };
@@ -1920,12 +1999,30 @@ start_locked(xrt_plugin_stereo_camera *c)
 		return false;
 	}
 
-	// Into in-app tracking BEFORE the camera service evicts the tracking
-	// service's camera; back out if the open does not get through.
+	// Into in-app tracking first, so the tracking service lets go of its lens;
+	// back out if the open does not get through.
 	handover_locked(c, true);
 	if (c->track && g_fov_state.load() == 0 && prop_bool("debug.dxr.leia.scam_fov_dump", false)) {
 		fov_dump_native(c->trk_lens);
 		g_fov_state.store(1);
+	}
+	// Then wait for the camera service to report both lenses free: never open
+	// the pair over a lens another client still streams (see g_in_use).
+	// debug.dxr.leia.scam_wait_free=0 opens at once (the old eviction order),
+	// for a vendor repro only.
+	if (prop_bool("debug.dxr.leia.scam_wait_free", true)) {
+		const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+		const std::string busy = wait_lenses_free(c->desc, kLensFreeNs, c->closing);
+		if (!busy.empty()) {
+			SCAM_LOG_W("leia stereo camera (android): lens %s still in use %lld ms after the hand-over (the tracking "
+			           "service or another app holds it); not opening the pair over it",
+			           busy.c_str(), (long long)((clock_ns(CLOCK_MONOTONIC) - t0) / kNsPerMs));
+			teardown_locked(c);
+			handover_locked(c, false);
+			return false;
+		}
+		SCAM_LOG_W("leia stereo camera (android): lenses %s + %s free after %.1f ms", c->desc.main_id,
+		           c->desc.sub_id, (double)(clock_ns(CLOCK_MONOTONIC) - t0) / 1e6);
 	}
 	c->dev_cb = {c, dev_disconnected, dev_error};
 	camera_status_t st = ACameraManager_openCamera(mgr(), c->desc.logical_id, &c->dev_cb, &c->dev);
@@ -1985,7 +2082,10 @@ start_locked(xrt_plugin_stereo_camera *c)
 bool
 supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 {
-	*out_gave_up = false;
+	*out_gave_up = c->gave_up;
+	if (c->gave_up) {
+		return false;
+	}
 	const bool streaming = c->session != nullptr && !c->device_failed.load();
 	const int64_t last = c->last_pair_ns.load();
 	const bool stalled = streaming && ((last != 0 && now - last > kStallNs) ||
@@ -1993,6 +2093,9 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 	if (streaming && !stalled) {
 		c->down_since_ns = 0;
 		c->backoff_ns = 0;
+		if (c->early_fails != 0 && now - c->opened_ns >= kEarlyFailNs) {
+			c->early_fails = 0; // this open held
+		}
 		if (now - c->stats_ns >= 10000 * kNsPerMs) {
 			const uint64_t p = c->pairs.load();
 			const double fed = (double)c->trk_fed.load();
@@ -2013,11 +2116,29 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 		c->backoff_ns = kReopenFirstNs;
 		SCAM_LOG_W("leia stereo camera (android): source down (%s, device error %d); reopening",
 		           stalled ? "no frames" : "device failed", c->device_error.load());
+		// Lost before the first pair or within kEarlyFailNs of the open: the
+		// open itself is failing (a provider that aborts on it reports exactly
+		// this). Reopening into it again only crashes the HAL again, and every
+		// crash also drops the tracking camera.
+		const bool early = c->opened_ns != 0 && (last == 0 || now - c->opened_ns < kEarlyFailNs);
+		c->early_fails = early ? c->early_fails + 1 : 0;
 		std::lock_guard<std::mutex> lk(c->cam_mu);
 		teardown_locked(c);
 		handover_locked(c, false);
+		if (c->early_fails >= kEarlyFailMax) {
+			SCAM_LOG_W("leia stereo camera (android): camera %s lost within %lld ms of opening %d times in a row "
+			           "(device error %d); not reopening it",
+			           c->desc.logical_id, (long long)(kEarlyFailNs / kNsPerMs), c->early_fails,
+			           c->device_error.load());
+			c->gave_up = true;
+			*out_gave_up = true;
+			return false;
+		}
 	}
 	if (now - c->down_since_ns > kGiveUpNs) {
+		SCAM_LOG_W("leia stereo camera (android): source gone for %lld ms; giving up",
+		           (long long)(kGiveUpNs / kNsPerMs));
+		c->gave_up = true;
 		*out_gave_up = true;
 		return false;
 	}
@@ -2309,9 +2430,7 @@ leia_stereo_camera_android_wait_frame(struct xrt_plugin_stereo_camera *c,
 		bool gave_up = false;
 		const bool up = supervise(c, now, &gave_up);
 		if (gave_up) {
-			SCAM_LOG_W("leia stereo camera (android): source gone for %lld ms; giving up",
-			           (long long)(kGiveUpNs / kNsPerMs));
-			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+			return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR; // supervise logged why, once
 		}
 		{
 			std::unique_lock<std::mutex> lk(c->pair_mu);
