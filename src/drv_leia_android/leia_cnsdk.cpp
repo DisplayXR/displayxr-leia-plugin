@@ -10,6 +10,7 @@
 
 #include "leia_cnsdk.h"
 #include "leia_stereo_camera_android.h"
+#include "leia_stereo_camera_android_calib.h"
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -262,6 +263,12 @@ struct leia_cnsdk
 	//! tracking_camera_id names the tracker's camera for sure: CNSDK's own
 	//! accessor, or the factory stereo main lens. False = the cameras[0] guess.
 	bool tracking_camera_known{false};
+	//! That camera's configured intrinsics (at its calibResolution, i.e. the
+	//! tracker's own capture), when tracking_camera_known and they are sane.
+	struct leia_camera_intrinsics tracking_cam_intr {};
+	bool tracking_cam_intr_ok{false};
+	//! Which intrinsics the in-app feed last pushed (1 config, 2 block): logged on change.
+	int ext_intr_src{0};
 
 	// In-service face readout. With LEIA_FACE_TRACKING_RUNTIME_IN_SERVICE the
 	// detection runs in the system head-tracking service and steers the weave
@@ -1051,6 +1058,10 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 			cnsdk->camera_center_z_m = cam.translation_mm.z / 1000.0f;
 			snprintf(cnsdk->tracking_camera_id, sizeof(cnsdk->tracking_camera_id), "%.15s", cam.id);
 			cnsdk->camera_extrinsics_ok = true;
+			cnsdk->tracking_cam_intr = cam.intrinsics;
+			cnsdk->tracking_cam_intr_ok = cnsdk->tracking_camera_known && cam.intrinsics.width > 0 &&
+			                              cam.intrinsics.height > 0 && cam.intrinsics.fx > 1.0f &&
+			                              cam.intrinsics.fy > 1.0f;
 			U_LOG_W("CNSDK camera extrinsics: translation=(%.1f,%.1f,%.1f) mm "
 			        "rotation=(%.1f,%.1f,%.1f) deg sensorOri=%d frontFacing=%d",
 			        cam.translation_mm.x, cam.translation_mm.y, cam.translation_mm.z,
@@ -2210,6 +2221,70 @@ leia_cnsdk_ext_tracking_end(void)
 	}
 }
 
+/*!
+ * Under g_ext_mu + c->ext_mu: the intrinsics @p c's in-app tracker gets for
+ * the fed frame. Preferred: the core's tracking camera's CONFIGURED
+ * intrinsics, the ones the vendor tracking service is calibrated with, at the
+ * tracker's own capture, re-expressed for our frame's field (intr.fov_ratio,
+ * leia_scam_track_intrinsics_from_config); only when that camera is the lens
+ * we feed. Else the factory block's values from the stereo camera source.
+ * Returns true when the config path was taken. Logs a change of source.
+ */
+static bool
+ext_intrinsics_for_core(struct leia_cnsdk *c,
+                        const struct leia_cnsdk_ext_intrinsics &intr,
+                        int32_t width,
+                        int32_t height,
+                        struct leia_camera_intrinsics *ci)
+{
+	ci->width = intr.width;
+	ci->height = intr.height;
+	ci->fx = intr.fx;
+	ci->fy = intr.fy;
+	ci->ppx = intr.cx;
+	ci->ppy = intr.cy;
+	for (int i = 0; i < 8; i++) {
+		ci->distortionCoeffs[i] = intr.d[i];
+	}
+	ci->isMirrored = intr.mirrored ? 1 : 0;
+	double k[4];
+	const struct leia_camera_intrinsics &t = c->tracking_cam_intr;
+	const bool cfg = intr.fov_ratio > 0.0 && c->tracking_cam_intr_ok &&
+	                 strncmp(c->tracking_camera_id, intr.lens, sizeof(c->tracking_camera_id)) == 0 &&
+	                 leia_scam_track_intrinsics_from_config(t.fx, t.fy, t.ppx, t.ppy, (uint32_t)t.width,
+	                                                        (uint32_t)t.height, intr.fov_ratio, (uint32_t)width,
+	                                                        (uint32_t)height, k);
+	if (cfg) {
+		ci->width = width;
+		ci->height = height;
+		ci->fx = (float)k[0];
+		ci->fy = (float)k[1];
+		ci->ppx = (float)k[2];
+		ci->ppy = (float)k[3];
+		for (int i = 0; i < 8; i++) {
+			ci->distortionCoeffs[i] = t.distortionCoeffs[i];
+		}
+	}
+	const int src = cfg ? 1 : 2;
+	if (src != c->ext_intr_src) {
+		c->ext_intr_src = src;
+		if (cfg) {
+			U_LOG_W("leia ext tracking: core %p in-app intrinsics from the device config's camera \"%.15s\" "
+			        "(fx %.1f fy %.1f pp %.1f,%.1f at %dx%d) / field ratio %.4f -> fx %.1f fy %.1f pp %.1f,%.1f at "
+			        "%dx%d (factory block said fx %.1f)",
+			        (void *)c, c->tracking_camera_id, t.fx, t.fy, t.ppx, t.ppy, t.width, t.height, intr.fov_ratio,
+			        ci->fx, ci->fy, ci->ppx, ci->ppy, width, height, intr.fx);
+		} else {
+			U_LOG_W("leia ext tracking: core %p in-app intrinsics from the FACTORY BLOCK (fx %.1f fy %.1f pp "
+			        "%.1f,%.1f): no configured intrinsics for the fed lens \"%.15s\" (core's tracking camera "
+			        "\"%.15s\", known=%d, intrinsics=%d, field ratio %.4f)",
+			        (void *)c, intr.fx, intr.fy, intr.cx, intr.cy, intr.lens, c->tracking_camera_id,
+			        (int)c->tracking_camera_known, (int)c->tracking_cam_intr_ok, intr.fov_ratio);
+		}
+	}
+	return cfg;
+}
+
 extern "C" void
 leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, int64_t ts_boottime_ns)
 {
@@ -2222,6 +2297,7 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 	{
 		struct leia_shared_camera_sink *sink;
 		bool push_intr;
+		struct leia_camera_intrinsics ci;
 	};
 	std::vector<fed> sinks;
 	struct leia_cnsdk_ext_intrinsics intr;
@@ -2234,21 +2310,12 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 				leia_shared_camera_sink_retain(c->ext_sink);
 				// Intrinsics first, then every 60 frames: the sink only accepts
 				// them while active, so a single early push can be lost.
-				sinks.push_back({c->ext_sink, intr.valid && (c->ext_frames++ % 60u) == 0});
+				struct leia_camera_intrinsics ci = {};
+				const bool cfg = ext_intrinsics_for_core(c, intr, width, height, &ci);
+				sinks.push_back({c->ext_sink, (cfg || intr.valid) && (c->ext_frames++ % 60u) == 0, ci});
 			}
 		}
 	}
-	struct leia_camera_intrinsics ci = {};
-	ci.width = intr.width;
-	ci.height = intr.height;
-	ci.fx = intr.fx;
-	ci.fy = intr.fy;
-	ci.ppx = intr.cx;
-	ci.ppy = intr.cy;
-	for (int i = 0; i < 8; i++) {
-		ci.distortionCoeffs[i] = intr.d[i];
-	}
-	ci.isMirrored = intr.mirrored ? 1 : 0;
 	struct leia_image_desc d = {};
 	d.data = y;
 	d.width = width;
@@ -2259,7 +2326,7 @@ leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, in
 	for (const fed &f : sinks) {
 		if (leia_shared_camera_sink_is_active(f.sink)) {
 			if (f.push_intr) {
-				leia_shared_camera_sink_on_intrinsics_change(f.sink, &ci);
+				leia_shared_camera_sink_on_intrinsics_change(f.sink, &f.ci);
 			}
 			leia_shared_camera_sink_on_image(f.sink, &d, ts);
 		}
