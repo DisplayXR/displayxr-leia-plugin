@@ -351,6 +351,51 @@ main(void)
 		CHECK(rw == 3264 && rh == 2448);
 	}
 
+	// In-app tracking intrinsics: the tracker's configured values (its own
+	// 640x480@90 capture) re-expressed for our wider 640x480 cut of a
+	// 1280x960@30 stream. Phone-class front lens: array 4576x3168, sensor modes
+	// 4192x3144@30 and 2288x1284@90 (2x2 binned 4576x2568).
+	{
+		const int32_t table[] = {2, 3, 4192, 3144, 30, 2288, 1284, 90};
+		struct leia_scam_sensor_mode modes[4];
+		const size_t n = leia_scam_parse_sensor_modes(table, 8, modes, 4);
+		CHECK(n == 2 && modes[1].w == 2288 && modes[1].fps == 90);
+		CHECK(leia_scam_parse_sensor_modes(table, 7, modes, 4) == 0); // truncated
+		const int32_t bad_tbl[] = {2, 2, 4192, 3144, 2288, 1284};
+		CHECK(leia_scam_parse_sensor_modes(bad_tbl, 6, modes, 4) == 0); // no fps field
+		CHECK(leia_scam_parse_sensor_modes(table, 8, modes, 4) == 2);
+		NEAR(leia_scam_stream_field_width(4576, 3168, modes, n, 30, 1280, 960), 4192.0, 1e-9);
+		NEAR(leia_scam_stream_field_width(4576, 3168, modes, n, 90, 640, 480), 3424.0, 1e-9);
+		const double r = leia_scam_track_fov_ratio(4576, 3168, modes, n, 1280, 960, 30, 640, 480, 90);
+		NEAR(r, 4192.0 / 3424.0, 1e-12);
+		// Asking for more fps than any mode has: the fastest mode.
+		NEAR(leia_scam_stream_field_width(4576, 3168, modes, n, 120, 640, 480), 3424.0, 1e-9);
+		// No table: unknown (the caller then keeps 1.0 or a setting).
+		CHECK(leia_scam_track_fov_ratio(4576, 3168, modes, 0, 1280, 960, 30, 640, 480, 90) == 0.0);
+		// One full-field 4:3 mode (a tablet-like sensor): the same field at any rate.
+		const struct leia_scam_sensor_mode one = {3264, 2448, 30};
+		NEAR(leia_scam_track_fov_ratio(3264, 2448, &one, 1, 1280, 960, 30, 640, 480, 90), 1.0, 1e-12);
+		// A 2x2-binned 4:3 fast mode keeps the field too.
+		const struct leia_scam_sensor_mode two[2] = {{3264, 2448, 30}, {1632, 1224, 90}};
+		NEAR(leia_scam_track_fov_ratio(3264, 2448, two, 2, 1280, 960, 30, 640, 480, 90), 1.0, 1e-12);
+
+		double k[4];
+		CHECK(leia_scam_track_intrinsics_from_config(350, 350, 320, 240, 640, 480, r, 640, 480, k));
+		NEAR(k[0], 350.0 * 3424.0 / 4192.0, 1e-9); // ~285.9
+		NEAR(k[1], k[0], 1e-9);
+		NEAR(k[2], 320.0, 1e-9);
+		NEAR(k[3], 240.0, 1e-9);
+		// An off-centre principal point moves toward the centre by the ratio;
+		// a different frame size rescales on top.
+		CHECK(leia_scam_track_intrinsics_from_config(350, 352, 330, 236, 640, 480, 1.25, 1280, 960, k));
+		NEAR(k[0], 350.0 * 2.0 / 1.25, 1e-9);
+		NEAR(k[1], 352.0 * 2.0 / 1.25, 1e-9);
+		NEAR(k[2], 640.0 + 10.0 * 2.0 / 1.25, 1e-9);
+		NEAR(k[3], 480.0 - 4.0 * 2.0 / 1.25, 1e-9);
+		CHECK(!leia_scam_track_intrinsics_from_config(350, 350, 320, 240, 640, 480, 0.0, 640, 480, k));
+		CHECK(!leia_scam_track_intrinsics_from_config(350, 350, 320, 240, 0, 480, 1.0, 640, 480, k));
+	}
+
 	// Frame orientation (runtime XR_DXR_stereo_camera v7): what remains after the turn.
 	CHECK(leia_scam_frame_orientation_deg(true, 270, 0) == 270); // tablet front, unturned
 	CHECK(leia_scam_frame_orientation_deg(true, 90, 0) == 90);   // tablet rear, unturned

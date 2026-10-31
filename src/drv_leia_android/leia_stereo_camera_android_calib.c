@@ -359,6 +359,112 @@ leia_scam_factory_orient_by_pose(struct leia_scam_factory_calib *f,
 	return 1;
 }
 
+size_t
+leia_scam_parse_sensor_modes(const int32_t *v, size_t n, struct leia_scam_sensor_mode *out, size_t cap)
+{
+	if (v == NULL || out == NULL || n < 2 || v[0] <= 0 || v[1] < 3) {
+		return 0;
+	}
+	const size_t count = (size_t)v[0], fields = (size_t)v[1];
+	if (n < 2 + count * fields) {
+		return 0;
+	}
+	size_t k = 0;
+	for (size_t i = 0; i < count && k < cap; i++) {
+		const int32_t *m = v + 2 + i * fields;
+		if (m[0] <= 0 || m[1] <= 0 || m[2] <= 0) {
+			return 0;
+		}
+		out[k].w = (uint32_t)m[0];
+		out[k].h = (uint32_t)m[1];
+		out[k].fps = (uint32_t)m[2];
+		k++;
+	}
+	return k;
+}
+
+double
+leia_scam_stream_field_width(uint32_t array_w,
+                             uint32_t array_h,
+                             const struct leia_scam_sensor_mode *modes,
+                             size_t n,
+                             uint32_t fps,
+                             uint32_t sw,
+                             uint32_t sh)
+{
+	if (modes == NULL || n == 0 || array_w == 0 || array_h == 0 || sw == 0 || sh == 0) {
+		return 0.0;
+	}
+	const struct leia_scam_sensor_mode *pick = NULL, *fastest = NULL;
+	for (size_t i = 0; i < n; i++) {
+		const struct leia_scam_sensor_mode *m = &modes[i];
+		if (m->w == 0 || m->h == 0) {
+			continue;
+		}
+		if (fastest == NULL || m->fps > fastest->fps) {
+			fastest = m;
+		}
+		if (m->fps >= fps && (pick == NULL || (uint64_t)m->w * m->h > (uint64_t)pick->w * pick->h)) {
+			pick = m;
+		}
+	}
+	if (pick == NULL) {
+		pick = fastest;
+	}
+	if (pick == NULL) {
+		return 0.0;
+	}
+	uint32_t k = 1;
+	while ((k + 1) * pick->w <= array_w && (k + 1) * pick->h <= array_h) {
+		k++;
+	}
+	const double mw = fmin((double)(k * pick->w), (double)array_w);
+	const double mh = fmin((double)(k * pick->h), (double)array_h);
+	// Largest centred region of the stream's aspect within the mode's field.
+	return (mw * sh <= mh * sw) ? mw : mh * (double)sw / (double)sh;
+}
+
+double
+leia_scam_track_fov_ratio(uint32_t array_w,
+                          uint32_t array_h,
+                          const struct leia_scam_sensor_mode *modes,
+                          size_t n,
+                          uint32_t our_w,
+                          uint32_t our_h,
+                          uint32_t our_fps,
+                          uint32_t trk_w,
+                          uint32_t trk_h,
+                          uint32_t trk_fps)
+{
+	const double ours = leia_scam_stream_field_width(array_w, array_h, modes, n, our_fps, our_w, our_h);
+	const double trk = leia_scam_stream_field_width(array_w, array_h, modes, n, trk_fps, trk_w, trk_h);
+	return (ours > 0.0 && trk > 0.0) ? ours / trk : 0.0;
+}
+
+bool
+leia_scam_track_intrinsics_from_config(double fx,
+                                       double fy,
+                                       double ppx,
+                                       double ppy,
+                                       uint32_t cfg_w,
+                                       uint32_t cfg_h,
+                                       double ratio,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       double out[4])
+{
+	if (out == NULL || cfg_w == 0 || cfg_h == 0 || w == 0 || h == 0 || !(ratio > 0.0) || !isfinite(ratio) ||
+	    !(fx > 0.0) || !(fy > 0.0) || !isfinite(ppx) || !isfinite(ppy)) {
+		return false;
+	}
+	const double sx = (double)w / (double)cfg_w / ratio, sy = (double)h / (double)cfg_h / ratio;
+	out[0] = fx * sx;
+	out[1] = fy * sy;
+	out[2] = (double)w / 2.0 + (ppx - (double)cfg_w / 2.0) * sx;
+	out[3] = (double)h / 2.0 + (ppy - (double)cfg_h / 2.0) * sy;
+	return true;
+}
+
 int32_t
 leia_scam_frame_orientation_deg(bool have_sensor_orientation, int32_t sensor_orientation, uint32_t rot)
 {
