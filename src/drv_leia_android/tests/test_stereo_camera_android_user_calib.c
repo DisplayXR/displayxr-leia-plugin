@@ -184,12 +184,62 @@ test_check(void)
 	CHECK(strlen(leia_scam_user_calib_verdict_str(LEIA_SCAM_USER_CALIB_BLOCK_CHANGED)) > 0);
 }
 
+//! The provider vs cache choice; the cache passes the same gate as a fresh record.
+static void
+test_choose(void)
+{
+	uint8_t b[690], sha[32], other[32];
+	block(b, sizeof(b));
+	leia_scam_sha256(b, sizeof(b), sha);
+	b[0] ^= 1; // a re-burned block
+	leia_scam_sha256(b, sizeof(b), other);
+	double Rf[3][3];
+	rot_y(1.2, Rf);
+	const size_t n = strlen(kRecord);
+	struct leia_scam_user_calib_choice c;
+
+	// Provider answers with a good record: use it, refresh the cache.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_RECORD, kRecord, n, NULL, 0, "2", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_PROVIDER && c.cache_write && !c.cache_drop);
+	CHECK(c.verdict == LEIA_SCAM_USER_CALIB_OK && c.delta_deg > 0.5);
+	NEAR(c.rec.R[0][0], 0.99998838, 1e-12);
+
+	// Provider answers with a record for a changed block: factory, and the cache goes.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_RECORD, kRecord, n, kRecord, n, "2", "1", "0", other, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && c.cache_drop && !c.cache_write);
+	CHECK(c.considered && c.verdict == LEIA_SCAM_USER_CALIB_BLOCK_CHANGED);
+
+	// Provider answers "nothing saved" (restored to factory): factory, the cache goes,
+	// even though a valid cache exists.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_NO_RECORD, NULL, 0, kRecord, n, "2", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && c.cache_drop && !c.considered);
+
+	// Provider unreachable, valid cache: the cache is used, and not rewritten.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_UNAVAILABLE, NULL, 0, kRecord, n, "2", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_CACHE && !c.cache_write && !c.cache_drop);
+	CHECK(c.verdict == LEIA_SCAM_USER_CALIB_OK);
+
+	// Provider unreachable, cache saved against another block (SHA mismatch): ignored.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_UNAVAILABLE, NULL, 0, kRecord, n, "2", "1", "0", other, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && !c.cache_write);
+	CHECK(c.considered && c.verdict == LEIA_SCAM_USER_CALIB_BLOCK_CHANGED);
+
+	// Provider unreachable, cache for another pair / unparseable / absent: factory.
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_UNAVAILABLE, NULL, 0, kRecord, n, "3", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && c.verdict == LEIA_SCAM_USER_CALIB_OTHER_PAIR);
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_UNAVAILABLE, NULL, 0, kRecord, n - 5, "2", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && c.parse_failed);
+	leia_scam_user_calib_choose(LEIA_SCAM_PROVIDER_UNAVAILABLE, NULL, 0, NULL, 0, "2", "1", "0", sha, Rf, &c);
+	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && !c.considered && !c.cache_drop);
+}
+
 int
 main(void)
 {
 	test_sha256();
 	test_parse();
 	test_check();
+	test_choose();
 	if (g_fail != 0) {
 		printf("%d check(s) failed\n", g_fail);
 		return 1;
