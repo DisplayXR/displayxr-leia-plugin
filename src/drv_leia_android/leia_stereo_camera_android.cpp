@@ -321,9 +321,22 @@ struct pair_desc
 	bool front{false};
 	uint32_t array_w{0}, array_h{0}; //!< main lens active array
 	bool calibrated{false};
+	//! The factory block re-expressed at the active array (see ref_w / ref_h).
 	leia_scam_factory_calib factory{};
 	leia_scam_stream_calib stream{};
 	uint64_t block_hash{0};
+	//! Size the block's intrinsics were expressed at (= array unless the block
+	//! centres on a listed output size, leia_scam_pick_calib_reference).
+	uint32_t ref_w{0}, ref_h{0};
+	int32_t sensor_orientation{0};
+	//! Clockwise turn applied to each eye after the crop: 90 / 270 when the
+	//! lenses are stacked along the sensor's y axis (a phone held upright), so
+	//! the published pair is side by side and upright in the device's natural
+	//! orientation. debug.dxr.leia.scam_rotate=0|90|180|270 forces it.
+	uint32_t rot{0};
+	//! Crop of the capture, before the turn (= the eye size when rot is 0 / 180).
+	uint32_t crop_w{1280}, crop_h{720};
+	//! Published per-eye size (after the turn).
 	uint32_t eye_w{1280}, eye_h{720};
 	//! What each lens streams: 4:3 at the eye width when the lenses list it
 	//! (the eye is then a centre crop and the tracking frame keeps the full
@@ -440,6 +453,7 @@ scan_locked()
 		}
 		std::string a = phys[0], b = phys[1];
 		ACameraMetadata_free(meta);
+		std::vector<uint32_t> ref_sizes;
 		if ((p.front && !g_pairs.empty() && g_pairs[0].front) ||
 		    (!p.front && std::any_of(g_pairs.begin(), g_pairs.end(), [](const pair_desc &q) { return !q.front; }))) {
 			continue; // one pair per facing
@@ -472,6 +486,8 @@ scan_locked()
 				p.array_w = (uint32_t)arr[2];
 				p.array_h = (uint32_t)arr[3];
 			}
+			p.crop_w = want_w;
+			p.crop_h = want_h;
 			p.eye_w = want_w;
 			p.eye_h = want_h;
 			p.cap_w = want_w;
@@ -489,13 +505,60 @@ scan_locked()
 				SCAM_LOG_W("leia stereo camera (android): %ux%u not listed for lens %s; trying it anyway",
 				           want_w, want_h, p.main_id);
 			}
+			std::vector<int32_t> so;
+			if (get_i32(mm, ACAMERA_SENSOR_ORIENTATION, so)) {
+				p.sensor_orientation = so[0];
+			}
+			// Candidate calibration reference sizes: every listed YUV / JPEG output.
+			std::vector<int32_t> cfg;
+			if (get_i32(mm, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, cfg)) {
+				for (size_t i = 0; i + 3 < cfg.size(); i += 4) {
+					if ((cfg[i] == AIMAGE_FORMAT_YUV_420_888 || cfg[i] == AIMAGE_FORMAT_JPEG) &&
+					    cfg[i + 3] == ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT && cfg[i + 1] > 0 &&
+					    cfg[i + 2] > 0) {
+						ref_sizes.push_back((uint32_t)cfg[i + 1]);
+						ref_sizes.push_back((uint32_t)cfg[i + 2]);
+					}
+				}
+			}
 			ACameraMetadata_free(mm);
 		}
 
-		if (have && leia_scam_factory_calib_parse(blk.data(), blk.size(), &p.factory) && p.array_w > 0) {
-			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w,
-			                                                   p.cap_h, p.eye_w,
-			                                                   p.eye_h, &p.stream);
+		leia_scam_factory_calib raw{};
+		double ref_off = 0.0;
+		if (have && leia_scam_factory_calib_parse(blk.data(), blk.size(), &raw) && p.array_w > 0) {
+			// 1. The size the block is expressed at, then the block at the array.
+			const std::string ref = prop_str("debug.dxr.leia.scam_calib_ref", "auto");
+			ref_off = leia_scam_pick_calib_reference(&raw, p.array_w, p.array_h, ref_sizes.data(),
+			                                         ref_sizes.size() / 2, &p.ref_w, &p.ref_h);
+			if (ref == "array") {
+				p.ref_w = p.array_w;
+				p.ref_h = p.array_h;
+			} else if (ref != "auto") {
+				parse_size(ref, &p.ref_w, &p.ref_h);
+			}
+			leia_scam_factory_to_array(&raw, p.ref_w, p.ref_h, p.array_w, p.array_h, &p.factory);
+			// 2. Lenses stacked along the sensor's y axis: turn each eye so the
+			// pair is side by side, by the sensor orientation (upright in the
+			// device's natural orientation).
+			if (leia_scam_factory_is_vertical(&p.factory)) {
+				p.rot = (p.sensor_orientation == 90 || p.sensor_orientation == 270) ? (uint32_t)p.sensor_orientation
+				                                                                    : 90u;
+			}
+		}
+		{
+			const std::string r = prop_str("debug.dxr.leia.scam_rotate", "auto");
+			if (r == "0" || r == "90" || r == "180" || r == "270") {
+				p.rot = (uint32_t)atoi(r.c_str());
+			}
+		}
+		if (p.rot == 90 || p.rot == 270) {
+			p.eye_w = p.crop_h;
+			p.eye_h = p.crop_w;
+		}
+		if (p.ref_w != 0) {
+			p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w, p.cap_h,
+			                                                   p.crop_w, p.crop_h, p.rot, &p.stream);
 			p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
 		}
 		if (swap == "0" || swap == "1") {
@@ -504,9 +567,12 @@ scan_locked()
 		}
 		SCAM_LOG_W(
 		    "leia stereo camera (android): %s pair = logical %s, main lens %s, sub lens %s, array %ux%u, eye "
-		    "%ux%u (captured %ux%u), factory block %s (%zu bytes, %s) -> %s, baseline %.2f mm, SBS left = %s lens",
+		    "%ux%u (captured %ux%u, cropped %ux%u, turned %u deg cw, sensor orientation %d), factory block %s "
+		    "(%zu bytes, %s, expressed at %ux%u, principal points %.1f %% off its centre) -> %s, baseline %.2f mm, "
+		    "SBS left = %s lens",
 		    p.front ? "front" : "rear", p.logical_id, p.main_id, p.sub_id, p.array_w, p.array_h, p.eye_w, p.eye_h,
-		    p.cap_w, p.cap_h, have ? "found" : "MISSING", blk.size(), have ? key.c_str() : suffix,
+		    p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot, p.sensor_orientation, have ? "found" : "MISSING",
+		    blk.size(), have ? key.c_str() : suffix, p.ref_w, p.ref_h, ref_off * 100.0,
 		    p.calibrated ? "CALIBRATED" : "raw only",
 		    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
 		    p.calibrated ? (p.stream.left_is_sub ? "sub" : "main") : "sub (assumed)");
@@ -565,8 +631,10 @@ struct xrt_plugin_stereo_camera
 	int trk_eye{1};
 	char trk_lens[16]{};
 	struct leia_cnsdk_ext_intrinsics trk_intr{};
-	uint32_t w{0}, h{0};         //!< per-eye output
-	uint32_t cap_w{0}, cap_h{0}; //!< per-lens capture
+	uint32_t w{0}, h{0};           //!< per-eye output (after the turn)
+	uint32_t crop_w{0}, crop_h{0}; //!< per-eye crop of the capture (before the turn)
+	uint32_t rot{0};               //!< clockwise turn of each eye
+	uint32_t cap_w{0}, cap_h{0};   //!< per-lens capture
 
 	// Camera objects (camera thread = whoever runs (re)open; the HAL calls back
 	// on its own threads).
@@ -691,6 +759,70 @@ pack_eye(const yuv_view &v, uint8_t *dst, uint32_t W, uint32_t H, uint32_t x0)
 }
 
 /*!
+ * One eye into the SBS NV12 buffer at column @p x0 (stride = 2 * @p ew), turned
+ * clockwise by @p rot (90, 180 or 270): the centre @p cw x @p ch crop of the
+ * capture (even offsets), published as @p ew x @p eh (= ch x cw for 90 / 270).
+ * Tiled 32 x 32 so the transposed reads stay in cache. Matches
+ * leia_scam_stream_calib_from_factory's step 3: one 90 deg clockwise step
+ * takes crop pixel (x, y) to (ch - 1 - y, x).
+ */
+void
+pack_eye_turned(const yuv_view &v, uint8_t *dst, uint32_t cw, uint32_t ch, uint32_t rot, uint32_t ew, uint32_t eh,
+                uint32_t x0)
+{
+	if ((uint32_t)v.w < cw || (uint32_t)v.h < ch) {
+		return; // the capture is smaller than the crop: never configured that way
+	}
+	const uint32_t stride = 2 * ew;
+	const uint32_t ox = (((uint32_t)v.w - cw) / 2) & ~1u, oy = (((uint32_t)v.h - ch) / 2) & ~1u;
+	// Source crop pixel of published pixel (X, Y) in a W x H crop.
+	auto src_of = [rot](uint32_t X, uint32_t Y, uint32_t W, uint32_t H, uint32_t *x, uint32_t *y) {
+		if (rot == 90) {
+			*x = Y;
+			*y = H - 1 - X;
+		} else if (rot == 270) {
+			*x = W - 1 - Y;
+			*y = X;
+		} else {
+			*x = W - 1 - X;
+			*y = H - 1 - Y;
+		}
+	};
+	constexpr uint32_t T = 32;
+	for (uint32_t ty = 0; ty < eh; ty += T) {
+		for (uint32_t tx = 0; tx < ew; tx += T) {
+			const uint32_t ye = std::min(ty + T, eh), xe = std::min(tx + T, ew);
+			for (uint32_t Y = ty; Y < ye; Y++) {
+				uint8_t *d = dst + (size_t)Y * stride + x0;
+				for (uint32_t X = tx; X < xe; X++) {
+					uint32_t x, y;
+					src_of(X, Y, cw, ch, &x, &y);
+					d[X] = v.y[(size_t)(y + oy) * v.y_stride + x + ox];
+				}
+			}
+		}
+	}
+	uint8_t *uv = dst + (size_t)stride * eh;
+	const int32_t ps = v.uv_pixel > 0 ? v.uv_pixel : 1;
+	const uint32_t cw2 = cw / 2, ch2 = ch / 2, ew2 = ew / 2, eh2 = eh / 2;
+	for (uint32_t ty = 0; ty < eh2; ty += T) {
+		for (uint32_t tx = 0; tx < ew2; tx += T) {
+			const uint32_t ye = std::min(ty + T, eh2), xe = std::min(tx + T, ew2);
+			for (uint32_t Y = ty; Y < ye; Y++) {
+				uint8_t *d = uv + (size_t)Y * stride + x0;
+				for (uint32_t X = tx; X < xe; X++) {
+					uint32_t x, y;
+					src_of(X, Y, cw2, ch2, &x, &y);
+					const size_t o = (size_t)(y + oy / 2) * v.uv_stride + (size_t)(x + ox / 2) * ps;
+					d[2 * X] = v.u[o];
+					d[2 * X + 1] = v.v[o];
+				}
+			}
+		}
+	}
+}
+
+/*!
  * The tracking frame from the main lens's capture: its centre 4:3 region
  * scaled to 640x480 (2x2 box for an exact 1280x960 capture, which is the
  * whole sensor field of view; nearest otherwise).
@@ -766,8 +898,13 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_b
 		c->drops++;
 		return;
 	}
-	pack_eye(vl, b.data.data(), c->w, c->h, 0);
-	pack_eye(vr, b.data.data(), c->w, c->h, c->w);
+	if (c->rot == 0) {
+		pack_eye(vl, b.data.data(), c->w, c->h, 0);
+		pack_eye(vr, b.data.data(), c->w, c->h, c->w);
+	} else {
+		pack_eye_turned(vl, b.data.data(), c->crop_w, c->crop_h, c->rot, c->w, c->h, 0);
+		pack_eye_turned(vr, b.data.data(), c->crop_w, c->crop_h, c->rot, c->w, c->h, c->w);
+	}
 	b.seq = ++c->seq;
 	b.time_mono_ns = ts_boot - boot_minus_mono_ns();
 	if (c->ready >= 0) {
@@ -1090,9 +1227,9 @@ start_locked(xrt_plugin_stereo_camera *c)
 	c->opened_ns = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(0);
 	SCAM_LOG_W("leia stereo camera (android): %s pair streaming: logical %s, L=%s R=%s, %ux%u YUV per lens -> %ux%u "
-	           "eyes, tracking %s",
+	           "eyes (turned %u deg cw), tracking %s",
 	           c->desc.front ? "front" : "rear", c->desc.logical_id, left, right, c->cap_w, c->cap_h, c->w, c->h,
-	           c->track ? "640x480 from the tracking lens" : "not handed over");
+	           c->rot, c->track ? "640x480 from the tracking lens (unturned)" : "not handed over");
 	return true;
 }
 
@@ -1231,7 +1368,8 @@ leia_stereo_camera_android_get_calibration(struct xrt_plugin_instance *inst,
 			f.T[i] = -f.T[i];
 		}
 		leia_scam_stream_calib alt;
-		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.cap_w, p.cap_h, p.eye_w, p.eye_h, &alt);
+		leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot,
+		                                    &alt);
 		s = alt;
 	}
 	const uint32_t sz = out->struct_size;
@@ -1282,6 +1420,9 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	c->lsub = left_is_sub(c->desc);
 	c->w = c->desc.eye_w;
 	c->h = c->desc.eye_h;
+	c->crop_w = c->desc.crop_w;
+	c->crop_h = c->desc.crop_h;
+	c->rot = c->desc.rot;
 	c->cap_w = c->desc.cap_w;
 	c->cap_h = c->desc.cap_h;
 	c->track = c->desc.front && prop_bool("debug.dxr.leia.scam_track", true);

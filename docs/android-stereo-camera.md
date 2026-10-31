@@ -74,7 +74,7 @@ little-endian IEEE-754 double:
 
 | Bytes | Content |
 |---|---|
-| 1–128 | main lens: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6 s1–s4, pixels at the full active array |
+| 1–128 | main lens: fx fy cx cy k1 k2 p1 p2 k3 k4 k5 k6 s1–s4, pixels at the reference size (usually the full active array, see below) |
 | 129–256 | sub lens, same order |
 | 257–328 | R (3×3, row-major) |
 | 329–352 | T (mm) |
@@ -96,6 +96,33 @@ fy 345.6).
 **Stream conversion.** A 16:9 stream from the 4:3 array is the array scaled to
 the stream width, with the rows centre-cropped:
 `cy' = (cy − H/2)·s + h/2`.
+
+**Reference size.** The block is usually expressed at the full active array.
+Some modules use a listed output size instead. The phone-class front module's
+block centres on its largest 4:3 output, **4192×3144**: the principal points
+(2098.2, 1565.6) / (2094.8, 1568.1) sit 2–6 px from that size's centre. They
+are 190 px off the 4576×3168 array's centre, and about 6 px off a centred
+4208×3120. Rule (`leia_scam_pick_calib_reference`): keep the array unless both
+principal points are more than 3 % off its centre and a listed YUV / JPEG
+output size has them within 1 %. The closest such size wins. The block is
+then re-expressed at the array through the HAL's own array → stream step
+(largest centred region of the stream's aspect, scaled). For the phone that
+puts the principal point at (2290, 1578), close to the array centre (2288,
+1584). The tablets' blocks sit within 0.6 % of their array centre, so nothing
+changes for them.
+
+**Vertical pairs (phone held upright).** When `|T.y| > |T.x|`, the two lenses
+are stacked along the sensor's y axis (phone-class front: T = (0.37, 14.89,
+−0.48) mm). The runtime's rectifier only takes side-by-side pairs. The source
+therefore turns each eye clockwise by the sensor orientation (270 on the
+phone). It publishes 720×1280 portrait eyes, upright in the device's natural
+orientation. The calibration turns with them, as the **last** step after any
+calibration source (a later recalibrated R included):
+`fx' = fy`, `cx' = H−1−cy`, `cy' = cx` per 90° step, `p1' = p2`, `p2' = −p1`,
+`R' = Q R Qᵀ`, `T' = Q T` with `Q = [[0,−1,0],[1,0,0],[0,0,1]]`. The eye
+order is then decided on the turned geometry. The 640×480 tracking frame is
+cut from the unturned capture, so the in-app tracker's intrinsics do not
+change.
 
 Measured on a Lume Pad 2:
 
@@ -161,3 +188,5 @@ On either, the source:
 | `debug.dxr.leia.scam_track=0` | do not hand tracking over (the service then loses its camera) |
 | `debug.dxr.leia.scam_swap=auto\|0\|1` | SBS eye order |
 | `debug.dxr.leia.scam_calib_key_prefix` | vendor key prefix of the factory block |
+| `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |
+| `debug.dxr.leia.scam_calib_ref=auto\|array\|WxH` | the size the factory block's intrinsics are expressed at (auto: see *Reference size*) |

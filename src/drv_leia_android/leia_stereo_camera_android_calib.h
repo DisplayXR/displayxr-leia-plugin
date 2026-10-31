@@ -64,7 +64,7 @@ leia_scam_factory_calib_parse(const uint8_t *bytes, size_t len, struct leia_scam
  */
 struct leia_scam_stream_calib
 {
-	uint32_t width, height;
+	uint32_t width, height; //!< per published eye, after the rotation
 	double k[2][4];        //!< fx fy cx cy per eye, pixels at width x height
 	double d[2][8];        //!< RADTAN8 per eye
 	double R_rl[3][3];     //!< x_right = R_rl * x_left + T_rl
@@ -91,6 +91,17 @@ struct leia_scam_stream_calib
  * 4576x3168 array captured at 1280x960 and cropped to 1280x720 differs from
  * "1280x720 straight from the array" by 8 % in focal length and ~53 px in the
  * principal point.
+ *
+ * Last, @p rot_cw (0, 90, 180 or 270) turns each eye clockwise by that angle
+ * AFTER the crop, as pack_eye does: the published eye is then @p height x
+ * @p width for 90 / 270, and the intrinsics, the tangential distortion, R and T
+ * are turned with it (x' = Q x for both lenses, R' = Q R Q^T, T' = Q T). The
+ * eye order is decided on the turned geometry. A lens pair whose baseline lies
+ * along the sensor's y axis (a phone held upright) is published this way, so
+ * that the runtime's rectifier sees a side-by-side pair.
+ *
+ * The rotation is the last step, so it applies to whatever R / T the caller
+ * put in @p f (the factory block, or a later recalibration of R).
  */
 bool
 leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
@@ -100,7 +111,50 @@ leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
                                     uint32_t cap_h,
                                     uint32_t width,
                                     uint32_t height,
+                                    uint32_t rot_cw,
                                     struct leia_scam_stream_calib *out);
+
+/*!
+ * true when the block's baseline lies along the sensor's y axis (|T.y| >
+ * |T.x|): the pair is stacked vertically in the sensor frame and must be
+ * published turned by 90 or 270 degrees.
+ */
+bool
+leia_scam_factory_is_vertical(const struct leia_scam_factory_calib *f);
+
+/*!
+ * The size the factory block's intrinsics are expressed at. Usually the
+ * active array; on some modules a listed output size instead (a phone-class
+ * module's block centres on its largest 4:3 output 4192x3144, not on its
+ * 4576x3168 array). Rule: keep the array unless both lenses' principal points
+ * sit more than 3 % (of the width / height) off its centre AND one of the
+ * @p n candidate sizes (@p sizes = w0 h0 w1 h1 ..., no larger than the array,
+ * at least half its width) has them within 1 %; then the closest candidate
+ * wins. Writes the array size when nothing better fits. Returns the
+ * worst-lens relative offset of the choice.
+ */
+double
+leia_scam_pick_calib_reference(const struct leia_scam_factory_calib *f,
+                               uint32_t array_w,
+                               uint32_t array_h,
+                               const uint32_t *sizes,
+                               size_t n,
+                               uint32_t *out_w,
+                               uint32_t *out_h);
+
+/*!
+ * Re-express the block's intrinsics, given at @p ref_w x @p ref_h, at the
+ * active array: the inverse of the HAL's array -> stream step (largest centred
+ * region of the stream's aspect, scaled). A no-op when the reference is the
+ * array. R, T and distortion are unchanged.
+ */
+void
+leia_scam_factory_to_array(const struct leia_scam_factory_calib *f,
+                           uint32_t ref_w,
+                           uint32_t ref_h,
+                           uint32_t array_w,
+                           uint32_t array_h,
+                           struct leia_scam_factory_calib *out);
 
 /*!
  * One lens's intrinsics rescaled to a stream (same crop rule as above): what
