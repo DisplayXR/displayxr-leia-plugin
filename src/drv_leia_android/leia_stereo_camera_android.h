@@ -65,6 +65,17 @@ leia_stereo_camera_android_release_frame(struct xrt_plugin_stereo_camera *cam);
 void
 leia_stereo_camera_android_close(struct xrt_plugin_stereo_camera *cam);
 
+/*!
+ * The physical id of the FRONT pair's factory "main" lens (the one carrying
+ * the factory stereo block), scanning once if needed. It stands in for the
+ * head tracker's camera: CNSDK uses the display config's trackingCameras[0]
+ * (or debug.cnsdk.cam), which its public C API does not expose, and
+ * leia_device_config_get_camera_data indexes cameras[], whose order differs
+ * on some devices. False when there is no front pair.
+ */
+bool
+leia_stereo_camera_android_tracking_lens(char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

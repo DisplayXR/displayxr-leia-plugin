@@ -261,6 +261,87 @@ main(void)
 			}
 		}
 
+		// Eye order from the HAL's lens poses (device frame, metres). The
+		// phone-class device publishes lens 0 ("sub") at (-15.3, -0.75) mm of lens 1
+		// ("main"): sub on the user's left = the front camera's own right, so main
+		// is the SBS left eye. Read in this file's convention the block says the
+		// opposite after the 270 turn; the poses win and the convention is swapped.
+		{
+			const double p_main[3] = {0.0, 0.0, 0.0};
+			const double p_sub[3] = {-0.01530, -0.00075, 0.0};
+			const double p_none[3] = {0.0, 0.0, 0.0};
+			CHECK(s270.left_is_sub); // the block alone
+			CHECK(leia_scam_pose_sub_side(p_main, p_sub, true, 270, 270) == 1);
+			struct leia_scam_factory_calib po = pa;
+			CHECK(leia_scam_factory_orient_by_pose(&po, p_main, p_sub, true, 270, 270) == 1);
+			struct leia_scam_stream_calib sp;
+			CHECK(leia_scam_stream_calib_from_factory(&po, 4576, 3168, 1280, 960, 1280, 720, 270, &sp));
+			CHECK(!sp.left_is_sub); // (a) left = main
+			CHECK(sp.T_rl_mm[0] < -14.0 && fabs(sp.T_rl_mm[1]) < 1.0);
+			NEAR(sp.k[0][0], s270.k[1][0], 1e-9); // the eyes trade places, intrinsics follow
+			// Agreeing again is a no-op; swapping twice is the identity.
+			CHECK(leia_scam_factory_orient_by_pose(&po, p_main, p_sub, true, 270, 270) == 0);
+			struct leia_scam_factory_calib twice = pa;
+			leia_scam_factory_swap_convention(&twice);
+			leia_scam_factory_swap_convention(&twice);
+			for (int i = 0; i < 3; i++) {
+				NEAR(twice.T[i], pa.T[i], 1e-4); // the rounded R is orthonormal to ~1e-6
+				for (int j = 0; j < 3; j++) {
+					NEAR(twice.R[i][j], pa.R[i][j], 1e-12);
+				}
+			}
+			// No poses (both at the origin, the usual "not published"): block unchanged.
+			po = pa;
+			CHECK(leia_scam_pose_sub_side(p_none, p_none, true, 270, 270) == 0);
+			CHECK(leia_scam_factory_orient_by_pose(&po, p_none, p_none, true, 270, 270) == -1);
+			CHECK(memcmp(&po, &pa, sizeof(po)) == 0);
+			// A pose along the published y axis decides nothing either.
+			const double p_y[3] = {0.0, 0.015, 0.0};
+			CHECK(leia_scam_pose_sub_side(p_main, p_y, true, 270, 270) == 0);
+			CHECK(leia_scam_pose_sub_side(p_main, p_sub, true, 45, 270) == 0);
+
+			// (c) The same block on a front pair mounted the other way up (sensor
+			// orientation 90, turned 90): the block alone flips the order relative to
+			// 270, the poses decide it the same way for the same physical layout.
+			CHECK(leia_scam_pose_sub_side(p_main, p_sub, true, 90, 90) == 1);
+			po = pa;
+			CHECK(leia_scam_factory_orient_by_pose(&po, p_main, p_sub, true, 90, 90) == 0);
+			CHECK(leia_scam_stream_calib_from_factory(&po, 4576, 3168, 1280, 960, 1280, 720, 90, &sp));
+			CHECK(!sp.left_is_sub && sp.T_rl_mm[0] < 0.0);
+			const double p_sub_r[3] = {0.01530, 0.00075, 0.0}; // mirrored layout
+			po = pa;
+			CHECK(leia_scam_factory_orient_by_pose(&po, p_main, p_sub_r, true, 90, 90) == 1);
+			CHECK(leia_scam_stream_calib_from_factory(&po, 4576, 3168, 1280, 960, 1280, 720, 90, &sp));
+			CHECK(sp.left_is_sub && sp.T_rl_mm[0] < 0.0);
+			// A rear lens sees the device's +x on its own right: the same offset flips.
+			CHECK(leia_scam_pose_sub_side(p_main, p_sub, false, 270, 270) == -1);
+		}
+
+		// (b) Tablets: horizontal pairs, never turned. Front (sensor 270): the block
+		// puts the sub lens on the left; poses that agree, or no poses, keep it.
+		{
+			struct leia_scam_factory_calib tb;
+			CHECK(leia_scam_factory_calib_parse(blk, sizeof(blk), &tb));
+			struct leia_scam_stream_calib st;
+			const double z[3] = {0.0, 0.0, 0.0};
+			const double below[3] = {0.0, -0.015, 0.0};
+			struct leia_scam_factory_calib to = tb;
+			CHECK(leia_scam_factory_orient_by_pose(&to, z, z, true, 270, 0) == -1);
+			CHECK(leia_scam_factory_orient_by_pose(&to, z, below, true, 270, 0) == 0);
+			CHECK(memcmp(&to, &tb, sizeof(to)) == 0);
+			CHECK(leia_scam_stream_calib_from_factory(&to, 3264, 2448, 0, 0, 1280, 720, 0, &st));
+			CHECK(st.left_is_sub);
+			// Rear (sensor 90), main on the left (T = -15 mm): unchanged likewise.
+			memcpy(bad, blk, sizeof(bad));
+			wd(bad, 329, -14.989);
+			CHECK(leia_scam_factory_calib_parse(bad, sizeof(bad), &tb));
+			to = tb;
+			CHECK(leia_scam_factory_orient_by_pose(&to, z, z, false, 90, 0) == -1);
+			CHECK(leia_scam_factory_orient_by_pose(&to, z, below, false, 90, 0) == 0);
+			CHECK(leia_scam_stream_calib_from_factory(&to, 3264, 2448, 0, 0, 1280, 720, 0, &st));
+			CHECK(!st.left_is_sub);
+		}
+
 		// The tablets' blocks centre on their array: the array is kept.
 		struct leia_scam_factory_calib tf;
 		CHECK(leia_scam_factory_calib_parse(blk, sizeof(blk), &tf));
