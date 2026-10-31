@@ -329,14 +329,24 @@ read_vendor_i32(const char *cam_id, const char *full_name, std::vector<int32_t> 
 		if (!j.ok() || get_service == nullptr) {
 			break;
 		}
+		// Every call that can throw is checked before the next JNI call: with
+		// an exception pending, CheckJNI aborts the whole process. A provider
+		// that has just died throws from getCameraCharacteristics ("unknown
+		// device"), which took the service down here once.
 		jobject cm = env->CallObjectMethod(j.ctx, get_service, env->NewStringUTF("camera"));
+		if (!j.ok() || cm == nullptr) {
+			break;
+		}
 		jclass cm_cls = env->FindClass("android/hardware/camera2/CameraManager");
-		if (!j.ok() || cm == nullptr || cm_cls == nullptr) {
+		if (!j.ok() || cm_cls == nullptr) {
 			break;
 		}
 		jmethodID get_cc = env->GetMethodID(cm_cls, "getCameraCharacteristics",
 		                                    "(Ljava/lang/String;)Landroid/hardware/camera2/CameraCharacteristics;");
 		jobject cc = j.ok() ? env->CallObjectMethod(cm, get_cc, env->NewStringUTF(cam_id)) : nullptr;
+		if (!j.ok() || cc == nullptr) {
+			break;
+		}
 		jclass cc_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics");
 		jclass key_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics$Key");
 		jclass ints_cls = env->FindClass("[I");
