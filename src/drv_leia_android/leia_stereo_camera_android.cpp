@@ -1033,6 +1033,9 @@ struct xrt_plugin_stereo_camera
 	//! (begun right before openCamera, ended on a failed start, a source loss
 	//! or close), so a camera that cannot open never leaves the cores untracked.
 	bool handed{false};
+	//! The last openCamera was refused by policy (ACAMERA_ERROR_CAMERA_DISABLED):
+	//! the next start opens the device first and hands tracking over after.
+	bool open_refused{false};
 	//! SBS eye (0 = left, 1 = right) whose lens feeds the tracker, and its id.
 	int trk_eye{1};
 	char trk_lens[16]{};
@@ -1586,16 +1589,39 @@ start_locked(xrt_plugin_stereo_camera *c)
 	}
 
 	// Into in-app tracking BEFORE the camera service evicts the tracking
-	// service's camera; back out if the open does not get through.
-	handover_locked(c, true);
+	// service's camera; back out if the open does not get through. Not after a
+	// refused open: while the camera service refuses this process ("disabled by
+	// policy", the first seconds after the consumer's app comes forward) it
+	// refuses the tracking service's camera too, so there is nothing to evict,
+	// and handing over on every retry only churns tracking (an engine switch
+	// and a restart of the tracking service each way, once a second).
+	const bool hand_first = !c->open_refused;
+	if (hand_first) {
+		handover_locked(c, true);
+	}
 	c->dev_cb = {c, dev_disconnected, dev_error};
 	camera_status_t st = ACameraManager_openCamera(mgr(), c->desc.logical_id, &c->dev_cb, &c->dev);
 	if (st != ACAMERA_OK || c->dev == nullptr) {
-		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) failed (%d)", c->desc.logical_id, (int)st);
+		const bool refused = st == ACAMERA_ERROR_CAMERA_DISABLED;
+		if (refused && !c->open_refused) {
+			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) refused by policy (%d); tracking stays with "
+			           "the tracking service until an open gets through",
+			           c->desc.logical_id, (int)st);
+		} else if (!refused) {
+			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) failed (%d)", c->desc.logical_id, (int)st);
+		}
+		c->open_refused = refused;
 		c->dev = nullptr;
 		teardown_locked(c);
 		handover_locked(c, false);
 		return false;
+	}
+	if (c->open_refused) {
+		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) let through after refusals", c->desc.logical_id);
+		c->open_refused = false;
+	}
+	if (!hand_first) {
+		handover_locked(c, true);
 	}
 	if (ACaptureSessionOutputContainer_create(&c->outputs) != ACAMERA_OK ||
 	    ACameraDevice_createCaptureRequest(c->dev, TEMPLATE_PREVIEW, &c->req) != ACAMERA_OK) {
