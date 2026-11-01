@@ -680,6 +680,9 @@ int64_t g_user_calib_read_ns = 0; //!< CLOCK_MONOTONIC of the last user-calibrat
 constexpr int64_t kUserCalibRereadNs = 1000 * kNsPerMs;
 constexpr int64_t kUserCalibUnreachableRetryNs = 30000 * kNsPerMs;
 
+leia_scam_factory_calib
+oriented_factory(const pair_desc &p);
+
 /*!
  * Put the calibration app's rotation for @p p into p.factory.R when a valid
  * record exists, else the block's own R, and recompute the stream
@@ -799,7 +802,8 @@ apply_user_calib_locked(pair_desc &p)
 			break;
 		}
 	}
-	p.calibrated = leia_scam_stream_calib_from_factory(&p.factory, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w,
+	const leia_scam_factory_calib p_oriented_tmp = oriented_factory(p);
+	p.calibrated = leia_scam_stream_calib_from_factory(&p_oriented_tmp, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w,
 	                                                   p.crop_h, p.rot, &p.stream);
 	if (state != p.user_calib_state) {
 		p.user_calib_state = state;
