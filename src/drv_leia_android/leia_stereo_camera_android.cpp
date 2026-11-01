@@ -93,6 +93,7 @@ constexpr int64_t kStallNs = 1500 * kNsPerMs;      //!< no pair for this long = 
 constexpr int64_t kReopenFirstNs = 500 * kNsPerMs;  //!< first reopen delay
 constexpr int64_t kReopenMaxNs = 4000 * kNsPerMs;   //!< back-off cap
 constexpr int64_t kReopenFastMaxNs = 1000 * kNsPerMs; //!< back-off cap for the first 10 s down
+constexpr int64_t kReopenRefusedNs = 250 * kNsPerMs;  //!< retry period while the open is refused by policy
 constexpr int64_t kGiveUpNs = 15000 * kNsPerMs;     //!< device gone this long -> ERROR
 constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;  //!< measured skew is 0; be lenient
 constexpr uint32_t kTrackW = 640, kTrackH = 480;    //!< the in-app detector accepts only this
@@ -1721,8 +1722,11 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 		// runtime ("disabled by policy" / "access restricted") until the
 		// satellite inherits the while-in-use camera capability, which takes a
 		// few seconds (measured 1.8-8 s on a Lume Pad 2). Back off further after.
-		const int64_t cap = now - c->down_since_ns < 10000 * kNsPerMs ? kReopenFastMaxNs : kReopenMaxNs;
-		c->backoff_ns = std::min(c->backoff_ns * 2, cap);
+		// A refused open no longer hands tracking over (start_locked), so it
+		// costs a few ms: poll the refusal fast to catch the moment it lifts.
+		const bool fast = now - c->down_since_ns < 10000 * kNsPerMs;
+		const int64_t cap = fast ? kReopenFastMaxNs : kReopenMaxNs;
+		c->backoff_ns = fast && c->open_refused ? kReopenRefusedNs : std::min(c->backoff_ns * 2, cap);
 		c->next_reopen_ns = now + c->backoff_ns;
 	}
 	return false;
