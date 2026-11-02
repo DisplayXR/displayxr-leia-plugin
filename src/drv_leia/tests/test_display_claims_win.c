@@ -867,6 +867,19 @@ test_sr_authenticated(void)
 	struct leia_win_sr_display pair_before[2] = {paired[0], edid_only[0]};
 	CHECK(!leia_win_sr_authenticated(pair_before, 2, pair_before, 2));
 	CHECK(!leia_win_sr_authenticated(NULL, 1, paired, 1));
+
+	// SR's verified id is a small sequence number it reuses: a read can list a stale
+	// 0x1 VERIFIED next to the new EDID_ONLY hash. 0x1 then listed without the hash is
+	// the authentication, although prev listed 0x1 verified too...
+	struct leia_win_sr_display stale[2] = {paired[0], edid_only[0]};
+	CHECK(leia_win_sr_authenticated(stale, 2, paired, 1));
+	// ...but not while the hash is still listed, nor the hash alone (SR lost the FPC),
+	CHECK(!leia_win_sr_authenticated(stale, 2, stale, 2));
+	CHECK(!leia_win_sr_authenticated(stale, 2, edid_only, 1));
+	// ...nor a twin's verified entry after the other panel's hash went away (an unplug).
+	struct leia_win_sr_display twin_left[2] = {twin[0], mine[0]};
+	twin_left[0].edid_serial = 841937064u;
+	CHECK(!leia_win_sr_authenticated(twin_left, 2, twin_left, 1));
 }
 
 /*!
@@ -936,6 +949,72 @@ test_sr_auth_watch(void)
 	CHECK(!leia_win_sr_auth_watch_feed(&w, laptop, 1, 2000));
 	CHECK(leia_win_sr_auth_watch_feed(&w, both, 2, 3000));
 	CHECK(!leia_win_sr_auth_watch_feed(&w, both, 2, 4000));
+
+	// The stale-0x1 read (a reused verified id next to the new hash), then 0x1 alone: one sweep.
+	memset(&w, 0, sizeof(w));
+	struct leia_win_sr_display stale[2] = {paired[0], edid_only[0]};
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, stale, 2, 2000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, 3000));
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+
+	// A flapping FPC: the first authentication asks at once. The next, inside the
+	// interval, is held with the panel kept pending (no grace runs out while held),
+	// and asks on the first read after the interval.
+	const uint64_t asked = 2000;
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked));
+	CHECK(!w.held);
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 3000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 4000));
+	CHECK(w.held);
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS - 1));
+	CHECK(w.held);
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS));
+	CHECK(!w.held);
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS + 1000));
+
+	// EDID_ONLY again while held drops the held request: nothing is asked while the
+	// panel is EDID_ONLY, even past the interval; its next authentication asks.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 3000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 4000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 5000));
+	CHECK(!w.held);
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS + 5000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS + 6000));
+
+	// Held, then one read lists nothing: the grace counts from the last held read.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 3000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 20000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, NULL, 0, 21000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS));
+
+	// Held while another panel stays EDID_ONLY (its FPC cable out): that panel's
+	// entry in the same reads does not replace the list the held request needs.
+	memset(&w, 0, sizeof(w));
+	const struct leia_win_sr_display other_edid_only = srd(0x8, "AUO", B194_PROD, false, NULL, 0, 0, true);
+	struct leia_win_sr_display two_edid_only[2] = {other_edid_only, edid_only[0]};
+	struct leia_win_sr_display one_paired[2] = {other_edid_only, paired[0]};
+	CHECK(!leia_win_sr_auth_watch_feed(&w, two_edid_only, 2, 1000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, one_paired, 2, asked));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, two_edid_only, 2, 3000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, one_paired, 2, 4000));
+	CHECK(w.held);
+	CHECK(!leia_win_sr_auth_watch_feed(&w, one_paired, 2, 5000));
+	CHECK(w.held);
+	CHECK(leia_win_sr_auth_watch_feed(&w, one_paired, 2, asked + LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS));
+	CHECK(leia_win_sr_auth_watch_pending(&w)); // the other panel, still EDID_ONLY
 
 	CHECK(!leia_win_sr_auth_watch_pending(NULL));
 	CHECK(!leia_win_sr_auth_watch_feed(NULL, paired, 1, 1000));

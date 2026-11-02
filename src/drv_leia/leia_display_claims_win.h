@@ -365,6 +365,9 @@ leia_win_sr_edid_only_count(const struct leia_win_sr_display *displays, int32_t 
  * the same EDID (manufacturer and product, and serial number when both have
  * one; an EDID_ONLY entry with no EDID matches any). SR re-keys the panel when
  * its FPC pairs, so the verified entry usually has a new id and the same EDID.
+ * Also true when @p prev listed that verified id too but @p cur no longer
+ * lists the EDID_ONLY entry: SR's verified id is a small sequence number
+ * (0x1) that a read can list stale next to the new EDID_ONLY hash.
  * No OS display event comes with it, so the runtime's claims keep the EDID_ONLY
  * answer (EDID confidence, no serial, the dead id) until it is asked to sweep
  * again. A first read (@p prev_count < 0), a hotplug of another panel and an
@@ -379,16 +382,24 @@ leia_win_sr_authenticated(const struct leia_win_sr_display *prev,
 //! #483: how long a panel stays pending after SR stopped listing it EDID_ONLY with no verified entry yet.
 #define LEIA_WIN_SR_AUTH_GRACE_MS 10000u
 
+//! #483: the shortest time between two claim sweep requests. A sweep that changes a
+//! claim rebuilds the per-screen DPs (a brief 3D drop), so a flapping FPC asks at most
+//! once per interval.
+#define LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS 30000u
+
 /*!
  * #483: what the plug-in keeps between reads of SR's display list to see SR
- * authenticate a panel: the last list that held an EDID_ONLY display.
- * Zero-initialised = nothing pending.
+ * authenticate a panel: the last list that held an EDID_ONLY display, and
+ * when it last asked for a sweep. Zero-initialised = nothing pending.
  */
 struct leia_win_sr_auth_watch
 {
 	struct leia_win_sr_display pending[LEIA_WIN_SR_MAX_DISPLAYS];
 	int32_t pending_count; //!< 0 = nothing pending
-	uint64_t pending_ms;   //!< when a read last listed a display EDID_ONLY
+	uint64_t pending_ms;   //!< when a read last listed a display EDID_ONLY, or held a request
+	uint64_t asked_ms;     //!< when a feed last returned true
+	bool asked;            //!< a feed returned true before
+	bool held;             //!< the last read saw an authentication inside the interval
 };
 
 /*!
@@ -398,6 +409,11 @@ struct leia_win_sr_auth_watch
  * A panel stays pending for LEIA_WIN_SR_AUTH_GRACE_MS after a read stops listing
  * it EDID_ONLY, so a re-key that one read sees as "gone" and the next as
  * "verified" still counts.
+ * Within LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS of the last true, an authentication
+ * is held (@c held) and the panel stays pending: the first read after the
+ * interval that still sees it returns true. If SR lists the panel EDID_ONLY
+ * again first, the held request is dropped and the new EDID_ONLY phase asks
+ * when it authenticates, so a flap never asks while the panel is EDID_ONLY.
  */
 bool
 leia_win_sr_auth_watch_feed(struct leia_win_sr_auth_watch *w,

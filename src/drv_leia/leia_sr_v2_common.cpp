@@ -802,7 +802,8 @@ leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *ou
  *  - #483: when the FPC pairs, SR re-keys an EDID_ONLY panel with no OS
  *    display event, so the runtime would keep its EDID_ONLY claim. Each read
  *    compares with the last list that held an EDID_ONLY panel (g_auth_watch)
- *    and asks the runtime for a claim sweep on the change; a poll keeps
+ *    and asks the runtime for a claim sweep on the change, at most once per
+ *    LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS (a flapping FPC); a poll keeps
  *    reading while a panel is EDID_ONLY. The macOS arm does the same
  *    (leia_sr_macos.m).
  * ------------------------------------------------------------------ */
@@ -1063,8 +1064,14 @@ refresh_locked(uint64_t now_ns)
 	}
 	// #483: whoever reads the list sees SR authenticate a panel (the poll, a DP's
 	// create attempt, a sweep); enumerate_serve tells the runtime.
+	const bool was_held = g_auth_watch.held;
 	if (leia_win_sr_auth_watch_feed(&g_auth_watch, fresh, (int32_t)count, now_ns / 1000000ull)) {
 		g_rescan_due = true;
+	}
+	if (g_auth_watch.held && !was_held) {
+		U_LOG_W("leia_plugin: SR authenticated a panel again within %u s of the last claim sweep request -- "
+		        "asking once %u s have passed (#483)",
+		        LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS / 1000u, LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS / 1000u);
 	}
 
 	memcpy(g_cache, fresh, count * sizeof(fresh[0]));
@@ -1075,14 +1082,16 @@ refresh_locked(uint64_t now_ns)
 
 /* ------------------------------------------------------------------ *
  * #483: the authentication poll. Runs while SR lists a panel EDID_ONLY (and
- * for LEIA_WIN_SR_AUTH_GRACE_MS after) and the runtime gave a rescan
- * listener; reads SR's list fresh every AUTH_POLL_MS, so refresh_locked sees
- * the EDID_ONLY -> FPC_VERIFIED change even with no app, DP or sweep reading
- * it. Exits once nothing is pending. Detached, like the readiness watcher:
- * shutdown signals g_auth_poll_stop and waits on g_auth_poll_done, and is
- * final, as the watcher's is (on Windows the runtime keeps the plug-in's
- * instance for the process, so destroy is process teardown), until the next
- * negotiate hands over a listener again.
+ * for LEIA_WIN_SR_AUTH_GRACE_MS after, or while a sweep request is held for
+ * the interval) and the runtime gave a rescan listener; reads SR's list fresh
+ * every AUTH_POLL_MS, so refresh_locked sees the EDID_ONLY -> FPC_VERIFIED
+ * change even with no app, DP or sweep reading it. Exits once nothing is
+ * pending. Detached, like the readiness watcher. The runtime does not call
+ * destroy on Windows today (it releases claim-only plug-in instances on other
+ * platforms only), so nothing stops a running poll before the process exits.
+ * For a host that does call it, shutdown signals g_auth_poll_stop, waits on
+ * g_auth_poll_done and latches until the next negotiate hands over a listener
+ * again.
  * ------------------------------------------------------------------ */
 
 std::mutex g_auth_poll_mu; // guards the three flags below and the start/exit decision
@@ -1176,6 +1185,12 @@ auth_poll_body()
 			break;
 		}
 		AcquireSRWLockExclusive(&g_enum_lock);
+		// A stop whose bounded wait ran out: do not make the probe instance
+		// again after shutdown dropped it.
+		if (WaitForSingleObject(g_auth_poll_stop, 0) == WAIT_OBJECT_0) {
+			ReleaseSRWLockExclusive(&g_enum_lock);
+			break;
+		}
 		const uint64_t now_ns = os_monotonic_get_ns();
 		if (!g_enum_unsupported && probe_instance_ensure_locked(now_ns)) {
 			(void)refresh_locked(now_ns);
