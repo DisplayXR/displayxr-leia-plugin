@@ -208,7 +208,15 @@ env:
   # after a foreground start from the background, retries a refused first open), #762
   # (shared-camera frames with rotation/padded planes no longer dropped), #768 (a legacy
   # millimetre don_mm in the config is converted to donopx). No weave or ABI change.
-  CNSDK_TAG: v0.10.93
+  #
+  # 0.10.95 (cnsdk-android-0.10.95+217.ec01903): CNSDK#770 - a client keeps its binding
+  # when the head-tracking engine process dies, so Android restarts the service and the
+  # client reconnects by itself (before: no engine, no frames, every 3D app flat at the
+  # zero face until the app restarted its session; verified fixed on the Lume phone).
+  # CNSDK#769 - the GL late-latching uniform write skips unmapped or undersized slots
+  # (a calibration app crashed writing _faceX through a null mapping). Service/impl side
+  # only; no loader API or INTRODUCED_IN change. (v0.10.94 = #769 only, no release.)
+  CNSDK_TAG: v0.10.95
 
 jobs:
   Android:
