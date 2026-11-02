@@ -535,6 +535,77 @@ leia_win_claims_generation(void)
 	return g;
 }
 
+int32_t
+leia_win_sr_edid_only_count(const struct leia_win_sr_display *displays, int32_t count)
+{
+	int32_t n = 0;
+	for (int32_t i = 0; displays != NULL && i < count; i++) {
+		if (!displays[i].fpc_verified) {
+			n++;
+		}
+	}
+	return n;
+}
+
+bool
+leia_win_sr_authenticated(const struct leia_win_sr_display *prev,
+                          int32_t prev_count,
+                          const struct leia_win_sr_display *cur,
+                          int32_t cur_count)
+{
+	for (int32_t i = 0; prev != NULL && cur != NULL && i < cur_count; i++) {
+		if (!cur[i].fpc_verified) {
+			continue;
+		}
+		bool was_verified = false;
+		bool was_edid_only = false;
+		for (int32_t j = 0; j < prev_count; j++) {
+			if (prev[j].fpc_verified) {
+				was_verified = was_verified || prev[j].display_id == cur[i].display_id;
+			} else {
+				was_edid_only = was_edid_only || prev[j].display_id == cur[i].display_id ||
+				                same_panel_edid(cur[i].manufacturer_id, cur[i].product_id, cur[i].edid_serial,
+				                                prev[j].manufacturer_id, prev[j].product_id, prev[j].edid_serial);
+			}
+		}
+		if (was_edid_only && !was_verified) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+leia_win_sr_auth_watch_feed(struct leia_win_sr_auth_watch *w,
+                            const struct leia_win_sr_display *displays,
+                            int32_t count,
+                            uint64_t now_ms)
+{
+	if (w == NULL || count < 0) {
+		return false;
+	}
+	bool due = false;
+	if (w->pending_count > 0 && leia_win_sr_authenticated(w->pending, w->pending_count, displays, count)) {
+		due = true;
+		w->pending_count = 0;
+	}
+	if (leia_win_sr_edid_only_count(displays, count) > 0) {
+		const int32_t n = count < LEIA_WIN_SR_MAX_DISPLAYS ? count : LEIA_WIN_SR_MAX_DISPLAYS;
+		memcpy(w->pending, displays, (size_t)n * sizeof(w->pending[0]));
+		w->pending_count = n;
+		w->pending_ms = now_ms;
+	} else if (w->pending_count > 0 && now_ms - w->pending_ms > LEIA_WIN_SR_AUTH_GRACE_MS) {
+		w->pending_count = 0;
+	}
+	return due;
+}
+
+bool
+leia_win_sr_auth_watch_pending(const struct leia_win_sr_auth_watch *w)
+{
+	return w != NULL && w->pending_count > 0;
+}
+
 
 /*
  *
@@ -585,6 +656,12 @@ leia_win_sr_enumerate_shutdown(void)
 void
 leia_win_sr_enumerate_refresh_next(void)
 {
+}
+
+void
+leia_win_sr_set_rescan_listener(void (*fn)(const char *reason))
+{
+	(void)fn;
 }
 
 bool

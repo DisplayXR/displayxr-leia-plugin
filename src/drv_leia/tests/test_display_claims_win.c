@@ -792,6 +792,155 @@ test_rebind_requires_the_same_panel(void)
 	      fpc_id);
 }
 
+/*!
+ * #483: the change that asks the runtime for a claim sweep. The same G16 replug:
+ * SR listed the DS1 EDID_ONLY under a hash id, then FPC_VERIFIED as 0x1 once the
+ * FPC paired, with no OS display event in between.
+ */
+static void
+test_sr_authenticated(void)
+{
+	const uint64_t edid_id = 0x4a3069e5e4f6985eull;
+	const uint64_t fpc_id = 0x1;
+	struct leia_win_sr_display edid_only[1] = {srd(edid_id, "ACR", DS1_PROD, false, NULL, -3840, 0, true)};
+	struct leia_win_sr_display paired[1] = {srd(fpc_id, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true)};
+	struct leia_win_sr_display laptop[1] = {srd(0x7, "AUO", B194_PROD, true, "QALA2137AL0011", 0, 0, true)};
+
+	// Pending: how many SR has not authenticated.
+	CHECK(leia_win_sr_edid_only_count(edid_only, 1) == 1);
+	CHECK(leia_win_sr_edid_only_count(paired, 1) == 0);
+	CHECK(leia_win_sr_edid_only_count(edid_only, -1) == 0);
+	CHECK(leia_win_sr_edid_only_count(NULL, 1) == 0);
+
+	// The re-key: EDID_ONLY under the hash id, then FPC_VERIFIED under the new id.
+	CHECK(leia_win_sr_authenticated(edid_only, 1, paired, 1));
+	// The same id turning verified counts too.
+	struct leia_win_sr_display same_id[1] = {srd(edid_id, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true)};
+	CHECK(leia_win_sr_authenticated(edid_only, 1, same_id, 1));
+	// The same id is enough even when the verified entry carries no EDID.
+	same_id[0].manufacturer_id = 0;
+	same_id[0].product_id = 0;
+	CHECK(leia_win_sr_authenticated(edid_only, 1, same_id, 1));
+
+	// Still EDID_ONLY, already verified, first read, unplug: no sweep from here.
+	CHECK(!leia_win_sr_authenticated(edid_only, 1, edid_only, 1));
+	CHECK(!leia_win_sr_authenticated(paired, 1, paired, 1));
+	CHECK(!leia_win_sr_authenticated(NULL, -1, paired, 1));
+	CHECK(!leia_win_sr_authenticated(edid_only, 1, edid_only, 0));
+	// A verified panel hotplugged with nothing EDID_ONLY before: the OS event covers it.
+	struct leia_win_sr_display hotplugged[2] = {laptop[0], paired[0]};
+	CHECK(!leia_win_sr_authenticated(laptop, 1, hotplugged, 2));
+	// A list SR could not give: nothing to compare.
+	CHECK(!leia_win_sr_authenticated(edid_only, 1, paired, -1));
+
+	// Two panels: the laptop's stays verified, the DS1's authenticates -> a sweep;
+	// the laptop's own verified entry alone does not count as new.
+	struct leia_win_sr_display before[2] = {laptop[0], edid_only[0]};
+	struct leia_win_sr_display after[2] = {laptop[0], paired[0]};
+	struct leia_win_sr_display after_still[2] = {laptop[0], edid_only[0]};
+	CHECK(leia_win_sr_authenticated(before, 2, after, 2));
+	CHECK(!leia_win_sr_authenticated(before, 2, after_still, 2));
+	CHECK(leia_win_sr_edid_only_count(before, 2) == 1);
+	// A panel that went from verified to EDID_ONLY (SR lost its FPC) is not authentication.
+	CHECK(!leia_win_sr_authenticated(paired, 1, edid_only, 1));
+
+	// Only the panel that was EDID_ONLY counts: another verified panel is not it...
+	CHECK(!leia_win_sr_authenticated(edid_only, 1, laptop, 1));
+	// ...nor a twin of the same model with another EDID serial number,
+	struct leia_win_sr_display mine[1] = {srd(edid_id, "ACR", DS1_PROD, false, NULL, -3840, 0, true)};
+	mine[0].edid_serial = 841937063u;
+	struct leia_win_sr_display twin[1] = {srd(0x2, "ACR", DS1_PROD, true, "QI0000000000002", -3840, 0, true)};
+	twin[0].edid_serial = 841937064u;
+	CHECK(!leia_win_sr_authenticated(mine, 1, twin, 1));
+	// ...while the same serial, or a serial on one side only, is the panel.
+	twin[0].edid_serial = 841937063u;
+	CHECK(leia_win_sr_authenticated(mine, 1, twin, 1));
+	twin[0].edid_serial = 0;
+	CHECK(leia_win_sr_authenticated(mine, 1, twin, 1));
+	// An EDID_ONLY entry with no EDID matches any newly verified panel.
+	struct leia_win_sr_display blank[1] = {srd(edid_id, "ACR", DS1_PROD, false, NULL, -3840, 0, true)};
+	blank[0].manufacturer_id = 0;
+	blank[0].product_id = 0;
+	CHECK(leia_win_sr_authenticated(blank, 1, laptop, 1));
+	// Two of one model, one verified and one EDID_ONLY: the verified one being listed
+	// again is not news, even though its EDID matches the other's.
+	struct leia_win_sr_display pair_before[2] = {paired[0], edid_only[0]};
+	CHECK(!leia_win_sr_authenticated(pair_before, 2, pair_before, 2));
+	CHECK(!leia_win_sr_authenticated(NULL, 1, paired, 1));
+}
+
+/*!
+ * #483: the watch the plug-in keeps between reads (the review's case: a re-key
+ * that one read sees as "gone" and the next as "verified").
+ */
+static void
+test_sr_auth_watch(void)
+{
+	const uint64_t edid_id = 0x4a3069e5e4f6985eull;
+	struct leia_win_sr_display edid_only[1] = {srd(edid_id, "ACR", DS1_PROD, false, NULL, -3840, 0, true)};
+	struct leia_win_sr_display paired[1] = {srd(0x1, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true)};
+	struct leia_win_sr_display laptop[1] = {srd(0x7, "AUO", B194_PROD, true, "QALA2137AL0011", 0, 0, true)};
+
+	// Nothing pending at first; a verified panel alone never is.
+	struct leia_win_sr_auth_watch w;
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+
+	// EDID_ONLY -> pending; still EDID_ONLY -> pending, no sweep; verified -> one sweep, not pending.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 2000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, 3000));
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, 1, 4000));
+
+	// A failed read is not fed: it changes nothing, and does not run the grace out.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, paired, -1, 2000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, NULL, -1, 1000 + LEIA_WIN_SR_AUTH_GRACE_MS + 5000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, 1000 + LEIA_WIN_SR_AUTH_GRACE_MS + 6000));
+
+	// The grace counts from the LAST read that listed the panel EDID_ONLY: a long
+	// EDID-only phase, gone for one read, then verified.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 60000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, NULL, 0, 61000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, 62000));
+
+	// Gone for one read, then verified within the grace: still one sweep.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, NULL, 0, 2000));
+	CHECK(leia_win_sr_auth_watch_pending(&w));
+	CHECK(leia_win_sr_auth_watch_feed(&w, paired, 1, 1000 + LEIA_WIN_SR_AUTH_GRACE_MS));
+
+	// Gone past the grace (an unplug): no longer pending, and a later verified panel is the OS event's job.
+	memset(&w, 0, sizeof(w));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, edid_only, 1, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, laptop, 1, 1000 + LEIA_WIN_SR_AUTH_GRACE_MS + 1));
+	CHECK(!leia_win_sr_auth_watch_pending(&w));
+	struct leia_win_sr_display both[2] = {laptop[0], paired[0]};
+	CHECK(!leia_win_sr_auth_watch_feed(&w, both, 2, 20000));
+
+	// Two panels: the laptop's verified entry is not news; the DS1's is, once.
+	memset(&w, 0, sizeof(w));
+	struct leia_win_sr_display before[2] = {laptop[0], edid_only[0]};
+	CHECK(!leia_win_sr_auth_watch_feed(&w, before, 2, 1000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, laptop, 1, 2000));
+	CHECK(leia_win_sr_auth_watch_feed(&w, both, 2, 3000));
+	CHECK(!leia_win_sr_auth_watch_feed(&w, both, 2, 4000));
+
+	CHECK(!leia_win_sr_auth_watch_pending(NULL));
+	CHECK(!leia_win_sr_auth_watch_feed(NULL, paired, 1, 1000));
+}
+
 int
 main(void)
 {
@@ -812,6 +961,8 @@ main(void)
         test_panel_pick_rules();
 	test_rebind_display_id();
 	test_rebind_requires_the_same_panel();
+	test_sr_authenticated();
+	test_sr_auth_watch();
         if (g_failures != 0) {
 		fprintf(stderr, "%d check(s) failed\n", g_failures);
 		return 1;

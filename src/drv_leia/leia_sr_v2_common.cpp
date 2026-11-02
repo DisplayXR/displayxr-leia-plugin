@@ -799,6 +799,12 @@ leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *ou
  *    events (the EDID_ONLY id is a hash until the FPC pairs it), so nothing
  *    here persists beyond the cache TTL; M5/M6 must re-resolve from the
  *    claim table, not remember a displayId.
+ *  - #483: when the FPC pairs, SR re-keys an EDID_ONLY panel with no OS
+ *    display event, so the runtime would keep its EDID_ONLY claim. Each read
+ *    compares with the last list that held an EDID_ONLY panel (g_auth_watch)
+ *    and asks the runtime for a claim sweep on the change; a poll keeps
+ *    reading while a panel is EDID_ONLY. The macOS arm does the same
+ *    (leia_sr_macos.m).
  * ------------------------------------------------------------------ */
 
 #ifdef DXR_LEIA_HAS_SR_DISPLAY_ENUM
@@ -809,7 +815,9 @@ leia_sr_v2_create_lens(SrInstance instance, uint64_t bind_display_id, SrLens *ou
 
 #include <sr/sr_display.h>
 
+#include <mutex>
 #include <stdio.h>
+#include <thread>
 
 namespace {
 
@@ -830,9 +838,25 @@ uint64_t g_cache_ns = 0;
 bool g_force_refresh = false;
 uint64_t g_logged_fingerprint = 0;
 
+// --- #483: SR authenticating a panel it listed EDID_ONLY ---------------------
+//! The runtime's request_display_rescan (leia_win_sr_set_rescan_listener); NULL = none.
+std::atomic<void (*)(const char *)> g_rescan_fn{nullptr};
+//! The last list that held an EDID_ONLY display. Unlike g_cache, a failed read
+//! does not drop it, so the EDID_ONLY -> FPC_VERIFIED change is seen across one.
+struct leia_win_sr_auth_watch g_auth_watch = {};
+//! refresh_locked saw SR authenticate a panel; the caller serves it outside g_enum_lock.
+bool g_rescan_due = false;
+
 constexpr uint64_t CACHE_TTL_NS = 2000000000ull;        // 2 s
 constexpr uint64_t CREATE_RETRY_NS = 2000000000ull;     // after a failed srCreateInstance
 constexpr double CREATE_MAX_WAIT_S = 0.25;              // non-blocking mode: one or two spins at most
+//! #483: the poll's period while SR lists a panel EDID_ONLY. SR retries a failed FPC
+//! authentication with a 1-30 s backoff (47 s after the replug on the G16), so 1 s
+//! costs at most a second; after AUTH_POLL_SLOW_AFTER_MS a panel that does not
+//! authenticate (its FPC cable out) is read every AUTH_POLL_SLOW_MS instead.
+constexpr DWORD AUTH_POLL_MS = 1000;
+constexpr DWORD AUTH_POLL_SLOW_MS = 5000;
+constexpr uint64_t AUTH_POLL_SLOW_AFTER_MS = 120000;
 
 void
 probe_instance_drop_locked()
@@ -1037,10 +1061,164 @@ refresh_locked(uint64_t now_ns)
 			        (double)s.refresh_hz, s.device_name, (unsigned long long)s.hmonitor);
 		}
 	}
+	// #483: whoever reads the list sees SR authenticate a panel (the poll, a DP's
+	// create attempt, a sweep); enumerate_serve tells the runtime.
+	if (leia_win_sr_auth_watch_feed(&g_auth_watch, fresh, (int32_t)count, now_ns / 1000000ull)) {
+		g_rescan_due = true;
+	}
+
 	memcpy(g_cache, fresh, count * sizeof(fresh[0]));
 	g_cache_count = (int32_t)count;
 	g_cache_ns = now_ns;
 	return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * #483: the authentication poll. Runs while SR lists a panel EDID_ONLY (and
+ * for LEIA_WIN_SR_AUTH_GRACE_MS after) and the runtime gave a rescan
+ * listener; reads SR's list fresh every AUTH_POLL_MS, so refresh_locked sees
+ * the EDID_ONLY -> FPC_VERIFIED change even with no app, DP or sweep reading
+ * it. Exits once nothing is pending. Detached, like the readiness watcher:
+ * shutdown signals g_auth_poll_stop and waits on g_auth_poll_done, and is
+ * final, as the watcher's is (on Windows the runtime keeps the plug-in's
+ * instance for the process, so destroy is process teardown), until the next
+ * negotiate hands over a listener again.
+ * ------------------------------------------------------------------ */
+
+std::mutex g_auth_poll_mu; // guards the three flags below and the start/exit decision
+bool g_auth_poll_running = false;
+bool g_auth_poll_shutdown = false;
+bool g_auth_poll_start_failed_logged = false;
+HANDLE g_auth_poll_stop = nullptr; // manual-reset
+HANDLE g_auth_poll_done = nullptr; // manual-reset
+
+void
+auth_poll_body();
+
+//! Caller holds g_auth_poll_mu. Logs the first failure only.
+void
+auth_poll_start_failed_locked(const char *what)
+{
+	if (!g_auth_poll_start_failed_logged) {
+		g_auth_poll_start_failed_logged = true;
+		U_LOG_E("leia_plugin: %s -- no SR authentication poll; a panel SR authenticates after the runtime's "
+		        "follow-up sweeps is claimed only at the next display event (#483)",
+		        what);
+	}
+}
+
+void
+auth_poll_start()
+{
+	std::lock_guard<std::mutex> lk(g_auth_poll_mu);
+	if (g_auth_poll_running || g_auth_poll_shutdown) {
+		return;
+	}
+	if (g_auth_poll_stop == nullptr) {
+		g_auth_poll_stop = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+	}
+	if (g_auth_poll_done == nullptr) {
+		g_auth_poll_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+	}
+	if (g_auth_poll_stop == nullptr || g_auth_poll_done == nullptr) {
+		auth_poll_start_failed_locked("CreateEvent failed");
+		return;
+	}
+	ResetEvent(g_auth_poll_stop);
+	ResetEvent(g_auth_poll_done);
+	g_auth_poll_running = true;
+	try {
+		std::thread([]() { auth_poll_body(); }).detach();
+	} catch (...) {
+		// std::system_error (no thread or memory left): leave the flag clear,
+		// so the next read tries again.
+		g_auth_poll_running = false;
+		SetEvent(g_auth_poll_done);
+		auth_poll_start_failed_locked("the poll thread could not be started");
+		return;
+	}
+	U_LOG_W("leia_plugin: SR lists a panel EDID_ONLY (FPC not authenticated yet) -- polling srEnumerateDisplays "
+	        "every %lu ms until it is, then asking the runtime for a claim sweep (#483)",
+	        (unsigned long)AUTH_POLL_MS);
+}
+
+/*!
+ * After a read, outside g_enum_lock: tell the runtime when refresh_locked saw
+ * SR authenticate a panel, and keep the poll going while a panel is pending.
+ */
+void
+enumerate_serve(bool due, bool pending)
+{
+	auto fn = g_rescan_fn.load();
+	if (due) {
+		// SR's monitor join is read by the sweep too; it may still name the
+		// EDID_ONLY id inside the cache TTL.
+		leia_win_sr_enumerate_refresh_next();
+		if (fn != nullptr) {
+			U_LOG_W("leia_plugin: SR authenticated a panel (EDID_ONLY -> FPC_VERIFIED) -- asking the runtime for "
+			        "a claim sweep (#483)");
+			fn("leia-sr: SR panel authenticated (EDID_ONLY -> FPC_VERIFIED)");
+		}
+	}
+	if (pending && fn != nullptr) {
+		auth_poll_start();
+	}
+}
+
+void
+auth_poll_body()
+{
+	const uint64_t since_ms = GetTickCount64();
+	for (;;) {
+		const DWORD wait_ms =
+		    GetTickCount64() - since_ms < AUTH_POLL_SLOW_AFTER_MS ? AUTH_POLL_MS : AUTH_POLL_SLOW_MS;
+		if (WaitForSingleObject(g_auth_poll_stop, wait_ms) == WAIT_OBJECT_0) {
+			break;
+		}
+		AcquireSRWLockExclusive(&g_enum_lock);
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (!g_enum_unsupported && probe_instance_ensure_locked(now_ns)) {
+			(void)refresh_locked(now_ns);
+		}
+		const bool due = g_rescan_due;
+		g_rescan_due = false;
+		ReleaseSRWLockExclusive(&g_enum_lock);
+		enumerate_serve(due, false);
+
+		// Exit under g_auth_poll_mu, reading the watch under g_enum_lock inside
+		// it: a read that makes a panel pending after this check starts the
+		// poll again, because it finds g_auth_poll_running false.
+		std::lock_guard<std::mutex> lk(g_auth_poll_mu);
+		AcquireSRWLockShared(&g_enum_lock);
+		const bool pending = leia_win_sr_auth_watch_pending(&g_auth_watch) && !g_enum_unsupported;
+		ReleaseSRWLockShared(&g_enum_lock);
+		if (!pending) {
+			g_auth_poll_running = false;
+			SetEvent(g_auth_poll_done);
+			return;
+		}
+	}
+	std::lock_guard<std::mutex> lk(g_auth_poll_mu);
+	g_auth_poll_running = false;
+	SetEvent(g_auth_poll_done);
+}
+
+//! Stop the poll for good and wait for it (bounded, as for the readiness watcher). Not under g_enum_lock.
+void
+auth_poll_stop()
+{
+	bool wait = false;
+	{
+		std::lock_guard<std::mutex> lk(g_auth_poll_mu);
+		g_auth_poll_shutdown = true; // no restart can reset the events under the wait below
+		if (g_auth_poll_running && g_auth_poll_stop != nullptr) {
+			SetEvent(g_auth_poll_stop);
+			wait = true;
+		}
+	}
+	if (wait) {
+		(void)WaitForSingleObject(g_auth_poll_done, 2500);
+	}
 }
 
 } // namespace
@@ -1124,6 +1302,8 @@ extern "C" int32_t
 leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
 {
 	int32_t ret = -1;
+	bool due = false;
+	bool pending = false;
 	AcquireSRWLockExclusive(&g_enum_lock);
 	if (!g_enum_unsupported) {
 		const uint64_t now_ns = os_monotonic_get_ns();
@@ -1140,8 +1320,12 @@ leia_win_sr_enumerate_displays(struct leia_win_sr_display *out, uint32_t cap)
 			}
 			ret = g_cache_count;
 		}
+		due = g_rescan_due;
+		g_rescan_due = false;
+		pending = leia_win_sr_auth_watch_pending(&g_auth_watch);
 	}
 	ReleaseSRWLockExclusive(&g_enum_lock);
+	enumerate_serve(due, pending);
 	return ret;
 }
 
@@ -1287,6 +1471,7 @@ leia_win_sr_enumerate_monitors(struct leia_win_sr_monitor *out, uint32_t cap)
 extern "C" void
 leia_win_sr_enumerate_shutdown(void)
 {
+	auth_poll_stop(); // #483: it reads through the probe instance
 	AcquireSRWLockExclusive(&g_enum_lock);
 	probe_instance_drop_locked();
 	g_cache_count = -1;
@@ -1306,6 +1491,15 @@ leia_win_sr_enumerate_refresh_next(void)
 	g_mon_force_refresh = true;
 #endif
 	ReleaseSRWLockExclusive(&g_enum_lock);
+}
+
+extern "C" void
+leia_win_sr_set_rescan_listener(void (*fn)(const char *reason))
+{
+	g_rescan_fn.store(fn);
+	// A negotiate after a destroy: the poll may run again.
+	std::lock_guard<std::mutex> lk(g_auth_poll_mu);
+	g_auth_poll_shutdown = false;
 }
 
 #endif // DXR_LEIA_HAS_SR_DISPLAY_ENUM
