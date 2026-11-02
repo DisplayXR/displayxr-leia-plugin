@@ -198,7 +198,17 @@ env:
   # product name instead of the model string (it no longer enables on the Lume Pad 2).
   # CNSDK#759 — the lls_gyro weave predictor is the default with a 40 ms weave horizon on
   # every device. No loader API or INTRODUCED_IN change. (v0.10.86 = #761 only, no release.)
-  CNSDK_TAG: v0.10.87
+  #
+  # 0.10.93 (cnsdk-android-0.10.93+216.4af911d): adds four loader entries, all
+  # INTRODUCED_IN 0.10.91 and thunked to 0/false against an older impl:
+  # leia_device_config_get_tracking_camera_data (CNSDK#763; the comments in leia_cnsdk.*
+  # still say 0.10.89 - the entry was retagged to 0.10.91 before merge) and
+  # leia_device_config_get/find/count_stereo_calibration (CNSDK#766). Also CNSDK#764
+  # (lls_gyro no longer weaves to 1e13 mm on a stale gyro), #765 (HTS regains the camera
+  # after a foreground start from the background, retries a refused first open), #762
+  # (shared-camera frames with rotation/padded planes no longer dropped), #768 (a legacy
+  # millimetre don_mm in the config is converted to donopx). No weave or ABI change.
+  CNSDK_TAG: v0.10.93
 
 jobs:
   Android:
