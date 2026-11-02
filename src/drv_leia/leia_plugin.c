@@ -794,14 +794,28 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
                    struct xrt_plugin_iface **out_iface,
                    uint32_t *out_plugin_api_version)
 {
-	(void)host;
-
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 
 	if (runtime_api_version != XRT_PLUGIN_API_VERSION_CURRENT) {
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+
+#ifdef XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN
+	/* #483 (DisplayXR ADR-047 Amendment 8): SR lists a replugged panel
+	 * EDID_ONLY until its FPC pairs, then re-keys it FPC_VERIFIED with no OS
+	 * display event; asking the runtime for a claim sweep then moves the
+	 * claim to VERIFIED with the serial and the new id. As on macOS. A runtime
+	 * predating the slot leaves it zero (carved from reserved[]). */
+	if (host != NULL &&
+	    host->struct_size >= offsetof(struct xrt_plugin_host_iface, request_display_rescan) +
+	                             sizeof(host->request_display_rescan) &&
+	    host->request_display_rescan != NULL) {
+		leia_win_sr_set_rescan_listener(host->request_display_rescan);
+	}
+#else
+	(void)host;
+#endif
 
 	*out_iface = &g_leia_iface;
 	return XRT_SUCCESS;

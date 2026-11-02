@@ -535,6 +535,103 @@ leia_win_claims_generation(void)
 	return g;
 }
 
+int32_t
+leia_win_sr_edid_only_count(const struct leia_win_sr_display *displays, int32_t count)
+{
+	int32_t n = 0;
+	for (int32_t i = 0; displays != NULL && i < count; i++) {
+		if (!displays[i].fpc_verified) {
+			n++;
+		}
+	}
+	return n;
+}
+
+static bool
+sr_lists_edid_only(uint64_t id, const struct leia_win_sr_display *displays, int32_t count)
+{
+	for (int32_t i = 0; i < count; i++) {
+		if (!displays[i].fpc_verified && displays[i].display_id == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+leia_win_sr_authenticated(const struct leia_win_sr_display *prev,
+                          int32_t prev_count,
+                          const struct leia_win_sr_display *cur,
+                          int32_t cur_count)
+{
+	for (int32_t i = 0; prev != NULL && cur != NULL && i < cur_count; i++) {
+		if (!cur[i].fpc_verified) {
+			continue;
+		}
+		bool was_verified = false;
+		for (int32_t j = 0; j < prev_count; j++) {
+			was_verified = was_verified || (prev[j].fpc_verified && prev[j].display_id == cur[i].display_id);
+		}
+		for (int32_t j = 0; j < prev_count; j++) {
+			if (prev[j].fpc_verified) {
+				continue;
+			}
+			const bool same_panel =
+			    prev[j].display_id == cur[i].display_id ||
+			    same_panel_edid(cur[i].manufacturer_id, cur[i].product_id, cur[i].edid_serial,
+			                    prev[j].manufacturer_id, prev[j].product_id, prev[j].edid_serial);
+			// A verified id prev listed too may be SR's reused 0x1, listed stale next
+			// to the EDID_ONLY hash: then the hash going away is the change.
+			if (same_panel && (!was_verified || !sr_lists_edid_only(prev[j].display_id, cur, cur_count))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool
+leia_win_sr_auth_watch_feed(struct leia_win_sr_auth_watch *w,
+                            const struct leia_win_sr_display *displays,
+                            int32_t count,
+                            uint64_t now_ms)
+{
+	if (w == NULL || count < 0) {
+		return false;
+	}
+	bool due = false;
+	w->held = false;
+	if (w->pending_count > 0 && leia_win_sr_authenticated(w->pending, w->pending_count, displays, count)) {
+		if (!w->asked || now_ms - w->asked_ms >= LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS) {
+			due = true;
+			w->asked = true;
+			w->asked_ms = now_ms;
+			w->pending_count = 0;
+		} else {
+			// Keep this list pending, so the first read after the interval still
+			// sees the panel authenticated and asks then.
+			w->held = true;
+			w->pending_ms = now_ms;
+			return false;
+		}
+	}
+	if (leia_win_sr_edid_only_count(displays, count) > 0) {
+		const int32_t n = count < LEIA_WIN_SR_MAX_DISPLAYS ? count : LEIA_WIN_SR_MAX_DISPLAYS;
+		memcpy(w->pending, displays, (size_t)n * sizeof(w->pending[0]));
+		w->pending_count = n;
+		w->pending_ms = now_ms;
+	} else if (w->pending_count > 0 && now_ms - w->pending_ms > LEIA_WIN_SR_AUTH_GRACE_MS) {
+		w->pending_count = 0;
+	}
+	return due;
+}
+
+bool
+leia_win_sr_auth_watch_pending(const struct leia_win_sr_auth_watch *w)
+{
+	return w != NULL && w->pending_count > 0;
+}
+
 
 /*
  *
@@ -585,6 +682,12 @@ leia_win_sr_enumerate_shutdown(void)
 void
 leia_win_sr_enumerate_refresh_next(void)
 {
+}
+
+void
+leia_win_sr_set_rescan_listener(void (*fn)(const char *reason))
+{
+	(void)fn;
 }
 
 bool

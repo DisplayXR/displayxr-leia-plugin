@@ -354,6 +354,77 @@ leia_win_sr_note_display_edid(uint64_t id,
                               uint16_t *io_product,
                               uint32_t *io_serial);
 
+//! #483: how many displays SR lists EDID_ONLY (its FPC not authenticated yet); 0 when @p count < 0.
+int32_t
+leia_win_sr_edid_only_count(const struct leia_win_sr_display *displays, int32_t count);
+
+/*!
+ * #483: did SR authenticate a panel between two reads of its display list?
+ * True when @p cur lists an FPC_VERIFIED display that @p prev did not list
+ * FPC_VERIFIED, and that is a panel @p prev listed EDID_ONLY: the same id, or
+ * the same EDID (manufacturer and product, and serial number when both have
+ * one; an EDID_ONLY entry with no EDID matches any). SR re-keys the panel when
+ * its FPC pairs, so the verified entry usually has a new id and the same EDID.
+ * Also true when @p prev listed that verified id too but @p cur no longer
+ * lists the EDID_ONLY entry: SR's verified id is a small sequence number
+ * (0x1) that a read can list stale next to the new EDID_ONLY hash.
+ * No OS display event comes with it, so the runtime's claims keep the EDID_ONLY
+ * answer (EDID confidence, no serial, the dead id) until it is asked to sweep
+ * again. A first read (@p prev_count < 0), a hotplug of another panel and an
+ * unplug are not this change: the OS display event covers those.
+ */
+bool
+leia_win_sr_authenticated(const struct leia_win_sr_display *prev,
+                          int32_t prev_count,
+                          const struct leia_win_sr_display *cur,
+                          int32_t cur_count);
+
+//! #483: how long a panel stays pending after SR stopped listing it EDID_ONLY with no verified entry yet.
+#define LEIA_WIN_SR_AUTH_GRACE_MS 10000u
+
+//! #483: the shortest time between two claim sweep requests. A sweep that changes a
+//! claim rebuilds the per-screen DPs (a brief 3D drop), so a flapping FPC asks at most
+//! once per interval.
+#define LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS 30000u
+
+/*!
+ * #483: what the plug-in keeps between reads of SR's display list to see SR
+ * authenticate a panel: the last list that held an EDID_ONLY display, and
+ * when it last asked for a sweep. Zero-initialised = nothing pending.
+ */
+struct leia_win_sr_auth_watch
+{
+	struct leia_win_sr_display pending[LEIA_WIN_SR_MAX_DISPLAYS];
+	int32_t pending_count; //!< 0 = nothing pending
+	uint64_t pending_ms;   //!< when a read last listed a display EDID_ONLY, or held a request
+	uint64_t asked_ms;     //!< when a feed last returned true
+	bool asked;            //!< a feed returned true before
+	bool held;             //!< the last read saw an authentication inside the interval
+};
+
+/*!
+ * #483: feed one read SR answered (@p count >= 0; a failed read is not fed).
+ * @return true when SR authenticated a panel since the last list that held one
+ * EDID_ONLY (@ref leia_win_sr_authenticated): ask the runtime for a claim sweep.
+ * A panel stays pending for LEIA_WIN_SR_AUTH_GRACE_MS after a read stops listing
+ * it EDID_ONLY, so a re-key that one read sees as "gone" and the next as
+ * "verified" still counts.
+ * Within LEIA_WIN_SR_RESCAN_MIN_INTERVAL_MS of the last true, an authentication
+ * is held (@c held) and the panel stays pending: the first read after the
+ * interval that still sees it returns true. If SR lists the panel EDID_ONLY
+ * again first, the held request is dropped and the new EDID_ONLY phase asks
+ * when it authenticates, so a flap never asks while the panel is EDID_ONLY.
+ */
+bool
+leia_win_sr_auth_watch_feed(struct leia_win_sr_auth_watch *w,
+                            const struct leia_win_sr_display *displays,
+                            int32_t count,
+                            uint64_t now_ms);
+
+//! #483: is a panel pending, i.e. should the plug-in keep reading SR's list?
+bool
+leia_win_sr_auth_watch_pending(const struct leia_win_sr_auth_watch *w);
+
 
 /*
  *
@@ -411,6 +482,19 @@ leia_win_sr_enumerate_shutdown(void);
  */
 void
 leia_win_sr_enumerate_refresh_next(void);
+
+/*!
+ * #483: who to tell when SR authenticates a panel it listed EDID_ONLY (see
+ * @ref leia_win_sr_authenticated): the runtime's
+ * `xrt_plugin_host_iface::request_display_rescan`, which re-runs the
+ * per-monitor claim sweep (DisplayXR ADR-047 Amendment 8). Every read of SR's
+ * display list checks for that change, and while SR lists a panel EDID_ONLY a
+ * poll thread re-reads it, so the change is seen without an app or DP asking.
+ * Without a listener (an older runtime) nothing polls. NULL clears. Called once,
+ * at negotiate; the pointer lives in the runtime, which keeps this DLL loaded.
+ */
+void
+leia_win_sr_set_rescan_listener(void (*fn)(const char *reason));
 
 /*!
  * runtime ADR-060 R2 (L4): does the installed SR runtime support EXTERNAL
