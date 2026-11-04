@@ -315,6 +315,88 @@ leia_scam_factory_baseline_mm(const struct leia_scam_factory_calib *f);
 uint64_t
 leia_scam_block_hash(const uint8_t *bytes, size_t len);
 
+/*
+ *
+ * Factory-block read retry (#505). The block is read over JNI, which needs the
+ * host's JavaVM + Context (leia_cnsdk_get_jni). The runtime's camera manager
+ * can enumerate before the host has published them; an empty read made then
+ * says nothing about the block, so it must never be cached as "absent".
+ *
+ */
+
+//! Outcome of reading the block for one pair (logical id + its lenses).
+enum leia_scam_block_read
+{
+	//! Bytes were read.
+	LEIA_SCAM_BLOCK_READ_FOUND = 0,
+	//! JNI worked and every characteristics read listed its keys: no block.
+	LEIA_SCAM_BLOCK_READ_ABSENT = 1,
+	//! No JavaVM / Context from the host yet: not readable, says nothing.
+	LEIA_SCAM_BLOCK_READ_NO_JNI = 2,
+	//! JNI was there but a characteristics call threw or returned null.
+	LEIA_SCAM_BLOCK_READ_FAILED = 3,
+	//! The process lacks android.permission.CAMERA: the camera service then
+	//! strips the permission-gated vendor keys from the characteristics, so
+	//! the keys list without the block although the HAL publishes it (#505,
+	//! measured on a nubia Pad 3D II after a fresh runtime install).
+	LEIA_SCAM_BLOCK_READ_NO_PERMISSION = 4,
+};
+
+/*!
+ * One pair's verdict from the reads of its logical id and lenses: FOUND if
+ * any read found the block; else NO_JNI if any read had no JNI; else
+ * NO_PERMISSION if any lacked the camera permission; else FAILED if any
+ * failed; ABSENT only when every read succeeded and none found it (and when
+ * @p n is 0).
+ */
+enum leia_scam_block_read
+leia_scam_block_read_combine(const enum leia_scam_block_read *reads, size_t n);
+
+//! What to do with a pair after a read (leia_scam_block_retry_step).
+enum leia_scam_block_verdict
+{
+	//! Not readable yet: keep the pair unlisted, read again from next_ns.
+	LEIA_SCAM_BLOCK_PENDING = 0,
+	//! The block was read.
+	LEIA_SCAM_BLOCK_HAVE = 1,
+	//! A successful read found no block: final, raw only.
+	LEIA_SCAM_BLOCK_NONE = 2,
+	//! Never readable within the bounds: final, raw only.
+	LEIA_SCAM_BLOCK_GAVE_UP = 3,
+};
+
+//! Retry period while a pair is pending.
+#define LEIA_SCAM_BLOCK_RETRY_PERIOD_NS (500ll * 1000 * 1000)
+//! How long to wait for the host's JNI context, from the first read.
+#define LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS (30000ll * 1000 * 1000)
+//! Failed reads WITH a JNI context before giving up.
+#define LEIA_SCAM_BLOCK_MAX_FAILED 3u
+
+struct leia_scam_block_retry
+{
+	int64_t first_ns;  //!< time of the first read (valid when attempts > 0)
+	int64_t next_ns;   //!< no read before this while pending
+	uint32_t attempts; //!< reads made
+	uint32_t failed;   //!< FAILED reads (JNI there)
+	bool jni_seen;     //!< some read had a JNI context
+	enum leia_scam_block_verdict verdict;
+};
+
+//! Is a read due at @p now_ns? Only while pending (a fresh struct is due at once).
+bool
+leia_scam_block_retry_due(const struct leia_scam_block_retry *st, int64_t now_ns);
+
+/*!
+ * Fold one read made at @p now_ns into @p st and return the new verdict.
+ * FOUND -> HAVE and ABSENT -> NONE at once; NO_JNI stays PENDING until
+ * LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS after the first read; FAILED stays PENDING
+ * for LEIA_SCAM_BLOCK_MAX_FAILED reads; NO_PERMISSION stays PENDING with no
+ * bound (the grant can come at any time, and the check is cheap). A final
+ * verdict never changes.
+ */
+enum leia_scam_block_verdict
+leia_scam_block_retry_step(struct leia_scam_block_retry *st, enum leia_scam_block_read r, int64_t now_ns);
+
 #ifdef __cplusplus
 }
 #endif

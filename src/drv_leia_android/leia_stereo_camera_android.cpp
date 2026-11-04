@@ -202,23 +202,64 @@ struct jni_env
 };
 
 /*!
+ * Does this process hold android.permission.CAMERA (Context.checkSelfPermission)?
+ * Without it the camera service strips the permission-gated vendor keys from
+ * CameraCharacteristics, the factory block included, while getKeys() still
+ * lists the rest (#505: measured after a fresh runtime install, whose CAMERA
+ * grant is only requested at the first stream's consent). A failed check
+ * counts as granted, so the read itself decides.
+ */
+bool
+has_camera_permission(jni_env &j)
+{
+	JNIEnv *env = j.env;
+	jclass ctx_cls = env->FindClass("android/content/Context");
+	if (!j.ok() || ctx_cls == nullptr) {
+		return true;
+	}
+	jmethodID check = env->GetMethodID(ctx_cls, "checkSelfPermission", "(Ljava/lang/String;)I");
+	if (!j.ok() || check == nullptr) {
+		env->DeleteLocalRef(ctx_cls);
+		return true;
+	}
+	jstring perm = env->NewStringUTF("android.permission.CAMERA");
+	const jint r = env->CallIntMethod(j.ctx, check, perm);
+	const bool ok = j.ok();
+	env->DeleteLocalRef(perm);
+	env->DeleteLocalRef(ctx_cls);
+	return !ok || r == 0; // PackageManager.PERMISSION_GRANTED
+}
+
+/*!
  * Bytes of the characteristics key of @p cam_id named @p full_name, else of
  * the first listed key whose name ends with @p suffix. Vendor keys are usually
  * NOT in getKeys() (measured on a Lume Pad 2), so the named lookup comes
  * first; it builds the Key exactly as an app would.
+ *
+ * #505: ABSENT only when the characteristics were read AND getKeys() listed
+ * them without the key. A read without the host's JavaVM / Context (NO_JNI:
+ * the runtime's camera manager can enumerate before the host published them)
+ * or one whose characteristics call threw (FAILED, @p out_why says where)
+ * says nothing about the block.
  */
-bool
+leia_scam_block_read
 read_vendor_block(const char *cam_id, const char *full_name, const char *suffix, std::vector<uint8_t> &out,
-                  std::string *out_key)
+                  std::string *out_key, std::string *out_why)
 {
 	jni_env j;
 	if (!j.acquire()) {
-		return false;
+		return LEIA_SCAM_BLOCK_READ_NO_JNI;
 	}
 	JNIEnv *env = j.env;
+	if (!has_camera_permission(j)) {
+		return LEIA_SCAM_BLOCK_READ_NO_PERMISSION;
+	}
 	bool found = false;
+	leia_scam_block_read res = LEIA_SCAM_BLOCK_READ_FAILED;
+	const char *step = "?";
 	env->PushLocalFrame(64);
 	do {
+		step = "Context.getSystemService(\"camera\")";
 		jclass ctx_cls = env->FindClass("android/content/Context");
 		if (!j.ok() || ctx_cls == nullptr) {
 			break;
@@ -231,6 +272,7 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 		if (!j.ok() || cm == nullptr) {
 			break;
 		}
+		step = "CameraManager.getCameraCharacteristics";
 		jclass cm_cls = env->FindClass("android/hardware/camera2/CameraManager");
 		jmethodID get_cc = env->GetMethodID(cm_cls, "getCameraCharacteristics",
 		                                    "(Ljava/lang/String;)Landroid/hardware/camera2/CameraCharacteristics;");
@@ -241,6 +283,7 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 		if (!j.ok() || cc == nullptr) {
 			break;
 		}
+		step = "CameraCharacteristics key lookup";
 		jclass cc_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics");
 		jclass key_cls = env->FindClass("android/hardware/camera2/CameraCharacteristics$Key");
 		jclass list_cls = env->FindClass("java/util/List");
@@ -274,11 +317,15 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 				break;
 			}
 		}
+		step = "CameraCharacteristics.getKeys()";
 		jobject keys = env->CallObjectMethod(cc, get_keys);
 		if (!j.ok() || keys == nullptr) {
 			break;
 		}
 		const jint n = env->CallIntMethod(keys, l_size);
+		if (!j.ok()) {
+			break;
+		}
 		const size_t slen = strlen(suffix);
 		for (jint i = 0; i < n && !found; i++) {
 			jobject key = env->CallObjectMethod(keys, l_get, i);
@@ -312,10 +359,19 @@ read_vendor_block(const char *cam_id, const char *full_name, const char *suffix,
 			env->DeleteLocalRef(jname);
 			env->DeleteLocalRef(key);
 		}
+		if (!found) {
+			res = LEIA_SCAM_BLOCK_READ_ABSENT; // the keys were listed: the block is not there
+		}
 	} while (false);
 	j.ok();
 	env->PopLocalFrame(nullptr);
-	return found;
+	if (found) {
+		return LEIA_SCAM_BLOCK_READ_FOUND;
+	}
+	if (res == LEIA_SCAM_BLOCK_READ_FAILED && out_why != nullptr) {
+		*out_why = std::string(step) + " failed for camera " + cam_id;
+	}
+	return res;
 }
 
 /*!
@@ -626,6 +682,12 @@ write_small_file(const std::string &path, const std::string &data)
 struct pair_desc
 {
 	char logical_id[16]{};
+	char lens_a[16]{}, lens_b[16]{}; //!< the physical lenses, in the HAL's order
+	//! #505: the factory block's read state. Until it is final (not PENDING)
+	//! nothing below is derived and no pair is listed.
+	leia_scam_block_retry block_retry{};
+	//! The pending reason last logged (-1 = none), so each reason logs once.
+	int block_deferred_reason{-1};
 	char main_id[16]{}; //!< lens that carries the factory block (= the tracking service's)
 	char sub_id[16]{};
 	bool front{false};
@@ -985,10 +1047,289 @@ oriented_factory(const pair_desc &p)
 	return f;
 }
 
+/*!
+ * Read the factory block of @p p (its logical id and both lenses) and derive
+ * everything from it. While the block is not readable yet (#505) the read
+ * is only recorded in p.block_retry and nothing else changes; once the
+ * verdict is final the pair is described, logged and listed.
+ */
+void
+describe_pair_locked(ACameraManager *m, pair_desc &p)
+{
+	uint32_t want_w = 1280, want_h = 720;
+	parse_size(prop_str("debug.dxr.leia.scam_size", ""), &want_w, &want_h);
+	const std::string swap = prop_str("debug.dxr.leia.scam_swap", "auto");
+	std::vector<uint32_t> ref_sizes;
+
+	// Factory block: on the logical id and on the main lens only.
+	const char *suffix = p.front ? "eeprom3d_front" : "eeprom3d_rear";
+	const std::string full = prop_str("debug.dxr.leia.scam_calib_key_prefix", kCalibKeyPrefix) + suffix;
+	// The physical lenses are read explicitly by their own ids: the HAL
+	// publishes the block on the main lens (tablets: front = lens 1, rear =
+	// lens 0), and the logical id does not always carry it.
+	const std::string a = p.lens_a, b = p.lens_b;
+	std::vector<uint8_t> blk;
+	std::string key, why;
+	leia_scam_block_read reads[3];
+	reads[0] = read_vendor_block(p.logical_id, full.c_str(), suffix, blk, &key, &why);
+	bool have = reads[0] == LEIA_SCAM_BLOCK_READ_FOUND;
+	std::vector<uint8_t> tmp;
+	std::string lens_key;
+	reads[1] = read_vendor_block(a.c_str(), full.c_str(), suffix, tmp, &lens_key, &why);
+	const bool a_has = reads[1] == LEIA_SCAM_BLOCK_READ_FOUND;
+	reads[2] = a_has ? LEIA_SCAM_BLOCK_READ_ABSENT
+	                 : read_vendor_block(b.c_str(), full.c_str(), suffix, tmp, &lens_key, &why);
+	const bool b_has = !a_has && reads[2] == LEIA_SCAM_BLOCK_READ_FOUND;
+	const std::string main_id = b_has ? b : a, sub_id = b_has ? a : b;
+	if (!have && (a_has || b_has)) {
+		blk = tmp;
+		key = lens_key;
+		have = true;
+	}
+	const leia_scam_block_read combined = leia_scam_block_read_combine(reads, 3);
+	const leia_scam_block_verdict verdict =
+	    leia_scam_block_retry_step(&p.block_retry, combined, clock_ns(CLOCK_MONOTONIC));
+	if (verdict == LEIA_SCAM_BLOCK_PENDING) {
+		// #505: not readable yet. Nothing is derived (or listed) from an empty
+		// read: the pair stays unlisted until the block is read, or the retry
+		// gives up, and only then is it described.
+		if (p.block_deferred_reason != (int)combined) {
+			p.block_deferred_reason = (int)combined;
+			if (combined == LEIA_SCAM_BLOCK_READ_NO_PERMISSION) {
+				SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s): factory block read deferred: "
+				           "this process lacks android.permission.CAMERA, so the camera service hides the "
+				           "vendor key %s from its characteristics; the pair is not listed until the "
+				           "permission is granted (checked on every enumerate), then it appears CALIBRATED",
+				           p.front ? "front" : "rear", p.logical_id, full.c_str());
+			} else if (combined == LEIA_SCAM_BLOCK_READ_NO_JNI) {
+				SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s): factory block read deferred: "
+				           "CNSDK host context not ready (leia_cnsdk_get_jni has no JavaVM / Context yet); "
+				           "the pair is not listed until it is read, retrying every %lld ms for up to %lld s",
+				           p.front ? "front" : "rear", p.logical_id,
+				           (long long)(LEIA_SCAM_BLOCK_RETRY_PERIOD_NS / kNsPerMs),
+				           (long long)(LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS / (1000 * kNsPerMs)));
+			} else {
+				SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s): factory block read deferred: %s; "
+				           "the pair is not listed until it is read, %u attempts at most",
+				           p.front ? "front" : "rear", p.logical_id, why.c_str(), LEIA_SCAM_BLOCK_MAX_FAILED);
+			}
+		}
+		return;
+	}
+	if (verdict == LEIA_SCAM_BLOCK_NONE) {
+		why = "absent: the characteristics of logical " + std::string(p.logical_id) + ", lens " + a + " and lens " +
+		      b + " were read and none has " + full;
+	} else if (verdict == LEIA_SCAM_BLOCK_GAVE_UP) {
+		char buf[200];
+		snprintf(buf, sizeof(buf), "never readable after %u attempts over %.1f s: ", p.block_retry.attempts,
+		         (double)(clock_ns(CLOCK_MONOTONIC) - p.block_retry.first_ns) / 1e9);
+		why = buf + (combined == LEIA_SCAM_BLOCK_READ_NO_JNI ? std::string("no CNSDK host context (JavaVM / Context)")
+		                                                     : why);
+	}
+	snprintf(p.main_id, sizeof(p.main_id), "%s", main_id.c_str());
+	snprintf(p.sub_id, sizeof(p.sub_id), "%s", sub_id.c_str());
+
+	ACameraMetadata *mm = nullptr;
+	if (ACameraManager_getCameraCharacteristics(m, p.main_id, &mm) == ACAMERA_OK && mm != nullptr) {
+		std::vector<int32_t> arr;
+		if (get_i32(mm, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, arr) && arr.size() >= 4) {
+			// NDK layout: xmin, ymin, width, height.
+			p.array_w = (uint32_t)arr[2];
+			p.array_h = (uint32_t)arr[3];
+		}
+		p.crop_w = want_w;
+		p.crop_h = want_h;
+		p.eye_w = want_w;
+		p.eye_h = want_h;
+		p.cap_w = want_w;
+		p.cap_h = want_h;
+		const uint32_t w43 = want_w, h43 = (want_w * 3 / 4) & ~1u;
+		ACameraMetadata *sm = nullptr;
+		bool sub_ok = false;
+		if (ACameraManager_getCameraCharacteristics(m, p.sub_id, &sm) == ACAMERA_OK && sm != nullptr) {
+			sub_ok = stream_supported(sm, AIMAGE_FORMAT_YUV_420_888, w43, h43);
+			ACameraMetadata_free(sm);
+		}
+		if (h43 >= want_h && stream_supported(mm, AIMAGE_FORMAT_YUV_420_888, w43, h43) && sub_ok) {
+			p.cap_h = h43;
+		} else if (!stream_supported(mm, AIMAGE_FORMAT_YUV_420_888, want_w, want_h)) {
+			SCAM_LOG_W("leia stereo camera (android): %ux%u not listed for lens %s; trying it anyway",
+			           want_w, want_h, p.main_id);
+		}
+		std::vector<int32_t> so;
+		if (get_i32(mm, ACAMERA_SENSOR_ORIENTATION, so)) {
+			p.sensor_orientation = so[0];
+			p.have_sensor_orientation = true;
+		}
+		// Candidate calibration reference sizes: every listed YUV / JPEG output.
+		std::vector<int32_t> cfg;
+		if (get_i32(mm, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, cfg)) {
+			for (size_t i = 0; i + 3 < cfg.size(); i += 4) {
+				if ((cfg[i] == AIMAGE_FORMAT_YUV_420_888 || cfg[i] == AIMAGE_FORMAT_JPEG) &&
+				    cfg[i + 3] == ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT && cfg[i + 1] > 0 &&
+				    cfg[i + 2] > 0) {
+					ref_sizes.push_back((uint32_t)cfg[i + 1]);
+					ref_sizes.push_back((uint32_t)cfg[i + 2]);
+				}
+			}
+		}
+		ACameraMetadata_free(mm);
+	}
+
+	leia_scam_factory_calib raw{};
+	double ref_off = 0.0;
+	if (have && leia_scam_factory_calib_parse(blk.data(), blk.size(), &raw) && p.array_w > 0) {
+		// 1. The size the block is expressed at, then the block at the array.
+		const std::string ref = prop_str("debug.dxr.leia.scam_calib_ref", "auto");
+		ref_off = leia_scam_pick_calib_reference(&raw, p.array_w, p.array_h, ref_sizes.data(),
+		                                         ref_sizes.size() / 2, &p.ref_w, &p.ref_h);
+		if (ref == "array") {
+			p.ref_w = p.array_w;
+			p.ref_h = p.array_h;
+		} else if (ref != "auto") {
+			parse_size(ref, &p.ref_w, &p.ref_h);
+		}
+		leia_scam_factory_to_array(&raw, p.ref_w, p.ref_h, p.array_w, p.array_h, &p.factory);
+		// 2. Lenses stacked along the sensor's y axis: turn each eye so the
+		// pair is side by side, by the sensor orientation (upright in the
+		// device's natural orientation).
+		if (leia_scam_factory_is_vertical(&p.factory)) {
+			p.rot = (p.sensor_orientation == 90 || p.sensor_orientation == 270) ? (uint32_t)p.sensor_orientation
+			                                                                    : 90u;
+		}
+	}
+	{
+		const std::string r = prop_str("debug.dxr.leia.scam_rotate", "auto");
+		if (r == "0" || r == "90" || r == "180" || r == "270") {
+			p.rot = (uint32_t)atoi(r.c_str());
+		}
+	}
+	if (p.rot == 90 || p.rot == 270) {
+		p.eye_w = p.crop_h;
+		p.eye_h = p.crop_w;
+	}
+	// 3. Eye order: the HAL's own lens poses say which lens is on the camera's
+	// left. A block written in the other convention (x_main = R x_sub + T, as
+	// on a phone-class front module) disagrees with them and is swapped here,
+	// before anything is derived from it. No poses: the block decides alone.
+	{
+		uint8_t ref_m = 0, ref_s = 0;
+		p.have_pose = read_lens_pose(p.main_id, p.pose_main, &ref_m) &&
+		              read_lens_pose(p.sub_id, p.pose_sub, &ref_s) && ref_m == ref_s;
+	}
+	if (p.ref_w != 0 && p.have_pose && p.have_sensor_orientation &&
+	    prop_bool("debug.dxr.leia.scam_pose", true)) {
+		leia_scam_factory_calib probe = p.factory;
+		p.pose_orient = leia_scam_factory_orient_by_pose(&probe, p.pose_main, p.pose_sub, p.front,
+		                                                 p.sensor_orientation, p.rot);
+		if (p.pose_orient == 1) {
+			SCAM_LOG_W("leia stereo camera (android): %s pair: the HAL's lens poses (main %s at "
+			           "(%.1f, %.1f, %.1f) mm, sub %s at (%.1f, %.1f, %.1f) mm) disagree with the factory "
+			           "block's eye order; reading the block as x_main = R x_sub + T",
+			           p.front ? "front" : "rear", p.main_id, p.pose_main[0] * 1e3, p.pose_main[1] * 1e3,
+			           p.pose_main[2] * 1e3, p.sub_id, p.pose_sub[0] * 1e3, p.pose_sub[1] * 1e3,
+			           p.pose_sub[2] * 1e3);
+		}
+	}
+	if (p.ref_w != 0) {
+		const leia_scam_factory_calib of = oriented_factory(p);
+		p.calibrated = leia_scam_stream_calib_from_factory(&of, p.array_w, p.array_h, p.cap_w, p.cap_h,
+		                                                   p.crop_w, p.crop_h, p.rot, &p.stream);
+		p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
+		p.have_block = true;
+		leia_scam_sha256(blk.data(), blk.size(), p.block_sha256);
+		memcpy(p.factory_R, p.factory.R, sizeof(p.factory_R));
+	}
+	if (swap == "0" || swap == "1") {
+		p.swap_override = true;
+		p.swap_value = swap == "1";
+	}
+	const bool eff_sub = left_is_sub(p);
+	const char *order_src = p.swap_override ? "forced by debug.dxr.leia.scam_swap"
+	                        : !p.calibrated  ? "assumed, no calibration"
+	                        : p.pose_orient == 1 ? "HAL lens poses; block convention swapped"
+	                        : p.pose_orient == 0 ? "HAL lens poses agree with the block"
+	                                             : "factory block; no usable lens poses";
+	SCAM_LOG_W(
+	    "leia stereo camera (android): %s pair = logical %s, main lens %s, sub lens %s, array %ux%u, eye "
+	    "%ux%u (captured %ux%u, cropped %ux%u, turned %u deg cw, sensor orientation %d), factory block %s "
+	    "(%zu bytes, %s, expressed at %ux%u, principal points %.1f %% off its centre) -> %s, baseline %.2f mm, "
+	    "SBS left = %s lens %s (%s)",
+	    p.front ? "front" : "rear", p.logical_id, p.main_id, p.sub_id, p.array_w, p.array_h, p.eye_w, p.eye_h,
+	    p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot, p.sensor_orientation, have ? "found" : "MISSING",
+	    blk.size(), have ? key.c_str() : suffix, p.ref_w, p.ref_h, ref_off * 100.0,
+	    p.calibrated ? "CALIBRATED" : "raw only",
+	    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
+	    eff_sub ? "sub" : "main", eff_sub ? p.sub_id : p.main_id, order_src);
+	if (have) {
+		// The calibration app's user rotation, when it saved one for this pair
+		// (logs the source that won: user calibration, its cached copy, or the
+		// factory block's own R, and why the higher ones were skipped).
+		apply_user_calib_locked(p);
+	} else {
+		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) calibration source=none (raw only, ideal "
+		           "parallel pair downstream): user calibration skipped (it refines the factory block's R and is "
+		           "keyed to the block's SHA-256, so it needs the block); factory block skipped (%s)",
+		           p.front ? "front" : "rear", p.logical_id, why.c_str());
+	}
+}
+
+//! Is any pair still waiting for its factory block (#505)?
+bool
+any_pending_locked()
+{
+	return std::any_of(g_pairs.begin(), g_pairs.end(),
+	                   [](const pair_desc &q) { return q.block_retry.verdict == LEIA_SCAM_BLOCK_PENDING; });
+}
+
+/*!
+ * #505: read the factory block again for every pair still pending, when its
+ * retry is due. Runs on every enumerate (the runtime re-enumerates at most
+ * once a second on a client's enumerate and every ~2 s while one listens for
+ * camera events), open, get_calibration and tracking-lens query.
+ *
+ * The runtime keeps a camera's FIRST description (flags included) until the
+ * service restarts, and a camera's device_identity carries the block's hash,
+ * so a pair is never listed raw and later upgraded: while any pair is pending
+ * none is listed (indices stay stable), and once all are final they appear as
+ * NEW cameras, which makes the runtime fetch their calibration and send
+ * XrEventDataStereoCamerasChangedDXR to every listening client.
+ */
+void
+retry_pending_locked()
+{
+	if (!any_pending_locked()) {
+		return;
+	}
+	ACameraManager *m = mgr();
+	const int64_t now = clock_ns(CLOCK_MONOTONIC);
+	for (pair_desc &p : g_pairs) {
+		if (m != nullptr && leia_scam_block_retry_due(&p.block_retry, now)) {
+			describe_pair_locked(m, p);
+		}
+	}
+	if (any_pending_locked()) {
+		return;
+	}
+	std::string v;
+	for (const pair_desc &q : g_pairs) {
+		char buf[160];
+		snprintf(buf, sizeof(buf), "%s%s pair %s after %u read(s)", v.empty() ? "" : ", ", q.front ? "front" : "rear",
+		         q.block_retry.verdict == LEIA_SCAM_BLOCK_HAVE   ? "CALIBRATED from the factory block"
+		         : q.block_retry.verdict == LEIA_SCAM_BLOCK_NONE ? "raw only (no factory block)"
+		                                                         : "raw only (factory block never readable)",
+		         q.block_retry.attempts);
+		v += buf;
+	}
+	SCAM_LOG_W("leia stereo camera (android): factory block retry finished: %s; listing the cameras now",
+	           v.c_str());
+}
+
 void
 scan_locked()
 {
 	if (g_scanned) {
+		retry_pending_locked();
 		return;
 	}
 	g_scanned = true;
@@ -1000,9 +1341,6 @@ scan_locked()
 	if (m == nullptr) {
 		return;
 	}
-	uint32_t want_w = 1280, want_h = 720;
-	parse_size(prop_str("debug.dxr.leia.scam_size", ""), &want_w, &want_h);
-	const std::string swap = prop_str("debug.dxr.leia.scam_swap", "auto");
 
 	// The logical pairs are hidden from the camera id list on these devices,
 	// so probe ids directly (cheap: an absent id fails at once).
@@ -1028,170 +1366,20 @@ scan_locked()
 			ACameraMetadata_free(meta);
 			continue;
 		}
-		std::string a = phys[0], b = phys[1];
+		snprintf(p.lens_a, sizeof(p.lens_a), "%s", phys[0]);
+		snprintf(p.lens_b, sizeof(p.lens_b), "%s", phys[1]);
 		ACameraMetadata_free(meta);
-		std::vector<uint32_t> ref_sizes;
 		if ((p.front && !g_pairs.empty() && g_pairs[0].front) ||
 		    (!p.front && std::any_of(g_pairs.begin(), g_pairs.end(), [](const pair_desc &q) { return !q.front; }))) {
 			continue; // one pair per facing
 		}
-
-		// Factory block: on the logical id and on the main lens only.
-		const char *suffix = p.front ? "eeprom3d_front" : "eeprom3d_rear";
-		const std::string full = prop_str("debug.dxr.leia.scam_calib_key_prefix", kCalibKeyPrefix) + suffix;
-		std::vector<uint8_t> blk;
-		std::string key;
-		bool have = read_vendor_block(p.logical_id, full.c_str(), suffix, blk, &key);
-		std::vector<uint8_t> tmp;
-		std::string lens_key;
-		const bool a_has = read_vendor_block(a.c_str(), full.c_str(), suffix, tmp, &lens_key);
-		const bool b_has = !a_has && read_vendor_block(b.c_str(), full.c_str(), suffix, tmp, &lens_key);
-		const std::string main_id = b_has ? b : a, sub_id = b_has ? a : b;
-		if (!have && (a_has || b_has)) {
-			blk = tmp;
-			key = lens_key;
-			have = true;
+		if (!p.front && !prop_bool("debug.dxr.leia.scam_rear", true)) {
+			continue;
 		}
-		snprintf(p.main_id, sizeof(p.main_id), "%s", main_id.c_str());
-		snprintf(p.sub_id, sizeof(p.sub_id), "%s", sub_id.c_str());
-
-		ACameraMetadata *mm = nullptr;
-		if (ACameraManager_getCameraCharacteristics(m, p.main_id, &mm) == ACAMERA_OK && mm != nullptr) {
-			std::vector<int32_t> arr;
-			if (get_i32(mm, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, arr) && arr.size() >= 4) {
-				// NDK layout: xmin, ymin, width, height.
-				p.array_w = (uint32_t)arr[2];
-				p.array_h = (uint32_t)arr[3];
-			}
-			p.crop_w = want_w;
-			p.crop_h = want_h;
-			p.eye_w = want_w;
-			p.eye_h = want_h;
-			p.cap_w = want_w;
-			p.cap_h = want_h;
-			const uint32_t w43 = want_w, h43 = (want_w * 3 / 4) & ~1u;
-			ACameraMetadata *sm = nullptr;
-			bool sub_ok = false;
-			if (ACameraManager_getCameraCharacteristics(m, p.sub_id, &sm) == ACAMERA_OK && sm != nullptr) {
-				sub_ok = stream_supported(sm, AIMAGE_FORMAT_YUV_420_888, w43, h43);
-				ACameraMetadata_free(sm);
-			}
-			if (h43 >= want_h && stream_supported(mm, AIMAGE_FORMAT_YUV_420_888, w43, h43) && sub_ok) {
-				p.cap_h = h43;
-			} else if (!stream_supported(mm, AIMAGE_FORMAT_YUV_420_888, want_w, want_h)) {
-				SCAM_LOG_W("leia stereo camera (android): %ux%u not listed for lens %s; trying it anyway",
-				           want_w, want_h, p.main_id);
-			}
-			std::vector<int32_t> so;
-			if (get_i32(mm, ACAMERA_SENSOR_ORIENTATION, so)) {
-				p.sensor_orientation = so[0];
-				p.have_sensor_orientation = true;
-			}
-			// Candidate calibration reference sizes: every listed YUV / JPEG output.
-			std::vector<int32_t> cfg;
-			if (get_i32(mm, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, cfg)) {
-				for (size_t i = 0; i + 3 < cfg.size(); i += 4) {
-					if ((cfg[i] == AIMAGE_FORMAT_YUV_420_888 || cfg[i] == AIMAGE_FORMAT_JPEG) &&
-					    cfg[i + 3] == ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT && cfg[i + 1] > 0 &&
-					    cfg[i + 2] > 0) {
-						ref_sizes.push_back((uint32_t)cfg[i + 1]);
-						ref_sizes.push_back((uint32_t)cfg[i + 2]);
-					}
-				}
-			}
-			ACameraMetadata_free(mm);
-		}
-
-		leia_scam_factory_calib raw{};
-		double ref_off = 0.0;
-		if (have && leia_scam_factory_calib_parse(blk.data(), blk.size(), &raw) && p.array_w > 0) {
-			// 1. The size the block is expressed at, then the block at the array.
-			const std::string ref = prop_str("debug.dxr.leia.scam_calib_ref", "auto");
-			ref_off = leia_scam_pick_calib_reference(&raw, p.array_w, p.array_h, ref_sizes.data(),
-			                                         ref_sizes.size() / 2, &p.ref_w, &p.ref_h);
-			if (ref == "array") {
-				p.ref_w = p.array_w;
-				p.ref_h = p.array_h;
-			} else if (ref != "auto") {
-				parse_size(ref, &p.ref_w, &p.ref_h);
-			}
-			leia_scam_factory_to_array(&raw, p.ref_w, p.ref_h, p.array_w, p.array_h, &p.factory);
-			// 2. Lenses stacked along the sensor's y axis: turn each eye so the
-			// pair is side by side, by the sensor orientation (upright in the
-			// device's natural orientation).
-			if (leia_scam_factory_is_vertical(&p.factory)) {
-				p.rot = (p.sensor_orientation == 90 || p.sensor_orientation == 270) ? (uint32_t)p.sensor_orientation
-				                                                                    : 90u;
-			}
-		}
-		{
-			const std::string r = prop_str("debug.dxr.leia.scam_rotate", "auto");
-			if (r == "0" || r == "90" || r == "180" || r == "270") {
-				p.rot = (uint32_t)atoi(r.c_str());
-			}
-		}
-		if (p.rot == 90 || p.rot == 270) {
-			p.eye_w = p.crop_h;
-			p.eye_h = p.crop_w;
-		}
-		// 3. Eye order: the HAL's own lens poses say which lens is on the camera's
-		// left. A block written in the other convention (x_main = R x_sub + T, as
-		// on a phone-class front module) disagrees with them and is swapped here,
-		// before anything is derived from it. No poses: the block decides alone.
-		{
-			uint8_t ref_m = 0, ref_s = 0;
-			p.have_pose = read_lens_pose(p.main_id, p.pose_main, &ref_m) &&
-			              read_lens_pose(p.sub_id, p.pose_sub, &ref_s) && ref_m == ref_s;
-		}
-		if (p.ref_w != 0 && p.have_pose && p.have_sensor_orientation &&
-		    prop_bool("debug.dxr.leia.scam_pose", true)) {
-			leia_scam_factory_calib probe = p.factory;
-			p.pose_orient = leia_scam_factory_orient_by_pose(&probe, p.pose_main, p.pose_sub, p.front,
-			                                                 p.sensor_orientation, p.rot);
-			if (p.pose_orient == 1) {
-				SCAM_LOG_W("leia stereo camera (android): %s pair: the HAL's lens poses (main %s at "
-				           "(%.1f, %.1f, %.1f) mm, sub %s at (%.1f, %.1f, %.1f) mm) disagree with the factory "
-				           "block's eye order; reading the block as x_main = R x_sub + T",
-				           p.front ? "front" : "rear", p.main_id, p.pose_main[0] * 1e3, p.pose_main[1] * 1e3,
-				           p.pose_main[2] * 1e3, p.sub_id, p.pose_sub[0] * 1e3, p.pose_sub[1] * 1e3,
-				           p.pose_sub[2] * 1e3);
-			}
-		}
-		if (p.ref_w != 0) {
-			const leia_scam_factory_calib of = oriented_factory(p);
-			p.calibrated = leia_scam_stream_calib_from_factory(&of, p.array_w, p.array_h, p.cap_w, p.cap_h,
-			                                                   p.crop_w, p.crop_h, p.rot, &p.stream);
-			p.block_hash = leia_scam_block_hash(blk.data(), blk.size());
-			p.have_block = true;
-			leia_scam_sha256(blk.data(), blk.size(), p.block_sha256);
-			memcpy(p.factory_R, p.factory.R, sizeof(p.factory_R));
-		}
-		if (swap == "0" || swap == "1") {
-			p.swap_override = true;
-			p.swap_value = swap == "1";
-		}
-		const bool eff_sub = left_is_sub(p);
-		const char *order_src = p.swap_override ? "forced by debug.dxr.leia.scam_swap"
-		                        : !p.calibrated  ? "assumed, no calibration"
-		                        : p.pose_orient == 1 ? "HAL lens poses; block convention swapped"
-		                        : p.pose_orient == 0 ? "HAL lens poses agree with the block"
-		                                             : "factory block; no usable lens poses";
-		SCAM_LOG_W(
-		    "leia stereo camera (android): %s pair = logical %s, main lens %s, sub lens %s, array %ux%u, eye "
-		    "%ux%u (captured %ux%u, cropped %ux%u, turned %u deg cw, sensor orientation %d), factory block %s "
-		    "(%zu bytes, %s, expressed at %ux%u, principal points %.1f %% off its centre) -> %s, baseline %.2f mm, "
-		    "SBS left = %s lens %s (%s)",
-		    p.front ? "front" : "rear", p.logical_id, p.main_id, p.sub_id, p.array_w, p.array_h, p.eye_w, p.eye_h,
-		    p.cap_w, p.cap_h, p.crop_w, p.crop_h, p.rot, p.sensor_orientation, have ? "found" : "MISSING",
-		    blk.size(), have ? key.c_str() : suffix, p.ref_w, p.ref_h, ref_off * 100.0,
-		    p.calibrated ? "CALIBRATED" : "raw only",
-		    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
-		    eff_sub ? "sub" : "main", eff_sub ? p.sub_id : p.main_id, order_src);
-		// The calibration app's user rotation, when it saved one for this pair.
-		apply_user_calib_locked(p);
+		describe_pair_locked(m, p);
 		if (p.front) {
 			g_pairs.insert(g_pairs.begin(), p);
-		} else if (prop_bool("debug.dxr.leia.scam_rear", true)) {
+		} else {
 			g_pairs.push_back(p);
 		}
 	}
@@ -2024,7 +2212,8 @@ leia_stereo_camera_android_enumerate(struct xrt_plugin_instance *inst,
 	std::lock_guard<std::mutex> lk(g_mu);
 	scan_locked();
 	refresh_user_calib_locked();
-	const uint32_t count = (uint32_t)g_pairs.size();
+	// #505: nothing is listed while a factory block is still being read.
+	const uint32_t count = any_pending_locked() ? 0u : (uint32_t)g_pairs.size();
 	if (out == nullptr || capacity == 0) {
 		return count;
 	}
@@ -2080,7 +2269,7 @@ leia_stereo_camera_android_get_calibration(struct xrt_plugin_instance *inst,
 	(void)inst;
 	std::lock_guard<std::mutex> lk(g_mu);
 	scan_locked();
-	if (out == nullptr || index >= g_pairs.size() || !g_pairs[index].calibrated) {
+	if (out == nullptr || index >= g_pairs.size() || any_pending_locked() || !g_pairs[index].calibrated) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	const pair_desc &p = g_pairs[index];
@@ -2134,7 +2323,7 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	{
 		std::lock_guard<std::mutex> lk(g_mu);
 		scan_locked();
-		if (index >= g_pairs.size()) {
+		if (index >= g_pairs.size() || any_pending_locked()) {
 			delete c;
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 		}
@@ -2356,8 +2545,8 @@ leia_stereo_camera_android_tracking_lens(char *out, size_t cap)
 	}
 	std::lock_guard<std::mutex> lk(g_mu);
 	scan_locked();
-	if (g_pairs.empty() || !g_pairs[0].front) {
-		return false;
+	if (g_pairs.empty() || !g_pairs[0].front || g_pairs[0].block_retry.verdict == LEIA_SCAM_BLOCK_PENDING) {
+		return false; // #505: the main lens is not known before the block is read
 	}
 	snprintf(out, cap, "%s", g_pairs[0].main_id);
 	return true;

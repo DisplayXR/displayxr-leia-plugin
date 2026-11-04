@@ -412,6 +412,81 @@ main(void)
 	CHECK(leia_scam_block_hash(blk, sizeof(blk)) == leia_scam_block_hash(blk, sizeof(blk)));
 	CHECK(leia_scam_block_hash(blk, sizeof(blk)) != leia_scam_block_hash(bad, sizeof(bad)));
 
+	// #505: factory-block read retry. A fake reader replays a script of reads.
+	{
+		const int64_t ms = 1000000;
+		// Combine: any FOUND wins; NO_JNI beats FAILED beats ABSENT.
+		const enum leia_scam_block_read cold[3] = {LEIA_SCAM_BLOCK_READ_NO_JNI, LEIA_SCAM_BLOCK_READ_NO_JNI,
+		                                           LEIA_SCAM_BLOCK_READ_NO_JNI};
+		const enum leia_scam_block_read lens[3] = {LEIA_SCAM_BLOCK_READ_ABSENT, LEIA_SCAM_BLOCK_READ_FOUND,
+		                                           LEIA_SCAM_BLOCK_READ_NO_JNI};
+		const enum leia_scam_block_read mixed[2] = {LEIA_SCAM_BLOCK_READ_ABSENT, LEIA_SCAM_BLOCK_READ_FAILED};
+		const enum leia_scam_block_read absent[2] = {LEIA_SCAM_BLOCK_READ_ABSENT, LEIA_SCAM_BLOCK_READ_ABSENT};
+		CHECK(leia_scam_block_read_combine(cold, 3) == LEIA_SCAM_BLOCK_READ_NO_JNI);
+		CHECK(leia_scam_block_read_combine(lens, 3) == LEIA_SCAM_BLOCK_READ_FOUND);
+		CHECK(leia_scam_block_read_combine(mixed, 2) == LEIA_SCAM_BLOCK_READ_FAILED);
+		CHECK(leia_scam_block_read_combine(absent, 2) == LEIA_SCAM_BLOCK_READ_ABSENT);
+		CHECK(leia_scam_block_read_combine(NULL, 0) == LEIA_SCAM_BLOCK_READ_ABSENT);
+
+		// The #505 boot: a cold scan with no host context, the context ~1 s
+		// later, then the block. The cold read must NOT become MISSING.
+		struct leia_scam_block_retry st = {0};
+		CHECK(leia_scam_block_retry_due(&st, 0));
+		CHECK(leia_scam_block_retry_step(&st, LEIA_SCAM_BLOCK_READ_NO_JNI, 100 * ms) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(!leia_scam_block_retry_due(&st, 300 * ms)); // throttled
+		CHECK(leia_scam_block_retry_due(&st, 600 * ms));
+		CHECK(leia_scam_block_retry_step(&st, LEIA_SCAM_BLOCK_READ_NO_JNI, 600 * ms) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(!st.jni_seen);
+		CHECK(leia_scam_block_retry_step(&st, LEIA_SCAM_BLOCK_READ_FOUND, 1100 * ms) == LEIA_SCAM_BLOCK_HAVE);
+		CHECK(!leia_scam_block_retry_due(&st, 99999 * ms)); // final
+		CHECK(leia_scam_block_retry_step(&st, LEIA_SCAM_BLOCK_READ_ABSENT, 99999 * ms) == LEIA_SCAM_BLOCK_HAVE);
+
+		// A successful read with no key is final at once (cached MISSING).
+		struct leia_scam_block_retry a = {0};
+		CHECK(leia_scam_block_retry_step(&a, LEIA_SCAM_BLOCK_READ_NO_JNI, 0) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(leia_scam_block_retry_step(&a, LEIA_SCAM_BLOCK_READ_ABSENT, 500 * ms) == LEIA_SCAM_BLOCK_NONE);
+		CHECK(a.jni_seen);
+
+		// No context ever: pending until the limit, then raw only.
+		struct leia_scam_block_retry n = {0};
+		int64_t t = 0;
+		while (leia_scam_block_retry_step(&n, LEIA_SCAM_BLOCK_READ_NO_JNI, t) == LEIA_SCAM_BLOCK_PENDING) {
+			CHECK(t < LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS);
+			t += LEIA_SCAM_BLOCK_RETRY_PERIOD_NS;
+		}
+		CHECK(n.verdict == LEIA_SCAM_BLOCK_GAVE_UP);
+		CHECK(t == LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS);
+		// A read long after the limit with the context there still wins if it
+		// is the first one made (nobody enumerated meanwhile).
+		struct leia_scam_block_retry late = {0};
+		CHECK(leia_scam_block_retry_step(&late, LEIA_SCAM_BLOCK_READ_FOUND, 3600000 * ms) == LEIA_SCAM_BLOCK_HAVE);
+
+		// #505 as measured: no CAMERA permission. The keys list WITHOUT the
+		// block; that must stay pending (unbounded) and win once granted.
+		const enum leia_scam_block_read noperm[3] = {LEIA_SCAM_BLOCK_READ_NO_PERMISSION,
+		                                             LEIA_SCAM_BLOCK_READ_NO_PERMISSION,
+		                                             LEIA_SCAM_BLOCK_READ_ABSENT};
+		CHECK(leia_scam_block_read_combine(noperm, 3) == LEIA_SCAM_BLOCK_READ_NO_PERMISSION);
+		struct leia_scam_block_retry np = {0};
+		for (int i = 0; i < 1000; i++) { // ~8 minutes of enumerates
+			CHECK(leia_scam_block_retry_step(&np, LEIA_SCAM_BLOCK_READ_NO_PERMISSION,
+			                                 (int64_t)i * LEIA_SCAM_BLOCK_RETRY_PERIOD_NS) ==
+			      LEIA_SCAM_BLOCK_PENDING);
+		}
+		CHECK(leia_scam_block_retry_step(&np, LEIA_SCAM_BLOCK_READ_FOUND, 600000 * ms) == LEIA_SCAM_BLOCK_HAVE);
+
+		// JNI there but the characteristics call fails: a few tries, then raw only.
+		struct leia_scam_block_retry f = {0};
+		CHECK(leia_scam_block_retry_step(&f, LEIA_SCAM_BLOCK_READ_FAILED, 0) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(leia_scam_block_retry_step(&f, LEIA_SCAM_BLOCK_READ_FAILED, 500 * ms) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(leia_scam_block_retry_step(&f, LEIA_SCAM_BLOCK_READ_FAILED, 1000 * ms) == LEIA_SCAM_BLOCK_GAVE_UP);
+		CHECK(f.failed == LEIA_SCAM_BLOCK_MAX_FAILED);
+		// ...but a failure followed by a good read recovers.
+		struct leia_scam_block_retry r = {0};
+		CHECK(leia_scam_block_retry_step(&r, LEIA_SCAM_BLOCK_READ_FAILED, 0) == LEIA_SCAM_BLOCK_PENDING);
+		CHECK(leia_scam_block_retry_step(&r, LEIA_SCAM_BLOCK_READ_FOUND, 500 * ms) == LEIA_SCAM_BLOCK_HAVE);
+	}
+
 	if (g_fail == 0) {
 		printf("test_stereo_camera_android_calib: all passed\n");
 	}
