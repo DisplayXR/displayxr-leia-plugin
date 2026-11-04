@@ -397,6 +397,15 @@ target_include_directories(test_stereo_camera_android_user_calib PRIVATE ${CMAKE
 target_link_libraries(test_stereo_camera_android_user_calib PRIVATE m)
 add_test(NAME test_stereo_camera_android_user_calib COMMAND test_stereo_camera_android_user_calib)
 
+# --- Host unit test: Android tracking-feed rate accounting ---
+# The 10 s report of the stereo camera's feed into the CNSDK shared-camera sink
+# (captured vs fed rate, engine stalls, longest gap, face polls).
+add_executable(test_tracking_feed_stats
+    ../drv_leia_android/tests/test_tracking_feed_stats.c
+    ../drv_leia_android/leia_tracking_feed_stats.c)
+target_include_directories(test_tracking_feed_stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_android)
+add_test(NAME test_tracking_feed_stats COMMAND test_tracking_feed_stats)
+
 # macOS-arm SR display readiness (leia_sr_readiness.c): platform-neutral C,
 # host-tested here because the macOS arm has no CI ctest lane.
 add_executable(test_sr_readiness

@@ -537,9 +537,24 @@ leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr);
 void
 leia_cnsdk_ext_tracking_feed(const uint8_t *y, int32_t width, int32_t height, int64_t ts_boottime_ns);
 
+/*!
+ * Replace the intrinsics of the fed frames (the fed lens changed while tracking
+ * is in-app). Every in-app core gets them with its next frame.
+ */
+void
+leia_cnsdk_ext_tracking_set_intrinsics(const struct leia_cnsdk_ext_intrinsics *intr);
+
 //! Hand tracking back to the vendor service (outermost end only).
 void
 leia_cnsdk_ext_tracking_end(void);
+
+/*!
+ * Cumulative face polls of this process (leia_cnsdk_get_primary_face calls
+ * that reached the core) and how many of them got a face from the core
+ * (predicted or not). For the tracking feed's rate report.
+ */
+void
+leia_cnsdk_face_poll_counters(uint64_t *out_polls, uint64_t *out_faces);
 
 /*!
  * The Camera2 id of the head tracker's camera, from any live core of this

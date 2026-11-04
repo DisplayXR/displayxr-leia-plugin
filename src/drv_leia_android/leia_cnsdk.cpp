@@ -2209,6 +2209,20 @@ leia_cnsdk_ext_tracking_begin(const struct leia_cnsdk_ext_intrinsics *intr)
 }
 
 extern "C" void
+leia_cnsdk_ext_tracking_set_intrinsics(const struct leia_cnsdk_ext_intrinsics *intr)
+{
+	if (intr == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(g_ext_mu);
+	g_ext_intr = *intr;
+	for (struct leia_cnsdk *c : g_ext_cores) {
+		std::lock_guard<std::mutex> lk2(c->ext_mu);
+		c->ext_frames = 0; // the next feed pushes them (ext_frames % 60 == 0)
+	}
+}
+
+extern "C" void
 leia_cnsdk_ext_tracking_end(void)
 {
 	std::lock_guard<std::mutex> lk(g_ext_mu);
@@ -2461,6 +2475,21 @@ check_orientation_tripwire(struct leia_cnsdk *cnsdk)
 }
 #endif // XRT_OS_ANDROID
 
+// leia_cnsdk_face_poll_counters: every poll that reached the core, and the
+// ones that came back with a face.
+static std::atomic<uint64_t> g_face_polls{0}, g_face_hits{0};
+
+extern "C" void
+leia_cnsdk_face_poll_counters(uint64_t *out_polls, uint64_t *out_faces)
+{
+	if (out_polls != nullptr) {
+		*out_polls = g_face_polls.load(std::memory_order_relaxed);
+	}
+	if (out_faces != nullptr) {
+		*out_faces = g_face_hits.load(std::memory_order_relaxed);
+	}
+}
+
 extern "C" bool
 leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
                             float *out_x,
@@ -2531,6 +2560,10 @@ leia_cnsdk_get_primary_face(struct leia_cnsdk *cnsdk,
 	struct leia_float_slice np_slice = {np_pos, 3};
 	const bool pred_ok = leia_core_get_primary_face(cnsdk->core, pred_slice);
 	const bool np_ok = leia_core_get_non_predicted_primary_face(cnsdk->core, np_slice);
+	g_face_polls.fetch_add(1, std::memory_order_relaxed);
+	if (pred_ok || np_ok) {
+		g_face_hits.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	static int dbg = 0;
 	if ((dbg++ % 60) == 0) {

@@ -54,6 +54,7 @@
 
 #include "leia_stereo_camera_android_calib.h"
 #include "leia_stereo_camera_android_user_calib.h"
+#include "leia_tracking_feed_stats.h"
 #include "leia_cnsdk.h"
 
 #include <camera/NdkCameraCaptureSession.h>
@@ -67,6 +68,7 @@
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -605,6 +607,48 @@ files_dir()
 	jmethodID get_path =
 	    file_cls != nullptr ? env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;") : nullptr;
 	jobject f = j.ok() && get_files != nullptr ? env->CallObjectMethod(j.ctx, get_files) : nullptr;
+	jstring s = j.ok() && f != nullptr && get_path != nullptr ? (jstring)env->CallObjectMethod(f, get_path) : nullptr;
+	if (j.ok() && s != nullptr) {
+		const char *c = env->GetStringUTFChars(s, nullptr);
+		if (c != nullptr) {
+			dir = c;
+			env->ReleaseStringUTFChars(s, c);
+		}
+	}
+	j.ok();
+	env->PopLocalFrame(nullptr);
+	return dir;
+}
+
+/*!
+ * The host process's external files directory
+ * (Context.getExternalFilesDir(null), /sdcard/Android/data/<pkg>/files), which
+ * adb can read without run-as: where the tracking-frame dump goes. Resolved
+ * once; empty when unknown.
+ */
+const std::string &
+ext_files_dir()
+{
+	static std::string dir;
+	static bool tried = false;
+	if (tried) {
+		return dir;
+	}
+	tried = true;
+	jni_env j;
+	if (!j.acquire()) {
+		return dir;
+	}
+	JNIEnv *env = j.env;
+	env->PushLocalFrame(16);
+	jclass ctx_cls = env->FindClass("android/content/Context");
+	jclass file_cls = env->FindClass("java/io/File");
+	jmethodID get_files = ctx_cls != nullptr
+	                          ? env->GetMethodID(ctx_cls, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;")
+	                          : nullptr;
+	jmethodID get_path =
+	    file_cls != nullptr ? env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;") : nullptr;
+	jobject f = j.ok() && get_files != nullptr ? env->CallObjectMethod(j.ctx, get_files, (jstring) nullptr) : nullptr;
 	jstring s = j.ok() && f != nullptr && get_path != nullptr ? (jstring)env->CallObjectMethod(f, get_path) : nullptr;
 	if (j.ok() && s != nullptr) {
 		const char *c = env->GetStringUTFChars(s, nullptr);
@@ -1451,7 +1495,12 @@ struct xrt_plugin_stereo_camera
 	//! the next start opens the device first and hands tracking over after.
 	bool open_refused{false};
 	//! SBS eye (0 = left, 1 = right) whose lens feeds the tracker, and its id.
-	int trk_eye{1};
+	//! Which SBS eye carries trk_lens. Atomic: the feeder can re-pick the lens
+	//! (pick_tracking_lens) while the reader threads read it.
+	std::atomic<int> trk_eye{1};
+	//! The lens was chosen without knowing the cores' tracking camera (no core
+	//! had read its config yet): the feeder re-asks until one knows.
+	bool trk_lens_guessed{false};
 	char trk_lens[16]{};
 	struct leia_cnsdk_ext_intrinsics trk_intr{};
 	uint32_t w{0}, h{0};           //!< per-eye output (after the turn)
@@ -1485,7 +1534,9 @@ struct xrt_plugin_stereo_camera
 	std::atomic<uint64_t> pairs{0}, drops{0}, singles{0};
 	int64_t rate_t0{0};
 	int rate_n{0};
-	std::vector<uint8_t> trk_scratch;
+	//! Per eye: each reader thread uses only its own, so a lens re-pick that
+	//! moves the tracking frame to the other reader never shares a buffer.
+	std::vector<uint8_t> trk_scratch[2];
 
 	// Tracking feed.
 	std::mutex trk_mu;
@@ -1778,13 +1829,14 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 		// The tracking frame comes from EVERY main-lens image, before and
 		// independent of pairing: CNSDK resets its predictor on a >70 ms gap,
 		// so one lost pair must never become a lost tracking frame. Only this
-		// reader's thread touches trk_scratch.
-		if (c->track && eye == c->trk_eye && !c->closing.load()) {
+		// reader's thread touches trk_scratch[eye].
+		if (c->track && eye == c->trk_eye.load(std::memory_order_relaxed) && !c->closing.load()) {
 			yuv_view vm;
 			if (yuv_view_of(img, &vm)) {
-				c->trk_scratch.resize((size_t)kTrackW * kTrackH);
-				crop_track_from_eye(vm, c->trk_scratch.data());
-				push_tracking(c, c->trk_scratch.data(), kTrackW, ts, true);
+				std::vector<uint8_t> &scratch = c->trk_scratch[eye];
+				scratch.resize((size_t)kTrackW * kTrackH);
+				crop_track_from_eye(vm, scratch.data());
+				push_tracking(c, scratch.data(), kTrackW, ts, true);
 			}
 		}
 		std::lock_guard<std::mutex> lk(c->pair_mu);
@@ -1835,32 +1887,220 @@ on_eye_r(void *ctx, AImageReader *r)
 }
 
 /*!
+ * Chooses the lens that feeds the in-app tracker and the intrinsics handed to
+ * the cores with it (c->trk_lens, trk_eye, trk_intr, trk_lens_guessed). Run at
+ * open, and again from the feeder once a core knows its tracking camera when
+ * open had to guess (tracking_feeder). Returns true when the choice changed.
+ */
+bool
+pick_tracking_lens(xrt_plugin_stereo_camera *c)
+{
+	const std::string prev = c->trk_lens;
+	// Which lens feeds the tracker: the one the vendor device config names
+	// as the tracking camera (its pose is what the in-app engine applies),
+	// else the factory block's main lens. A Lume Pad 2's config names none
+	// and its service tracks from the main lens; a nubia Pad 3D II's service
+	// tracks from the sub lens. debug.dxr.leia.scam_track_lens=<id> forces it.
+	char cfg_id[16] = {0};
+	std::string forced = prop_str("debug.dxr.leia.scam_track_lens", "");
+	const bool have_cfg = leia_cnsdk_get_tracking_camera_id(cfg_id, sizeof(cfg_id));
+	// The cores' tracking camera when they know it for sure (CNSDK's own
+	// accessor, or the factory main lens matched in the device config;
+	// face_tracking_worker), else the factory main lens. Never the device
+	// config's cameras[0]: a phone-class config lists camera 0 first while
+	// its trackingCameras[0] is camera 1.
+	const char *want = !forced.empty() ? forced.c_str() : (have_cfg ? cfg_id : c->desc.main_id);
+	const bool use_sub = strcmp(want, c->desc.sub_id) == 0;
+	snprintf(c->trk_lens, sizeof(c->trk_lens), "%s", use_sub ? c->desc.sub_id : c->desc.main_id);
+	// SBS left eye = sub when lsub; the tracking eye is the one showing trk_lens.
+	c->trk_eye.store((use_sub == c->lsub) ? 0 : 1);
+	SCAM_LOG_W("leia stereo camera (android): tracking lens %s (%s)", c->trk_lens,
+	           !forced.empty() ? "forced by debug.dxr.leia.scam_track_lens"
+	           : have_cfg      ? "the cores' tracking camera"
+	                           : "factory main lens; no core knows the tracking camera yet");
+	leia_scam_lens tl{};
+	leia_scam_lens_for_stream(use_sub ? &c->desc.factory.sub : &c->desc.factory.main, c->desc.array_w,
+	                          c->desc.array_h, c->cap_w, c->cap_h, &tl);
+	{
+		const double cw = std::min<double>(c->cap_w, c->cap_h * 4.0 / 3.0);
+		const double ch = std::min<double>(c->cap_h, cw * 0.75);
+		const double s = (double)kTrackW / cw;
+		tl.fx *= s;
+		tl.fy *= s;
+		tl.cx = (tl.cx - (c->cap_w - cw) / 2.0) * s;
+		tl.cy = (tl.cy - (c->cap_h - ch) / 2.0) * s;
+	}
+	struct leia_cnsdk_ext_intrinsics ei;
+	memset(&ei, 0, sizeof(ei));
+	ei.width = (int32_t)kTrackW;
+	ei.height = (int32_t)kTrackH;
+	ei.fx = (float)tl.fx;
+	ei.fy = (float)tl.fy;
+	ei.cx = (float)tl.cx;
+	ei.cy = (float)tl.cy;
+	for (int i = 0; i < 8; i++) {
+		ei.d[i] = tl.d[i];
+	}
+	ei.mirrored = true;
+	ei.valid = c->desc.calibrated;
+	// The head tracker's configured intrinsics describe ITS capture (e.g.
+	// 640x480 at 90 fps), which on some modules is a narrower cut of the
+	// sensor than our 640x480: the cores prefer those values, re-expressed
+	// for our field, over the factory block's (leia_cnsdk_ext_tracking_feed).
+	// The field ratio comes from the HAL's sensor-mode table when it has one
+	// (leia_scam_track_fov_ratio), else 1 (Camera2: every stream sees the
+	// same field); debug.dxr.leia.scam_track_fov_ratio overrides it.
+	{
+		const uint32_t trk_fps = (uint32_t)std::max(1, atoi(prop_str("debug.dxr.leia.scam_track_fps", "90").c_str()));
+		std::vector<int32_t> tbl;
+		leia_scam_sensor_mode modes[8];
+		size_t nm = 0;
+		if (read_vendor_i32(c->trk_lens, "org.quic.camera2.sensormode.info.SensorModeTable", tbl)) {
+			nm = leia_scam_parse_sensor_modes(tbl.data(), tbl.size(), modes, 8);
+		}
+		double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->cap_w, c->cap_h,
+		                                     30, kTrackW, kTrackH, trk_fps);
+		const char *src = "sensor-mode table";
+		if (r > 0.0 && c->cap_w * 3 > c->cap_h * 4) {
+			r *= (double)c->cap_h * 4.0 / (3.0 * (double)c->cap_w); // our 4:3 cut of a wider capture
+		}
+		if (!(r > 0.0)) {
+			r = 1.0;
+			src = "no sensor-mode table: same field assumed";
+		}
+		const std::string ov = prop_str("debug.dxr.leia.scam_track_fov_ratio", "");
+		const double ovr = ov.empty() ? 0.0 : atof(ov.c_str());
+		if (ovr > 0.1 && ovr < 10.0) {
+			r = ovr;
+			src = "forced by debug.dxr.leia.scam_track_fov_ratio";
+		}
+		ei.fov_ratio = r;
+		snprintf(ei.lens, sizeof(ei.lens), "%s", c->trk_lens);
+		SCAM_LOG_W("leia stereo camera (android): tracking frame field = %.4f x the tracker's own %ux%u@%u "
+		           "capture (%s; %zu sensor mode(s); our %ux%u@30 cut to 640x480); block-derived fx %.1f",
+		           r, kTrackW, kTrackH, trk_fps, src, nm, c->cap_w, c->cap_h, tl.fx);
+	}
+	c->trk_intr = ei; // handed over by start_locked, around the actual open
+	c->trk_lens_guessed = forced.empty() && !have_cfg;
+	return prev != c->trk_lens;
+}
+
+//! Writes one fed tracking frame (exactly the bytes the sink got) as a binary
+//! PGM, for checking orientation / aspect / luma against what the tracker expects.
+void
+dump_tracking_frame(xrt_plugin_stereo_camera *c, const std::string &path, const uint8_t *y)
+{
+	FILE *f = fopen(path.c_str(), "wb");
+	if (f == nullptr) {
+		SCAM_LOG_W("leia stereo camera (android): tracking frame dump: cannot write %s", path.c_str());
+		return;
+	}
+	fprintf(f, "P5\n%u %u\n255\n", kTrackW, kTrackH);
+	const size_t n = fwrite(y, 1, (size_t)kTrackW * kTrackH, f);
+	fclose(f);
+	SCAM_LOG_W("leia stereo camera (android): tracking frame dump: wrote %s (%zu bytes Y8 %ux%u, lens %s, "
+	           "unturned sensor-native, as fed to the shared-camera sink)",
+	           path.c_str(), n, kTrackW, kTrackH, c->trk_lens);
+}
+
+/*!
  * Hands tracking frames to CNSDK through the C API (leia_cnsdk_ext_tracking_feed
  * -> leia_shared_camera_sink_on_image) with a tight 640-stride Y8 buffer and
  * no rotation. That path never had the Java/JNI SharedCameraSink bugs fixed by
  * CNSDK #762 (padded strides, non-zero rotation), so nothing here changes when
  * the plug-in pins a CNSDK >= 0.10.88.
+ *
+ * This thread exists so that nothing the engine does can reach the camera:
+ * the engine runs detection on the caller's thread, and its idle throttle
+ * SLEEPS the caller 500 ms per skipped frame (CNSDK engine FrameThrottle,
+ * active 5 s after start once no face was seen for 2 s). The capture callback
+ * only overwrites the latest-frame slot (push_tracking), so a sleeping engine
+ * costs tracking frames, never camera pairs. The 10 s rate WARN below is where
+ * that shows: fed/s far under captured/s with stalls > 0 is the throttle.
+ *
+ * Dump: touch <external files dir>/dxr_track_dump_trigger (the host process's
+ * /sdcard/Android/data/<pkg>/files) and the next fed frame is written beside it
+ * as dxr_track_frame.pgm.
  */
 void
 tracking_feeder(xrt_plugin_stereo_camera *c)
 {
 	std::vector<uint8_t> local;
+	leia_tfs stats;
+	leia_tfs_init(&stats, clock_ns(CLOCK_MONOTONIC));
+	{
+		uint64_t polls = 0, faces = 0;
+		leia_cnsdk_face_poll_counters(&polls, &faces);
+		stats.captured_at = c->trk_in.load();
+		stats.faces_at = faces;
+		stats.polls_at = polls;
+	}
+	const std::string &dir = ext_files_dir();
+	const std::string trigger = dir.empty() ? std::string() : dir + "/dxr_track_dump_trigger";
+	int64_t next_trigger_check_ns = 0;
+	int64_t next_lens_check_ns = 0;
 	for (;;) {
 		int64_t ts = 0;
+		bool have = false;
 		{
 			std::unique_lock<std::mutex> lk(c->trk_mu);
-			c->trk_cv.wait(lk, [c] { return c->trk_quit.load() || c->trk_have; });
+			// Bounded: the rate report must also come out when no frame does.
+			c->trk_cv.wait_for(lk, std::chrono::milliseconds(1000),
+			                   [c] { return c->trk_quit.load() || c->trk_have; });
 			if (c->trk_quit.load()) {
 				return;
 			}
-			local.swap(c->trk_slot);
-			ts = c->trk_ts_boot;
-			c->trk_have = false;
+			if (c->trk_have) {
+				local.swap(c->trk_slot);
+				ts = c->trk_ts_boot;
+				c->trk_have = false;
+				have = true;
+			}
 		}
-		const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
-		leia_cnsdk_ext_tracking_feed(local.data(), (int32_t)kTrackW, (int32_t)kTrackH, ts);
-		c->trk_busy_ns += clock_ns(CLOCK_MONOTONIC) - t0;
-		c->trk_fed++;
+		if (have) {
+			const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+			leia_cnsdk_ext_tracking_feed(local.data(), (int32_t)kTrackW, (int32_t)kTrackH, ts);
+			const int64_t t1 = clock_ns(CLOCK_MONOTONIC);
+			leia_tfs_on_feed(&stats, t0, t1);
+			c->trk_busy_ns += t1 - t0;
+			c->trk_fed++;
+			if (!trigger.empty() && t1 >= next_trigger_check_ns) {
+				next_trigger_check_ns = t1 + 1000 * kNsPerMs;
+				struct stat st;
+				if (stat(trigger.c_str(), &st) == 0) {
+					unlink(trigger.c_str());
+					dump_tracking_frame(c, dir + "/dxr_track_frame.pgm", local.data());
+				}
+			}
+		}
+		// Open had to guess the tracking lens (the stream can open before this
+		// process's core has read its device config): feed the lens the engine
+		// is configured for (its pose and intrinsics) as soon as a core knows.
+		const int64_t now = clock_ns(CLOCK_MONOTONIC);
+		if (c->trk_lens_guessed && now >= next_lens_check_ns) {
+			next_lens_check_ns = now + 1000 * kNsPerMs;
+			char known[16] = {0};
+			if (leia_cnsdk_get_tracking_camera_id(known, sizeof(known))) {
+				std::lock_guard<std::mutex> lk(c->cam_mu);
+				const std::string was = c->trk_lens;
+				if (pick_tracking_lens(c)) {
+					leia_cnsdk_ext_tracking_set_intrinsics(&c->trk_intr);
+					SCAM_LOG_W("leia stereo camera (android): tracking lens %s -> %s once the cores knew their "
+					           "tracking camera (\"%s\"); fed frames now come from lens %s",
+					           was.c_str(), c->trk_lens, known, c->trk_lens);
+				}
+			}
+		}
+		uint64_t polls = 0, faces = 0;
+		leia_cnsdk_face_poll_counters(&polls, &faces);
+		leia_tfs_report r;
+		if (leia_tfs_report_due(&stats, clock_ns(CLOCK_MONOTONIC), c->trk_in.load(), faces, polls, &r)) {
+			SCAM_LOG_W("leia stereo camera (android): tracking feed %.1f captured/s -> %.1f fed/s to the sink "
+			           "(call avg %.1f ms max %.0f ms, longest gap %.0f ms, %llu engine stall(s) >= 400 ms), "
+			           "faces %.1f/s of %.1f polls/s, lens %s",
+			           r.captured_per_s, r.fed_per_s, r.avg_call_ms, r.max_call_ms, r.max_gap_ms,
+			           (unsigned long long)r.stalls, r.faces_per_s, r.polls_per_s, c->trk_lens);
+		}
 	}
 }
 
@@ -2346,91 +2586,7 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		// The main lens's capture, then crop_track_from_eye's centre 4:3 region
 		// scaled to 640x480. With a 4:3 capture that is the whole array, i.e.
 		// the tracking service's own 640x480 intrinsics.
-		// Which lens feeds the tracker: the one the vendor device config names
-		// as the tracking camera (its pose is what the in-app engine applies),
-		// else the factory block's main lens. A Lume Pad 2's config names none
-		// and its service tracks from the main lens; a nubia Pad 3D II's service
-		// tracks from the sub lens. debug.dxr.leia.scam_track_lens=<id> forces it.
-		char cfg_id[16] = {0};
-		std::string forced = prop_str("debug.dxr.leia.scam_track_lens", "");
-		const bool have_cfg = leia_cnsdk_get_tracking_camera_id(cfg_id, sizeof(cfg_id));
-		// The cores' tracking camera when they know it for sure (CNSDK's own
-		// accessor, or the factory main lens matched in the device config;
-		// face_tracking_worker), else the factory main lens. Never the device
-		// config's cameras[0]: a phone-class config lists camera 0 first while
-		// its trackingCameras[0] is camera 1.
-		const char *want = !forced.empty() ? forced.c_str() : (have_cfg ? cfg_id : c->desc.main_id);
-		const bool use_sub = strcmp(want, c->desc.sub_id) == 0;
-		snprintf(c->trk_lens, sizeof(c->trk_lens), "%s", use_sub ? c->desc.sub_id : c->desc.main_id);
-		// SBS left eye = sub when lsub; the tracking eye is the one showing trk_lens.
-		c->trk_eye = (use_sub == c->lsub) ? 0 : 1;
-		SCAM_LOG_W("leia stereo camera (android): tracking lens %s (%s)", c->trk_lens,
-		           !forced.empty() ? "forced by debug.dxr.leia.scam_track_lens"
-		           : have_cfg      ? "the cores' tracking camera"
-		                           : "factory main lens; no core knows the tracking camera yet");
-		leia_scam_lens tl{};
-		leia_scam_lens_for_stream(use_sub ? &c->desc.factory.sub : &c->desc.factory.main, c->desc.array_w,
-		                          c->desc.array_h, c->cap_w, c->cap_h, &tl);
-		{
-			const double cw = std::min<double>(c->cap_w, c->cap_h * 4.0 / 3.0);
-			const double ch = std::min<double>(c->cap_h, cw * 0.75);
-			const double s = (double)kTrackW / cw;
-			tl.fx *= s;
-			tl.fy *= s;
-			tl.cx = (tl.cx - (c->cap_w - cw) / 2.0) * s;
-			tl.cy = (tl.cy - (c->cap_h - ch) / 2.0) * s;
-		}
-		struct leia_cnsdk_ext_intrinsics ei;
-		memset(&ei, 0, sizeof(ei));
-		ei.width = (int32_t)kTrackW;
-		ei.height = (int32_t)kTrackH;
-		ei.fx = (float)tl.fx;
-		ei.fy = (float)tl.fy;
-		ei.cx = (float)tl.cx;
-		ei.cy = (float)tl.cy;
-		for (int i = 0; i < 8; i++) {
-			ei.d[i] = tl.d[i];
-		}
-		ei.mirrored = true;
-		ei.valid = c->desc.calibrated;
-		// The head tracker's configured intrinsics describe ITS capture (e.g.
-		// 640x480 at 90 fps), which on some modules is a narrower cut of the
-		// sensor than our 640x480: the cores prefer those values, re-expressed
-		// for our field, over the factory block's (leia_cnsdk_ext_tracking_feed).
-		// The field ratio comes from the HAL's sensor-mode table when it has one
-		// (leia_scam_track_fov_ratio), else 1 (Camera2: every stream sees the
-		// same field); debug.dxr.leia.scam_track_fov_ratio overrides it.
-		{
-			const uint32_t trk_fps = (uint32_t)std::max(1, atoi(prop_str("debug.dxr.leia.scam_track_fps", "90").c_str()));
-			std::vector<int32_t> tbl;
-			leia_scam_sensor_mode modes[8];
-			size_t nm = 0;
-			if (read_vendor_i32(c->trk_lens, "org.quic.camera2.sensormode.info.SensorModeTable", tbl)) {
-				nm = leia_scam_parse_sensor_modes(tbl.data(), tbl.size(), modes, 8);
-			}
-			double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->cap_w, c->cap_h,
-			                                     30, kTrackW, kTrackH, trk_fps);
-			const char *src = "sensor-mode table";
-			if (r > 0.0 && c->cap_w * 3 > c->cap_h * 4) {
-				r *= (double)c->cap_h * 4.0 / (3.0 * (double)c->cap_w); // our 4:3 cut of a wider capture
-			}
-			if (!(r > 0.0)) {
-				r = 1.0;
-				src = "no sensor-mode table: same field assumed";
-			}
-			const std::string ov = prop_str("debug.dxr.leia.scam_track_fov_ratio", "");
-			const double ovr = ov.empty() ? 0.0 : atof(ov.c_str());
-			if (ovr > 0.1 && ovr < 10.0) {
-				r = ovr;
-				src = "forced by debug.dxr.leia.scam_track_fov_ratio";
-			}
-			ei.fov_ratio = r;
-			snprintf(ei.lens, sizeof(ei.lens), "%s", c->trk_lens);
-			SCAM_LOG_W("leia stereo camera (android): tracking frame field = %.4f x the tracker's own %ux%u@%u "
-			           "capture (%s; %zu sensor mode(s); our %ux%u@30 cut to 640x480); block-derived fx %.1f",
-			           r, kTrackW, kTrackH, trk_fps, src, nm, c->cap_w, c->cap_h, tl.fx);
-		}
-		c->trk_intr = ei; // handed over by start_locked, around the actual open
+		pick_tracking_lens(c);
 		c->trk_thread = std::thread(tracking_feeder, c);
 	}
 

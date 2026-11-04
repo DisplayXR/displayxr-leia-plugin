@@ -221,6 +221,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_stereo_camera_android_user_calib
 
+      - name: Unit test — Android tracking-feed rate accounting
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_tracking_feed_stats
+
       - name: Unit test — EDID panel list + per-monitor claims (multi-screen M0)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_display_claims_linux
