@@ -69,6 +69,39 @@ with `debug.dxr.leia.scam_calib_key_prefix`.
 Vendor keys are not listed by `CameraCharacteristics.getKeys()`. The source
 therefore builds the key by name over JNI, the same way an app would.
 
+**When the block can be read (#505).** An empty read is not proof that the
+block is absent. A read is final only when the host JavaVM / Context exists
+(`leia_cnsdk_get_jni`), the process holds `android.permission.CAMERA`, and
+`getKeys()` listed the characteristics of the logical id and both lenses.
+Without the permission, the camera service strips the permission-gated vendor
+keys from the characteristics. The keys then list without the block although
+the HAL publishes it. This was measured on a nubia Pad 3D II: a fresh runtime
+install drops the CAMERA grant, and the runtime asks for it again only at the
+first stream's consent. Until a read is final, the pair stays **unlisted**:
+
+- no permission: re-checked on every enumerate, with no bound;
+- no JNI context: retried for up to 30 s;
+- a characteristics call that threw: retried for at most 3 reads.
+
+Each reason logs one WARN (`factory block read deferred: ...`). The pair is
+then described once and appears as a NEW camera. The runtime keeps a camera's
+first description until the service restarts, and `device_identity` carries
+the block's hash, so a camera is never listed raw and upgraded later. The
+runtime then fetches the calibration and sends
+`XrEventDataStereoCamerasChangedDXR`, and the browser lists "3D Camera".
+While any pair is pending, none is listed, so indices stay stable.
+
+**Calibration source, in order:**
+
+1. The calibration app's record (schema >= 1, keyed to the block's SHA-256),
+   which replaces R only.
+2. The factory block.
+3. Nothing: raw only, an ideal parallel pair downstream.
+
+The record refines the block, so it is not usable without the block. Every
+final description logs the source that won and why the higher ones were
+skipped.
+
 Layout, version 1. Byte 0 is the version. Every value after it is a
 little-endian IEEE-754 double:
 

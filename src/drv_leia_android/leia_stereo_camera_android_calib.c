@@ -571,3 +571,58 @@ leia_scam_block_hash(const uint8_t *bytes, size_t len)
 	}
 	return h;
 }
+
+enum leia_scam_block_read
+leia_scam_block_read_combine(const enum leia_scam_block_read *reads, size_t n)
+{
+	bool no_jni = false, no_perm = false, failed = false;
+	for (size_t i = 0; i < n; i++) {
+		switch (reads[i]) {
+		case LEIA_SCAM_BLOCK_READ_FOUND: return LEIA_SCAM_BLOCK_READ_FOUND;
+		case LEIA_SCAM_BLOCK_READ_NO_JNI: no_jni = true; break;
+		case LEIA_SCAM_BLOCK_READ_NO_PERMISSION: no_perm = true; break;
+		case LEIA_SCAM_BLOCK_READ_FAILED: failed = true; break;
+		case LEIA_SCAM_BLOCK_READ_ABSENT: break;
+		}
+	}
+	return no_jni    ? LEIA_SCAM_BLOCK_READ_NO_JNI
+	       : no_perm ? LEIA_SCAM_BLOCK_READ_NO_PERMISSION
+	       : failed  ? LEIA_SCAM_BLOCK_READ_FAILED
+	                 : LEIA_SCAM_BLOCK_READ_ABSENT;
+}
+
+bool
+leia_scam_block_retry_due(const struct leia_scam_block_retry *st, int64_t now_ns)
+{
+	return st->verdict == LEIA_SCAM_BLOCK_PENDING && (st->attempts == 0 || now_ns >= st->next_ns);
+}
+
+enum leia_scam_block_verdict
+leia_scam_block_retry_step(struct leia_scam_block_retry *st, enum leia_scam_block_read r, int64_t now_ns)
+{
+	if (st->verdict != LEIA_SCAM_BLOCK_PENDING) {
+		return st->verdict;
+	}
+	if (st->attempts == 0) {
+		st->first_ns = now_ns;
+	}
+	st->attempts++;
+	st->next_ns = now_ns + LEIA_SCAM_BLOCK_RETRY_PERIOD_NS;
+	switch (r) {
+	case LEIA_SCAM_BLOCK_READ_FOUND: st->jni_seen = true; st->verdict = LEIA_SCAM_BLOCK_HAVE; break;
+	case LEIA_SCAM_BLOCK_READ_ABSENT: st->jni_seen = true; st->verdict = LEIA_SCAM_BLOCK_NONE; break;
+	case LEIA_SCAM_BLOCK_READ_FAILED:
+		st->jni_seen = true;
+		if (++st->failed >= LEIA_SCAM_BLOCK_MAX_FAILED) {
+			st->verdict = LEIA_SCAM_BLOCK_GAVE_UP;
+		}
+		break;
+	case LEIA_SCAM_BLOCK_READ_NO_PERMISSION: st->jni_seen = true; break;
+	case LEIA_SCAM_BLOCK_READ_NO_JNI:
+		if (now_ns - st->first_ns >= LEIA_SCAM_BLOCK_NO_JNI_LIMIT_NS) {
+			st->verdict = LEIA_SCAM_BLOCK_GAVE_UP;
+		}
+		break;
+	}
+	return st->verdict;
+}
