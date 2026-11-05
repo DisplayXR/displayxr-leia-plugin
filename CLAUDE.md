@@ -289,6 +289,21 @@ git push origin vX.Y.Z
 Full spec:
 [`displayxr-runtime/docs/specs/runtime/versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md).
 
+## Testing the weave with nobody at the panel
+
+Set `SR_SIMULATED_VIEWER="x,y,z,ipd"` (millimetres; head centre + interpupillary distance, e.g. `0,0,700,63`) in the process that **creates the weaver**. SR then weaves, lens-filters and phases for those eyes exactly as if they were tracked, without changing the platform's tracking state. API form: `srWeaverSetSimulatedViewer` (`sr_weaver.h`, LeiaSR ST-5804).
+
+Why it matters: an untracked capture is a different image (the weaver's not-tracking fallback), so anything tracking-dependent, such as a 2D-layer line at a tile edge, can vanish or turn into a darker box as soon as you step away.
+
+For the service route that process is `displayxr-service`, which reads its own environment and not the client's. Stop it and relaunch it from a `.bat` via `explorer.exe`, so it stays Medium-integrity:
+
+```bat
+set SR_SIMULATED_VIEWER=0,0,700,63
+start "" "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
+```
+
+The value is read when each weaver is created, so restart the client too. Then capture with the service's `%TEMP%\displayxr_atlas_trigger.<client-exe>` trigger (runtime `CLAUDE.md`, Autonomous capture). Restart the service normally when done, or the panel stays pinned to that viewer. Not to be confused with SR's `DummyEyetracker`, which produces no eyes at all.
+
 ## Things to be careful about
 
 - **Don't `throw` from anywhere reachable by the runtime's loader or
