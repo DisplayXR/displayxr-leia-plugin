@@ -252,15 +252,48 @@ in-service.
 
 **Feeding.** A feeder thread pushes each 640×480 Y8 frame through the C API:
 
-1. `leia_shared_camera_sink_on_intrinsics_change` with the main lens's
+1. `leia_shared_camera_sink_on_intrinsics_change` with the tracking lens's
    intrinsics at 640×480, mirrored. It runs first, then every 60 frames.
 2. `leia_shared_camera_sink_on_image` with a tight 640 stride, rotation 0, and
    a BOOTTIME timestamp.
 
-Detection runs on the caller's thread and can stall for 500 ms with no face in
-view, so frames are latest-wins and never queued. The tracking frame is cut
-from every main-lens image *before* pairing. CNSDK resets its predictor on a
-gap above 70 ms, so a lost pair must not become a lost tracking frame.
+Detection runs on the caller's thread, so frames are latest-wins and never
+queued, and the capture callback only overwrites the slot. The tracking frame is
+cut from every tracking-lens image *before* pairing. CNSDK resets its predictor
+on a gap above 70 ms, so a lost pair must not become a lost tracking frame.
+
+**The engine's idle throttle sleeps the feeder.** CNSDK's `FrameThrottle`
+(`Engine::ProcessFrame`, 0.10.95) turns on 5 s after tracking starts once no face
+was seen for 2 s. From then on every frame that arrives within 500 ms of the last
+processed one is skipped *and the caller sleeps until 500 ms have passed*, under
+the engine's frame lock. With its own camera the caller is CNSDK's camera
+thread; with a shared-camera sink it is our feeder. The sink then gets about 4
+frames/s in pairs (one processed, one skipped and slept on), whatever the camera
+delivers. Nothing upstream of the feeder slows down: pairs, the 3D stream and
+the capture callback keep the camera rate. The fix for the sleep belongs in
+CNSDK (a shared-camera sink should be skipped without sleeping, or not throttled).
+
+**Which lens.** The engine applies its configured tracking camera's pose and
+intrinsics, so the fed frames must come from that lens (on a nubia Pad 3D II
+it is the pair's sub lens, `"3"`). A stream can open before this process's
+core has read its device config; the lens is then guessed (the factory main
+lens), and the feeder asks again every second and switches to the configured
+lens, re-pushing intrinsics, as soon as a core knows it
+(`tracking lens 1 -> 3 once the cores knew their tracking camera`).
+
+**Rate WARN.** Every 10 s while the pair is owned:
+
+```
+tracking feed 30.0 captured/s -> 3.9 fed/s to the sink (call avg 254.0 ms max 501 ms, longest gap 501 ms,
+20 engine stall(s) >= 400 ms), faces 0.0/s of 118.6 polls/s, lens 3
+```
+
+`fed/s` far below `captured/s` with stalls is the throttle; `faces/s` counts face
+polls (`leia_cnsdk_get_primary_face`) that got a face from the core.
+
+**Frame dump.** `adb shell touch /sdcard/Android/data/<runtime-pkg>/files/dxr_track_dump_trigger`
+writes the next fed frame, exactly as the sink got it, to `dxr_track_frame.pgm`
+in the same directory (Y8, 640×480, sensor-native: the engine rotates it).
 
 **CNSDK #762.** The Java/JNI `SharedCameraSink.onImage` bugs it fixes (padded
 Y stride, non-zero rotation) are not on this path. Nothing here changes when

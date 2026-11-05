@@ -103,6 +103,10 @@ set(DRV_LEIA_ANDROID_SOURCES
     # (tests/test_stereo_camera_android_user_calib.c, Linux CI).
     leia_stereo_camera_android_user_calib.c
     leia_stereo_camera_android_user_calib.h
+    # Rate accounting for the in-app tracking feed (10 s WARN). Pure C,
+    # host-tested (tests/test_tracking_feed_stats.c, Linux CI).
+    leia_tracking_feed_stats.c
+    leia_tracking_feed_stats.h
 )
 
 # Post-weave alpha-gate (#568) + pre-weave compose-under-bg (runtime#1073 T0)
