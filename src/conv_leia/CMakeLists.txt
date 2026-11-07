@@ -141,8 +141,9 @@ target_link_libraries(test_conv_leia_provider PRIVATE
     xrt-interfaces aux_util aux_os d3d11 dxgi d3dcompiler version advapi32)
 set_target_properties(test_conv_leia_provider PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
-# Two fake conversion modules (a DLL named NeurD.dll with a VERSIONINFO and no
-# entry point): one older than the default floor (0.4.6), one newer.
+# Fake conversion modules (a DLL named NeurD.dll with a VERSIONINFO and no
+# entry point): one older than the default floor (0.4.6), one newer (0.4.9), and
+# one with NeurD's own stereographer auto-convergence (0.4.10).
 function(leia_conv_fake_module name major minor patch product)
     set(FAKE_MAJOR ${major})
     set(FAKE_MINOR ${minor})
@@ -159,6 +160,8 @@ function(leia_conv_fake_module name major minor patch product)
 endfunction()
 leia_conv_fake_module(leia_conv_fake_old 0 4 1 "Fake conversion module (internal test build)")
 leia_conv_fake_module(leia_conv_fake_noentry 0 4 9 "Fake conversion module (commercial)")
+# First version with NeurD's own stereographer auto-convergence (XRT_CONV_CAP_AUTO_CONVERGENCE).
+leia_conv_fake_module(leia_conv_fake_autoconv 0 4 10 "Fake conversion module (commercial)")
 
 add_test(NAME test_conv_leia_provider_missing
     COMMAND test_conv_leia_provider missing "$<SHELL_PATH:${CMAKE_CURRENT_BINARY_DIR}/fake_modules/none/NeurD.dll>")
@@ -166,5 +169,7 @@ add_test(NAME test_conv_leia_provider_old
     COMMAND test_conv_leia_provider old "$<SHELL_PATH:$<TARGET_FILE:leia_conv_fake_old>>")
 add_test(NAME test_conv_leia_provider_noentry
     COMMAND test_conv_leia_provider noentry "$<SHELL_PATH:$<TARGET_FILE:leia_conv_fake_noentry>>")
+add_test(NAME test_conv_leia_provider_autoconv
+    COMMAND test_conv_leia_provider autoconv "$<SHELL_PATH:$<TARGET_FILE:leia_conv_fake_autoconv>>")
 add_test(NAME test_conv_leia_provider_disabled
     COMMAND test_conv_leia_provider disabled "$<SHELL_PATH:$<TARGET_FILE:leia_conv_fake_noentry>>")

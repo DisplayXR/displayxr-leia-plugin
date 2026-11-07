@@ -13,6 +13,9 @@
  *                                      provider INCOMPATIBLE, the file never loaded
  *   noentry  : new enough, no entry -> INSTALLED, then FAILED(LOAD) after warm
  *   disabled : Enable=0             -> DISABLED
+ *   autoconv : like noentry, but a version with NeurD's own (stereographer)
+ *              auto-convergence -> VIEWS_MONO declares AUTO_CONVERGENCE
+ *              (noentry, one version older, must not; depth caps never do)
  *
  * One scenario per process (the module is process-wide, as NeurD is): ctest
  * runs `test_conv_leia_provider <scenario> <module path>`. The provider's
@@ -30,6 +33,10 @@
 #include <cstring>
 #include <set>
 #include <string>
+
+#ifndef XRT_CONV_CAP_AUTO_CONVERGENCE
+#define XRT_CONV_CAP_AUTO_CONVERGENCE (1u << 11) // as the provider: until the runtime pin carries it
+#endif
 
 extern "C" xrt_result_t
 xrtConversionPluginNegotiate(uint32_t runtime_api_version,
@@ -58,6 +65,8 @@ int g_checks = 0;
 std::string g_module_path;
 std::string g_enable = "";
 int g_notifies = 0;
+//! VIEWS_MONO must declare AUTO_CONVERGENCE (the module's version has its own rule).
+bool g_expect_autoconv = false;
 
 bool
 fake_get_setting(const char *key, char *buf, uint32_t size)
@@ -221,8 +230,10 @@ check_describe(struct xrt_conversion_plugin_iface *iface, struct xrt_conversion_
 			CHECK(cap.min_views == 2u && cap.max_views == 2u);
 			CHECK((cap.outputs & XRT_CONV_OUT_VIEWS) != 0);
 			CHECK((cap.flags & XRT_CONV_CAP_TEMPORAL) == 0);
+			CHECK(((cap.flags & XRT_CONV_CAP_AUTO_CONVERGENCE) != 0) == g_expect_autoconv);
 		} else {
 			CHECK(cap.outputs == XRT_CONV_OUT_DEPTH);
+			CHECK((cap.flags & XRT_CONV_CAP_AUTO_CONVERGENCE) == 0); // no convergence on depth
 			CHECK(((cap.flags & XRT_CONV_CAP_TEMPORAL) != 0) == (cap.task == XRT_CONV_TASK_DEPTH_VIDEO));
 		}
 		if ((cap.outputs & XRT_CONV_OUT_DEPTH) != 0) {
@@ -367,7 +378,7 @@ scenario(const std::string &name)
 		CHECK(!module_mapped());
 		const struct xrt_conv_state st = state_of(iface, inst, 1);
 		CHECK(strcmp(st.version, "0.4.1") == 0);
-	} else if (name == "noentry") {
+	} else if (name == "noentry" || name == "autoconv") {
 		CHECK(provider_status(iface) == 1u); // READY: the dependency is there
 		all_caps(iface, inst, XRT_CONV_STATE_INSTALLED, XRT_CONV_FAIL_NONE, 0u);
 		CHECK(licence_of(iface, inst) == XRT_CONV_LICENCE_COMMERCIAL);
@@ -376,6 +387,7 @@ scenario(const std::string &name)
 		CHECK(module_mapped()); // it was loaded: the floor admitted it
 		all_caps(iface, inst, XRT_CONV_STATE_FAILED, XRT_CONV_FAIL_LOAD, 1u);
 		CHECK(g_notifies > before); // the readiness move was pushed
+		check_describe(iface, inst);  // the flag survives the warm (provisional from the file)
 	} else if (name == "disabled") {
 		all_caps(iface, inst, XRT_CONV_STATE_DISABLED, XRT_CONV_FAIL_NONE, 0u);
 		CHECK(iface->warm(inst, 2, never, nullptr) != XRT_SUCCESS);
@@ -402,7 +414,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s missing|old|noentry|disabled <module path>\n", argv[0]);
+		fprintf(stderr, "usage: %s missing|old|noentry|autoconv|disabled <module path>\n", argv[0]);
 		return 2;
 	}
 	const std::string name = argv[1];
@@ -410,6 +422,7 @@ main(int argc, char **argv)
 	if (name == "disabled") {
 		g_enable = "0";
 	}
+	g_expect_autoconv = name == "autoconv";
 	const int r = scenario(name);
 	printf("test_conv_leia_provider %s: %d checks, %d failed\n", name.c_str(), g_checks, g_fail);
 	return r != 0 ? r : (g_fail == 0 ? 0 : 1);

@@ -284,6 +284,9 @@ struct leia_lift_neurd_presence
 	bool have_version;
 	uint32_t ver_major, ver_minor, ver_patch;
 	bool too_old; //!< have_version and older than the floor
+	//! have_version and new enough that NeurD's own auto-convergence is the
+	//! stereographer screen-plane rule (>= 0.4.10): the provider owns AUTO.
+	bool own_autoconv;
 	uint32_t min_major, min_minor, min_patch;
 	char product_name[64]; //!< VERSIONINFO ProductName; "" = none
 };
@@ -311,6 +314,9 @@ struct leia_lift_neurd_status
 	bool float_depth;  //!< READY: SBS streams can return the depth of the same inference
 	bool metric_depth; //!< ...and it is metric (VideoModel=metric)
 	bool offaxis;      //!< READY: the metric off-axis camera is available
+	//! READY: the loaded NeurD's own auto-convergence is the stereographer
+	//! screen-plane rule (>= 0.4.10), so a caller's AUTO is left to it.
+	bool own_autoconv;
 	uint64_t latency_ns; //!< EMA of a full convert; 0 = none yet
 	uint64_t nd_luid;    //!< NeurD's D3D11 adapter LUID (READY), else 0
 };

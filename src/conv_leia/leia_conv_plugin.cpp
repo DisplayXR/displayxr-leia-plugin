@@ -42,6 +42,14 @@
 // runtime#2562; defined here until the runtime pin carries it (bit value is ABI).
 #define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
 #endif
+#ifndef XRT_CONV_CAP_AUTO_CONVERGENCE
+// The provider runs its own auto-convergence when params.convergence_mode is
+// AUTO; the runtime then leaves AUTO to it instead of running its observer.
+// Pairs with the runtime PR adding XRT_CONV_CAP_AUTO_CONVERGENCE to
+// xrt_conversion_plugin.h; defined here until the runtime pin carries it (bit
+// value is ABI). A runtime that predates it ignores the bit.
+#define XRT_CONV_CAP_AUTO_CONVERGENCE (1u << 11)
+#endif
 #include "leia_lift_neurd.h"
 
 #include "util/u_logging.h"
@@ -297,6 +305,18 @@ views_offaxis(const struct snapshot &s)
 #endif
 }
 
+//! VIEWS_MONO's own auto-convergence: the loaded NeurD runs the stereographer
+//! screen-plane rule (>= 0.4.10). Once READY from the loaded module; before,
+//! provisionally from the file's version resource (spec §3.4 rule 6).
+bool
+views_own_autoconv(const struct snapshot &s)
+{
+	if (s.activated && s.status.module_status == LEIA_LIFT_MODULE_READY) {
+		return s.status.own_autoconv;
+	}
+	return s.presence.found && s.presence.have_version && s.presence.own_autoconv;
+}
+
 bool
 metric_depth(const struct snapshot &s)
 {
@@ -351,6 +371,12 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		if (views_offaxis(s)) {
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA;
 		}
+		// Convergence applies to views only. With NeurD's stereographer rule the
+		// provider owns AUTO: the runtime's observer standing in as well made the
+		// two alternate frame to frame (the depth "pumped").
+		if (views_own_autoconv(s)) {
+			c->flags |= XRT_CONV_CAP_AUTO_CONVERGENCE;
+		}
 		c->outputs = XRT_CONV_OUT_VIEWS;
 		if (views_have_depth(s)) {
 			c->outputs |= XRT_CONV_OUT_DEPTH;
@@ -398,6 +424,7 @@ describe_key_of(const struct snapshot &s)
 	auto mix = [&k](uint64_t v) { k = (k ^ v) * 1099511628211ull; };
 	mix(views_have_depth(s) ? 1u : 0u);
 	mix(views_offaxis(s) ? 1u : 0u);
+	mix(views_own_autoconv(s) ? 1u : 0u);
 	mix(metric_depth(s) ? 1u : 0u);
 	mix(s.licence_class);
 	{

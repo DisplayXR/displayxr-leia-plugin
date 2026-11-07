@@ -1671,6 +1671,10 @@ struct lift_stream
 	//! caller-set (the runtime's auto-convergence policy, or the app); -1 =
 	//! none yet.
 	int32_t conv_src_logged;
+	//! Convergence-source changes seen on this stream (the first few WARN, then INFO).
+	uint32_t conv_src_changes;
+	//! Last logged viewpoint source (0 default pattern, 1 tracked, 2 explicit); -1 = none yet.
+	int32_t vp_src_logged;
 
 	// Depth bridge (R32_FLOAT, NeurD's device -> caller's).
 	uint32_t depth_w, depth_h;
@@ -2423,6 +2427,8 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *l, const struct leia_lift_
 	s->vp_logged = ~0u;
 	s->cam_logged = ~0u;
 	s->conv_src_logged = -1;
+	s->conv_src_changes = 0;
+	s->vp_src_logged = -1;
 	s->aux_depth = (desc->aux_outputs & LEIA_LIFT_AUX_DEPTH) != 0 && desc->mode != LEIA_LIFT_MODE_DEPTH;
 	l->streams.push_back(s);
 	g.streams_live.fetch_add(1);
@@ -2670,14 +2676,30 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 		}
 		const bool auto_conv = !(dp.convergence >= 0.0f);
 		if (s->mode != LEIA_LIFT_MODE_DEPTH && s->conv_src_logged != (auto_conv ? 0 : 1)) {
+			// Logged once per change of source, never per frame. A caller whose
+			// source alternates frame to frame (two auto-convergences fighting)
+			// would still turn that into a per-frame WARN: the first few changes
+			// WARN, then one WARN says it is flapping and the rest go to INFO.
+			constexpr uint32_t kConvSrcWarnChanges = 4;
 			s->conv_src_logged = auto_conv ? 0 : 1;
-			if (auto_conv) {
-				U_LOG_W("Leia lift: stream %llu convergence = NeurD auto-convergence (caller AUTO; %s)",
-				        (unsigned long long)s->id, autoconv_rule_str(nd->version));
+			const uint32_t n = ++s->conv_src_changes;
+			if (n <= kConvSrcWarnChanges) {
+				if (auto_conv) {
+					U_LOG_W("Leia lift: stream %llu convergence = NeurD auto-convergence (caller AUTO; %s)",
+					        (unsigned long long)s->id, autoconv_rule_str(nd->version));
+				} else {
+					U_LOG_W("Leia lift: stream %llu convergence = caller-set (runtime auto-convergence "
+					        "policy or the app) — NeurD auto-convergence OFF",
+					        (unsigned long long)s->id);
+				}
 			} else {
-				U_LOG_W("Leia lift: stream %llu convergence = caller-set (runtime auto-convergence policy or "
-				        "the app) — NeurD auto-convergence OFF",
-				        (unsigned long long)s->id);
+				const char *src = auto_conv ? "NeurD auto-convergence (caller AUTO)" : "caller-set";
+				if (n == kConvSrcWarnChanges + 1) {
+					U_LOG_W("Leia lift: stream %llu convergence source is flapping (%u changes) — the caller "
+					        "alternates AUTO and a set value; further changes logged at INFO",
+					        (unsigned long long)s->id, n);
+				}
+				U_LOG_I("Leia lift: stream %llu convergence = %s (change %u)", (unsigned long long)s->id, src, n);
 			}
 		}
 		// strength: 1 = NeurD's calibrated budget, 0 = flat; negative/NaN = default.
@@ -2851,10 +2873,12 @@ leia_lift_neurd_convert(struct leia_lift_neurd *l,
 			// Which viewpoints this convert used, logged once per change: an A/B of
 			// DXR_LEIA_LIFT_VIEW_GAIN with nobody in front of the tracker lands on the
 			// default pattern and reads as "the gain does nothing".
+			// Per stream: a process-wide "last" WARNed every frame while two
+			// streams on different sources were converting.
 			const int vp_src = !vp.empty() ? (eyes_valid ? 1 : 2) : 0;
-			static std::atomic<int> s_last_vp_src{-1};
-			if (s_last_vp_src.exchange(vp_src) != vp_src) {
-				U_LOG_W("Leia lift: viewpoints = %s (mode %d, %u view(s)%s)",
+			if (s->vp_src_logged != vp_src) {
+				s->vp_src_logged = vp_src;
+				U_LOG_W("Leia lift: stream %llu viewpoints = %s (mode %d, %u view(s)%s)", (unsigned long long)s->id,
 				        vp_src == 1 ? "TRACKED eyes" : (vp_src == 2 ? "explicit/untracked N-view" : "DEFAULT pattern (no tracked eyes)"),
 				        (int)s->mode, views, vp_src != 0 ? ", view_gain applied" : ", view_gain NOT applied");
 			}
@@ -3160,6 +3184,7 @@ leia_lift_neurd_probe_presence(struct leia_lift_neurd *l, struct leia_lift_neurd
 		out->ver_minor = (uint32_t)NEURD_GET_VERSION_MINOR(ver);
 		out->ver_patch = (uint32_t)NEURD_GET_VERSION_PATCH(ver);
 		out->too_old = ver < floor_v;
+		out->own_autoconv = ver >= kNeurDStereographerAutoConvVersion;
 	}
 	file_product_name(out->path, out->product_name, sizeof(out->product_name));
 	return true;
@@ -3223,6 +3248,7 @@ leia_lift_neurd_get_status(struct leia_lift_neurd *l, struct leia_lift_neurd_sta
 		out->float_depth = g.float_depth;
 		out->metric_depth = g.float_depth && g.k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY;
 		out->offaxis = g.offaxis && g.k0.offaxis;
+		out->own_autoconv = g.nd != nullptr && g.nd->version >= kNeurDStereographerAutoConvVersion;
 		out->nd_luid = ((uint64_t)(uint32_t)g.nd_luid.HighPart << 32) | (uint64_t)g.nd_luid.LowPart;
 	}
 	out->latency_ns = g.latency_ns.load();
