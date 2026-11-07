@@ -124,6 +124,11 @@ constexpr uint64_t kDefaultMinNeurDVersion = NEURD_MAKE_VERSION(0, 4, 6);
 //! (c = -(d - 128) * 0.1 / 128, clamped to the AUTO_CONVERGENCE_MIN/MAX_LIMIT props, default
 //! +-0.1), so the off-axis anchor h0 = 0.5 - 5c is unchanged; only the logs name the rule.
 constexpr uint64_t kNeurDStereographerAutoConvVersion = NEURD_MAKE_VERSION(0, 4, 10);
+//! First NeurD with its OWN auto-convergence at all (0.4.6 - 0.4.9: saliency-masked mean disparity;
+//! 0.4.10+: the stereographer rule above). From here the conversion provider declares
+//! XRT_CONV_CAP_AUTO_CONVERGENCE and owns AUTO: which rule runs is the installed NeurD's, i.e. the
+//! user's choice, not the runtime's (David, 2026-11-08).
+constexpr uint64_t kNeurDOwnAutoConvVersion = NEURD_MAKE_VERSION(0, 4, 6);
 //! ReliefDepthM default: relief thickness of RELATIVE depth on the off-axis
 //! path, metres. Matches the panel-calibrated legacy look (DepthGain 2: ~1 % of
 //! the width of disparity at the ends of the range, i.e. ~±3.5 cm of depth in
@@ -214,7 +219,7 @@ autoconv_rule_str(uint64_t neurd_version)
 	if (neurd_version >= kNeurDStereographerAutoConvVersion) {
 		return "stereographer screen-plane rule";
 	}
-	if (neurd_version >= NEURD_MAKE_VERSION(0, 4, 6)) {
+	if (neurd_version >= kNeurDOwnAutoConvVersion) {
 		return "saliency mean disparity (NeurD < 0.4.10)";
 	}
 	return "pre-0.4.6";
@@ -3184,7 +3189,7 @@ leia_lift_neurd_probe_presence(struct leia_lift_neurd *l, struct leia_lift_neurd
 		out->ver_minor = (uint32_t)NEURD_GET_VERSION_MINOR(ver);
 		out->ver_patch = (uint32_t)NEURD_GET_VERSION_PATCH(ver);
 		out->too_old = ver < floor_v;
-		out->own_autoconv = ver >= kNeurDStereographerAutoConvVersion;
+		out->own_autoconv = ver >= kNeurDOwnAutoConvVersion;
 	}
 	file_product_name(out->path, out->product_name, sizeof(out->product_name));
 	return true;
@@ -3248,7 +3253,7 @@ leia_lift_neurd_get_status(struct leia_lift_neurd *l, struct leia_lift_neurd_sta
 		out->float_depth = g.float_depth;
 		out->metric_depth = g.float_depth && g.k0.video_model == NEURD_MODEL_VIDEO_METRIC_QUALITY;
 		out->offaxis = g.offaxis && g.k0.offaxis;
-		out->own_autoconv = g.nd != nullptr && g.nd->version >= kNeurDStereographerAutoConvVersion;
+		out->own_autoconv = g.nd != nullptr && g.nd->version >= kNeurDOwnAutoConvVersion;
 		out->nd_luid = ((uint64_t)(uint32_t)g.nd_luid.HighPart << 32) | (uint64_t)g.nd_luid.LowPart;
 	}
 	out->latency_ns = g.latency_ns.load();

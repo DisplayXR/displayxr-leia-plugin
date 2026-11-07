@@ -305,8 +305,9 @@ views_offaxis(const struct snapshot &s)
 #endif
 }
 
-//! VIEWS_MONO's own auto-convergence: the loaded NeurD runs the stereographer
-//! screen-plane rule (>= 0.4.10). Once READY from the loaded module; before,
+//! VIEWS_MONO's own auto-convergence: the loaded NeurD runs one of its own
+//! (>= 0.4.6 saliency rule, >= 0.4.10 stereographer rule — which one is the
+//! installed NeurD's, the user's choice). Once READY from the loaded module; before,
 //! provisionally from the file's version resource (spec §3.4 rule 6).
 bool
 views_own_autoconv(const struct snapshot &s)
@@ -371,9 +372,9 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		if (views_offaxis(s)) {
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA;
 		}
-		// Convergence applies to views only. With NeurD's stereographer rule the
-		// provider owns AUTO: the runtime's observer standing in as well made the
-		// two alternate frame to frame (the depth "pumped").
+		// Convergence applies to views only. When NeurD has its own
+		// auto-convergence the provider owns AUTO: the runtime's observer standing
+		// in as well made the two alternate frame to frame (the depth "pumped").
 		if (views_own_autoconv(s)) {
 			c->flags |= XRT_CONV_CAP_AUTO_CONVERGENCE;
 		}

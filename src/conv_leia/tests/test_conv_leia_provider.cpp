@@ -13,9 +13,10 @@
  *                                      provider INCOMPATIBLE, the file never loaded
  *   noentry  : new enough, no entry -> INSTALLED, then FAILED(LOAD) after warm
  *   disabled : Enable=0             -> DISABLED
- *   autoconv : like noentry, but a version with NeurD's own (stereographer)
- *              auto-convergence -> VIEWS_MONO declares AUTO_CONVERGENCE
- *              (noentry, one version older, must not; depth caps never do)
+ *   autoconv : like noentry, at 0.4.10 (stereographer rule)
+ * Every NeurD >= 0.4.6 runs its own auto-convergence, so noentry (0.4.9) and
+ * autoconv declare AUTO_CONVERGENCE on VIEWS_MONO; old / missing / disabled do
+ * not; depth capabilities never do.
  *
  * One scenario per process (the module is process-wide, as NeurD is): ctest
  * runs `test_conv_leia_provider <scenario> <module path>`. The provider's
@@ -65,7 +66,7 @@ int g_checks = 0;
 std::string g_module_path;
 std::string g_enable = "";
 int g_notifies = 0;
-//! VIEWS_MONO must declare AUTO_CONVERGENCE (the module's version has its own rule).
+//! VIEWS_MONO must declare AUTO_CONVERGENCE (the module's version, >= 0.4.6, has its own).
 bool g_expect_autoconv = false;
 
 bool
@@ -422,7 +423,7 @@ main(int argc, char **argv)
 	if (name == "disabled") {
 		g_enable = "0";
 	}
-	g_expect_autoconv = name == "autoconv";
+	g_expect_autoconv = name == "autoconv" || name == "noentry";
 	const int r = scenario(name);
 	printf("test_conv_leia_provider %s: %d checks, %d failed\n", name.c_str(), g_checks, g_fail);
 	return r != 0 ? r : (g_fail == 0 ? 0 : 1);

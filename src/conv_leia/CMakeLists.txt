@@ -142,8 +142,9 @@ target_link_libraries(test_conv_leia_provider PRIVATE
 set_target_properties(test_conv_leia_provider PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
 # Fake conversion modules (a DLL named NeurD.dll with a VERSIONINFO and no
-# entry point): one older than the default floor (0.4.6), one newer (0.4.9), and
-# one with NeurD's own stereographer auto-convergence (0.4.10).
+# entry point): one older than the default floor (0.4.6), one newer (0.4.9:
+# saliency auto-convergence), and one with the stereographer rule (0.4.10). Both
+# newer ones declare XRT_CONV_CAP_AUTO_CONVERGENCE.
 function(leia_conv_fake_module name major minor patch product)
     set(FAKE_MAJOR ${major})
     set(FAKE_MINOR ${minor})
@@ -160,7 +161,7 @@ function(leia_conv_fake_module name major minor patch product)
 endfunction()
 leia_conv_fake_module(leia_conv_fake_old 0 4 1 "Fake conversion module (internal test build)")
 leia_conv_fake_module(leia_conv_fake_noentry 0 4 9 "Fake conversion module (commercial)")
-# First version with NeurD's own stereographer auto-convergence (XRT_CONV_CAP_AUTO_CONVERGENCE).
+# First version with NeurD's stereographer auto-convergence rule.
 leia_conv_fake_module(leia_conv_fake_autoconv 0 4 10 "Fake conversion module (commercial)")
 
 add_test(NAME test_conv_leia_provider_missing
