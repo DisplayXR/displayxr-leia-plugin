@@ -219,3 +219,17 @@ leia_conv_depth_kind(uint32_t units, uint32_t encoding)
 	}
 	return inverse ? LEIA_CONV_DEPTH_AFFINE_INVERSE : LEIA_CONV_DEPTH_AFFINE;
 }
+
+bool
+leia_conv_installed_usable(const struct leia_conv_module_view *in)
+{
+	if (in == NULL || !in->enabled) {
+		return false;
+	}
+	switch (in->module_status) {
+	case LEIA_CONV_MODULE_READY:
+	case LEIA_CONV_MODULE_ACTIVATING: return true; // loaded; activating its licence
+	case LEIA_CONV_MODULE_UNKNOWN: return in->found && !in->too_old; // presence decides until activation
+	default: return false; // ABSENT, TOO_OLD, UNLICENSED, LOAD_FAILED, DISABLED
+	}
+}

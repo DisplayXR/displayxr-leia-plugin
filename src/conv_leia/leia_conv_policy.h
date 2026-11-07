@@ -121,6 +121,17 @@ uint32_t
 leia_conv_licence_class(const char *licence_line, const char *product_name);
 
 /*!
+ * True while the NeurD runtime the user installed is present and usable: found
+ * at a supported version and not refused (absent, too old, unlicensed, failed
+ * to load, disabled). The provider then declares its capabilities
+ * XRT_CONV_CAP_LICENSED_LOCAL_INSTALL, so the runtime selects NeurD without the
+ * AllowResearchOnly opt-in (the install is the opt-in) and falls through to the
+ * next provider the moment this turns false.
+ */
+bool
+leia_conv_installed_usable(const struct leia_conv_module_view *in);
+
+/*!
  * Views target extent for an input of in_w x in_h: per view the input size,
  * scaled down (aspect kept) so the whole target fits @p max_dim texels per
  * edge — N views side by side for ROW, one view per layer for ARRAY.
