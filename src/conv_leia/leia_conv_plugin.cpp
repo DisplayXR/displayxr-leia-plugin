@@ -37,6 +37,11 @@
 
 #include "leia_conv_d3d11.h"
 #include "leia_conv_policy.h"
+
+#ifndef XRT_CONV_CAP_LICENSED_LOCAL_INSTALL
+// runtime#2562; defined here until the runtime pin carries it (bit value is ABI).
+#define XRT_CONV_CAP_LICENSED_LOCAL_INSTALL (1u << 10)
+#endif
 #include "leia_lift_neurd.h"
 
 #include "util/u_logging.h"
@@ -362,6 +367,13 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		c->intrinsics_source = XRT_CONV_INTRINSICS_NONE;
 	}
 
+	// The user installed NeurD under its own licence: while that install is
+	// usable, the runtime admits it without AllowResearchOnly (runtime#2562).
+	const struct leia_conv_module_view mv = view_of(s);
+	if (leia_conv_installed_usable(&mv)) {
+		c->flags |= XRT_CONV_CAP_LICENSED_LOCAL_INSTALL;
+	}
+
 	c->licence_class = s.licence_class;
 	c->commercial_ok = s.licence_class == XRT_CONV_LICENCE_COMMERCIAL ? 1u : 0u;
 	copy_str(c->licence_spdx, sizeof(c->licence_spdx), kSpdx);
@@ -388,6 +400,10 @@ describe_key_of(const struct snapshot &s)
 	mix(views_offaxis(s) ? 1u : 0u);
 	mix(metric_depth(s) ? 1u : 0u);
 	mix(s.licence_class);
+	{
+		const struct leia_conv_module_view mv = view_of(s);
+		mix(leia_conv_installed_usable(&mv) ? 1u : 0u); // LICENSED_LOCAL_INSTALL moves the describe
+	}
 	mix(s.device_luid);
 	char buf[48];
 	module_version_str(s, buf, sizeof(buf));

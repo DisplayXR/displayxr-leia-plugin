@@ -140,6 +140,32 @@ test_licence(void)
 }
 
 static void
+test_installed_usable(void)
+{
+	struct leia_conv_module_view v;
+	memset(&v, 0, sizeof(v));
+	v.enabled = true;
+	CHECK(!leia_conv_installed_usable(&v)); // never activated, nothing found
+	v.found = true;
+	CHECK(leia_conv_installed_usable(&v)); // found at a supported version
+	v.too_old = true;
+	CHECK(!leia_conv_installed_usable(&v));
+	v.too_old = false;
+	v.module_status = LEIA_CONV_MODULE_READY;
+	CHECK(leia_conv_installed_usable(&v));
+	v.module_status = LEIA_CONV_MODULE_ACTIVATING;
+	CHECK(leia_conv_installed_usable(&v));
+	v.module_status = LEIA_CONV_MODULE_UNLICENSED;
+	CHECK(!leia_conv_installed_usable(&v));
+	v.module_status = LEIA_CONV_MODULE_LOAD_FAILED;
+	CHECK(!leia_conv_installed_usable(&v));
+	v.module_status = LEIA_CONV_MODULE_READY;
+	v.enabled = false;
+	CHECK(!leia_conv_installed_usable(&v)); // Enable=0 setting
+	CHECK(!leia_conv_installed_usable(NULL));
+}
+
+static void
 test_extents(void)
 {
 	uint32_t w = 0, h = 0;
@@ -204,6 +230,7 @@ main(void)
 {
 	test_readiness_gate();
 	test_licence();
+	test_installed_usable();
 	test_extents();
 	test_convergence();
 	test_depth_kind();
