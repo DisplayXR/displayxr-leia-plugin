@@ -131,7 +131,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            git ca-certificates jq \
+            git ca-certificates jq curl \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
@@ -192,14 +192,15 @@ jobs:
       - name: Configure
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          NEURD_ARGS=()
+          # POSIX sh (this job runs in a container): no arrays.
+          NEURD_ROOT=""
           if [ -f "NeurD-SDK-$NEURD_SDK_REF/include/NeurD_version.h" ]; then
-            NEURD_ARGS=(-DNEURD_SDK_ROOT="$GITHUB_WORKSPACE/NeurD-SDK-$NEURD_SDK_REF")
+            NEURD_ROOT="$GITHUB_WORKSPACE/NeurD-SDK-$NEURD_SDK_REF"
           fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime" \
-            "${NEURD_ARGS[@]}"
+            -DNEURD_SDK_ROOT="$NEURD_ROOT"
 
       - name: Build plug-in
         if: needs.DetectChanges.outputs.docs_only != 'true'

@@ -21,7 +21,15 @@ REF="${2:?usage: $0 <repo> <ref> <dest>}"
 DEST="${3:?usage: $0 <repo> <ref> <dest>}"
 INC="$DEST/include"
 
-get() { gh api "repos/$REPO/contents/$1?ref=$REF" -H 'Accept: application/vnd.github.raw'; }
+# gh when present; plain curl + GH_TOKEN otherwise (CI's bare build containers have no gh).
+get() {
+    if command -v gh >/dev/null 2>&1; then
+        gh api "repos/$REPO/contents/$1?ref=$REF" -H 'Accept: application/vnd.github.raw'
+    else
+        curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN needed without gh}" \
+            -H 'Accept: application/vnd.github.raw' "https://api.github.com/repos/$REPO/contents/$1?ref=$REF"
+    fi
+}
 
 if ! {
     mkdir -p "$INC"
