@@ -246,6 +246,33 @@ leia_sr_presence_apply(enum leia_sr_presence p, bool eye_pair_tracking)
 	}
 }
 
+/*!
+ * What the DP's own weaver says about its eyes (LeiaSR srWeaverGetTrackingState).
+ * UNKNOWN = no answer: an SR runtime or SDK without the query, a v1 weaver, or
+ * no weaver yet.
+ */
+enum leia_sr_weaver_tracking
+{
+	LEIA_SR_WEAVER_TRACKING_UNKNOWN = 0,
+	LEIA_SR_WEAVER_TRACKING_TRACKING = 1, //!< The eyes follow a viewer.
+	LEIA_SR_WEAVER_TRACKING_LOST = 2,     //!< Tracking runs but has no face (lags a real loss).
+	LEIA_SR_WEAVER_TRACKING_RESTED = 3,   //!< The weaver's tracking rests: nobody is being looked for.
+};
+
+/*!
+ * Fold the weaver's own answer into the display's presence. RESTED wins over
+ * everything: a rested weaver serves a collapsed or nominal pair, and
+ * presence can still read PRESENT when another client keeps the shared camera
+ * streaming, which would otherwise call that pair a tracked viewer. Every
+ * other answer leaves @p p as it is (LOST lags a real loss by the tracker's
+ * face-lost delay, so presence and the pair heuristic stay the faster signal).
+ */
+static inline enum leia_sr_presence
+leia_sr_presence_with_weaver(enum leia_sr_presence p, enum leia_sr_weaver_tracking w)
+{
+	return w == LEIA_SR_WEAVER_TRACKING_RESTED ? LEIA_SR_PRESENCE_ABSENT : p;
+}
+
 #ifdef __cplusplus
 }
 #endif

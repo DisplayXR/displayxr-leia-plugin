@@ -207,6 +207,24 @@ test_apply_unknown_is_todays_heuristic(void)
 	CHECK(!leia_sr_presence_apply(LEIA_SR_PRESENCE_ABSENT, true));
 }
 
+static void
+test_rested_weaver_wins_over_presence(void)
+{
+	// The gap this closes: another client keeps the shared camera streaming,
+	// so presence reads PRESENT while this DP's own weaver rests.
+	CHECK(!leia_sr_presence_apply(
+	    leia_sr_presence_with_weaver(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_RESTED), true));
+	CHECK(!leia_sr_presence_apply(
+	    leia_sr_presence_with_weaver(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_RESTED), true));
+	// Every other answer leaves presence (and so the heuristic) untouched.
+	CHECK(leia_sr_presence_with_weaver(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_LOST) ==
+	      LEIA_SR_PRESENCE_PRESENT);
+	CHECK(leia_sr_presence_with_weaver(LEIA_SR_PRESENCE_ABSENT, LEIA_SR_WEAVER_TRACKING_TRACKING) ==
+	      LEIA_SR_PRESENCE_ABSENT);
+	CHECK(leia_sr_presence_with_weaver(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_UNKNOWN) ==
+	      LEIA_SR_PRESENCE_UNKNOWN);
+}
+
 int
 main(void)
 {
@@ -216,6 +234,7 @@ main(void)
 	test_latest_time_wins();
 	test_matching();
 	test_apply_unknown_is_todays_heuristic();
+	test_rested_weaver_wins_over_presence();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_presence: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

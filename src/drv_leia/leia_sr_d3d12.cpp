@@ -470,6 +470,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "D3D12", &sr.presence_state);
+		leia_sr_v2_weaver_apply_tracking_policy(sr.weaver_v2, "D3D12");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		leia_sr_presence_monitor_destroy(&sr.presence);
@@ -1704,7 +1705,11 @@ leiasr_d3d12_get_user_presence(struct leiasr_d3d12 *leiasr)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr != nullptr) {
-		return leia_sr_presence_load(leiasr->presence_state);
+		// A rested weaver means "no viewer", ahead of the display's presence
+		// (leia_sr_presence_with_weaver). weaver_v2 is read only once READY.
+		const SrWeaver w = w_ready(leiasr) ? leiasr->weaver_v2 : nullptr;
+		return leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state),
+		                                    leia_sr_v2_weaver_tracking(w));
 	}
 #else
 	(void)leiasr;

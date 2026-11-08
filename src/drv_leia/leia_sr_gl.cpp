@@ -418,6 +418,7 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "GL", &sr.presence_state);
+		leia_sr_v2_weaver_apply_tracking_policy(sr.weaver_v2, "GL");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		leia_sr_presence_monitor_destroy(&sr.presence);
@@ -1107,7 +1108,11 @@ leiasr_gl_get_user_presence(struct leiasr_gl *leiasr)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr != nullptr) {
-		return leia_sr_presence_load(leiasr->presence_state);
+		// A rested weaver means "no viewer", ahead of the display's presence
+		// (leia_sr_presence_with_weaver). weaver_v2 is read only once READY.
+		const SrWeaver w = w_ready(leiasr) ? leiasr->weaver_v2 : nullptr;
+		return leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state),
+		                                    leia_sr_v2_weaver_tracking(w));
 	}
 #else
 	(void)leiasr;

@@ -579,6 +579,7 @@ create_v2(double max_time,
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "VK", &sr.presence_state);
+		leia_sr_v2_weaver_apply_tracking_policy(weaver, "VK");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		leia_sr_presence_monitor_destroy(&sr.presence);
@@ -1653,7 +1654,12 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	// camera has answered; otherwise the heuristic above, as always.
 	bool pair_tracking = (dist_sq > 1e-6f);
 #ifdef DXR_LEIA_HAS_SR_V2
-	out_eye_pos->is_tracking = leia_sr_presence_apply(leia_sr_presence_load(leiasr->presence_state), pair_tracking);
+	// A rested weaver means "no viewer", ahead of the display's presence
+	// (leia_sr_presence_with_weaver); `weaver` is an SrWeaver iff instance_v2.
+	const enum leia_sr_weaver_tracking wt = leia_sr_v2_weaver_tracking(
+	    leiasr->instance_v2 != nullptr ? static_cast<SrWeaver>(leiasr->weaver) : nullptr);
+	out_eye_pos->is_tracking = leia_sr_presence_apply(
+	    leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state), wt), pair_tracking);
 #else
 	out_eye_pos->is_tracking = pair_tracking;
 #endif

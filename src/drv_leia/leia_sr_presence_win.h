@@ -33,6 +33,7 @@
 #include "leia_sr_presence.h"
 
 #include <sr/sr_instance.h>
+#include <sr/sr_weaver.h>
 
 #include <atomic>
 #include <stdint.h>
@@ -72,5 +73,25 @@ leia_sr_presence_load(const std::atomic<int32_t> &state)
 {
 	return (enum leia_sr_presence)state.load(std::memory_order_relaxed);
 }
+
+/*!
+ * The weaver's tracking state (LeiaSR srWeaverGetTrackingState), safe every
+ * frame and on any thread that may use @p weaver. UNKNOWN when @p weaver is
+ * NULL, when the plug-in was built against an SDK without the query
+ * (SR_WEAVER_TRACKING_POLICY_AVAILABLE), or when the SR runtime answers
+ * SR_ERROR_FUNCTION_UNSUPPORTED (logged once per process, then not asked again).
+ */
+enum leia_sr_weaver_tracking
+leia_sr_v2_weaver_tracking(SrWeaver weaver);
+
+/*!
+ * Apply DXR_LEIA_TRACKING_POLICY (auto | always_on | off) to a new weaver.
+ * Unset or "auto" = no call: AUTO is what a weaver does by default (rest
+ * after the lens has been off for SR's hold). "always_on" keeps this weaver's
+ * tracking awake in 2D; "off" withdraws its demand at once. Never blocks.
+ * Logged once per weaver when it is applied, once per process when refused.
+ */
+void
+leia_sr_v2_weaver_apply_tracking_policy(SrWeaver weaver, const char *arm);
 
 #endif // DXR_LEIA_HAS_SR_V2

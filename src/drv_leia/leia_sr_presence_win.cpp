@@ -21,6 +21,9 @@
 #include <sr/sr_system.h>
 #include <sr/sr_types.h>
 
+#include <sr/sr_weaver.h>
+
+#include <cstdlib>
 #include <mutex>
 #include <new>
 #include <string.h>
@@ -200,6 +203,110 @@ leia_sr_presence_monitor_destroy(struct leia_sr_presence_monitor **monitor_ptr)
 		m->out->store((int32_t)LEIA_SR_PRESENCE_UNKNOWN, std::memory_order_relaxed);
 	}
 	delete m;
+}
+
+/*
+ * Weaver tracking state + policy (LeiaSR tracker-rest gate, PR 2).
+ */
+
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+namespace {
+
+//! Set once the SR runtime answered FUNCTION_UNSUPPORTED: an older runtime
+//! will not grow the slot mid-process, so stop asking.
+std::atomic<bool> g_tracking_query_unsupported{false};
+std::atomic<bool> g_tracking_policy_unsupported{false};
+
+//! -1 = unset/auto (no call), else an SrTrackingPolicy value.
+int
+tracking_policy_from_env()
+{
+	const char *e = std::getenv("DXR_LEIA_TRACKING_POLICY");
+	if (e == nullptr || e[0] == '\0' || _stricmp(e, "auto") == 0) {
+		return -1;
+	}
+	if (_stricmp(e, "always_on") == 0 || _stricmp(e, "on") == 0) {
+		return (int)SR_TRACKING_POLICY_ALWAYS_ON;
+	}
+	if (_stricmp(e, "off") == 0) {
+		return (int)SR_TRACKING_POLICY_OFF;
+	}
+	static std::atomic<bool> warned{false};
+	if (!warned.exchange(true)) {
+		U_LOG_W("DXR_LEIA_TRACKING_POLICY='%s' not recognised (auto | always_on | off); using auto", e);
+	}
+	return -1;
+}
+
+} // namespace
+#endif
+
+enum leia_sr_weaver_tracking
+leia_sr_v2_weaver_tracking(SrWeaver weaver)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	if (weaver == nullptr || g_tracking_query_unsupported.load(std::memory_order_relaxed)) {
+		return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+	}
+	SrTrackingState st = SR_TRACKING_STATE_TRACKING;
+	SrResult r = SR_ERROR_HANDLE_INVALID;
+	try {
+		r = srWeaverGetTrackingState(weaver, &st);
+	} catch (...) {
+		return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+	}
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		if (!g_tracking_query_unsupported.exchange(true)) {
+			U_LOG_W("SR weaver tracking state: unsupported by this SR runtime; presence alone decides is_tracking");
+		}
+		return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+	}
+	if (!SR_SUCCEEDED(r)) {
+		return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+	}
+	switch (st) {
+	case SR_TRACKING_STATE_TRACKING: return LEIA_SR_WEAVER_TRACKING_TRACKING;
+	case SR_TRACKING_STATE_LOST: return LEIA_SR_WEAVER_TRACKING_LOST;
+	case SR_TRACKING_STATE_RESTED: return LEIA_SR_WEAVER_TRACKING_RESTED;
+	default: return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+	}
+#else
+	(void)weaver;
+	return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+#endif
+}
+
+void
+leia_sr_v2_weaver_apply_tracking_policy(SrWeaver weaver, const char *arm)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	const int policy = tracking_policy_from_env();
+	if (weaver == nullptr || policy < 0 || g_tracking_policy_unsupported.load(std::memory_order_relaxed)) {
+		return;
+	}
+	SrResult r = SR_ERROR_HANDLE_INVALID;
+	try {
+		r = srWeaverSetTrackingPolicy(weaver, (SrTrackingPolicy)policy);
+	} catch (...) {
+		return;
+	}
+	const char *name = policy == (int)SR_TRACKING_POLICY_OFF ? "off" : "always_on";
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		if (!g_tracking_policy_unsupported.exchange(true)) {
+			U_LOG_W("SR %s weaver: DXR_LEIA_TRACKING_POLICY=%s ignored, this SR runtime has no tracking policy",
+			        arm, name);
+		}
+		return;
+	}
+	if (SR_SUCCEEDED(r)) {
+		U_LOG_W("SR %s weaver: tracking policy %s (DXR_LEIA_TRACKING_POLICY)", arm, name);
+	} else {
+		U_LOG_W("SR %s weaver: tracking policy %s refused: %s (%d)", arm, name, leia_sr_v2_result_str(r), (int)r);
+	}
+#else
+	(void)weaver;
+	(void)arm;
+#endif
 }
 
 #endif // DXR_LEIA_HAS_SR_V2
