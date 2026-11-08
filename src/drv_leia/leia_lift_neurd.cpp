@@ -325,6 +325,49 @@ env_ieq(const char *a, const char *b)
 const wchar_t *const kLiftRegKey = L"SOFTWARE\\DisplayXR\\Leia\\Lift";
 
 /*!
+ * Provider hosting reads only the provider's own settings (discovery spec
+ * §2.4), so a knob a user set the display-plug-in way -- DXR_LEIA_LIFT_* or
+ * HKLM\SOFTWARE\DisplayXR\Leia\Lift -- has no effect. That used to be
+ * silent: the knob simply stayed at its default. Say so once per knob, with
+ * the `conv set` line that does take effect.
+ */
+void
+warn_if_legacy_knob_ignored(const char *env_name, const wchar_t *reg_name, const char *key)
+{
+	char val[128] = {};
+	const char *where = nullptr;
+	const char *e = std::getenv(env_name);
+	if (e != nullptr && e[0] != '\0') {
+		snprintf(val, sizeof(val), "%s", e);
+		where = env_name;
+	} else {
+		wchar_t w[128] = {};
+		DWORD cb = sizeof(w);
+		const DWORD flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
+		const LSTATUS r = RegGetValueW(HKEY_LOCAL_MACHINE, kLiftRegKey, reg_name, flags, nullptr, w, &cb);
+		if (r == ERROR_SUCCESS && w[0] != L'\0' &&
+		    WideCharToMultiByte(CP_UTF8, 0, w, -1, val, (int)sizeof(val), nullptr, nullptr) > 0) {
+			where = "HKLM\\SOFTWARE\\DisplayXR\\Leia\\Lift";
+		}
+	}
+	if (where == nullptr) {
+		return;
+	}
+	static std::mutex mtx;
+	static std::vector<std::string> warned;
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		if (std::find(warned.begin(), warned.end(), std::string(key)) != warned.end()) {
+			return;
+		}
+		warned.emplace_back(key);
+	}
+	U_LOG_W("Leia lift: knob %s=%s from %s is IGNORED by the leia-conversion provider, which reads only its own "
+	        "settings; to apply it: displayxr-cli conv set leia-conversion %s %s",
+	        key, val, where, key, val);
+}
+
+/*!
  * One knob's raw string: env @p env_name if set and non-empty, else REG_SZ
  * @p reg_name under @p reg (may be NULL), else absent. @p out is UTF-8.
  */
@@ -341,7 +384,11 @@ knob_lookup(HKEY reg, const char *env_name, const wchar_t *reg_name, char *out, 
 		for (size_t i = 0; i + 1 < sizeof(key) && reg_name[i] != L'\0'; i++) {
 			key[i] = (char)(reg_name[i] < 0x80 ? reg_name[i] : '?');
 		}
-		return setting_lookup(key, out, cap) ? KSRC_SETTING : KSRC_DEFAULT;
+		if (setting_lookup(key, out, cap)) {
+			return KSRC_SETTING;
+		}
+		warn_if_legacy_knob_ignored(env_name, reg_name, key);
+		return KSRC_DEFAULT;
 	}
 	const char *e = std::getenv(env_name);
 	if (e != nullptr && e[0] != '\0') {
