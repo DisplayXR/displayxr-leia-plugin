@@ -192,3 +192,51 @@ On a box with the runtime: register the dev DLL with the runtime's
 `conv status` and `displayxr-cli lift probe`. The conversion host logs to
 `%LOCALAPPDATA%\DisplayXR\DisplayXR_conversion-host_leia-conversion.<pid>_<ts>.log`; this
 provider's lines start `Leia conversion:` and the module's `Leia lift:` / `NeurD:`.
+
+## Desktop Linux (`DisplayXR-LeiaConversion.so`, CPU transport)
+
+The same provider source builds on desktop Linux with `LEIA_CONV_CPU_TRANSPORT`
+(`src/conv_leia/CMakeLists.txt`, POSIX section). Windows is unchanged: the D3D11
+transport and `../drv_leia/leia_lift_neurd.cpp` are not compiled there, and the
+Windows branch of `leia_conv_plugin.cpp` is textually the code it was.
+
+| | Windows | Linux |
+|---|---|---|
+| Binary | `DisplayXR-LeiaConversion.dll` | `DisplayXR-LeiaConversion.so` (one export, `xrtConversionPluginNegotiate`; version script) |
+| NeurD module | `drv_leia/leia_lift_neurd.cpp` (D3D11 bridge) | `conv_leia/leia_conv_neurd_posix.cpp` (`dlopen("libNeurD.so")`, `NeurD_convert_stream_cpu`) |
+| Transport | NT handle / CPU, keyed mutex / fence | host memory only (`XRT_CONV_MEM_CPU`, `SYNC_NONE`); the runtime copies GPU images to host memory for this lane |
+| Capabilities | DEPTH_MONO (1), DEPTH_VIDEO (2), VIEWS_MONO (3) | VIEWS_MONO (3) only: NeurD's CPU path returns views, no depth |
+| Viewpoints | explicit (interactive / off-axis) | the pair's horizontal separation, as NeurD's gain; midpoint and y / z are not reachable on NeurD's CPU path |
+| Convergence | runtime's DECODED value, or NeurD's own AUTO | not applied: NeurD's CPU renderer ignores `CONVERGENCE` / `AUTO_CONVERGENCE` (measured), so `AUTO_CONVERGENCE` is never declared |
+| Registration | `HKLM\…\ConversionProviders\leia-conversion`, ProbeOrder 50 | `050-leia-conversion-conversion-provider.json` in a DisplayProcessors root (the build writes a dev one under `build/src/conv_leia/_conv_manifest/`) |
+
+**Finding NeurD (no load).** In order: the `NeurDPath` setting (the `.so` or its
+directory; pins it), each `LD_LIBRARY_PATH` directory, `NEURD_PATH`, the per-user
+root `${XDG_DATA_HOME:-~/.local/share}/LeiaInc/NeurD-Runtime`, the machine root
+`/opt/LeiaInc/NeurD-Runtime`. The install's `VERSION.txt` (NeurD's install rules
+write it next to the library) is the pre-load version, the VERSIONINFO twin; the
+`MinVersion` floor (0.4.6) applies before and after the load. The licence class
+comes from NeurD's own `License:` log line, as on Windows; the
+`LICENSED_LOCAL_INSTALL` flag follows the same rule (#510).
+
+**Settings** (`<id>.settings.json` / the manifest `settings` object /
+`DXR_CONV_LEIA_CONVERSION_<KEY>`): `Enable`, `NeurDPath`, `Backend`
+(`auto` / `openvino` / `cuda`), `Scale` (default **1080p** here: NeurD renders the
+views at the autoscaled size, and a smaller frame costs a CPU resample back up),
+`DepthGain`, `Dilate`, `ConvGain`, `MinVersion`, `VideoModel`. OpenVINO picks its
+device itself (GPU, NPU, CPU); `NEURD_OV_DEVICE` in the hosting process's
+environment overrides it. The GPU needs the Intel compute runtime (OpenCL), the
+NPU the Level Zero NPU driver; without them OpenVINO runs on the CPU.
+
+**Testing without the panel.** `conv_leia_harness` loads the `.so` through its
+export with a fake host and converts a still image file:
+
+```bash
+NEURD_SDK_ROOT=… ./scripts/build-linux.sh        # or scripts/fetch-neurd-headers.sh first
+build/src/conv_leia/conv_leia_harness --provider build/src/conv_leia/DisplayXR-LeiaConversion.so \
+    --neurd-path /opt/LeiaInc/NeurD-Runtime --input frame.png --out views.png --frames 20
+```
+
+It prints the capability before / after warm, one line per frame and a
+summary (warm, first, median, p90 convert time). Without NeurD,
+`--expect absent` / `--enable 0 --expect disabled` check the gates (CI runs both).

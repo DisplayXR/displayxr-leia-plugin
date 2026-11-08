@@ -384,6 +384,9 @@ elseif(DXR_LINUX_DESKTOP)
     # find_package, no installer — the .so is discovered via a JSON
     # manifest (XRT_PLUGIN_SEARCH_PATH / XDG DisplayProcessors roots).
     add_subdirectory(src/drv_leia_linux)
+    # Conversion provider (ADR-053), CPU transport: a separate .so, no SR SDK,
+    # built only when the NeurD headers are found (NEURD_SDK_ROOT).
+    add_subdirectory(src/conv_leia)
 elseif(DXR_MACOS)
     # --- macOS (LeiaSR srSDK Metal weaver) ------------------------------
     # The runtime's Metal compositor calls create_dp_metal; the DP drives the

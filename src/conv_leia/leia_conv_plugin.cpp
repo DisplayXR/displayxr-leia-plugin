@@ -35,7 +35,17 @@
 
 #include "xrt/xrt_conversion_plugin.h"
 
+#ifdef LEIA_CONV_CPU_TRANSPORT
+// POSIX arm (desktop Linux): host-memory images, NeurD's CPU entry point.
+#include "leia_conv_cpu.h"
+#include "leia_conv_neurd_cpu.h"
+#include "leia_lift_viewpoint.h"
+#include <algorithm>
+#include <strings.h>
+#define _stricmp strcasecmp
+#else
 #include "leia_conv_d3d11.h"
+#endif
 #include "leia_conv_policy.h"
 
 #ifndef XRT_CONV_CAP_LICENSED_LOCAL_INSTALL
@@ -121,8 +131,13 @@ constexpr uint32_t kDepthMaxEdge = 1280;
 constexpr uint32_t kAuxDepthMaxEdge = 1024;
 //! D3D11's texture limit (views side by side must fit it).
 constexpr uint32_t kMaxTexDim = 16384;
+#ifdef LEIA_CONV_CPU_TRANSPORT
+//! Priors until a convert has been measured (OpenVINO on an integrated GPU, 720p; CPU-only is slower).
+constexpr uint32_t kPriorLatencyMs = 100;
+#else
 //! Priors until a convert has been measured (DirectML, 720p).
 constexpr uint32_t kPriorLatencyMs = 22;
+#endif
 //! Load + licence + model load, measured 8-10 s on a cold box.
 constexpr uint32_t kEstWarmupMs = 10000;
 //! The model's native long edge at the default 720p inference bucket.
@@ -212,10 +227,53 @@ struct leia_conv
 	uint32_t last_state = 0xffffffffu;
 
 	struct leia_lift_neurd *lift = nullptr; //!< [S] only
+#ifdef LEIA_CONV_CPU_TRANSPORT
+	bool cpu_up = false;      //!< [S] only: warm() succeeded (no device to own)
+	std::vector<uint8_t> bgr; //!< [S] only: the packed BGR8 input NeurD reads
+#else
 	struct leia_conv_d3d11 *dx = nullptr;   //!< [S] only
+#endif
 };
 
+#ifdef LEIA_CONV_CPU_TRANSPORT
+//! The CPU path synthesises views only: no depth capabilities on this arm.
+constexpr uint32_t kCapIds[] = {LEIA_CONV_CAP_VIEWS_MONO};
+#else
+constexpr uint32_t kCapIds[] = {LEIA_CONV_CAP_DEPTH_MONO, LEIA_CONV_CAP_DEPTH_VIDEO, LEIA_CONV_CAP_VIEWS_MONO};
+#endif
+constexpr uint32_t kCapCount = (uint32_t)(sizeof(kCapIds) / sizeof(kCapIds[0]));
+
+bool
+cap_declared(uint32_t cap_id)
+{
+	for (uint32_t i = 0; i < kCapCount; i++) {
+		if (kCapIds[i] == cap_id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The provider's transport is up (Windows: its own D3D11 device; POSIX: warm() succeeded).
+bool
+transport_up(const struct leia_conv *d)
+{
+#ifdef LEIA_CONV_CPU_TRANSPORT
+	return d->cpu_up;
+#else
+	return d->dx != nullptr;
+#endif
+}
+
 leia_conv *g_inst = nullptr;
+
+#define LIFT_LOG_ONCE(...)                                                                                     \
+	do {                                                                                                   \
+		static std::atomic<bool> warned_{false};                                                       \
+		if (!warned_.exchange(true)) {                                                                 \
+			U_LOG_W(__VA_ARGS__);                                                                  \
+		}                                                                                              \
+	} while (0)
 
 leia_conv *
 I(struct xrt_conversion_plugin_instance *inst)
@@ -346,13 +404,19 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 	                                                      XRT_CONV_TASK_VIEWS_MONO};
 	static const char *const k_names[LEIA_CONV_CAP_COUNT] = {"Leia NeurD depth (image)", "Leia NeurD depth (video)",
 	                                                         "Leia NeurD stereo views"};
-	c->cap_id = index + 1u;
-	c->task = k_tasks[index];
+	c->cap_id = kCapIds[index];
+	c->task = k_tasks[c->cap_id - 1u];
 	c->lanes = XRT_CONV_LANE_STREAM;
 	c->input_kinds = XRT_CONV_INPUT_MONO;
+#ifdef LEIA_CONV_CPU_TRANSPORT
+	// Host memory only; the runtime copies GPU images to host memory for this lane.
+	c->import_memory_kinds = XRT_CONV_MEM_CPU;
+	c->import_sync_kinds = 1u << XRT_CONV_SYNC_NONE;
+#else
 	c->import_memory_kinds = XRT_CONV_MEM_CPU | XRT_CONV_MEM_WIN32_NT_HANDLE;
 	c->import_sync_kinds =
 	    (1u << XRT_CONV_SYNC_NONE) | (1u << XRT_CONV_SYNC_KEYED_MUTEX) | (1u << XRT_CONV_SYNC_FENCE_NT);
+#endif
 	c->input_formats = (1u << XRT_CONV_FMT_RGBA8_UNORM) | (1u << XRT_CONV_FMT_RGBA8_SRGB) |
 	                   (1u << XRT_CONV_FMT_BGRA8_UNORM) | (1u << XRT_CONV_FMT_BGRA8_SRGB);
 	c->depth_output_format = XRT_CONV_FMT_R32_FLOAT;
@@ -368,6 +432,10 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		// "N-view"); more views come from the runtime's composed pipeline.
 		c->min_views = 2;
 		c->max_views = 2;
+		// Required for VIEWS_*. The CPU arm honours the pair's horizontal
+		// separation only (as NeurD's gain; see lc_stream_convert): NeurD's CPU
+		// entry point renders its fixed ±0.5 pair, so a midpoint offset and y / z
+		// do not reach the views there.
 		c->flags |= XRT_CONV_CAP_EXPLICIT_VIEWPOINTS;
 		if (views_offaxis(s)) {
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA;
@@ -411,7 +479,7 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 	} else {
 		copy_str(c->backend, sizeof(c->backend), "neurd");
 	}
-	copy_str(c->display_name, sizeof(c->display_name), k_names[index]);
+	copy_str(c->display_name, sizeof(c->display_name), k_names[c->cap_id - 1u]);
 	c->device_luid = s.device_luid;
 	c->est_warmup_ms = kEstWarmupMs;
 	c->est_latency_ms = s.status.latency_ns != 0 ? (uint32_t)(s.status.latency_ns / 1000000ull) : kPriorLatencyMs;
@@ -482,8 +550,8 @@ publish(leia_conv *d)
 	if (describe_moved) {
 		host_notify(0);
 	} else if (state_moved) {
-		for (uint32_t c = 1; c <= LEIA_CONV_CAP_COUNT; c++) {
-			host_notify(c);
+		for (uint32_t i = 0; i < kCapCount; i++) {
+			host_notify(kCapIds[i]);
 		}
 	}
 }
@@ -599,12 +667,12 @@ lc_describe_cap(struct xrt_conversion_plugin_instance *inst,
                 uint32_t *out_count)
 {
 	if (out_count != nullptr) {
-		*out_count = LEIA_CONV_CAP_COUNT;
+		*out_count = kCapCount;
 	}
 	if (out == nullptr) {
 		return XRT_SUCCESS;
 	}
-	if (index >= LEIA_CONV_CAP_COUNT || inst == nullptr) {
+	if (index >= kCapCount || inst == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct xrt_conv_capability full = {};
@@ -626,7 +694,7 @@ lc_get_generation(struct xrt_conversion_plugin_instance *inst)
 xrt_result_t
 lc_get_state(struct xrt_conversion_plugin_instance *inst, uint32_t cap_id, struct xrt_conv_state *out)
 {
-	if (inst == nullptr || out == nullptr || cap_id == 0 || cap_id > LEIA_CONV_CAP_COUNT) {
+	if (inst == nullptr || out == nullptr || !cap_declared(cap_id)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	struct xrt_conv_state full = {};
@@ -678,7 +746,7 @@ lc_warm(struct xrt_conversion_plugin_instance *inst,
         void *cancel_ctx)
 {
 	leia_conv *d = I(inst);
-	if (d == nullptr || cap_id == 0 || cap_id > LEIA_CONV_CAP_COUNT) {
+	if (d == nullptr || !cap_declared(cap_id)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 	if (is_cancelled == nullptr) {
@@ -686,7 +754,7 @@ lc_warm(struct xrt_conversion_plugin_instance *inst,
 	}
 	{
 		std::lock_guard<std::mutex> g(d->mtx);
-		if (is_ready(d->snap) && d->dx != nullptr) {
+		if (is_ready(d->snap) && transport_up(d)) {
 			return XRT_SUCCESS;
 		}
 	}
@@ -694,10 +762,12 @@ lc_warm(struct xrt_conversion_plugin_instance *inst,
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
 
+#ifndef LEIA_CONV_CPU_TRANSPORT
 	// A lost device is re-created below (DEVICE_LOST -> re-warm, spec §2.4).
 	if (d->dx != nullptr && leia_conv_d3d11_lost(d->dx)) {
 		leia_conv_d3d11_destroy(&d->dx);
 	}
+#endif
 	{
 		std::lock_guard<std::mutex> g(d->mtx);
 		d->snap.warming = true;
@@ -722,6 +792,20 @@ lc_warm(struct xrt_conversion_plugin_instance *inst,
 	refresh_status(d);
 
 	bool device_ok = true;
+#ifdef LEIA_CONV_CPU_TRANSPORT
+	// No device of our own: host memory in, NeurD's CPU entry point (its own
+	// worker owns whatever GPU context it uses).
+	if (ms == LEIA_LIFT_MODULE_READY && !is_cancelled(cancel_ctx)) {
+		d->cpu_up = true;
+	}
+	{
+		std::lock_guard<std::mutex> g(d->mtx);
+		d->snap.warming = false;
+		d->snap.device_lost = false;
+		d->snap.device_luid = 0;
+	}
+	(void)device_ok;
+#else
 	if (ms == LEIA_LIFT_MODULE_READY && d->dx == nullptr && !is_cancelled(cancel_ctx)) {
 		uint64_t preferred = 0, avoid = 0;
 		(void)host_adapter_hint(&preferred, &avoid);
@@ -739,10 +823,11 @@ lc_warm(struct xrt_conversion_plugin_instance *inst,
 		d->snap.device_lost = ms == LEIA_LIFT_MODULE_READY && !device_ok;
 		d->snap.device_luid = d->dx != nullptr ? leia_conv_d3d11_luid(d->dx) : 0;
 	}
+#endif
 	publish(d);
 
 	std::lock_guard<std::mutex> g(d->mtx);
-	return is_ready(d->snap) && d->dx != nullptr ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	return is_ready(d->snap) && transport_up(d) ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
 }
 
 xrt_result_t
@@ -762,7 +847,7 @@ lc_stream_create(struct xrt_conversion_plugin_instance *inst,
                  uint64_t *out_stream)
 {
 	leia_conv *d = I(inst);
-	if (d == nullptr || info == nullptr || out_stream == nullptr || cap_id == 0 || cap_id > LEIA_CONV_CAP_COUNT ||
+	if (d == nullptr || info == nullptr || out_stream == nullptr || !cap_declared(cap_id) ||
 	    !XRT_CONV_COVERS(info, struct xrt_conv_stream_info, outputs)) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
@@ -773,7 +858,7 @@ lc_stream_create(struct xrt_conversion_plugin_instance *inst,
 	uint32_t per_cap = 0;
 	{
 		std::lock_guard<std::mutex> g(d->mtx);
-		if (!is_ready(d->snap) || d->dx == nullptr) {
+		if (!is_ready(d->snap) || !transport_up(d)) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // [S] contract: cap READY
 		}
 		have_depth = views_have_depth(d->snap);
@@ -799,6 +884,11 @@ lc_stream_create(struct xrt_conversion_plugin_instance *inst,
 		if (si.views_layout != XRT_CONV_VIEWS_ROW && si.views_layout != XRT_CONV_VIEWS_ARRAY) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 		}
+#ifdef LEIA_CONV_CPU_TRANSPORT
+		if (si.views_layout != XRT_CONV_VIEWS_ROW) {
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // a host-memory target has one layer
+		}
+#endif
 		if ((si.outputs & XRT_CONV_OUT_DEPTH) != 0 && !have_depth) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED; // READY and lacks the output
 		}
@@ -852,6 +942,120 @@ lc_stream_get_output_desc(struct xrt_conversion_plugin_instance *inst,
 	return XRT_SUCCESS;
 }
 
+#ifdef LEIA_CONV_CPU_TRANSPORT
+/*!
+ * POSIX arm: host-memory RGBA8 / BGRA8 in -> packed BGR8 -> NeurD's CPU convert
+ * -> its side-by-side BGR8 views resampled into the host-memory views target.
+ * Views only (the CPU path returns no depth); sync is NONE both ways, so the
+ * target is complete when this returns.
+ */
+xrt_result_t
+lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
+                  uint64_t stream,
+                  const struct xrt_conv_frame_in *in,
+                  const struct xrt_conv_params *params,
+                  struct xrt_conv_frame_out *out)
+{
+	leia_conv *d = I(inst);
+	conv_stream s;
+	if (d == nullptr || in == nullptr || params == nullptr || out == nullptr || !transport_up(d) ||
+	    !find_stream(d, stream, &s) || !XRT_CONV_COVERS(in, struct xrt_conv_frame_in, images) ||
+	    !XRT_CONV_COVERS(out, struct xrt_conv_frame_out, depth_info)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	if (in->image_count < 1 || in->image_role[0] != XRT_CONV_IMG_COLOR || s.cap_id != LEIA_CONV_CAP_VIEWS_MONO) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	out->written = 0;
+	const struct xrt_conv_image &img = in->images[0];
+	if (img.memory_kind != XRT_CONV_MEM_CPU || img.cpu_ptr == nullptr || img.width == 0 || img.height == 0) {
+		LIFT_LOG_ONCE("Leia conversion: input memory kind 0x%x not importable (host memory only on this arm)",
+		              img.memory_kind);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	struct xrt_conv_params pa = {};
+	memcpy(&pa, params, params->struct_size < sizeof(pa) ? params->struct_size : sizeof(pa));
+
+	d->bgr.resize((size_t)img.width * img.height * 3u);
+	if (!leia_conv_cpu_pack_bgr8(img.cpu_ptr, img.byte_size, img.width, img.height, img.row_stride, img.format,
+	                             d->bgr.data())) {
+		LIFT_LOG_ONCE("Leia conversion: CPU input %ux%u format %u stride %u not importable", img.width, img.height,
+		              img.format, img.row_stride);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+
+	struct leia_lift_neurd_params lp = {};
+	leia_conv_convergence(pa.convergence_mode, pa.convergence, s.depth_kind, &lp.convergence,
+	                      &lp.convergence_metric_m);
+	lp.strength = (pa.strength > 0.0f && std::isfinite(pa.strength)) ? pa.strength : 1.0f;
+	lp.inpaint = (pa.frame_flags & XRT_CONV_FRAME_INPAINT) != 0 ? 1u : 0u;
+	lp.view_count = 2;
+	// The viewpoints: NeurD's CPU pair is fixed at x = ±0.5, one unit = the
+	// nominal 63 mm baseline (leia_lift_viewpoint.h). Its disparity scales with
+	// the gain, so the pair's horizontal separation is honoured as a gain factor;
+	// the midpoint (look-around) and y / z cannot be on this path.
+	{
+		float sep = 0.0f;
+		if (pa.viewpoint_count >= 2) {
+			sep = pa.viewpoints_xyz[1][0] - pa.viewpoints_xyz[0][0];
+		} else if (pa.baseline_m > 0.0f) {
+			sep = pa.baseline_m;
+		}
+		if (std::isfinite(sep) && sep > 0.0f) {
+			lp.strength *= std::min(sep / LEIA_LIFT_VP_REF_BASELINE_M, 10.0f);
+		} else if (pa.viewpoint_count >= 2 && std::isfinite(sep) && sep <= 0.0f) {
+			lp.strength = 0.0f; // coincident (or swapped) eyes: no parallax
+		}
+	}
+
+	struct leia_conv_bgr8_image src = {d->bgr.data(), img.width, img.height, img.width * 3u};
+	struct leia_conv_bgr8_image res = {};
+	if (!leia_lift_neurd_convert_cpu(d->lift, s.lift_id, &src, &lp, &res)) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // the runtime keeps the previous result
+	}
+
+	uint32_t written = 0;
+	if (out->views.memory_kind != 0) {
+		const struct xrt_conv_image &t = out->views;
+		if (t.memory_kind != XRT_CONV_MEM_CPU || t.cpu_ptr == nullptr || t.array_layer != 0 ||
+		    !leia_conv_cpu_write_views(res.data, res.width, res.height, res.stride, 2u, t.cpu_ptr, t.byte_size,
+		                               t.width, t.height, t.row_stride, t.format)) {
+			LIFT_LOG_ONCE("Leia conversion: views target (kind 0x%x, %ux%u, format %u) not writable",
+			              t.memory_kind, t.width, t.height, t.format);
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		written |= XRT_CONV_OUT_VIEWS;
+		struct xrt_conv_views_info *vi = &out->views_info;
+		memset(vi, 0, sizeof(*vi));
+		vi->view_count = 2;
+		vi->layout = s.layout;
+		const uint32_t m = pa.viewpoint_count > 2 ? 2 : pa.viewpoint_count;
+		memcpy(vi->eye_xyz, pa.viewpoints_xyz, sizeof(float) * 3 * m);
+		float b = pa.baseline_m;
+		if (!(b > 0.0f) && m == 2) {
+			const float dx = pa.viewpoints_xyz[3] - pa.viewpoints_xyz[0];
+			const float dy = pa.viewpoints_xyz[4] - pa.viewpoints_xyz[1];
+			const float dz = pa.viewpoints_xyz[5] - pa.viewpoints_xyz[2];
+			b = std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+		vi->baseline_m = b;
+	}
+	out->written = written;
+	if (written == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // nothing requested we could write: keep the previous result
+	}
+	{
+		std::lock_guard<std::mutex> g(d->mtx);
+		for (auto &it : d->streams) {
+			if (it.handle == stream) {
+				it.frames++;
+			}
+		}
+	}
+	refresh_status(d); // latency EMA for est_latency_ms (a status read, no NeurD call)
+	return XRT_SUCCESS;
+}
+#else
 xrt_result_t
 lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
                   uint64_t stream,
@@ -1052,6 +1256,8 @@ fail:
 	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // the runtime keeps the previous result
 }
 
+#endif // LEIA_CONV_CPU_TRANSPORT
+
 void
 lc_stream_destroy(struct xrt_conversion_plugin_instance *inst, uint64_t stream)
 {
@@ -1074,7 +1280,9 @@ lc_stream_destroy(struct xrt_conversion_plugin_instance *inst, uint64_t stream)
 	}
 	if (found) {
 		leia_lift_neurd_stream_destroy(d->lift, lift_id);
+#ifndef LEIA_CONV_CPU_TRANSPORT
 		leia_conv_d3d11_clear_cache(d->dx); // import caches are dropped with the stream (§2.4)
+#endif
 	}
 }
 
@@ -1110,7 +1318,9 @@ lc_destroy(struct xrt_conversion_plugin_instance *inst)
 	for (const auto &s : streams) {
 		leia_lift_neurd_stream_destroy(d->lift, s.lift_id);
 	}
+#ifndef LEIA_CONV_CPU_TRANSPORT
 	leia_conv_d3d11_destroy(&d->dx);
+#endif
 	leia_lift_neurd_destroy(&d->lift);
 	if (g_inst == d) {
 		g_inst = nullptr;

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # DisplayXR-LeiaConversion.dll — the Leia conversion provider (runtime ADR-053,
-# docs/conversion-provider.md). A SEPARATE DLL from DisplayXR-LeiaSR.dll: no SR
+# docs/conversion-provider.md). Desktop Linux builds DisplayXR-LeiaConversion.so
+# from the same provider source with the CPU transport (LEIA_CONV_CPU_TRANSPORT:
+# host-memory images, NeurD's CPU entry point; see the POSIX section below). A SEPARATE DLL from DisplayXR-LeiaSR.dll: no SR
 # SDK, no weaver, no SR session, no link to the display DLL. It compiles the
 # same NeurD module source the display DLL's lift slots use
 # (../drv_leia/leia_lift_neurd.cpp + the pure viewpoint / depth helpers) and
@@ -21,9 +23,23 @@ enable_testing()
 add_library(leia_conv_policy STATIC leia_conv_policy.c leia_conv_policy.h)
 target_include_directories(leia_conv_policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_executable(test_conv_leia_policy tests/test_conv_leia_policy.c)
-target_link_libraries(test_conv_leia_policy PRIVATE leia_conv_policy)
-add_test(NAME test_conv_leia_policy COMMAND test_conv_leia_policy)
+# The Linux arm's src/drv_leia_linux already builds this test for the Windows
+# provider's policy layer (it is added first); one target per name.
+if(NOT TARGET test_conv_leia_policy)
+    add_executable(test_conv_leia_policy tests/test_conv_leia_policy.c)
+    target_link_libraries(test_conv_leia_policy PRIVATE leia_conv_policy)
+    add_test(NAME test_conv_leia_policy COMMAND test_conv_leia_policy)
+endif()
+
+# --- Pure CPU transport (POSIX arm's pixel moves; plain C): every lane ----
+add_library(leia_conv_cpu STATIC leia_conv_cpu.c leia_conv_cpu.h)
+target_include_directories(leia_conv_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT WIN32)
+    target_link_libraries(leia_conv_cpu PUBLIC m)
+endif()
+add_executable(test_conv_leia_cpu tests/test_conv_leia_cpu.c)
+target_link_libraries(test_conv_leia_cpu PRIVATE leia_conv_cpu)
+add_test(NAME test_conv_leia_cpu COMMAND test_conv_leia_cpu)
 
 # --- Gate: conversion ABI header + NeurD headers ---------------------------
 set(LEIA_CONV_AVAILABLE FALSE)
@@ -53,6 +69,103 @@ else()
 endif()
 set(LEIA_CONV_AVAILABLE ${LEIA_CONV_AVAILABLE} PARENT_SCOPE)
 if(NOT LEIA_CONV_AVAILABLE)
+    return()
+endif()
+
+if(NOT WIN32)
+    # ---- POSIX arm (desktop Linux; the caller only adds this directory
+    # there). Same provider source, CPU transport. NeurD is dlopen'ed
+    # (libNeurD.so), never linked: a box without NeurD loads the provider and
+    # reports ABSENT. The D3D11 module (../drv_leia/leia_lift_neurd.cpp) is
+    # replaced by leia_conv_neurd_posix.cpp; the convert_ex / per-feature header
+    # greps do not apply (the CPU path has neither depth nor off-axis).
+    set(LEIA_CONV_POSIX_SOURCES
+        leia_conv_plugin.cpp
+        leia_conv_policy.c
+        leia_conv_policy.h
+        leia_conv_cpu.c
+        leia_conv_cpu.h
+        leia_conv_neurd_posix.cpp
+        leia_conv_neurd_cpu.h
+        ../drv_leia/leia_lift_neurd.h)
+    function(leia_conv_configure_posix tgt)
+        target_include_directories(${tgt} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia
+            "${NEURD_SDK_ROOT}/include")
+        target_compile_definitions(${tgt} PRIVATE
+            LEIA_CONV_CPU_TRANSPORT
+            DXR_LEIA_HAS_NEURD
+            DXR_PLUGIN_GIT_DESC="${DXR_PLUGIN_GIT_DESC}")
+        set_target_properties(${tgt} PROPERTIES
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
+            POSITION_INDEPENDENT_CODE ON)
+    endfunction()
+    include(GNUInstallDirs)
+    message(STATUS "Leia conversion provider: building DisplayXR-LeiaConversion.so (CPU transport; NeurD "
+                   "headers at ${NEURD_SDK_ROOT})")
+
+    add_library(DisplayXR-LeiaConversion SHARED ${LEIA_CONV_POSIX_SOURCES})
+    leia_conv_configure_posix(DisplayXR-LeiaConversion)
+    # aux_util / aux_os linked statically and kept local by the version script
+    # (the runtime's own POSIX conversion providers do the same).
+    target_link_libraries(DisplayXR-LeiaConversion PRIVATE xrt-interfaces aux_util aux_os ${CMAKE_DL_LIBS})
+    set_target_properties(DisplayXR-LeiaConversion PROPERTIES
+        OUTPUT_NAME "DisplayXR-LeiaConversion"
+        PREFIX ""
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    target_link_options(DisplayXR-LeiaConversion PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/conversion_plugin_exports.version"
+        "LINKER:--exclude-libs,ALL"
+        "LINKER:--no-undefined")
+    install(TARGETS DisplayXR-LeiaConversion
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Conversion)
+
+    # Dev manifest next to the build output (absolute binary_path, POSIX rule):
+    # point XRT_PLUGIN_SEARCH_PATH at this directory for a dev run.
+    set(LEIA_CONV_MANIFEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/_conv_manifest")
+    file(MAKE_DIRECTORY "${LEIA_CONV_MANIFEST_DIR}")
+    file(GENERATE OUTPUT "${LEIA_CONV_MANIFEST_DIR}/050-leia-conversion-conversion-provider.json" CONTENT
+"{
+    \"file_format_version\": \"1.0\",
+    \"plugin\": {
+        \"id\":           \"leia-conversion\",
+        \"display_name\": \"Leia conversion (NeurD)\",
+        \"vendor\":       \"Leia Inc.\",
+        \"version\":      \"${DXR_PLUGIN_GIT_DESC}\",
+        \"binary_path\":  \"$<TARGET_FILE:DisplayXR-LeiaConversion>\",
+        \"probe_order\":  50
+    }
+}
+")
+
+    # Headless harness: loads the provider .so through its one export (as the
+    # runtime does), converts a still image to side-by-side PNGs and prints
+    # timings. Not a ctest when NeurD is absent from the box; the ABSENT /
+    # DISABLED gates below are.
+    set(_lc_stb "")
+    foreach(_d IN LISTS _lc_xrt_inc)
+        string(REGEX REPLACE "^\\$<BUILD_INTERFACE:(.*)>$" "\\1" _d "${_d}")
+        if(EXISTS "${_d}/../../external/stb/stb_image.h")
+            get_filename_component(_lc_stb "${_d}/../../external/stb" ABSOLUTE)
+        endif()
+    endforeach()
+    if(_lc_stb)
+        add_executable(conv_leia_harness tests/conv_leia_harness.c)
+        target_include_directories(conv_leia_harness PRIVATE "${_lc_stb}")
+        target_link_libraries(conv_leia_harness PRIVATE xrt-interfaces ${CMAKE_DL_LIBS} m)
+        add_dependencies(conv_leia_harness DisplayXR-LeiaConversion)
+        add_test(NAME test_conv_leia_posix_absent
+            COMMAND conv_leia_harness --provider $<TARGET_FILE:DisplayXR-LeiaConversion>
+                    --neurd-path "${CMAKE_CURRENT_BINARY_DIR}/no-such-neurd" --expect absent)
+        add_test(NAME test_conv_leia_posix_disabled
+            COMMAND conv_leia_harness --provider $<TARGET_FILE:DisplayXR-LeiaConversion>
+                    --enable 0 --expect disabled)
+    else()
+        message(STATUS "Leia conversion provider: stb not found next to the runtime headers - harness not built")
+    endif()
     return()
 endif()
 
