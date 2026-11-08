@@ -216,7 +216,17 @@ env:
   # CNSDK#769 - the GL late-latching uniform write skips unmapped or undersized slots
   # (a calibration app crashed writing _faceX through a null mapping). Service/impl side
   # only; no loader API or INTRODUCED_IN change. (v0.10.94 = #769 only, no release.)
-  CNSDK_TAG: v0.10.95
+  #
+  # 0.10.98 (cnsdk-android-0.10.98+218.2a71434): CNSDK#775 - the shared-camera
+  # FrameThrottle no longer sleeps the PRODUCER thread, so a plug-in feeding the
+  # in-app tracker from its own camera stream is not starved (NP02J, 3D-camera call:
+  # tracking feed 30.0 captured/s -> 3.9 fed/s with 19 engine stalls >= 400 ms before,
+  # 30.1 -> 30.2 fed/s with 0 stalls after; the weave phase was off during the stall).
+  # CNSDK#771 - the Vulkan 2D-under-the-lens filter works (uniform stride, Adreno
+  # fetch, zero-pose guard). CNSDK#774 - per-panel 2D strength (Lume phone 1.0, others
+  # 0.6). Service/impl side only; no loader API or INTRODUCED_IN change. (v0.10.96 and
+  # v0.10.97 = version bumps without a release.)
+  CNSDK_TAG: v0.10.98
 
 jobs:
   Android:
