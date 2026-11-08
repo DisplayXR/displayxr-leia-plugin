@@ -287,6 +287,18 @@ struct leia_cnsdk
 	// pauses (its own resume will redo the handshake anyway).
 	std::atomic<bool> tracking_cycling{false};
 	std::atomic<bool> lifecycle_paused{false};
+	// Idle tracking rest (out-of-process only, see tracking_rest_tick): the
+	// last weave, and whether the worker has stopped face tracking since. Keyed
+	// on weaves, not on on_pause: a SERVICE-context DP (the browser's weave
+	// session) only ever hears on_pause as a lens-vote release, and its
+	// lifecycle_paused was measured true while the page was still weaving.
+	// Without this a backgrounded browser kept the head-tracking camera
+	// streaming for its whole life (NP02J: 26 min, +0.42 W). last_weave_ns is
+	// written by the render thread; tracking_rested is also cleared by
+	// ext_switch_locked, hence atomic.
+	std::atomic<int64_t> last_weave_ns{0};
+	std::atomic<bool> tracking_rested{false};
+	int64_t rested_at_ns{0}; // worker only
 
 	std::atomic<bool> listener_face_valid{false};
 	std::atomic<int> listener_miss_count{0};
@@ -865,6 +877,9 @@ ext_switch_locked(struct leia_cnsdk *cnsdk, bool in_app)
 	const bool en = leia_core_enable_face_tracking(core, true);
 	leia_core_start_face_tracking(core, true);
 	ext_attach_listener(cnsdk);
+	// The start above also ends an idle tracking rest; the worker rests again
+	// if nothing weaves and no external feed is active.
+	cnsdk->tracking_rested.store(false, std::memory_order_release);
 	const enum leia_face_tracking_runtime_type got = leia_core_get_face_tracking_runtime(core);
 	cnsdk->ext_in_app = in_app && got == LEIA_FACE_TRACKING_RUNTIME_IN_APP && cnsdk->ext_sink != nullptr;
 	// NEVER touch the backlight here (no apply_eye_tracking_mode, no
@@ -905,6 +920,71 @@ ext_on_core_started(struct leia_cnsdk *cnsdk)
 	}
 }
 
+
+/*!
+ * How long a SERVICE-context DP goes without a weave before the worker stops
+ * face tracking (debug.dxr.leia.tracking_rest_ms, default 15000; 0 disables).
+ *
+ * Not short: a page between 3D elements stops weaving too, and every wake from
+ * a stopped camera costs a cold open (~0.4 s measured on both devices,
+ * 2026-11-09) during which the weave has no face.
+ */
+int64_t
+tracking_rest_after_ns(void)
+{
+	int64_t ms = 15000;
+#ifdef XRT_OS_ANDROID
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.leia.tracking_rest_ms", buf) > 0 && buf[0] != '\0') {
+		ms = atoll(buf);
+	}
+#endif
+	return ms > 0 ? ms * 1000 * 1000LL : 0;
+}
+
+/*!
+ * Worker thread, every tick. Out-of-process only: in-process the core's own
+ * on_pause already stops tracking (measured ~20 ms after screen off) and the
+ * Activity lifecycle owns it. An active external feed (the stereo camera,
+ * ext_in_app) keeps tracking: the app's own capture session streams anyway.
+ *
+ * Returns true while tracking is rested, so the watchdog stands down (a
+ * rested camera delivers no frames by design).
+ */
+bool
+tracking_rest_tick(struct leia_cnsdk *cnsdk, int64_t now_ns)
+{
+	if (cnsdk->host_is_activity) {
+		return false;
+	}
+	const int64_t last_ns = cnsdk->last_weave_ns.load(std::memory_order_acquire);
+	std::lock_guard<std::mutex> lk(cnsdk->ext_mu);
+	if (cnsdk->tracking_rested.load(std::memory_order_acquire)) {
+		if (last_ns <= cnsdk->rested_at_ns) {
+			return true;
+		}
+		// Woven again: restart. The weave already re-asserted the lens, so the
+		// panel is 3D at once; the nominal viewer covers the cold open.
+		cnsdk->tracking_rested.store(false, std::memory_order_release);
+		const int64_t t0 = os_monotonic_get_ns();
+		leia_core_start_face_tracking(cnsdk->core, true);
+		U_LOG_W("HW_DBG_CNSDK: tracking rest: woven again — face tracking restarted (call %lld ms)",
+		        (long long)((os_monotonic_get_ns() - t0) / (1000 * 1000LL)));
+		return false;
+	}
+	const int64_t rest_after_ns = tracking_rest_after_ns();
+	if (rest_after_ns == 0 || last_ns == 0 || now_ns - last_ns < rest_after_ns ||
+	    cnsdk->ext_in_app.load(std::memory_order_acquire)) {
+		return false;
+	}
+	leia_core_start_face_tracking(cnsdk->core, false);
+	cnsdk->rested_at_ns = os_monotonic_get_ns();
+	cnsdk->tracking_rested.store(true, std::memory_order_release);
+	U_LOG_W("HW_DBG_CNSDK: tracking rest: no weave for %lld ms (service context) — face tracking "
+	        "STOPPED; the next weave restarts it",
+	        (long long)((now_ns - last_ns) / (1000 * 1000LL)));
+	return true;
+}
 
 void
 face_tracking_worker(struct leia_cnsdk *cnsdk)
@@ -1169,6 +1249,12 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 	bool was_paused = false;
 	while (!cnsdk->shutting_down.load(std::memory_order_acquire)) {
 		std::this_thread::sleep_for(50ms);
+		if (tracking_rest_tick(cnsdk, os_monotonic_get_ns())) {
+			// Rested by design: no frames, nothing to recover. Waking gives the
+			// cold open the start grace, as after a lifecycle pause.
+			was_paused = true;
+			continue;
+		}
 		if (cnsdk->lifecycle_paused.load(std::memory_order_relaxed)) {
 			was_paused = true;
 			continue;
@@ -3145,6 +3231,10 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
 	if (cnsdk == NULL || cnsdk->interlacer == NULL) {
 		return false;
 	}
+
+	// Idle tracking rest: the worker stops tracking after a run with no weave
+	// and restarts it once this moves again.
+	cnsdk->last_weave_ns.store(os_monotonic_get_ns(), std::memory_order_release);
 
 	// Live 2D/3D A-B toggle for verifying the weave on the panel.
 	apply_backlight_toggle(cnsdk);
