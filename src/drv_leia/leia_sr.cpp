@@ -78,6 +78,9 @@ struct leiasr
 	//! monitor, so a frame-thread read never races the monitor's destroy.
 	struct leia_sr_presence_monitor *presence = nullptr;
 	std::atomic<int32_t> presence_state{0};
+	//! The weaver waits at tracking policy OFF for its first 3D enable
+	//! (leia_sr_v2_weaver_apply_tracking_policy, 2D start).
+	std::atomic<bool> tracking_held_off{false};
 #endif
 
 	// Display dimensions in meters (for Kooima FOV calculation)
@@ -579,7 +582,7 @@ create_v2(double max_time,
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "VK", &sr.presence_state);
-		leia_sr_v2_weaver_apply_tracking_policy(weaver, "VK");
+		leia_sr_v2_weaver_apply_tracking_policy(weaver, &sr.tracking_held_off, "VK");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		leia_sr_presence_monitor_destroy(&sr.presence);
@@ -628,6 +631,12 @@ create_v2(double max_time,
 	} else if (bind_lens) {
 		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
 		sr.lens_bound = sr.lens_v2 != nullptr;
+	}
+	// The lens leiasr_request_display_mode will drive: the v2 handle for a
+	// screen-bound DP, the lens hint otherwise. None = nothing will ever ask
+	// this weaver for 3D, so it must not wait at OFF for it.
+	if (!(sr.screen_bound ? sr.lens_v2 != nullptr : sr.lens_hint != nullptr)) {
+		leia_sr_v2_weaver_tracking_no_lens(weaver, &sr.tracking_held_off, "VK");
 	}
 	if (non_active && segment_tracked) {
 		U_LOG_W(
@@ -1909,6 +1918,10 @@ bool
 leiasr_request_display_mode(struct leiasr *leiasr, bool enable_3d)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
+	// The first 3D lifts the 2D-start hold in the same call as the lens.
+	if (leiasr != nullptr && leiasr->instance_v2 != nullptr && leiasr->weaver != nullptr) {
+		leia_sr_v2_weaver_tracking_on_lens((SrWeaver)leiasr->weaver, enable_3d, &leiasr->tracking_held_off, "VK");
+	}
 	/*
 	 * Multi-screen M6: an EXTERNAL-routed (screen-bound) weaver never votes
 	 * for the lens, so the runtime's 2D/3D requests drive it through the v2

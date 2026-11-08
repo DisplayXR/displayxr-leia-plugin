@@ -84,6 +84,9 @@ struct leiasr_d3d11
 	//! monitor, so a frame-thread read never races the monitor's destroy.
 	struct leia_sr_presence_monitor *presence = nullptr;
 	std::atomic<int32_t> presence_state{0};
+	//! The weaver waits at tracking policy OFF for its first 3D enable
+	//! (leia_sr_v2_weaver_apply_tracking_policy, 2D start).
+	std::atomic<bool> tracking_held_off{false};
 #ifdef DXR_LEIA_HAS_SR_COMPOSE
 	// ST-5788 weaver 2D compose. The compose ORDER is sticky per weaver, so the
 	// probe is keyed to the weaver handle it ran on: a recreated weaver (#144
@@ -723,7 +726,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "D3D11", &sr.presence_state);
-		leia_sr_v2_weaver_apply_tracking_policy(sr.weaver_v2, "D3D11");
+		leia_sr_v2_weaver_apply_tracking_policy(sr.weaver_v2, &sr.tracking_held_off, "D3D11");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		// The recorder's senses belong to this instance — take them down
@@ -789,6 +792,9 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	} else if (bind_lens) {
 		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
 		sr.lens_bound = sr.lens_v2 != nullptr;
+	}
+	if (sr.lens_v2 == nullptr) {
+		leia_sr_v2_weaver_tracking_no_lens(sr.weaver_v2, &sr.tracking_held_off, "D3D11");
 	}
 	if (non_active && segment_tracked) {
 		U_LOG_W("SR D3D11 per-screen weaver: display 0x%016llx is not the active 0x%016llx but the runtime "
@@ -1374,6 +1380,8 @@ lens_set(leiasr_d3d11 *sr, bool enable)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
+		// The first 3D lifts the 2D-start hold in the same call as the lens.
+		leia_sr_v2_weaver_tracking_on_lens(sr->weaver_v2, enable, &sr->tracking_held_off, "D3D11");
 		if (sr->lens_v2 != nullptr) {
 			enable ? srLensEnable(sr->lens_v2) : srLensDisable(sr->lens_v2);
 		}

@@ -217,13 +217,21 @@ namespace {
 std::atomic<bool> g_tracking_query_unsupported{false};
 std::atomic<bool> g_tracking_policy_unsupported{false};
 
-//! -1 = unset/auto (no call), else an SrTrackingPolicy value.
+//! DXR_LEIA_TRACKING_POLICY unset: OFF until the first 3D enable, then AUTO.
+constexpr int kPolicy2dStart = -2;
+//! DXR_LEIA_TRACKING_POLICY=auto: no call, SR's default.
+constexpr int kPolicySrDefault = -1;
+
+//! kPolicy2dStart / kPolicySrDefault, else an SrTrackingPolicy value.
 int
 tracking_policy_from_env()
 {
 	const char *e = std::getenv("DXR_LEIA_TRACKING_POLICY");
-	if (e == nullptr || e[0] == '\0' || _stricmp(e, "auto") == 0) {
-		return -1;
+	if (e == nullptr || e[0] == '\0') {
+		return kPolicy2dStart;
+	}
+	if (_stricmp(e, "auto") == 0) {
+		return kPolicySrDefault;
 	}
 	if (_stricmp(e, "always_on") == 0 || _stricmp(e, "on") == 0) {
 		return (int)SR_TRACKING_POLICY_ALWAYS_ON;
@@ -233,9 +241,62 @@ tracking_policy_from_env()
 	}
 	static std::atomic<bool> warned{false};
 	if (!warned.exchange(true)) {
-		U_LOG_W("DXR_LEIA_TRACKING_POLICY='%s' not recognised (auto | always_on | off); using auto", e);
+		U_LOG_W("DXR_LEIA_TRACKING_POLICY='%s' not recognised (auto | always_on | off); using the default "
+		        "(tracking off until the first 3D)",
+		        e);
 	}
-	return -1;
+	return kPolicy2dStart;
+}
+
+const char *
+policy_name(SrTrackingPolicy p)
+{
+	switch (p) {
+	case SR_TRACKING_POLICY_AUTO: return "auto";
+	case SR_TRACKING_POLICY_ALWAYS_ON: return "always_on";
+	case SR_TRACKING_POLICY_OFF: return "off";
+	default: return "?";
+	}
+}
+
+//! One srWeaverSetTrackingPolicy; false when it did not take (logged).
+bool
+set_policy(SrWeaver weaver, SrTrackingPolicy p, const char *arm, const char *why)
+{
+	if (weaver == nullptr || g_tracking_policy_unsupported.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	SrResult r = SR_ERROR_HANDLE_INVALID;
+	try {
+		r = srWeaverSetTrackingPolicy(weaver, p);
+	} catch (...) {
+		return false;
+	}
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		if (!g_tracking_policy_unsupported.exchange(true)) {
+			U_LOG_W("SR %s weaver: this SR runtime has no tracking policy (%s not applied); SR's default "
+			        "applies",
+			        arm, policy_name(p));
+		}
+		return false;
+	}
+	if (!SR_SUCCEEDED(r)) {
+		U_LOG_W("SR %s weaver: tracking policy %s refused: %s (%d)", arm, policy_name(p),
+		        leia_sr_v2_result_str(r), (int)r);
+		return false;
+	}
+	U_LOG_W("SR %s weaver: tracking policy %s (%s)", arm, policy_name(p), why);
+	return true;
+}
+
+//! Lift a 2D-start hold (exactly once per weaver).
+void
+release_hold(SrWeaver weaver, std::atomic<bool> *held_off, const char *arm, const char *why)
+{
+	if (held_off == nullptr || !held_off->exchange(false, std::memory_order_acq_rel)) {
+		return;
+	}
+	(void)set_policy(weaver, SR_TRACKING_POLICY_AUTO, arm, why);
 }
 
 } // namespace
@@ -277,34 +338,53 @@ leia_sr_v2_weaver_tracking(SrWeaver weaver)
 }
 
 void
-leia_sr_v2_weaver_apply_tracking_policy(SrWeaver weaver, const char *arm)
+leia_sr_v2_weaver_apply_tracking_policy(SrWeaver weaver, std::atomic<bool> *held_off, const char *arm)
 {
+	if (held_off != nullptr) {
+		held_off->store(false, std::memory_order_release);
+	}
 #ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
 	const int policy = tracking_policy_from_env();
-	if (weaver == nullptr || policy < 0 || g_tracking_policy_unsupported.load(std::memory_order_relaxed)) {
+	if (policy == kPolicySrDefault) {
 		return;
 	}
-	SrResult r = SR_ERROR_HANDLE_INVALID;
-	try {
-		r = srWeaverSetTrackingPolicy(weaver, (SrTrackingPolicy)policy);
-	} catch (...) {
-		return;
-	}
-	const char *name = policy == (int)SR_TRACKING_POLICY_OFF ? "off" : "always_on";
-	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
-		if (!g_tracking_policy_unsupported.exchange(true)) {
-			U_LOG_W("SR %s weaver: DXR_LEIA_TRACKING_POLICY=%s ignored, this SR runtime has no tracking policy",
-			        arm, name);
+	if (policy == kPolicy2dStart) {
+		if (held_off != nullptr &&
+		    set_policy(weaver, SR_TRACKING_POLICY_OFF, arm, "2D start: AUTO on the first 3D request")) {
+			held_off->store(true, std::memory_order_release);
 		}
 		return;
 	}
-	if (SR_SUCCEEDED(r)) {
-		U_LOG_W("SR %s weaver: tracking policy %s (DXR_LEIA_TRACKING_POLICY)", arm, name);
-	} else {
-		U_LOG_W("SR %s weaver: tracking policy %s refused: %s (%d)", arm, name, leia_sr_v2_result_str(r), (int)r);
+	(void)set_policy(weaver, (SrTrackingPolicy)policy, arm, "DXR_LEIA_TRACKING_POLICY");
+#else
+	(void)weaver;
+	(void)arm;
+#endif
+}
+
+void
+leia_sr_v2_weaver_tracking_on_lens(SrWeaver weaver, bool enable_3d, std::atomic<bool> *held_off, const char *arm)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	if (enable_3d) {
+		release_hold(weaver, held_off, arm, "first 3D request");
 	}
 #else
 	(void)weaver;
+	(void)enable_3d;
+	(void)held_off;
+	(void)arm;
+#endif
+}
+
+void
+leia_sr_v2_weaver_tracking_no_lens(SrWeaver weaver, std::atomic<bool> *held_off, const char *arm)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	release_hold(weaver, held_off, arm, "no lens this DP will switch, so SR's default");
+#else
+	(void)weaver;
+	(void)held_off;
 	(void)arm;
 #endif
 }
