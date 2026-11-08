@@ -169,6 +169,9 @@ struct sr_ctx
 
 	SrInstance instance;
 	SrEyeTracker tracker; //!< may be NULL (no camera) — non-fatal
+	//! tracker != NULL, readable without g_ctx_lock (the render thread's
+	//! is_tracking and the camera-rest fast path); written under the lock.
+	atomic_bool have_tracker;
 	SrSystemMonitor monitor;
 	SrDisplay display;
 	SrLens lens; //!< may be NULL — non-fatal, event atomic backs 3D state
@@ -308,6 +311,7 @@ sr_ctx_teardown_locked(void)
 		g_ctx.monitor = NULL;
 	}
 	if (g_ctx.tracker != NULL) {
+		atomic_store(&g_ctx.have_tracker, false);
 		srDestroyEyeTracker(g_ctx.tracker);
 		g_ctx.tracker = NULL;
 	}
@@ -341,6 +345,7 @@ sr_ctx_abandon_locked(void)
 {
 	g_ctx.monitor = NULL;
 	g_ctx.tracker = NULL;
+	atomic_store(&g_ctx.have_tracker, false);
 	g_ctx.lens = NULL;
 	g_ctx.display = NULL;
 	g_ctx.instance = NULL;
@@ -552,6 +557,7 @@ sr_ctx_ensure(double retry_budget_s)
 		g_ctx.tracker = NULL;
 	} else {
 		srEyeTrackerAddCallback(g_ctx.tracker, sr_ctx_on_eye_pair, gen_tag);
+		atomic_store(&g_ctx.have_tracker, true);
 	}
 
 	SrSystemMonitorCreateInfo mci = SrSystemMonitorCreateInfo();
@@ -1737,11 +1743,12 @@ sdk_weaver_tracking(SrWeaver weaver)
 static void
 sdk_drop_own_tracker(enum leia_lnx_weaver_tracking w)
 {
-	if (w == LEIA_LNX_WEAVER_TRACKING_UNKNOWN || g_ctx.tracker == NULL) {
+	if (w == LEIA_LNX_WEAVER_TRACKING_UNKNOWN || !atomic_load(&g_ctx.have_tracker)) {
 		return;
 	}
 	pthread_mutex_lock(&g_ctx_lock);
 	if (g_ctx.tracker != NULL) {
+		atomic_store(&g_ctx.have_tracker, false);
 		srDestroyEyeTracker(g_ctx.tracker); // quiesces sr_ctx_on_eye_pair first
 		g_ctx.tracker = NULL;
 		atomic_store(&g_ctx.last_eye_time_us, 0);
@@ -1772,12 +1779,13 @@ sdk_apply_tracking_policy(struct leiasr_lnx *lnx)
 		}
 		mode = LEIA_LNX_TRACKING_2D_START;
 	}
-	switch (mode) {
-	case LEIA_LNX_TRACKING_2D_START:
+	if (leia_lnx_tracking_holds_at_create(mode)) {
 		if (sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_OFF, "2D start: AUTO on the first 3D request")) {
 			atomic_store(&lnx->tracking_held_off, true);
 		}
-		break;
+		return;
+	}
+	switch (mode) {
 	case LEIA_LNX_TRACKING_ALWAYS_ON:
 		(void)sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_ALWAYS_ON, "DXR_LEIA_TRACKING_POLICY");
 		break;
@@ -2519,13 +2527,18 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 		const int64_t last = atomic_load(&g_ctx.last_pair_mono_ns);
 		const bool fresh = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < kSampleFreshNs;
 		*out_is_tracking = leia_lnx_is_tracking(wt, atomic_load(&g_ctx.user_present), fresh,
-		                                        atomic_load(&g_ctx.device_ready), g_ctx.tracker != NULL);
+		                                        atomic_load(&g_ctx.device_ready),
+		                                        atomic_load(&g_ctx.have_tracker));
 	}
 	if (out_timestamp_ns != NULL) {
 		uint64_t t_us = atomic_load(&g_ctx.last_eye_time_us);
 		/* SrEyePair.timeUs epoch is "unspecified" (contract §8 R-T3 ask);
-		 * fall back to now when no sample has arrived. */
-		*out_timestamp_ns = t_us != 0 ? (int64_t)t_us * 1000 : (int64_t)os_monotonic_get_ns();
+		 * fall back to now when no sample has arrived. A weaver that answers
+		 * the tracking query means our tracker is (being) released, so it is
+		 * now from the first frame on: one timebase per session, as the
+		 * Windows arm always reports. */
+		const bool use_sample = t_us != 0 && sdk_weaver_tracking(lnx->weaver) == LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+		*out_timestamp_ns = use_sample ? (int64_t)t_us * 1000 : (int64_t)os_monotonic_get_ns();
 	}
 	return true;
 }

@@ -37,6 +37,19 @@ test_mode_parse(void)
 }
 
 static void
+test_only_2d_start_waits_for_3d(void)
+{
+	// The 2D start (and an unrecognised value, which falls back to it) waits
+	// at OFF for the first 3D request; an explicit policy never does, so a 3D
+	// request lifts nothing: "off" stays off in 3D, "always_on" stays on in 2D.
+	CHECK(leia_lnx_tracking_holds_at_create(leia_lnx_tracking_mode_parse(NULL)));
+	CHECK(leia_lnx_tracking_holds_at_create(leia_lnx_tracking_mode_parse("bogus")));
+	CHECK(!leia_lnx_tracking_holds_at_create(leia_lnx_tracking_mode_parse("off")));
+	CHECK(!leia_lnx_tracking_holds_at_create(leia_lnx_tracking_mode_parse("always_on")));
+	CHECK(!leia_lnx_tracking_holds_at_create(leia_lnx_tracking_mode_parse("auto")));
+}
+
+static void
 test_weaver_answer_decides(void)
 {
 	// The gap this closes: presence or a fresh sample would call a rested
@@ -65,6 +78,7 @@ int
 main(void)
 {
 	test_mode_parse();
+	test_only_2d_start_waits_for_3d();
 	test_weaver_answer_decides();
 	test_unknown_is_todays_heuristic();
 	if (g_failures != 0) {

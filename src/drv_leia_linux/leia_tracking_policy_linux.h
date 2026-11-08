@@ -81,6 +81,17 @@ leia_lnx_tracking_mode_parse(const char *e)
 	return LEIA_LNX_TRACKING_UNRECOGNISED;
 }
 
+/*!
+ * Whether a new weaver waits at OFF for its first 3D request (rule 2). Only the
+ * 2D start does; every explicit policy is final, so a later 3D request lifts
+ * nothing (DXR_LEIA_TRACKING_POLICY=off stays off in 3D).
+ */
+static inline bool
+leia_lnx_tracking_holds_at_create(enum leia_lnx_tracking_mode mode)
+{
+	return mode == LEIA_LNX_TRACKING_2D_START || mode == LEIA_LNX_TRACKING_UNRECOGNISED;
+}
+
 //! The weaver's own answer (srWeaverGetTrackingState); UNKNOWN = no answer.
 enum leia_lnx_weaver_tracking
 {
