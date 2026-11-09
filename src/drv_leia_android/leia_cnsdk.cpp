@@ -660,7 +660,17 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 	// are populated every frame — confirmed in the service log
 	// ([FaceTracker] detected face: ...posePosition={...}). Prefer detected
 	// faces; fall back to the tracking result for other devices/modes.
+	//
+	// Since CNSDK 0.10.76 the Android (MediaPipe) detector fills eyes[] and
+	// poseAngle but never posePosition, so every detected face arrives at
+	// (0,0,0) and the gate below rejected every frame. An all-zero (or
+	// non-finite) posePosition therefore means "not provided": the face point
+	// is then the midpoint of the raw eyePoints, which are camera-space mm like
+	// posePosition. NOT the tracking result: its point has the camera
+	// transform already applied (CNSDK types.h), and the consumers below lift
+	// camera space to display-centre, so it would get the extrinsics twice.
 	bool got = false;
+	bool pose_absent = false;
 	float px = 0.0f, py = 0.0f, pz = 0.0f;
 	// #ROLL: head roll, carried alongside the face point. The detected face's
 	// poseAngle is the only rotation the service publishes on this hardware, and
@@ -679,7 +689,9 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 		// headTracking/common/types.h). z is the roll about the view axis.
 		roll_rad = detected.faces[0].poseAngle.z;
 		got_roll = std::isfinite(roll_rad);
-		got = true;
+		pose_absent = !std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) ||
+		              (px == 0.0f && py == 0.0f && pz == 0.0f);
+		got = !pose_absent;
 	} else if (cnsdk != nullptr) {
 		struct leia_headtracking_tracking_result tracked = {};
 		if (leia_headtracking_frame_get_tracking_result(frame, &tracked) ==
@@ -726,6 +738,15 @@ on_headtracking_frame(struct leia_headtracking_frame *frame, void *userData)
 				        lx, ly, lz, rx, ry, rz, sep);
 			}
 		}
+	}
+
+	// The detected face carried no position (see above): take the eye midpoint.
+	// No plausible eye pair either means a miss, the same as no face at all.
+	if (pose_absent && got_eyes) {
+		px = 0.5f * (lx + rx);
+		py = 0.5f * (ly + ry);
+		pz = 0.5f * (lz + rz);
+		got = true;
 	}
 
 	// Plausibility gate: reject garbage detections (the service occasionally
