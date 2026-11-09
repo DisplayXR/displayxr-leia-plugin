@@ -571,7 +571,7 @@ sr_ctx_ensure(double retry_budget_s)
 	 * camera on from here, i.e. from service start (leia_tracking_policy_linux.h). */
 	SrEyeTrackerCreateInfo tci = SrEyeTrackerCreateInfo(.enablePrediction = SR_TRUE);
 	if (sdk_runtime_has_weaver_tracking()) {
-		U_LOG_I("leia_sr_sdk: SR runtime has the weaver tracking state — no eye tracker of our own, so the camera "
+		U_LOG_W("leia_sr_sdk: SR runtime has the weaver tracking state — no eye tracker of our own, so the camera "
 		        "may rest while nothing is 3D");
 		g_ctx.tracker = NULL;
 	} else if (SR_FAILED(res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker))) {
@@ -1738,8 +1738,15 @@ sdk_weaver_tracking(SrWeaver weaver)
 	const SrResult r = srWeaverGetTrackingState(weaver, &st);
 	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
 		if (!atomic_exchange(&g_tracking_query_unsupported, true)) {
-			U_LOG_W("leia_sr_sdk: weaver tracking state unsupported by this SR runtime — keeping our own eye "
-			        "tracker (the camera cannot rest while it lives)");
+			if (atomic_load(&g_ctx.have_tracker)) {
+				U_LOG_W("leia_sr_sdk: weaver tracking state unsupported by this SR runtime — keeping our own eye "
+				        "tracker (the camera cannot rest while it lives)");
+			} else {
+				/* The loader probe said the runtime has the call, so no tracker
+				 * was created; with neither, is_tracking stays false. */
+				U_LOG_W("leia_sr_sdk: weaver tracking state unsupported although the SR runtime looked like it had "
+				        "it — no eye tracker of our own either, so is_tracking stays false for this context");
+			}
 		}
 		return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
 	}
