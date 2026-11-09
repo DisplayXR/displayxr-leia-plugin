@@ -25,7 +25,10 @@
  *     answers srWeaverGetTrackingState, that answer replaces it, and the
  *     tracker is destroyed (once per context: the SDK takes senses only
  *     before srInitialize, so it can't be re-created, and there is no
- *     reason to).
+ *     reason to). On a runtime the loader reports as having the query
+ *     (srWeaverGetTrackingState(NULL) = HANDLE_INVALID, asked before
+ *     srInitialize) it is never created at all, so a probe-only client or a
+ *     freshly started service does not light the camera either.
  *     A runtime without the query keeps the tracker and today's heuristic.
  *  2. **2D start.** A new weaver starts at OFF and moves to AUTO on its first
  *     3D request (the runtime asks for 3D at every xrBeginSession of a 3D

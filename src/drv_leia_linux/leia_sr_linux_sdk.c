@@ -469,6 +469,24 @@ sr_ctx_reapply_lens_locked(void)
 }
 
 /*!
+ * Whether the installed SR runtime has the tracker rest gate's weaver queries
+ * (LeiaSR #846). Asked before srInitialize, when no weaver exists: the loader
+ * checks the dispatch slot before the handle, so a NULL weaver answers
+ * HANDLE_INVALID on a runtime that has the call and FUNCTION_UNSUPPORTED on
+ * one that predates it. Call after srCreateInstance (the runtime is loaded).
+ */
+static bool
+sdk_runtime_has_weaver_tracking(void)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	SrTrackingState st = SR_TRACKING_STATE_TRACKING;
+	return srWeaverGetTrackingState(NULL, &st) == SR_ERROR_HANDLE_INVALID;
+#else
+	return false;
+#endif
+}
+
+/*!
  * Lazily bring up the process-wide SR context, retrying srCreateInstance for
  * up to @p retry_budget_s while the SR runtime is unreachable (R-W1).
  * Returns the resulting seam code; SUCCESS ⟹ g_ctx.state == SR_CTX_READY.
@@ -547,10 +565,16 @@ sr_ctx_ensure(double retry_budget_s)
 	void *const gen_tag = (void *)(uintptr_t)gen;
 	atomic_store(&g_ctx.context_invalid, false);
 
-	/* Senses + callbacks BEFORE srInitialize (SDK lifecycle rule). */
+	/* Senses + callbacks BEFORE srInitialize (SDK lifecycle rule). A runtime
+	 * with the tracker rest gate gets no eye tracker of ours at all: the
+	 * weaver's tracking state replaces it, and a live one would keep the
+	 * camera on from here, i.e. from service start (leia_tracking_policy_linux.h). */
 	SrEyeTrackerCreateInfo tci = SrEyeTrackerCreateInfo(.enablePrediction = SR_TRUE);
-	res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker);
-	if (SR_FAILED(res)) {
+	if (sdk_runtime_has_weaver_tracking()) {
+		U_LOG_I("leia_sr_sdk: SR runtime has the weaver tracking state — no eye tracker of our own, so the camera "
+		        "may rest while nothing is 3D");
+		g_ctx.tracker = NULL;
+	} else if (SR_FAILED(res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker))) {
 		/* No camera is non-fatal: the weaver still weaves, is_tracking
 		 * stays false, poses fall back to nominal (R-T2). */
 		U_LOG_W("leia_sr_sdk: srCreateEyeTracker failed (%s) — untracked weaving", srResultToString(res));
