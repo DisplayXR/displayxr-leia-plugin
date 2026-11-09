@@ -153,6 +153,26 @@ leia_plugin_set_pose_source(struct xrt_plugin_instance *inst,
 	leia_hmd_set_pose_source(xdev, source);
 }
 
+/*
+ * The origin just written came from an identified monitor (an EDID record,
+ * SR's enumeration, a verified claim, the runtime's own descriptor): say so,
+ * so a panel that IS the monitor at the desktop origin is not read as "no
+ * preference" (displayxr-runtime#2577). Written only when the runtime's
+ * struct reaches the field (an older runtime's struct ends before it).
+ */
+static void
+leia_plugin_mark_origin_valid(struct xrt_plugin_display_info *out_info)
+{
+#ifdef XRT_PLUGIN_HAS_DISPLAY_ORIGIN_VALID
+	if (out_info->struct_size >=
+	    offsetof(struct xrt_plugin_display_info, display_flags) + sizeof(out_info->display_flags)) {
+		out_info->display_flags |= XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID;
+	}
+#else
+	(void)out_info;
+#endif
+}
+
 static bool
 leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
                              struct xrt_device *xdev,
@@ -203,6 +223,7 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
 		out_info->display_screen_left = edid.screen_left;
 		out_info->display_screen_top = edid.screen_top;
+		leia_plugin_mark_origin_valid(out_info);
         } else {
                 /*
                  * #430: the frozen EDID table does not know this panel (a
@@ -222,6 +243,7 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
                                           &claim)) {
                   out_info->display_screen_left = claim.screen_left;
                   out_info->display_screen_top = claim.screen_top;
+                  leia_plugin_mark_origin_valid(out_info);
                   static uint64_t s_logged_monitor = 0;
                   static int32_t s_logged_left = 0, s_logged_top = 0;
                   if (s_logged_monitor != claim.monitor_id ||
@@ -302,6 +324,7 @@ leia_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
 	out_info->display_pixel_height = px_h;
 	out_info->display_screen_left = display->screen_left;
 	out_info->display_screen_top = display->screen_top;
+	leia_plugin_mark_origin_valid(out_info);
 	out_info->refresh_mhz = display->refresh_mhz;
 
 	// Nominal viewer: centred, at the active panel's nominal distance scaled
