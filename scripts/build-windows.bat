@@ -121,11 +121,15 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: 117-118 pfnGetMultiViewerConfig, pfnSetMultiViewerConfig. New struct tags 33-36 and
 :: SR_ERROR_ACCESS_DENIED (-14). The plug-in uses pfnWeaverSetMultiViewerMode + the
 :: multi-viewer capability struct (#446, DXR_LEIA_HAS_SR_MULTI_VIEWER); nothing else new.
-set SR_V2_TAG=sr-sdk-v2-1.39.0.2950
-set SR_V2_DIR=LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
+:: 3296 = ST-5879 multi-viewer @ ec4ab4105 rebased on q4 903efef92. Physical index over
+:: SrDispatchTable: 119 -> 122 entries, 2950's 119 an exact ordered prefix, APPENDS ONLY --
+:: multi-viewer unchanged at 110-118; 119 reserved; 120-121 pfnWeaverSetTrackingPolicy,
+:: pfnWeaverGetTrackingState (#517, SR_WEAVER_TRACKING_POLICY_AVAILABLE).
+set SR_V2_TAG=sr-sdk-v2-1.39.0.3296
+set SR_V2_DIR=LeiaSR-SDK-1.39.0+3296.ec4ab41051-win64-Release
 :: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC
 :: with build-windows.yml (check_sr_pins.py asserts it).
-set SR_V2_SHA256=53395b80ea8dc4afadf113d48bc1a4942e0bf15e3cbc50119745f7aa1fbdfcb1
+set SR_V2_SHA256=439b312225f75009bf6b3e0eb60d068fca5b2e17713f85513673c4607d9533ad
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 

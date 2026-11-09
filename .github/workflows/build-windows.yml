@@ -110,10 +110,15 @@ jobs:
       # 117-118 Get/SetMultiViewerConfig. New struct tags 33-36 and
       # SR_ERROR_ACCESS_DENIED (-14). The plug-in uses pfnWeaverSetMultiViewerMode + the
       # multi-viewer capability struct (#446, DXR_LEIA_HAS_SR_MULTI_VIEWER); nothing else new.
-      SR_V2_TAG: sr-sdk-v2-1.39.0.2950
-      SR_V2_DIR: LeiaSR-SDK-1.39.0+2950.3da95bd3db-win64-Release
+      # 3296 = ST-5879 multi-viewer @ ec4ab4105 rebased on q4 903efef92 (sr-sdk-v2-1.39.0.3296).
+      # Dispatch table 119 -> 122 entries (sizeof/8), APPENDS ONLY (physical index over
+      # SrDispatchTable; 2950's 119 an exact ordered prefix, multi-viewer still 110-118):
+      # 119 reserved, 120-121 WeaverSetTrackingPolicy / WeaverGetTrackingState (#517,
+      # SR_WEAVER_TRACKING_POLICY_AVAILABLE). Both it and DXR_LEIA_HAS_SR_MULTI_VIEWER are lit.
+      SR_V2_TAG: sr-sdk-v2-1.39.0.3296
+      SR_V2_DIR: LeiaSR-SDK-1.39.0+3296.ec4ab41051-win64-Release
       # sha256 of "$SR_V2_DIR.zip"; the download is refused on a mismatch.
-      SR_V2_SHA256: 53395b80ea8dc4afadf113d48bc1a4942e0bf15e3cbc50119745f7aa1fbdfcb1
+      SR_V2_SHA256: 439b312225f75009bf6b3e0eb60d068fca5b2e17713f85513673c4607d9533ad
       # Every sr-sdk-v* release (SR SDK zips, the Vulkan weaver rescue DLLs, the
       # Linux SDK) lives in Leia's PRIVATE artifact repo, not here: they are
       # Leia SDK material (some unreleased) and must not be publicly reachable.
