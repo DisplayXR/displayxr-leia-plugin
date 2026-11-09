@@ -203,7 +203,7 @@ Windows branch of `leia_conv_plugin.cpp` is textually the code it was.
 | | Windows | Linux |
 |---|---|---|
 | Binary | `DisplayXR-LeiaConversion.dll` | `DisplayXR-LeiaConversion.so` (one export, `xrtConversionPluginNegotiate`; version script) |
-| NeurD module | `drv_leia/leia_lift_neurd.cpp` (D3D11 bridge, `NeurD_convert_stream_dx_ex`) | `conv_leia/leia_conv_neurd_posix.cpp` (`dlopen("libNeurD.so")`; `NeurD_convert_stream_cpu_ex` on NeurD >= 0.5.1, else `NeurD_convert_stream_cpu`) |
+| NeurD module | `drv_leia/leia_lift_neurd.cpp` (D3D11 bridge, `NeurD_convert_stream_dx_ex`) | `conv_leia/leia_conv_neurd_posix.cpp` (`dlopen("libNeurD.so")`; `NeurD_convert_stream_cpu_ex` on NeurD >= 0.5.0, else `NeurD_convert_stream_cpu`) |
 | Transport | NT handle / CPU, keyed mutex / fence | host memory only (`XRT_CONV_MEM_CPU`, `SYNC_NONE`); the runtime copies GPU images to host memory for this lane |
 | Capabilities | DEPTH_MONO (1), DEPTH_VIDEO (2), VIEWS_MONO (3) | VIEWS_MONO (3) only; with `cpu_ex` on OpenVINO it also returns the R32F depth of the same inference (aux depth) |
 | Viewpoints | explicit (interactive / off-axis) | `cpu_ex`: identical to Windows — the metric off-axis camera from the runtime's rect-relative eyes (`leia_lift_oa_build`, the same helper), else the dimensionless pattern (`leia_lift_vp_map`). Older NeurD: the pair's horizontal separation only, as NeurD's gain (no look-around) |

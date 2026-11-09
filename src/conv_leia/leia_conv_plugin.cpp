@@ -433,7 +433,7 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		c->min_views = 2;
 		c->max_views = 2;
 		// Required for VIEWS_*. The CPU arm honours them in full with NeurD's
-		// convert_stream_cpu_ex (>= 0.5.1, the Windows arm's camera); with the
+		// convert_stream_cpu_ex (>= 0.5.0, the Windows arm's camera); with the
 		// plain CPU convert only the pair's horizontal separation (as NeurD's
 		// gain): its fixed ±0.5 pair takes no midpoint offset, y or z.
 		c->flags |= XRT_CONV_CAP_EXPLICIT_VIEWPOINTS;

@@ -30,7 +30,7 @@
  *    NeurD until the next convert. NeurD's Linux backends (OpenVINO; CUDA when
  *    built with TensorRT) run inference there; OpenVINO picks GPU / NPU / CPU
  *    itself (NEURD_OV_DEVICE in the hosting process's environment overrides).
- *    With NeurD_convert_stream_cpu_ex (NeurD >= 0.5.1) the views follow the
+ *    With NeurD_convert_stream_cpu_ex (NeurD >= 0.5.0) the views follow the
  *    viewer exactly as the Windows module's NeurD_convert_stream_dx_ex does:
  *    the same metric off-axis camera built by the same helper
  *    (leia_lift_oa_build) from the runtime's rect-relative viewpoints, the same
@@ -445,7 +445,7 @@ struct global
 	char detail[96] = {};
 	char backend[32] = {};
 	bool stream_props = false;
-	//! NeurD_convert_stream_cpu_ex is present (NeurD >= 0.5.1 and a provider built
+	//! NeurD_convert_stream_cpu_ex is present (NeurD >= 0.5.0 and a provider built
 	//! against its header): look-around, the off-axis camera, float depth.
 	bool cpu_ex = false;
 	//! cpu_ex's float depth: the OpenVINO backend reads its raw output back.
@@ -770,7 +770,7 @@ leia_lift_neurd_activate(struct leia_lift_neurd *lift)
 	        (double)g.k.view_gain, (double)g.k.y_gain, g.k.offaxis ? 1 : 0, (double)g.k.relief_m,
 	        g.cpu_ex ? (g.float_depth ? "convert_stream_cpu_ex, look-around + float depth"
 	                                  : "convert_stream_cpu_ex, look-around, no float depth on this backend")
-	                 : "views only, no look-around (NeurD < 0.5.1 or provider built without cpu_ex)");
+	                 : "views only, no look-around (NeurD < 0.5.0 or provider built without cpu_ex)");
 	return g.module_status;
 }
 
@@ -840,7 +840,7 @@ leia_lift_neurd_stream_create(struct leia_lift_neurd *lift,
 		U_LOG_W("Leia conversion: stream %llu float depth per convert (NeurD_convert_stream_cpu_ex, %s)",
 		        (unsigned long long)s.id, s.aux_depth ? "aux depth requested" : "metric off-axis scale");
 	} else if (s.aux_depth) {
-		LIFT_WARN_ONCE("Leia conversion: aux depth requested but NeurD has no float depth here (needs >= 0.5.1 "
+		LIFT_WARN_ONCE("Leia conversion: aux depth requested but NeurD has no float depth here (needs >= 0.5.0 "
 		               "convert_stream_cpu_ex on OpenVINO) — none will be returned");
 	}
 	lift->streams.push_back(s);
@@ -975,7 +975,7 @@ log_camera(lift_stream *s,
 	}
 	U_LOG_W("Leia conversion: stream %llu camera = %s (%s)", (unsigned long long)s->id,
 	        dimless ? "LEGACY dimensionless [convert_stream_cpu_ex]" : "FIXED pair [convert_stream_cpu, no look-around]",
-	        !g.cpu_ex        ? "NeurD has no convert_stream_cpu_ex (< 0.5.1)"
+	        !g.cpu_ex        ? "NeurD has no convert_stream_cpu_ex (< 0.5.0)"
 	        : !g.k.offaxis   ? "OffAxis=0"
 	        : !g.offaxis_ok  ? "NeurD has no GL view renderer in this process"
 	                         : "the runtime passed no rect-relative viewpoint policy / rect size");

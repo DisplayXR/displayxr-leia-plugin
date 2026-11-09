@@ -79,7 +79,7 @@ if(NOT WIN32)
     # reports ABSENT. The D3D11 module (../drv_leia/leia_lift_neurd.cpp) is
     # replaced by leia_conv_neurd_posix.cpp, which builds the Windows module's
     # camera with the same pure helpers (leia_lift_viewpoint.c / leia_lift_depth.c)
-    # over NeurD_convert_stream_cpu_ex when the headers have it (NeurD >= 0.5.1).
+    # over NeurD_convert_stream_cpu_ex when the headers have it (NeurD >= 0.5.0).
     set(LEIA_CONV_POSIX_SOURCES
         leia_conv_plugin.cpp
         leia_conv_policy.c
@@ -114,7 +114,7 @@ if(NOT WIN32)
     if(_lc_cpu_ex)
         set(_lc_cpu_ex_note "NeurD_convert_stream_cpu_ex: look-around + float depth")
     else()
-        set(_lc_cpu_ex_note "headers predate NeurD_convert_stream_cpu_ex (< 0.5.1): fixed pair only")
+        set(_lc_cpu_ex_note "headers predate NeurD_convert_stream_cpu_ex (< 0.5.0): fixed pair only")
     endif()
     message(STATUS "Leia conversion provider: building DisplayXR-LeiaConversion.so (CPU transport; NeurD "
                    "headers at ${NEURD_SDK_ROOT}; ${_lc_cpu_ex_note})")

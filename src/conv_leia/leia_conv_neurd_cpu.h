@@ -11,7 +11,7 @@
  * point, so this arm implements the same lifecycle API in
  * leia_conv_neurd_posix.cpp and converts through NeurD's CPU entry points
  * (packed BGR8 in, BGR8 side-by-side views out): NeurD_convert_stream_cpu_ex
- * when the loaded NeurD has it (>= 0.5.1) — the Windows module's camera and
+ * when the loaded NeurD has it (>= 0.5.0) — the Windows module's camera and
  * float depth, built by the same helpers — else NeurD_convert_stream_cpu (a
  * fixed pair: views only, no look-around).
  *
