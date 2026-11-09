@@ -77,8 +77,9 @@ if(NOT WIN32)
     # there). Same provider source, CPU transport. NeurD is dlopen'ed
     # (libNeurD.so), never linked: a box without NeurD loads the provider and
     # reports ABSENT. The D3D11 module (../drv_leia/leia_lift_neurd.cpp) is
-    # replaced by leia_conv_neurd_posix.cpp; the convert_ex / per-feature header
-    # greps do not apply (the CPU path has neither depth nor off-axis).
+    # replaced by leia_conv_neurd_posix.cpp, which builds the Windows module's
+    # camera with the same pure helpers (leia_lift_viewpoint.c / leia_lift_depth.c)
+    # over NeurD_convert_stream_cpu_ex when the headers have it (NeurD >= 0.5.1).
     set(LEIA_CONV_POSIX_SOURCES
         leia_conv_plugin.cpp
         leia_conv_policy.c
@@ -87,7 +88,12 @@ if(NOT WIN32)
         leia_conv_cpu.h
         leia_conv_neurd_posix.cpp
         leia_conv_neurd_cpu.h
-        ../drv_leia/leia_lift_neurd.h)
+        ../drv_leia/leia_lift_neurd.h
+        ../drv_leia/leia_lift_viewpoint.c
+        ../drv_leia/leia_lift_viewpoint.h
+        ../drv_leia/leia_lift_depth.c
+        ../drv_leia/leia_lift_depth.h)
+    file(STRINGS "${NEURD_SDK_ROOT}/include/NeurD.h" _lc_cpu_ex REGEX "NeurD_convert_stream_cpu_ex[ ]*[(]")
     function(leia_conv_configure_posix tgt)
         target_include_directories(${tgt} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
@@ -97,13 +103,21 @@ if(NOT WIN32)
             LEIA_CONV_CPU_TRANSPORT
             DXR_LEIA_HAS_NEURD
             DXR_PLUGIN_GIT_DESC="${DXR_PLUGIN_GIT_DESC}")
+        if(_lc_cpu_ex)
+            target_compile_definitions(${tgt} PRIVATE DXR_LEIA_NEURD_HAS_CPU_EX)
+        endif()
         set_target_properties(${tgt} PROPERTIES
             CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON
             POSITION_INDEPENDENT_CODE ON)
     endfunction()
     include(GNUInstallDirs)
+    if(_lc_cpu_ex)
+        set(_lc_cpu_ex_note "NeurD_convert_stream_cpu_ex: look-around + float depth")
+    else()
+        set(_lc_cpu_ex_note "headers predate NeurD_convert_stream_cpu_ex (< 0.5.1): fixed pair only")
+    endif()
     message(STATUS "Leia conversion provider: building DisplayXR-LeiaConversion.so (CPU transport; NeurD "
-                   "headers at ${NEURD_SDK_ROOT})")
+                   "headers at ${NEURD_SDK_ROOT}; ${_lc_cpu_ex_note})")
 
     add_library(DisplayXR-LeiaConversion SHARED ${LEIA_CONV_POSIX_SOURCES})
     leia_conv_configure_posix(DisplayXR-LeiaConversion)

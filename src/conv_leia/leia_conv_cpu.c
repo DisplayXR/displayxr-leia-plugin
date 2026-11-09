@@ -160,3 +160,42 @@ leia_conv_cpu_write_views(const uint8_t *src,
 	}
 	return true;
 }
+
+bool
+leia_conv_cpu_write_depth(const float *src,
+                          uint32_t sw,
+                          uint32_t sh,
+                          uint32_t src_stride,
+                          void *dst,
+                          uint64_t dst_bytes,
+                          uint32_t dw,
+                          uint32_t dh,
+                          uint32_t dst_stride,
+                          uint32_t dst_fmt)
+{
+	if (src == NULL || dst == NULL || sw == 0 || sh == 0 || dst_fmt != LEIA_CONV_CPU_FMT_R32_FLOAT) {
+		return false;
+	}
+	if (src_stride == 0) {
+		src_stride = sw * 4u;
+	}
+	if (dst_stride == 0) {
+		dst_stride = dw * 4u;
+	}
+	// One float per texel: the 4-byte rule of fits() applies as is.
+	if (src_stride < sw * 4u || !fits(dst_bytes, dw, dh, dst_stride)) {
+		return false;
+	}
+	for (uint32_t y = 0; y < dh; y++) {
+		uint32_t sy = (uint32_t)(((uint64_t)y * sh * 2u + sh) / (2u * (uint64_t)dh));
+		sy = sy < sh ? sy : sh - 1u;
+		const float *row = (const float *)((const uint8_t *)src + (size_t)sy * src_stride);
+		float *d = (float *)((uint8_t *)dst + (size_t)y * dst_stride);
+		for (uint32_t x = 0; x < dw; x++) {
+			uint32_t sx = (uint32_t)(((uint64_t)x * sw * 2u + sw) / (2u * (uint64_t)dw));
+			sx = sx < sw ? sx : sw - 1u;
+			d[x] = row[sx];
+		}
+	}
+	return true;
+}

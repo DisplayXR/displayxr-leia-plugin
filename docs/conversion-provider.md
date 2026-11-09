@@ -203,11 +203,11 @@ Windows branch of `leia_conv_plugin.cpp` is textually the code it was.
 | | Windows | Linux |
 |---|---|---|
 | Binary | `DisplayXR-LeiaConversion.dll` | `DisplayXR-LeiaConversion.so` (one export, `xrtConversionPluginNegotiate`; version script) |
-| NeurD module | `drv_leia/leia_lift_neurd.cpp` (D3D11 bridge) | `conv_leia/leia_conv_neurd_posix.cpp` (`dlopen("libNeurD.so")`, `NeurD_convert_stream_cpu`) |
+| NeurD module | `drv_leia/leia_lift_neurd.cpp` (D3D11 bridge, `NeurD_convert_stream_dx_ex`) | `conv_leia/leia_conv_neurd_posix.cpp` (`dlopen("libNeurD.so")`; `NeurD_convert_stream_cpu_ex` on NeurD >= 0.5.1, else `NeurD_convert_stream_cpu`) |
 | Transport | NT handle / CPU, keyed mutex / fence | host memory only (`XRT_CONV_MEM_CPU`, `SYNC_NONE`); the runtime copies GPU images to host memory for this lane |
-| Capabilities | DEPTH_MONO (1), DEPTH_VIDEO (2), VIEWS_MONO (3) | VIEWS_MONO (3) only: NeurD's CPU path returns views, no depth |
-| Viewpoints | explicit (interactive / off-axis) | the pair's horizontal separation, as NeurD's gain; midpoint and y / z are not reachable on NeurD's CPU path |
-| Convergence | runtime's DECODED value, or NeurD's own AUTO | not applied: NeurD's CPU renderer ignores `CONVERGENCE` / `AUTO_CONVERGENCE` (measured), so `AUTO_CONVERGENCE` is never declared |
+| Capabilities | DEPTH_MONO (1), DEPTH_VIDEO (2), VIEWS_MONO (3) | VIEWS_MONO (3) only; with `cpu_ex` on OpenVINO it also returns the R32F depth of the same inference (aux depth) |
+| Viewpoints | explicit (interactive / off-axis) | `cpu_ex`: identical to Windows — the metric off-axis camera from the runtime's rect-relative eyes (`leia_lift_oa_build`, the same helper), else the dimensionless pattern (`leia_lift_vp_map`). Older NeurD: the pair's horizontal separation only, as NeurD's gain (no look-around) |
+| Convergence | runtime's DECODED value, or NeurD's own AUTO | `cpu_ex`: as Windows — `AUTO_CONVERGENCE` declared; the off-axis screen plane comes from the runtime's value, else NeurD's auto-convergence of the previous inference (when its depth is retained), else mid-depth. Older NeurD: not applied (its CPU renderer ignores `CONVERGENCE`), `AUTO_CONVERGENCE` never declared |
 | Registration | `HKLM\…\ConversionProviders\leia-conversion`, ProbeOrder 50 | `050-leia-conversion-conversion-provider.json` in a DisplayProcessors root (the build writes a dev one under `build/src/conv_leia/_conv_manifest/`) |
 
 **Finding NeurD (no load).** In order: the `NeurDPath` setting (the `.so` or its
@@ -223,7 +223,9 @@ comes from NeurD's own `License:` log line, as on Windows; the
 `DXR_CONV_LEIA_CONVERSION_<KEY>`): `Enable`, `NeurDPath`, `Backend`
 (`auto` / `openvino` / `cuda`), `Scale` (default **1080p** here: NeurD renders the
 views at the autoscaled size, and a smaller frame costs a CPU resample back up),
-`DepthGain`, `Dilate`, `ConvGain`, `MinVersion`, `VideoModel`. OpenVINO picks its
+`DepthGain`, `Dilate`, `ConvGain`, `MinVersion`, `VideoModel`, and the Windows
+module's look-around knobs `ViewGain`, `YGain`, `ZGain`, `OffAxis`, `ReliefDepthM`,
+`MetricReliefMaxM` (same ranges and defaults). OpenVINO picks its
 device itself (GPU, NPU, CPU); `NEURD_OV_DEVICE` in the hosting process's
 environment overrides it. The GPU needs the Intel compute runtime (OpenCL), the
 NPU the Level Zero NPU driver; without them OpenVINO runs on the CPU.
@@ -238,5 +240,7 @@ build/src/conv_leia/conv_leia_harness --provider build/src/conv_leia/DisplayXR-L
 ```
 
 It prints the capability before / after warm, one line per frame and a
-summary (warm, first, median, p90 convert time). Without NeurD,
+summary (warm, first, median, p90 convert time). `--eye-x 0,0.02,0.04` sweeps the
+viewer's midpoint (one `<out>.<i>.png` per value), `--rect WxH` / `--no-rect` choose
+rect-relative or panel viewpoints, `--depth d.f32` requests the aux depth. Without NeurD,
 `--expect absent` / `--enable 0 --expect disabled` check the gates (CI runs both).

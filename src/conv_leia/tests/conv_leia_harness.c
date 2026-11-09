@@ -12,6 +12,15 @@
  *                     [--set KEY=VALUE]... [--expect absent|disabled|ready]
  *                     [--input <image>] [--out <views.png>] [--frames N]
  *                     [--convergence <rel 0..1 | -1 = auto>] [--strength S]
+ *                     [--eye-x X[,X...]] [--eye-y Y] [--eye-z Z] [--rect WxH | --no-rect]
+ *                     [--depth <depth.f32>]
+ *
+ * Viewpoints are passed the way the runtime passes them (ADR-048): two eyes
+ * 64 mm apart around a midpoint (--eye-x, metres; a comma list sweeps it, --frames
+ * per value, views written as <out>.<i>.png), rect-relative (--rect, metres; the
+ * default is a 15.6-inch 16:9 panel) or panel-relative without a rect (--no-rect).
+ * --depth requests the aux depth of the same inference and writes the last one
+ * as raw little-endian float32 (the target's extent is printed).
  *
  * Settings reach the provider ONLY through the fake host's get_setting, as in
  * the runtime. --expect absent / disabled check the gate without NeurD and exit
@@ -106,6 +115,11 @@ main(int argc, char **argv)
 	const char *provider = NULL, *expect = NULL, *input = NULL, *out_png = "views.png";
 	int frames = 10;
 	float convergence = -1.0f, strength = 1.0f;
+	float eye_xs[16] = {0.0f};
+	int n_eye_x = 1;
+	float eye_y = 0.0f, eye_z = 0.6f, rect_w = 0.344f, rect_h = 0.194f;
+	bool use_rect = true;
+	const char *depth_out = NULL;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -136,6 +150,28 @@ main(int argc, char **argv)
 			convergence = strtof(v, NULL), i++;
 		} else if (strcmp(a, "--strength") == 0 && v) {
 			strength = strtof(v, NULL), i++;
+		} else if (strcmp(a, "--eye-x") == 0 && v) {
+			n_eye_x = 0;
+			for (const char *p = v; *p != '\0' && n_eye_x < 16;) {
+				char *end = NULL;
+				eye_xs[n_eye_x++] = strtof(p, &end);
+				p = (*end == ',') ? end + 1 : end;
+			}
+			i++;
+		} else if (strcmp(a, "--eye-y") == 0 && v) {
+			eye_y = strtof(v, NULL), i++;
+		} else if (strcmp(a, "--eye-z") == 0 && v) {
+			eye_z = strtof(v, NULL), i++;
+		} else if (strcmp(a, "--rect") == 0 && v) {
+			if (sscanf(v, "%fx%f", &rect_w, &rect_h) != 2) {
+				fprintf(stderr, "--rect wants WxH in metres\n");
+				return 2;
+			}
+			i++;
+		} else if (strcmp(a, "--no-rect") == 0) {
+			use_rect = false;
+		} else if (strcmp(a, "--depth") == 0 && v) {
+			depth_out = v, i++;
 		} else {
 			fprintf(stderr, "unknown argument %s\n", a);
 			return 2;
@@ -261,7 +297,7 @@ main(int argc, char **argv)
 	memset(&si, 0, sizeof(si));
 	si.struct_size = (uint32_t)sizeof(si);
 	si.input_kind = XRT_CONV_INPUT_MONO;
-	si.outputs = XRT_CONV_OUT_VIEWS;
+	si.outputs = XRT_CONV_OUT_VIEWS | (depth_out != NULL ? XRT_CONV_OUT_DEPTH : 0u);
 	si.content_hint = XRT_CONV_CONTENT_VIDEO;
 	si.view_count = 2;
 	si.views_layout = XRT_CONV_VIEWS_ROW;
@@ -280,6 +316,7 @@ main(int argc, char **argv)
 	       od.views_format, od.depth_width, od.depth_height);
 	const uint32_t vstride = od.views_width * 4u;
 	uint8_t *views = calloc((size_t)vstride * od.views_height, 1);
+	float *depth = depth_out != NULL && od.depth_width > 0 ? calloc((size_t)od.depth_width * od.depth_height, 4) : NULL;
 
 	struct xrt_conv_frame_in fin;
 	memset(&fin, 0, sizeof(fin));
@@ -297,9 +334,13 @@ main(int argc, char **argv)
 	im->row_stride = (uint32_t)w * 4u;
 	im->sync.kind = XRT_CONV_SYNC_NONE;
 
+	const int frames_per_eye = frames;
+	frames = frames_per_eye * n_eye_x;
 	double *ms = calloc((size_t)(frames > 0 ? frames : 1), sizeof(double));
 	int ok_frames = 0;
 	for (int f = 0; f < frames; f++) {
+		const int ei = f / (frames_per_eye > 0 ? frames_per_eye : 1);
+		const float ex = eye_xs[ei];
 		struct xrt_conv_params pa;
 		memset(&pa, 0, sizeof(pa));
 		pa.struct_size = (uint32_t)sizeof(pa);
@@ -308,12 +349,20 @@ main(int argc, char **argv)
 		pa.view_count = 2;
 		pa.content_hint = XRT_CONV_CONTENT_VIDEO;
 		pa.viewpoint_count = 2;
-		pa.viewpoints_xyz[0][0] = -0.032f;
-		pa.viewpoints_xyz[0][2] = 0.6f;
-		pa.viewpoints_xyz[1][0] = 0.032f;
-		pa.viewpoints_xyz[1][2] = 0.6f;
+		pa.viewpoints_xyz[0][0] = ex - 0.032f;
+		pa.viewpoints_xyz[0][1] = eye_y;
+		pa.viewpoints_xyz[0][2] = eye_z;
+		pa.viewpoints_xyz[1][0] = ex + 0.032f;
+		pa.viewpoints_xyz[1][1] = eye_y;
+		pa.viewpoints_xyz[1][2] = eye_z;
 		pa.baseline_m = 0.064f;
 		pa.nominal_z_m = 0.6f;
+		pa.axis_mode = XRT_CONV_AXIS_XY;
+		if (use_rect) {
+			pa.viewpoint_frame = 1u; // rect-relative, as the runtime's policy passes them
+			pa.rect_width_m = rect_w;
+			pa.rect_height_m = rect_h;
+		}
 		if (convergence >= 0.0f) {
 			// DECODED in the AFFINE_INVERSE units the provider maps from (1 - rel).
 			pa.convergence_mode = XRT_CONV_CONVERGENCE_DECODED;
@@ -333,15 +382,49 @@ main(int argc, char **argv)
 		fo.views.format = od.views_format;
 		fo.views.row_stride = vstride;
 		fo.views.sync.kind = XRT_CONV_SYNC_NONE;
+		if (depth != NULL) {
+			fo.depth.memory_kind = XRT_CONV_MEM_CPU;
+			fo.depth.import_key = 3;
+			fo.depth.cpu_ptr = depth;
+			fo.depth.byte_size = (uint64_t)od.depth_width * od.depth_height * 4u;
+			fo.depth.width = od.depth_width;
+			fo.depth.height = od.depth_height;
+			fo.depth.format = XRT_CONV_FMT_R32_FLOAT;
+			fo.depth.row_stride = od.depth_width * 4u;
+			fo.depth.sync.kind = XRT_CONV_SYNC_NONE;
+		}
 		const double t0 = now_ms();
 		const xrt_result_t r = iface->stream_convert(inst, stream, &fin, &pa, &fo);
 		ms[f] = now_ms() - t0;
-		printf("frame %d: %s written=0x%x %.1f ms\n", f, r == XRT_SUCCESS ? "OK" : "FAILED", fo.written, ms[f]);
+		printf("frame %d: eye_x=%+.3f %s written=0x%x %.1f ms\n", f, (double)ex, r == XRT_SUCCESS ? "OK" : "FAILED",
+		       fo.written, ms[f]);
+		if (r == XRT_SUCCESS && (fo.written & XRT_CONV_OUT_DEPTH) != 0 && f == frames - 1) {
+			printf("depth: %ux%u kind=%u scale=%g shift=%g near=%g far=%g conv=%g (flags 0x%x) relief=%u %g %g "
+			       "same_inference=%u frame=%llu\n",
+			       fo.depth.width, fo.depth.height, fo.depth_info.kind, (double)fo.depth_info.value_scale,
+			       (double)fo.depth_info.value_shift, (double)fo.depth_info.near_value,
+			       (double)fo.depth_info.far_value, (double)fo.depth_info.convergence_value,
+			       fo.depth_info.suggest_flags, fo.depth_info.relief_valid, (double)fo.depth_info.relief_scale,
+			       (double)fo.depth_info.relief_offset, fo.depth_info.same_inference,
+			       (unsigned long long)fo.depth_info.provider_frame_id);
+			FILE *df = fopen(depth_out, "wb");
+			if (df != NULL) {
+				fwrite(depth, 4, (size_t)od.depth_width * od.depth_height, df);
+				fclose(df);
+				printf("wrote %s\n", depth_out);
+			}
+		}
 		ok_frames += r == XRT_SUCCESS && (fo.written & XRT_CONV_OUT_VIEWS) != 0;
-	}
-	if (ok_frames > 0) {
-		stbi_write_png(out_png, (int)od.views_width, (int)od.views_height, 4, views, (int)vstride);
-		printf("wrote %s\n", out_png);
+		if (r == XRT_SUCCESS && (f + 1) % (frames_per_eye > 0 ? frames_per_eye : 1) == 0) {
+			char name[1024];
+			if (n_eye_x > 1) {
+				snprintf(name, sizeof(name), "%s.%d.png", out_png, ei);
+			} else {
+				snprintf(name, sizeof(name), "%s", out_png);
+			}
+			stbi_write_png(name, (int)od.views_width, (int)od.views_height, 4, views, (int)vstride);
+			printf("wrote %s (eye_x=%+.3f)\n", name, (double)ex);
+		}
 	}
 	if (frames > 0) {
 		const double first = ms[0];
@@ -371,6 +454,7 @@ main(int argc, char **argv)
 	iface->destroy(inst);
 	stbi_image_free(rgba);
 	free(views);
+	free(depth);
 	free(ms);
 	return ok_frames == frames ? 0 : 1;
 }

@@ -144,9 +144,37 @@ test_views_downscale_gradient(void)
 	}
 }
 
+static void
+test_depth(void)
+{
+	// 4x2 -> 2x1 and 8x4: point-sampled, values untouched, argument checks.
+	const float src[8] = {0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f};
+	float half[2] = {0};
+	CHECK(leia_conv_cpu_write_depth(src, 4, 2, 0, half, sizeof(half), 2, 1, 0, LEIA_CONV_CPU_FMT_R32_FLOAT));
+	CHECK(half[0] == 1.0f || half[0] == 16.0f || half[0] == 0.5f || half[0] == 8.0f);
+	CHECK(half[1] == 4.0f || half[1] == 64.0f || half[1] == 2.0f || half[1] == 32.0f);
+	float up[8 * 4];
+	CHECK(leia_conv_cpu_write_depth(src, 4, 2, 16, up, sizeof(up), 8, 4, 0, LEIA_CONV_CPU_FMT_R32_FLOAT));
+	CHECK(up[0] == 0.5f && up[1] == 0.5f && up[7] == 4.0f);
+	CHECK(up[3 * 8 + 0] == 8.0f && up[3 * 8 + 7] == 64.0f);
+	// Every value written is a source value (no blending).
+	for (int i = 0; i < 32; i++) {
+		int found = 0;
+		for (int j = 0; j < 8; j++) {
+			found |= up[i] == src[j];
+		}
+		CHECK(found);
+	}
+	CHECK(!leia_conv_cpu_write_depth(NULL, 4, 2, 0, up, sizeof(up), 8, 4, 0, LEIA_CONV_CPU_FMT_R32_FLOAT));
+	CHECK(!leia_conv_cpu_write_depth(src, 4, 2, 0, up, sizeof(up), 8, 4, 0, LEIA_CONV_CPU_FMT_RGBA8_UNORM));
+	CHECK(!leia_conv_cpu_write_depth(src, 4, 2, 8, up, sizeof(up), 8, 4, 0, LEIA_CONV_CPU_FMT_R32_FLOAT));
+	CHECK(!leia_conv_cpu_write_depth(src, 4, 2, 0, up, 16, 8, 4, 0, LEIA_CONV_CPU_FMT_R32_FLOAT));
+}
+
 int
 main(void)
 {
+	test_depth();
 	test_pack();
 	test_views_identity_and_order();
 	test_views_no_seam_bleed();

@@ -34,6 +34,7 @@ extern "C" {
 #define LEIA_CONV_CPU_FMT_RGBA8_SRGB 2u
 #define LEIA_CONV_CPU_FMT_BGRA8_UNORM 3u
 #define LEIA_CONV_CPU_FMT_BGRA8_SRGB 4u
+#define LEIA_CONV_CPU_FMT_R32_FLOAT 8u
 /*! @} */
 
 //! True for the four 4-byte colour formats this transport handles.
@@ -72,6 +73,27 @@ leia_conv_cpu_write_views(const uint8_t *src,
                           uint32_t sh,
                           uint32_t src_stride,
                           uint32_t views,
+                          void *dst,
+                          uint64_t dst_bytes,
+                          uint32_t dw,
+                          uint32_t dh,
+                          uint32_t dst_stride,
+                          uint32_t dst_fmt);
+
+/*!
+ * Write a float depth map (@p src, @p sw x @p sh floats, row stride @p src_stride
+ * bytes; 0 = packed) over the whole of a host-memory R32_FLOAT target of @p dw x
+ * @p dh (row stride @p dst_stride bytes; 0 = packed), point-sampled (depth is
+ * never blended across an edge), values as is.
+ *
+ * @return false on a bad argument (null, zero extent, a format other than
+ *         R32_FLOAT, or a stride / byte_size too small).
+ */
+bool
+leia_conv_cpu_write_depth(const float *src,
+                          uint32_t sw,
+                          uint32_t sh,
+                          uint32_t src_stride,
                           void *dst,
                           uint64_t dst_bytes,
                           uint32_t dw,

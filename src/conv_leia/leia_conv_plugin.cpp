@@ -338,7 +338,7 @@ is_ready(const struct snapshot &s)
 bool
 views_have_depth(const struct snapshot &s)
 {
-#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+#if defined(DXR_LEIA_NEURD_HAS_CONVERT_EX) || defined(DXR_LEIA_NEURD_HAS_CPU_EX)
 	if (s.activated && s.status.module_status == LEIA_LIFT_MODULE_READY) {
 		return s.status.float_depth;
 	}
@@ -352,7 +352,7 @@ views_have_depth(const struct snapshot &s)
 bool
 views_offaxis(const struct snapshot &s)
 {
-#ifdef DXR_LEIA_NEURD_HAS_CONVERT_EX
+#if defined(DXR_LEIA_NEURD_HAS_CONVERT_EX) || defined(DXR_LEIA_NEURD_HAS_CPU_EX)
 	if (s.activated && s.status.module_status == LEIA_LIFT_MODULE_READY) {
 		return s.status.offaxis;
 	}
@@ -432,10 +432,10 @@ fill_cap(const struct snapshot &s, uint32_t index, struct xrt_conv_capability *c
 		// "N-view"); more views come from the runtime's composed pipeline.
 		c->min_views = 2;
 		c->max_views = 2;
-		// Required for VIEWS_*. The CPU arm honours the pair's horizontal
-		// separation only (as NeurD's gain; see lc_stream_convert): NeurD's CPU
-		// entry point renders its fixed ±0.5 pair, so a midpoint offset and y / z
-		// do not reach the views there.
+		// Required for VIEWS_*. The CPU arm honours them in full with NeurD's
+		// convert_stream_cpu_ex (>= 0.5.1, the Windows arm's camera); with the
+		// plain CPU convert only the pair's horizontal separation (as NeurD's
+		// gain): its fixed ±0.5 pair takes no midpoint offset, y or z.
 		c->flags |= XRT_CONV_CAP_EXPLICIT_VIEWPOINTS;
 		if (views_offaxis(s)) {
 			c->flags |= XRT_CONV_CAP_OFFAXIS_CAMERA;
@@ -945,9 +945,11 @@ lc_stream_get_output_desc(struct xrt_conversion_plugin_instance *inst,
 #ifdef LEIA_CONV_CPU_TRANSPORT
 /*!
  * POSIX arm: host-memory RGBA8 / BGRA8 in -> packed BGR8 -> NeurD's CPU convert
- * -> its side-by-side BGR8 views resampled into the host-memory views target.
- * Views only (the CPU path returns no depth); sync is NONE both ways, so the
- * target is complete when this returns.
+ * -> its side-by-side BGR8 views resampled into the host-memory views target,
+ * and (aux depth) the R32F depth of the same inference point-sampled into the
+ * host-memory depth target. Parameters and viewpoints reach the module exactly
+ * as on the Windows arm (its leia_lift_neurd_convert), so the module builds the
+ * same camera. Sync is NONE both ways: the targets are complete on return.
  */
 xrt_result_t
 lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
@@ -975,6 +977,9 @@ lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
 	}
 	struct xrt_conv_params pa = {};
 	memcpy(&pa, params, params->struct_size < sizeof(pa) ? params->struct_size : sizeof(pa));
+	if ((pa.frame_flags & XRT_CONV_FRAME_RESET) != 0) {
+		leia_lift_neurd_stream_reset(d->lift, s.lift_id); // cut / seek: fresh temporal state
+	}
 
 	d->bgr.resize((size_t)img.width * img.height * 3u);
 	if (!leia_conv_cpu_pack_bgr8(img.cpu_ptr, img.byte_size, img.width, img.height, img.row_stride, img.format,
@@ -984,33 +989,36 @@ lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
 
+	// ---- Parameters: the runtime decided everything; translate units only
+	// (field for field the Windows arm's).
 	struct leia_lift_neurd_params lp = {};
 	leia_conv_convergence(pa.convergence_mode, pa.convergence, s.depth_kind, &lp.convergence,
 	                      &lp.convergence_metric_m);
 	lp.strength = (pa.strength > 0.0f && std::isfinite(pa.strength)) ? pa.strength : 1.0f;
 	lp.inpaint = (pa.frame_flags & XRT_CONV_FRAME_INPAINT) != 0 ? 1u : 0u;
 	lp.view_count = 2;
-	// The viewpoints: NeurD's CPU pair is fixed at x = ±0.5, one unit = the
-	// nominal 63 mm baseline (leia_lift_viewpoint.h). Its disparity scales with
-	// the gain, so the pair's horizontal separation is honoured as a gain factor;
-	// the midpoint (look-around) and y / z cannot be on this path.
-	{
-		float sep = 0.0f;
-		if (pa.viewpoint_count >= 2) {
-			sep = pa.viewpoints_xyz[1][0] - pa.viewpoints_xyz[0][0];
-		} else if (pa.baseline_m > 0.0f) {
-			sep = pa.baseline_m;
-		}
-		if (std::isfinite(sep) && sep > 0.0f) {
-			lp.strength *= std::min(sep / LEIA_LIFT_VP_REF_BASELINE_M, 10.0f);
-		} else if (pa.viewpoint_count >= 2 && std::isfinite(sep) && sep <= 0.0f) {
-			lp.strength = 0.0f; // coincident (or swapped) eyes: no parallax
-		}
+	lp.has_policy = true;
+	lp.rect_width_m = pa.rect_width_m;
+	lp.rect_height_m = pa.rect_height_m;
+	lp.baseline_m = pa.baseline_m;
+	lp.axis_mode = pa.axis_mode != 0 ? pa.axis_mode : XRT_CONV_AXIS_X;
+	lp.max_offset_m = pa.max_offset_m;
+	lp.viewpoint_frame = pa.viewpoint_frame;
+	lp.ref_z_m = pa.nominal_z_m > 0.0f ? pa.nominal_z_m : 0.0f;
+	lp.has_app_rig = true;
+	lp.viewpoint_source = pa.viewpoint_source;
+	lp.nominal_z_m = pa.nominal_z_m;
+
+	float vps[6] = {};
+	uint32_t vfloats = 0;
+	if (pa.viewpoint_count >= 2) {
+		memcpy(vps, pa.viewpoints_xyz, sizeof(vps));
+		vfloats = 6;
 	}
 
 	struct leia_conv_bgr8_image src = {d->bgr.data(), img.width, img.height, img.width * 3u};
 	struct leia_conv_bgr8_image res = {};
-	if (!leia_lift_neurd_convert_cpu(d->lift, s.lift_id, &src, &lp, &res)) {
+	if (!leia_lift_neurd_convert_cpu(d->lift, s.lift_id, &src, &lp, vfloats > 0 ? vps : nullptr, vfloats, &res)) {
 		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // the runtime keeps the previous result
 	}
 
@@ -1033,12 +1041,59 @@ lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
 		memcpy(vi->eye_xyz, pa.viewpoints_xyz, sizeof(float) * 3 * m);
 		float b = pa.baseline_m;
 		if (!(b > 0.0f) && m == 2) {
-			const float dx = pa.viewpoints_xyz[3] - pa.viewpoints_xyz[0];
-			const float dy = pa.viewpoints_xyz[4] - pa.viewpoints_xyz[1];
-			const float dz = pa.viewpoints_xyz[5] - pa.viewpoints_xyz[2];
+			const float dx = vps[3] - vps[0], dy = vps[4] - vps[1], dz = vps[5] - vps[2];
 			b = std::sqrt(dx * dx + dy * dy + dz * dz);
 		}
 		vi->baseline_m = b;
+	}
+	struct leia_lift_neurd_depth dd = {};
+	if (s.want_depth && out->depth.memory_kind != 0 && leia_lift_neurd_get_depth(d->lift, s.lift_id, &dd) &&
+	    dd.resource != nullptr) {
+		const struct xrt_conv_image &t = out->depth;
+		if (t.memory_kind != XRT_CONV_MEM_CPU || t.cpu_ptr == nullptr || t.array_layer != 0 ||
+		    !leia_conv_cpu_write_depth(static_cast<const float *>(dd.resource), dd.width, dd.height, dd.width * 4u,
+		                               t.cpu_ptr, t.byte_size, t.width, t.height, t.row_stride, t.format)) {
+			LIFT_LOG_ONCE("Leia conversion: depth target (kind 0x%x, %ux%u, format %u) not writable",
+			              t.memory_kind, t.width, t.height, t.format);
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		written |= XRT_CONV_OUT_DEPTH;
+		// Same mapping as the Windows arm (and the runtime's dp-lift adapter),
+		// intrinsics rescaled to the target.
+		struct xrt_conv_depth_info *di = &out->depth_info;
+		memset(di, 0, sizeof(*di));
+		di->kind = leia_conv_depth_kind(dd.units, dd.encoding);
+		di->measure = XRT_CONV_MEASURE_PLANAR;
+		di->value_scale = dd.value_scale != 0.0f && std::isfinite(dd.value_scale) ? dd.value_scale : 1.0f;
+		di->value_shift = std::isfinite(dd.value_offset) ? dd.value_offset : 0.0f;
+		di->near_value = dd.near_depth > 0.0f ? dd.near_depth : 0.0f;
+		di->far_value = dd.far_depth > 0.0f ? dd.far_depth : 0.0f;
+		di->invalid_sample = NAN;
+		if (dd.focal_x_px > 0.0f && dd.focal_y_px > 0.0f && dd.width > 0 && dd.height > 0) {
+			const float sx = (float)t.width / (float)dd.width;
+			const float sy = (float)t.height / (float)dd.height;
+			di->fx = dd.focal_x_px * sx;
+			di->fy = dd.focal_y_px * sy;
+			di->cx = dd.principal_x_px * sx;
+			di->cy = dd.principal_y_px * sy;
+			di->intrinsics_source = XRT_CONV_INTRINSICS_ASSUMED;
+		}
+		di->source_width = dd.source_width != 0 ? dd.source_width : img.width;
+		di->source_height = dd.source_height != 0 ? dd.source_height : img.height;
+		if (dd.convergence_depth > 0.0f) {
+			di->convergence_value = dd.convergence_depth;
+			di->suggest_flags |= 4u; // convergence_value valid
+		}
+		if (dd.relief_valid != 0 && std::isfinite(dd.relief_scale) && std::isfinite(dd.relief_offset) &&
+		    dd.relief_scale != 0.0f) {
+			di->relief_valid = 1;
+			di->relief_scale = dd.relief_scale;
+			di->relief_offset = dd.relief_offset;
+		}
+		di->same_inference = dd.same_inference != 0 ? 1u : 0u;
+		di->source_time_ns = pa.source_time_ns;
+		di->provider_frame_id = dd.vendor_frame_id;
+		s.depth_kind = di->kind;
 	}
 	out->written = written;
 	if (written == 0) {
@@ -1049,6 +1104,7 @@ lc_stream_convert(struct xrt_conversion_plugin_instance *inst,
 		for (auto &it : d->streams) {
 			if (it.handle == stream) {
 				it.frames++;
+				it.depth_kind = s.depth_kind;
 			}
 		}
 	}
