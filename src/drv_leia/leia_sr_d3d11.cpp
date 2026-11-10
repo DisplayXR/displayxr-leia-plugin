@@ -305,6 +305,9 @@ struct leiasr_d3d11
 	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
+	//! The SDK's WndProc drag phase-snap is live on our window, so
+	//! snap_window_rect declines (one owner per window, runtime#2593).
+	bool sdk_drag_snap = false;
 	bool display_bound = false;
 	bool binding_refused = false;
 	//! The weaver reads its phase from the present origin + viewport only
@@ -630,6 +633,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	wr = srCreateWeaverDX11(sr.instance_v2, &ci, &sr.weaver_v2);
 #endif
 	sr.external_routed = plan.routing_external;
+	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, hwnd != nullptr);
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 	if (sr.screen_bound && hwnd == nullptr && !sr.needs_present_origin) {
@@ -2776,6 +2780,17 @@ leiasr_d3d11_snap_window_rect(struct leiasr_d3d11 *leiasr,
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr->weaver_v2 != nullptr) {
+		if (leiasr->sdk_drag_snap) {
+			// The SDK subclassed this window and snaps its drags itself;
+			// a second snap on top of it disagrees and jitters (#2593).
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("%s snap: SDK drag phase-snap owns this window - declining the runtime snap (#2593)",
+				        "D3D11");
+			}
+			return false;
+		}
 		// The windowless snap — the entry point we asked Leia for, replacing
 		// the v1 probe below (a hidden window driven with a synthetic drag,
 		// LeiaInc/LeiaSR#163). One body for every backend (runtime#2405):

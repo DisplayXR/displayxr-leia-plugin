@@ -132,6 +132,22 @@ leia_win_sr_plan_needs_present_origin(const struct leia_win_sr_weaver_plan *p, b
 }
 
 /*!
+ * Does the SR SDK's own WndProc drag phase-snap live on this DP's window?
+ * The SDK subclasses the real HWND it was given unless the weaver is EXTERNAL
+ * routed without KEEP_DRAG_SNAP. When it does, the SDK already snaps every
+ * drag step, so the DP's snap_window_rect must decline: a runtime-owned
+ * window that also snaps through it gets two snaps per step that disagree by
+ * a pixel or two, which shows as 3D jitter while dragging (runtime#2593).
+ * One owner per window: the SDK hook when it is live, the runtime's provider
+ * (windowless srWeaverSnapToPhase) otherwise.
+ */
+static inline bool
+leia_win_sr_plan_sdk_owns_drag_snap(const struct leia_win_sr_weaver_plan *p, bool has_window)
+{
+	return has_window && (!p->routing_external || p->keep_drag_snap);
+}
+
+/*!
  * Should a screen-bound DP create a lens bound to ITS display and drive it
  * (SR D3)? Only with the display bound and the runtime reporting lens per
  * device: on an older runtime a bind to a non-active display is refused, and
