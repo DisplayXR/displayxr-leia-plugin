@@ -131,6 +131,9 @@ struct leiasr_gl
 	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
+	//! The SDK's WndProc drag phase-snap is live on our window, so
+	//! snap_window_rect declines (one owner per window, runtime#2593).
+	bool sdk_drag_snap = false;
 	bool display_bound = false;
 	//! The weaver reads its phase from the present origin + viewport only
 	//! (EXTERNAL without a window). Applied before every weave.
@@ -383,6 +386,11 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 	wr = srCreateWeaverGL(sr.instance_v2, &ci, &sr.weaver_v2);
 #endif
 	sr.external_routed = plan.routing_external;
+	// The SDK can only subclass a window of THIS process. A window owned by
+	// another process (the DisplayXR Browser's Chrome window under the
+	// service's XR_DXR_weave route) gets no SDK hook, and the caller's
+	// explicit snap is its only snapper, so it must not be declined.
+	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, leia_win_hwnd_in_this_process(hwnd));
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 
@@ -991,6 +999,17 @@ leiasr_gl_snap_window_rect(struct leiasr_gl *leiasr,
 	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr->weaver_v2 != nullptr) {
+		if (leiasr->sdk_drag_snap) {
+			// The SDK subclassed this window and snaps its drags itself;
+			// a second snap on top of it disagrees and jitters (#2593).
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("%s snap: SDK drag phase-snap owns this window - declining the runtime snap (#2593)",
+				        "GL");
+			}
+			return false;
+		}
 		return leia_sr_v2_snap_to_phase(leiasr->weaver_v2, "GL", origin_x, origin_y, target_x, target_y, out_x,
 		                                out_y);
 	}
