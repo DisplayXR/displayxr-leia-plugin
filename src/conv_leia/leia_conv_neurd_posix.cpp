@@ -10,12 +10,14 @@
  *
  *  - Dynamic load only. libNeurD.so is found without loading it (presence is a
  *    stat + VERSION.txt read), in this order:
- *      1. the provider's NeurDPath setting (the .so, or the directory holding it);
- *      2. each directory of LD_LIBRARY_PATH (where NeurD's own POSIX loader,
- *         dlopen("libNeurD.so"), would look first);
- *      3. NEURD_PATH (file or directory; the Windows loader's variable);
- *      4. the per-user install root ${XDG_DATA_HOME:-~/.local/share}/LeiaInc/NeurD-Runtime;
- *      5. the machine install root /opt/LeiaInc/NeurD-Runtime.
+ *      1. the provider's NeurDPath setting (the .so, or the directory holding it;
+ *         an explicit pin: nothing else is looked at);
+ *      2. the NeurD runtime package's install directory /opt/immersity/neurd-runtime
+ *         (the neurd-runtime .deb; NeurD's own loader falls back to it too);
+ *      3. NEURD_PATH (file or directory; the variable NeurD's loader reads);
+ *      4. each directory of LD_LIBRARY_PATH (NeurD's loader's default search);
+ *      5. the per-user root ${XDG_DATA_HOME:-~/.local/share}/LeiaInc/NeurD-Runtime
+ *         (an unpacked runtime, for development and boxes without the package).
  *    The install's VERSION.txt (written by NeurD's own install rules next to
  *    the library) is the pre-load version, the VERSIONINFO twin of Windows.
  *
@@ -92,7 +94,8 @@ constexpr uint64_t kDefaultMinNeurDVersion = NEURD_MAKE_VERSION(0, 4, 6);
 constexpr uint64_t kStreamPropsVersion = NEURD_MAKE_VERSION(0, 4, 9);
 constexpr uint64_t kActivationRetryMs = 15000;
 constexpr const char *kLibName = "libNeurD.so";
-constexpr const char *kMachineRoot = "/opt/LeiaInc/NeurD-Runtime";
+//! Where the neurd-runtime .deb installs (media_sdk package.sh / NEURD_LINUX_INSTALL_DIR).
+constexpr const char *kMachineRoot = "/opt/immersity/neurd-runtime";
 constexpr const char *kUserSubdir = "LeiaInc/NeurD-Runtime";
 
 #define LIFT_WARN_ONCE(...)                                                                                    \
@@ -351,6 +354,20 @@ neurd_resolve(const char **where)
 		*where = "NeurDPath setting";
 		return lib_at(v); // pinned: nothing else is looked at
 	}
+	{
+		const std::string f = lib_at(kMachineRoot);
+		if (!f.empty()) {
+			*where = "runtime package";
+			return f;
+		}
+	}
+	if (const char *np = std::getenv("NEURD_PATH"); np != nullptr && np[0] != '\0') {
+		const std::string f = lib_at(np);
+		if (!f.empty()) {
+			*where = "NEURD_PATH";
+			return f;
+		}
+	}
 	if (const char *ld = std::getenv("LD_LIBRARY_PATH"); ld != nullptr && ld[0] != '\0') {
 		std::string all(ld);
 		size_t at = 0;
@@ -368,13 +385,6 @@ neurd_resolve(const char **where)
 			at = colon + 1;
 		}
 	}
-	if (const char *np = std::getenv("NEURD_PATH"); np != nullptr && np[0] != '\0') {
-		const std::string f = lib_at(np);
-		if (!f.empty()) {
-			*where = "NEURD_PATH";
-			return f;
-		}
-	}
 	{
 		std::string root;
 		const char *xdg = std::getenv("XDG_DATA_HOME");
@@ -389,13 +399,6 @@ neurd_resolve(const char **where)
 				*where = "per-user install";
 				return f;
 			}
-		}
-	}
-	{
-		const std::string f = lib_at(kMachineRoot);
-		if (!f.empty()) {
-			*where = "machine install";
-			return f;
 		}
 	}
 	*where = "not found";
@@ -636,9 +639,9 @@ leia_lift_neurd_activate(struct leia_lift_neurd *lift)
 		const std::string path = neurd_resolve(&where);
 		if (path.empty()) {
 			set_failed(LEIA_LIFT_MODULE_ABSENT, true, "NeurD is not installed (libNeurD.so not found)");
-			U_LOG_W("Leia conversion: libNeurD.so not found (NeurDPath / LD_LIBRARY_PATH / NEURD_PATH / "
-			        "~/.local/share/%s / %s)",
-			        kUserSubdir, kMachineRoot);
+			U_LOG_W("Leia conversion: libNeurD.so not found (NeurDPath / %s / NEURD_PATH / LD_LIBRARY_PATH / "
+			        "~/.local/share/%s)",
+			        kMachineRoot, kUserSubdir);
 			return g.module_status;
 		}
 		uint32_t fma = 0, fmi = 0, fpa = 0;

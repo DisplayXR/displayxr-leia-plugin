@@ -211,9 +211,12 @@ Windows branch of `leia_conv_plugin.cpp` is textually the code it was.
 | Registration | `HKLM\…\ConversionProviders\leia-conversion`, ProbeOrder 50 | `050-leia-conversion-conversion-provider.json` in a DisplayProcessors root (the build writes a dev one under `build/src/conv_leia/_conv_manifest/`) |
 
 **Finding NeurD (no load).** In order: the `NeurDPath` setting (the `.so` or its
-directory; pins it), each `LD_LIBRARY_PATH` directory, `NEURD_PATH`, the per-user
-root `${XDG_DATA_HOME:-~/.local/share}/LeiaInc/NeurD-Runtime`, the machine root
-`/opt/LeiaInc/NeurD-Runtime`. The install's `VERSION.txt` (NeurD's install rules
+directory; pins it), the NeurD runtime package's install directory
+`/opt/immersity/neurd-runtime` (the `neurd-runtime` `.deb`, which downloads the
+encrypted models at install; NeurD's own loader falls back to the same directory),
+`NEURD_PATH`, each `LD_LIBRARY_PATH` directory, then the per-user root
+`${XDG_DATA_HOME:-~/.local/share}/LeiaInc/NeurD-Runtime` (an unpacked runtime, for
+development). The install's `VERSION.txt` (NeurD's install rules
 write it next to the library) is the pre-load version, the VERSIONINFO twin; the
 `MinVersion` floor (0.4.6) applies before and after the load. The licence class
 comes from NeurD's own `License:` log line, as on Windows; the
@@ -236,7 +239,7 @@ export with a fake host and converts a still image file:
 ```bash
 NEURD_SDK_ROOT=… ./scripts/build-linux.sh        # or scripts/fetch-neurd-headers.sh first
 build/src/conv_leia/conv_leia_harness --provider build/src/conv_leia/DisplayXR-LeiaConversion.so \
-    --neurd-path /opt/LeiaInc/NeurD-Runtime --input frame.png --out views.png --frames 20
+    --neurd-path /opt/immersity/neurd-runtime --input frame.png --out views.png --frames 20
 ```
 
 It prints the capability before / after warm, one line per frame and a
