@@ -386,7 +386,11 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 	wr = srCreateWeaverGL(sr.instance_v2, &ci, &sr.weaver_v2);
 #endif
 	sr.external_routed = plan.routing_external;
-	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, hwnd != nullptr);
+	// The SDK can only subclass a window of THIS process. A window owned by
+	// another process (the DisplayXR Browser's Chrome window under the
+	// service's XR_DXR_weave route) gets no SDK hook, and the caller's
+	// explicit snap is its only snapper, so it must not be declined.
+	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, leia_win_hwnd_in_this_process(hwnd));
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 
