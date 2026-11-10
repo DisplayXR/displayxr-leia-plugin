@@ -234,6 +234,32 @@ test_screen_origin_unbound_keeps_the_sr_location(void)
 	CHECK(!o.bound);
 }
 
+static void
+test_sdk_drag_snap_owner(void)
+{
+	// runtime#2593: exactly one drag snapper per window.
+	// Unbound DP with the real window: SDK routing, the SDK hook snaps.
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, AL_ID);
+	CHECK(leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
+	// Unbound and windowless: no hook anywhere.
+	CHECK(!leia_win_sr_plan_sdk_owns_drag_snap(&p, false));
+	// Majority segment: EXTERNAL + KEEP_DRAG_SNAP keeps the SDK hook.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, true, AL_ID);
+	CHECK(leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
+	// Windowless secondary segment: the runtime's provider is the only snapper.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, DS1_ID);
+	CHECK(!leia_win_sr_plan_sdk_owns_drag_snap(&p, false));
+	// EXTERNAL without KEEP_DRAG_SNAP (a runtime that lacks the flag): no hook.
+	struct leia_win_sr_multi_caps no_keep = k_caps_2056;
+	no_keep.keep_drag_snap = false;
+	p = leia_win_sr_plan_weaver(&no_keep, true, true, AL_ID);
+	CHECK(!leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
+	// Routing refused -> SDK routing again: the hook is back.
+	CHECK(leia_win_sr_plan_weaver_fallback(&p)); // drops the binding
+	CHECK(leia_win_sr_plan_weaver_fallback(&p)); // drops routing
+	CHECK(leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
+}
+
 int
 main(void)
 {
@@ -250,6 +276,7 @@ main(void)
 	test_screen_origin_binding_wins_over_a_transient_sr_location();
 	test_screen_origin_zero_is_a_real_origin();
 	test_screen_origin_unbound_keeps_the_sr_location();
+	test_sdk_drag_snap_owner();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_multi_win: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

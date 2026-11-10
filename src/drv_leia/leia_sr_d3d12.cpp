@@ -63,6 +63,9 @@ struct leiasr_d3d12
 	//! monitor, so a frame-thread read never races the monitor's destroy.
 	struct leia_sr_presence_monitor *presence = nullptr;
 	std::atomic<int32_t> presence_state{0};
+	//! The weaver waits at tracking policy OFF for its first 3D enable
+	//! (leia_sr_v2_weaver_apply_tracking_policy, 2D start).
+	std::atomic<bool> tracking_held_off{false};
 #endif
 
 	// D3D12 resources (references, not owned)
@@ -178,6 +181,9 @@ struct leiasr_d3d12
 	std::atomic<bool> bind_origin_logged{false};
 	//! What the create ended up with (for logs and the per-frame paths).
 	bool external_routed = false;
+	//! The SDK's WndProc drag phase-snap is live on our window, so
+	//! snap_window_rect declines (one owner per window, runtime#2593).
+	bool sdk_drag_snap = false;
 	bool display_bound = false;
 	bool binding_refused = false;
 	//! The weaver reads its phase from the present origin + viewport only
@@ -434,6 +440,11 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	wr = srCreateWeaverDX12(sr.instance_v2, &ci, &sr.weaver_v2);
 #endif
 	sr.external_routed = plan.routing_external;
+	// The SDK can only subclass a window of THIS process. A window owned by
+	// another process (the DisplayXR Browser's Chrome window under the
+	// service's XR_DXR_weave route) gets no SDK hook, and the caller's
+	// explicit snap is its only snapper, so it must not be declined.
+	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, leia_win_hwnd_in_this_process(hwnd));
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 
@@ -470,6 +481,7 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	if (!pin_viewer) {
 		sr.presence = leia_sr_presence_monitor_create(sr.instance_v2, mcaps.display_user_presence, info.display_id,
 		                                               "D3D12", &sr.presence_state);
+		leia_sr_v2_weaver_apply_tracking_policy(sr.weaver_v2, &sr.tracking_held_off, "D3D12");
 	}
 	if (!pin_viewer && !leia_sr_v2_initialize(sr.instance_v2)) {
 		leia_sr_presence_monitor_destroy(&sr.presence);
@@ -500,6 +512,9 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	} else if (bind_lens) {
 		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
 		sr.lens_bound = sr.lens_v2 != nullptr;
+	}
+	if (sr.lens_v2 == nullptr) {
+		leia_sr_v2_weaver_tracking_no_lens(sr.weaver_v2, &sr.tracking_held_off, "D3D12");
 	}
 	if (non_active && segment_tracked) {
 		U_LOG_W(
@@ -578,6 +593,8 @@ lens_set(leiasr_d3d12 *sr, bool enable)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
+		// The first 3D lifts the 2D-start hold in the same call as the lens.
+		leia_sr_v2_weaver_tracking_on_lens(sr->weaver_v2, enable, &sr->tracking_held_off, "D3D12");
 		if (sr->lens_v2 != nullptr) {
 			enable ? srLensEnable(sr->lens_v2) : srLensDisable(sr->lens_v2);
 		}
@@ -1312,6 +1329,17 @@ leiasr_d3d12_snap_window_rect(struct leiasr_d3d12 *leiasr,
 	}
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr->weaver_v2 != nullptr) {
+		if (leiasr->sdk_drag_snap) {
+			// The SDK subclassed this window and snaps its drags itself;
+			// a second snap on top of it disagrees and jitters (#2593).
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("%s snap: SDK drag phase-snap owns this window - declining the runtime snap (#2593)",
+				        "D3D12");
+			}
+			return false;
+		}
 		return leia_sr_v2_snap_to_phase(leiasr->weaver_v2, "D3D12", origin_x, origin_y, target_x, target_y, out_x,
 		                                out_y);
 	}
@@ -1704,7 +1732,11 @@ leiasr_d3d12_get_user_presence(struct leiasr_d3d12 *leiasr)
 {
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (leiasr != nullptr) {
-		return leia_sr_presence_load(leiasr->presence_state);
+		// A rested weaver means "no viewer", ahead of the display's presence
+		// (leia_sr_presence_with_weaver). weaver_v2 is read only once READY.
+		const SrWeaver w = w_ready(leiasr) ? leiasr->weaver_v2 : nullptr;
+		return leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state),
+		                                    leia_sr_v2_weaver_tracking(w));
 	}
 #else
 	(void)leiasr;

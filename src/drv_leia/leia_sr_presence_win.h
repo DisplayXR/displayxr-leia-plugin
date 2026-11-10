@@ -33,6 +33,7 @@
 #include "leia_sr_presence.h"
 
 #include <sr/sr_instance.h>
+#include <sr/sr_weaver.h>
 
 #include <atomic>
 #include <stdint.h>
@@ -72,5 +73,52 @@ leia_sr_presence_load(const std::atomic<int32_t> &state)
 {
 	return (enum leia_sr_presence)state.load(std::memory_order_relaxed);
 }
+
+/*!
+ * The weaver's tracking state (LeiaSR srWeaverGetTrackingState), safe every
+ * frame and on any thread that may use @p weaver. UNKNOWN when @p weaver is
+ * NULL, when the plug-in was built against an SDK without the query
+ * (SR_WEAVER_TRACKING_POLICY_AVAILABLE), or when the SR runtime answers
+ * SR_ERROR_FUNCTION_UNSUPPORTED (logged once per process, then not asked again).
+ */
+enum leia_sr_weaver_tracking
+leia_sr_v2_weaver_tracking(SrWeaver weaver);
+
+/*!
+ * Apply the tracking policy to a new weaver, BEFORE srInitialize (so a
+ * weaver that starts 2D never opens the camera at all).
+ *
+ * DXR_LEIA_TRACKING_POLICY:
+ * - unset (the default): **2D start**. The weaver starts at OFF, and
+ *   @ref leia_sr_v2_weaver_tracking_on_lens moves it to AUTO on the first 3D
+ *   enable, in the same call as the lens. A surface that is 2D from launch
+ *   (a browser on a 2D page) then never lights the camera, where SR's own
+ *   default would demand tracking until the lens has been off for its hold
+ *   (~20 s). @p held_off is set while the weaver waits for that first 3D.
+ * - "auto": no call, SR's default (the plug-in's behaviour up to 2.20.x).
+ * - "always_on": tracking stays awake in 2D. "off": tracking never runs.
+ *
+ * Never blocks. Logged once per weaver when applied, once per process when
+ * the SR runtime refuses (an older runtime: nothing changes).
+ */
+void
+leia_sr_v2_weaver_apply_tracking_policy(SrWeaver weaver, std::atomic<bool> *held_off, const char *arm);
+
+/*!
+ * Call alongside every lens enable/disable of this weaver, on a thread that
+ * may use @p weaver. On the first 3D enable of a weaver held at OFF by the
+ * 2D start, moves it to AUTO (the camera's warm start then overlaps the lens
+ * switch). A later 2D leaves it on AUTO: SR's hold covers quick 2D/3D flips.
+ */
+void
+leia_sr_v2_weaver_tracking_on_lens(SrWeaver weaver, bool enable_3d, std::atomic<bool> *held_off, const char *arm);
+
+/*!
+ * Release a 2D-start hold when the DP turns out to have no lens it will
+ * enable (no switchable lens, or a non-active screen whose lens it must not
+ * drive): a weaver nobody can switch to 3D must not stay untracked.
+ */
+void
+leia_sr_v2_weaver_tracking_no_lens(SrWeaver weaver, std::atomic<bool> *held_off, const char *arm);
 
 #endif // DXR_LEIA_HAS_SR_V2

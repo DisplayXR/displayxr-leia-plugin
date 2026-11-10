@@ -131,6 +131,44 @@ leia_win_sr_plan_needs_present_origin(const struct leia_win_sr_weaver_plan *p, b
 	return p->routing_external && !has_window;
 }
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+/*!
+ * Is @p hwnd a real window owned by THIS process? Only such a window can be
+ * subclassed by the SR SDK (runtime#2593).
+ */
+static inline bool
+leia_win_hwnd_in_this_process(const void *hwnd)
+{
+	DWORD pid = 0;
+	return hwnd != NULL && GetWindowThreadProcessId((HWND)hwnd, &pid) != 0 && pid == GetCurrentProcessId();
+}
+#endif
+
+/*!
+ * Does the SR SDK's own WndProc drag phase-snap live on this DP's window?
+ * The SDK subclasses the real HWND it was given unless the weaver is EXTERNAL
+ * routed without KEEP_DRAG_SNAP. When it does, the SDK already snaps every
+ * drag step, so the DP's snap_window_rect must decline: a runtime-owned
+ * window that also snaps through it gets two snaps per step that disagree by
+ * a pixel or two, which shows as 3D jitter while dragging (runtime#2593).
+ * One owner per window: the SDK hook when it is live, the runtime's provider
+ * (windowless srWeaverSnapToPhase) otherwise.
+ *
+ * @p has_window must mean "a real window of THIS process": the SDK cannot
+ * subclass another process's window, so a cross-process HWND (the browser
+ * under the service's weave route) never gets the hook. The caller passes
+ * leia_win_hwnd_in_this_process().
+ */
+static inline bool
+leia_win_sr_plan_sdk_owns_drag_snap(const struct leia_win_sr_weaver_plan *p, bool has_window)
+{
+	return has_window && (!p->routing_external || p->keep_drag_snap);
+}
+
 /*!
  * Should a screen-bound DP create a lens bound to ITS display and drive it
  * (SR D3)? Only with the display bound and the runtime reporting lens per

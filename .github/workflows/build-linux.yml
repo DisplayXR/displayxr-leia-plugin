@@ -72,7 +72,7 @@ env:
   # runtimes v2.16.0..main — see the CMakeLists comment. v2.29.0: past
   # v2.27.1, which owns the resampled-X11 refusal the windowless weaver
   # (multi-screen M4) no longer gets from the SR SDK.
-  RUNTIME_REF: v2.58.1
+  RUNTIME_REF: v2.66.8
   # NeurD headers for the conversion provider's CPU arm (src/conv_leia), from the
   # PRIVATE LeiaInc/media_sdk repo into the gitignored NeurD-SDK-<ref>/include --
   # never committed. Same pin as build-windows.yml / build-windows.bat.
