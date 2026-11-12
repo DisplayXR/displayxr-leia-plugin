@@ -73,6 +73,11 @@ env:
   # v2.27.1, which owns the resampled-X11 refusal the windowless weaver
   # (multi-screen M4) no longer gets from the SR SDK.
   RUNTIME_REF: v2.66.8
+  # NeurD headers for the conversion provider's CPU arm (src/conv_leia), from the
+  # PRIVATE LeiaInc/media_sdk repo into the gitignored NeurD-SDK-<ref>/include --
+  # never committed. Same pin as build-windows.yml / build-windows.bat.
+  NEURD_SDK_REF: v0.4.10
+  NEURD_SDK_REPO: LeiaInc/media_sdk
 
 jobs:
   # Classify the change. Same rule as displayxr-runtime's build-linux.yml:
@@ -126,7 +131,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            git ca-certificates jq \
+            git ca-certificates jq curl \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
@@ -170,12 +175,32 @@ jobs:
           path: displayxr-runtime
           fetch-depth: 1
 
+      # Soft: without the private headers (fork PR, no secret) the conversion
+      # provider is not built and everything else is unchanged.
+      - name: Fetch NeurD headers (conversion provider, optional)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::LEIALOFT_GITHUB_TOKEN absent — DisplayXR-LeiaConversion.so not built."
+            exit 0
+          fi
+          ./scripts/fetch-neurd-headers.sh "$NEURD_SDK_REPO" "$NEURD_SDK_REF" "NeurD-SDK-$NEURD_SDK_REF" ||
+            echo "::warning::NeurD headers unavailable — DisplayXR-LeiaConversion.so not built."
+
       - name: Configure
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
+          # POSIX sh (this job runs in a container): no arrays.
+          NEURD_ROOT=""
+          if [ -f "NeurD-SDK-$NEURD_SDK_REF/include/NeurD_version.h" ]; then
+            NEURD_ROOT="$GITHUB_WORKSPACE/NeurD-SDK-$NEURD_SDK_REF"
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime"
+            -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime" \
+            -DNEURD_SDK_ROOT="$NEURD_ROOT"
 
       - name: Build plug-in
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -270,6 +295,31 @@ jobs:
       - name: Unit test — Windows-arm conversion provider gate + licence class (ADR-053, host-run)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_conv_leia_policy
+
+      - name: Unit test — conversion provider CPU transport (src/conv_leia)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/conv_leia/test_conv_leia_cpu
+
+      # Built only when the NeurD headers were fetched. NeurD itself is never
+      # installed on CI: the gates check the provider loads through its one
+      # export and reports ABSENT (no NeurD) / DISABLED (Enable=0) correctly.
+      - name: Conversion provider — export, symbols, ABSENT / DISABLED gates
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          SO=build/src/conv_leia/DisplayXR-LeiaConversion.so
+          if [ ! -f "$SO" ]; then
+            echo "DisplayXR-LeiaConversion.so not built (no NeurD headers) — skipped"
+            exit 0
+          fi
+          syms=$(nm -D --defined-only "$SO" | awk '{print $NF}')
+          if [ "$syms" != "xrtConversionPluginNegotiate" ]; then
+            echo "::error::unexpected exports from $SO:"; nm -D --defined-only "$SO"; exit 1
+          fi
+          if ldd -r "$SO" 2>&1 | grep -q 'undefined symbol'; then
+            echo "::error::unresolved symbols in $SO:"; ldd -r "$SO" 2>&1 | grep 'undefined symbol' | sort -u; exit 1
+          fi
+          ./build/src/conv_leia/conv_leia_harness --provider "$SO" --neurd-path "$PWD/no-such-neurd" --expect absent
+          ./build/src/conv_leia/conv_leia_harness --provider "$SO" --enable 0 --expect disabled
 
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
