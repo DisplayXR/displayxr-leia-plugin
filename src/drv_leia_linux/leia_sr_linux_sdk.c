@@ -80,6 +80,7 @@
 #include "leia_sr_linux.h"
 #include "leia_edid_probe_linux.h"
 #include "leia_lens_owner_linux.h"
+#include "leia_tracking_policy_linux.h"
 #include "leia_sr_exit_linux.h"
 #include "leia_display_claims_linux.h"
 #include "leia_sr_routing_linux.h"
@@ -168,6 +169,9 @@ struct sr_ctx
 
 	SrInstance instance;
 	SrEyeTracker tracker; //!< may be NULL (no camera) — non-fatal
+	//! tracker != NULL, readable without g_ctx_lock (the render thread's
+	//! is_tracking and the camera-rest fast path); written under the lock.
+	atomic_bool have_tracker;
 	SrSystemMonitor monitor;
 	SrDisplay display;
 	SrLens lens; //!< may be NULL — non-fatal, event atomic backs 3D state
@@ -307,6 +311,7 @@ sr_ctx_teardown_locked(void)
 		g_ctx.monitor = NULL;
 	}
 	if (g_ctx.tracker != NULL) {
+		atomic_store(&g_ctx.have_tracker, false);
 		srDestroyEyeTracker(g_ctx.tracker);
 		g_ctx.tracker = NULL;
 	}
@@ -340,6 +345,7 @@ sr_ctx_abandon_locked(void)
 {
 	g_ctx.monitor = NULL;
 	g_ctx.tracker = NULL;
+	atomic_store(&g_ctx.have_tracker, false);
 	g_ctx.lens = NULL;
 	g_ctx.display = NULL;
 	g_ctx.instance = NULL;
@@ -463,6 +469,24 @@ sr_ctx_reapply_lens_locked(void)
 }
 
 /*!
+ * Whether the installed SR runtime has the tracker rest gate's weaver queries
+ * (LeiaSR #846). Asked before srInitialize, when no weaver exists: the loader
+ * checks the dispatch slot before the handle, so a NULL weaver answers
+ * HANDLE_INVALID on a runtime that has the call and FUNCTION_UNSUPPORTED on
+ * one that predates it. Call after srCreateInstance (the runtime is loaded).
+ */
+static bool
+sdk_runtime_has_weaver_tracking(void)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	SrTrackingState st = SR_TRACKING_STATE_TRACKING;
+	return srWeaverGetTrackingState(NULL, &st) == SR_ERROR_HANDLE_INVALID;
+#else
+	return false;
+#endif
+}
+
+/*!
  * Lazily bring up the process-wide SR context, retrying srCreateInstance for
  * up to @p retry_budget_s while the SR runtime is unreachable (R-W1).
  * Returns the resulting seam code; SUCCESS ⟹ g_ctx.state == SR_CTX_READY.
@@ -541,16 +565,23 @@ sr_ctx_ensure(double retry_budget_s)
 	void *const gen_tag = (void *)(uintptr_t)gen;
 	atomic_store(&g_ctx.context_invalid, false);
 
-	/* Senses + callbacks BEFORE srInitialize (SDK lifecycle rule). */
+	/* Senses + callbacks BEFORE srInitialize (SDK lifecycle rule). A runtime
+	 * with the tracker rest gate gets no eye tracker of ours at all: the
+	 * weaver's tracking state replaces it, and a live one would keep the
+	 * camera on from here, i.e. from service start (leia_tracking_policy_linux.h). */
 	SrEyeTrackerCreateInfo tci = SrEyeTrackerCreateInfo(.enablePrediction = SR_TRUE);
-	res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker);
-	if (SR_FAILED(res)) {
+	if (sdk_runtime_has_weaver_tracking()) {
+		U_LOG_W("leia_sr_sdk: SR runtime has the weaver tracking state — no eye tracker of our own, so the camera "
+		        "may rest while nothing is 3D");
+		g_ctx.tracker = NULL;
+	} else if (SR_FAILED(res = srCreateEyeTracker(g_ctx.instance, &tci, &g_ctx.tracker))) {
 		/* No camera is non-fatal: the weaver still weaves, is_tracking
 		 * stays false, poses fall back to nominal (R-T2). */
 		U_LOG_W("leia_sr_sdk: srCreateEyeTracker failed (%s) — untracked weaving", srResultToString(res));
 		g_ctx.tracker = NULL;
 	} else {
 		srEyeTrackerAddCallback(g_ctx.tracker, sr_ctx_on_eye_pair, gen_tag);
+		atomic_store(&g_ctx.have_tracker, true);
 	}
 
 	SrSystemMonitorCreateInfo mci = SrSystemMonitorCreateInfo();
@@ -886,6 +917,9 @@ struct leiasr_lnx
 	bool external_routed;
 	bool display_bound;
 	bool display_binding_refused; //!< a binding was chained and SR refused it (see the seam)
+	//! The weaver waits at tracking policy OFF for its first 3D request
+	//! (2D start, leia_tracking_policy_linux.h).
+	atomic_bool tracking_held_off;
 
 	VkRenderPass render_pass; //!< backend-owned, single color attachment (loadOp LOAD)
 	VkFormat render_pass_format;
@@ -1640,6 +1674,179 @@ sr_ctx_weaver_unpin(void)
 	pthread_mutex_unlock(&g_ctx_lock);
 }
 
+/*
+ *
+ * Camera rest (LeiaSR #844/#846, the tracker rest gate). The rules are in
+ * leia_tracking_policy_linux.h; this is only the SDK plumbing.
+ *
+ */
+
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+//! Set once the SR runtime answered FUNCTION_UNSUPPORTED: an older runtime
+//! will not grow the slot mid-process, so stop asking.
+static atomic_bool g_tracking_query_unsupported;
+static atomic_bool g_tracking_policy_unsupported;
+
+static const char *
+sdk_tracking_policy_name(SrTrackingPolicy p)
+{
+	switch (p) {
+	case SR_TRACKING_POLICY_AUTO: return "auto";
+	case SR_TRACKING_POLICY_ALWAYS_ON: return "always_on";
+	case SR_TRACKING_POLICY_OFF: return "off";
+	default: return "?";
+	}
+}
+
+//! One srWeaverSetTrackingPolicy; false when it did not take (logged).
+static bool
+sdk_set_tracking_policy(SrWeaver weaver, SrTrackingPolicy p, const char *why)
+{
+	if (weaver == NULL || atomic_load(&g_tracking_policy_unsupported)) {
+		return false;
+	}
+	const SrResult r = srWeaverSetTrackingPolicy(weaver, p);
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		if (!atomic_exchange(&g_tracking_policy_unsupported, true)) {
+			U_LOG_W("leia_sr_sdk: this SR runtime has no tracking policy (%s not applied); SR's default applies",
+			        sdk_tracking_policy_name(p));
+		}
+		return false;
+	}
+	if (SR_FAILED(r)) {
+		U_LOG_W("leia_sr_sdk: tracking policy %s refused: %s", sdk_tracking_policy_name(p), srResultToString(r));
+		return false;
+	}
+	U_LOG_W("leia_sr_sdk: weaver tracking policy %s (%s)", sdk_tracking_policy_name(p), why);
+	return true;
+}
+#endif
+
+/*!
+ * The weaver's own answer (srWeaverGetTrackingState), safe every frame on the
+ * render thread. UNKNOWN for no weaver, an SDK without the query, or a runtime
+ * that answers FUNCTION_UNSUPPORTED (logged once, then not asked again).
+ */
+static enum leia_lnx_weaver_tracking
+sdk_weaver_tracking(SrWeaver weaver)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	if (weaver == NULL || atomic_load(&g_tracking_query_unsupported)) {
+		return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+	}
+	SrTrackingState st = SR_TRACKING_STATE_TRACKING;
+	const SrResult r = srWeaverGetTrackingState(weaver, &st);
+	if (r == SR_ERROR_FUNCTION_UNSUPPORTED) {
+		if (!atomic_exchange(&g_tracking_query_unsupported, true)) {
+			if (atomic_load(&g_ctx.have_tracker)) {
+				U_LOG_W("leia_sr_sdk: weaver tracking state unsupported by this SR runtime — keeping our own eye "
+				        "tracker (the camera cannot rest while it lives)");
+			} else {
+				/* The loader probe said the runtime has the call, so no tracker
+				 * was created; with neither, is_tracking stays false. */
+				U_LOG_W("leia_sr_sdk: weaver tracking state unsupported although the SR runtime looked like it had "
+				        "it — no eye tracker of our own either, so is_tracking stays false for this context");
+			}
+		}
+		return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+	}
+	if (SR_FAILED(r)) {
+		return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+	}
+	switch (st) {
+	case SR_TRACKING_STATE_TRACKING: return LEIA_LNX_WEAVER_TRACKING_TRACKING;
+	case SR_TRACKING_STATE_LOST: return LEIA_LNX_WEAVER_TRACKING_LOST;
+	case SR_TRACKING_STATE_RESTED: return LEIA_LNX_WEAVER_TRACKING_RESTED;
+	default: return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+	}
+#else
+	(void)weaver;
+	return LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+#endif
+}
+
+/*!
+ * Destroy the context's own eye tracker once a weaver answers the tracking
+ * query: that answer replaces it, and while it lives SR keeps the camera on
+ * under every policy (leia_tracking_policy_linux.h, rule 1). Once per context;
+ * cheap when there is nothing to do.
+ */
+static void
+sdk_drop_own_tracker(enum leia_lnx_weaver_tracking w)
+{
+	if (w == LEIA_LNX_WEAVER_TRACKING_UNKNOWN || !atomic_load(&g_ctx.have_tracker)) {
+		return;
+	}
+	pthread_mutex_lock(&g_ctx_lock);
+	if (g_ctx.tracker != NULL) {
+		atomic_store(&g_ctx.have_tracker, false);
+		srDestroyEyeTracker(g_ctx.tracker); // quiesces sr_ctx_on_eye_pair first
+		g_ctx.tracker = NULL;
+		atomic_store(&g_ctx.last_eye_time_us, 0);
+		atomic_store(&g_ctx.last_pair_mono_ns, 0);
+		U_LOG_W("leia_sr_sdk: own eye tracker released — the weaver's tracking state decides is_tracking, so "
+		        "SR may rest the camera while nothing is 3D");
+	}
+	pthread_mutex_unlock(&g_ctx_lock);
+}
+
+/*!
+ * A new weaver's tracking policy (DXR_LEIA_TRACKING_POLICY; unset = 2D start:
+ * OFF until its first 3D request). Never blocks.
+ */
+static void
+sdk_apply_tracking_policy(struct leiasr_lnx *lnx)
+{
+	atomic_store(&lnx->tracking_held_off, false);
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	const char *e = getenv("DXR_LEIA_TRACKING_POLICY");
+	enum leia_lnx_tracking_mode mode = leia_lnx_tracking_mode_parse(e);
+	if (mode == LEIA_LNX_TRACKING_UNRECOGNISED) {
+		static atomic_bool warned;
+		if (!atomic_exchange(&warned, true)) {
+			U_LOG_W("leia_sr_sdk: DXR_LEIA_TRACKING_POLICY='%s' not recognised (auto | always_on | off); using "
+			        "the default (tracking off until the first 3D)",
+			        e);
+		}
+		mode = LEIA_LNX_TRACKING_2D_START;
+	}
+	if (leia_lnx_tracking_holds_at_create(mode)) {
+		if (sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_OFF, "2D start: AUTO on the first 3D request")) {
+			atomic_store(&lnx->tracking_held_off, true);
+		}
+		return;
+	}
+	switch (mode) {
+	case LEIA_LNX_TRACKING_ALWAYS_ON:
+		(void)sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_ALWAYS_ON, "DXR_LEIA_TRACKING_POLICY");
+		break;
+	case LEIA_LNX_TRACKING_OFF:
+		(void)sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_OFF, "DXR_LEIA_TRACKING_POLICY");
+		break;
+	case LEIA_LNX_TRACKING_SR_DEFAULT:
+	default: break;
+	}
+#else
+	(void)lnx;
+#endif
+}
+
+//! Lift a 2D-start hold (exactly once per weaver): the weaver goes to AUTO.
+static void
+sdk_tracking_release_hold(struct leiasr_lnx *lnx, const char *why)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	if (lnx == NULL || !atomic_exchange(&lnx->tracking_held_off, false)) {
+		return;
+	}
+	(void)sdk_set_tracking_policy(lnx->weaver, SR_TRACKING_POLICY_AUTO, why);
+#else
+	(void)lnx;
+	(void)why;
+#endif
+}
+
+
 enum leiasr_lnx_result
 leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx **out_lnx)
 {
@@ -1751,6 +1958,7 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 			window_logged = true;
 		}
 	}
+	bool lens_on_at_create = false; //!< we just turned this weaver's lens on (camera rest below)
 	if (lnx->external_routed) {
 		/* An EXTERNAL weaver never votes the lens: it is ours to turn on
 		 * (and to release when the last one goes — leiasr_lnx_destroy). */
@@ -1758,8 +1966,9 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		const enum leia_lens_action la = leia_lens_owner_on_external_weaver_created(&g_lens_owner);
 		if (la != LEIA_LENS_ACTION_NONE) {
 			if (g_ctx.lens != NULL) {
-				(void)sr_ctx_send_lens_locked(
-				    la, "EXTERNAL-routed weaver created — it never votes the lens");
+				lens_on_at_create =
+				    sr_ctx_send_lens_locked(la, "EXTERNAL-routed weaver created — it never votes the lens") &&
+				    la == LEIA_LENS_ACTION_ENABLE;
 			} else {
 				U_LOG_W(
 				    "leia_sr_sdk: EXTERNAL-routed weaver but no lens handle — the lens cannot be "
@@ -1768,6 +1977,17 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		}
 		pthread_mutex_unlock(&g_ctx_lock);
 	}
+
+	/* Camera rest (leia_tracking_policy_linux.h). The policy goes on before
+	 * the first weave; a weaver whose lens nothing will switch through us, or
+	 * whose lens we just turned on, needs no wait for a 3D request. */
+	sdk_apply_tracking_policy(lnx);
+	if (g_ctx.lens == NULL) {
+		sdk_tracking_release_hold(lnx, "no lens handle, so SR's default");
+	} else if (lens_on_at_create) {
+		sdk_tracking_release_hold(lnx, "EXTERNAL-routed weaver: lens on at create");
+	}
+	sdk_drop_own_tracker(sdk_weaver_tracking(lnx->weaver));
 
 	VkFormat rp_format = info->target_format != VK_FORMAT_UNDEFINED ? info->target_format
 	                                                                : VK_FORMAT_B8G8R8A8_UNORM;
@@ -2329,17 +2549,27 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 		 * as tracking. USER_LOST still clears user_present immediately, and
 		 * samples stop when the viewer leaves, so freshness lapses within
 		 * kSampleFreshNs rather than latching on. */
+		/* With the tracker rest gate (LeiaSR #846) the weaver's own answer
+		 * decides instead, and our tracker is released on the first one
+		 * (leia_tracking_policy_linux.h). */
 		const int64_t kSampleFreshNs = 250 * 1000 * 1000; /* ~8 samples at 30 Hz */
+		const enum leia_lnx_weaver_tracking wt = sdk_weaver_tracking(lnx->weaver);
+		sdk_drop_own_tracker(wt);
 		const int64_t last = atomic_load(&g_ctx.last_pair_mono_ns);
 		const bool fresh = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < kSampleFreshNs;
-		*out_is_tracking = (atomic_load(&g_ctx.user_present) || fresh) && atomic_load(&g_ctx.device_ready) &&
-		                   g_ctx.tracker != NULL;
+		*out_is_tracking = leia_lnx_is_tracking(wt, atomic_load(&g_ctx.user_present), fresh,
+		                                        atomic_load(&g_ctx.device_ready),
+		                                        atomic_load(&g_ctx.have_tracker));
 	}
 	if (out_timestamp_ns != NULL) {
 		uint64_t t_us = atomic_load(&g_ctx.last_eye_time_us);
 		/* SrEyePair.timeUs epoch is "unspecified" (contract §8 R-T3 ask);
-		 * fall back to now when no sample has arrived. */
-		*out_timestamp_ns = t_us != 0 ? (int64_t)t_us * 1000 : (int64_t)os_monotonic_get_ns();
+		 * fall back to now when no sample has arrived. A weaver that answers
+		 * the tracking query means our tracker is (being) released, so it is
+		 * now from the first frame on: one timebase per session, as the
+		 * Windows arm always reports. */
+		const bool use_sample = t_us != 0 && sdk_weaver_tracking(lnx->weaver) == LEIA_LNX_WEAVER_TRACKING_UNKNOWN;
+		*out_timestamp_ns = use_sample ? (int64_t)t_us * 1000 : (int64_t)os_monotonic_get_ns();
 	}
 	return true;
 }
@@ -2404,7 +2634,11 @@ leiasr_lnx_query_display_info(struct leiasr_lnx_display_info *out_info)
 bool
 leiasr_lnx_request_display_mode(struct leiasr_lnx *lnx, bool enable_3d)
 {
-	(void)lnx;
+	/* The first 3D lifts the 2D-start hold, BEFORE the lens decision: a 3D
+	 * wish before any 2D makes no lens call at all (it is the weaver's). */
+	if (enable_3d) {
+		sdk_tracking_release_hold(lnx, "first 3D request");
+	}
 	pthread_mutex_lock(&g_ctx_lock);
 	if (g_ctx.lens == NULL) {
 		pthread_mutex_unlock(&g_ctx_lock);
