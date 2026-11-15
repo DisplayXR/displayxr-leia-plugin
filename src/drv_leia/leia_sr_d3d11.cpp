@@ -1454,11 +1454,10 @@ lens_2d_dwell_ms()
  * std::thread body terminates the process, and the SR SDK throws as routine
  * control flow.
  *
- * NOTE: the #158 in-place reconnect worker tears down lens_v2 / lens_hint on
- * its OWN thread, so this worker can be mid-call against an object being
- * destroyed. That is the same hazard the synchronous path already had (the
- * runtime's caller thread is not the reconnect thread either); lens_present()
- * plus the try/catch is the mitigation, not a fix.
+ * The #158 in-place reconnect worker tears down lens_v2 / lens_hint on its OWN
+ * thread; it joins this worker first (lens_worker_join, #527), so a worker in
+ * its 2D dwell lands that call on the old objects before they go rather than
+ * on freed ones afterwards.
  */
 void
 lens_worker_body(leiasr_d3d11 *sr)
@@ -1536,11 +1535,20 @@ lens_worker_body(leiasr_d3d11 *sr)
 
 /*!
  * #215: join whatever lens worker is still running and empty the mailbox.
- * Bounded by one in-flight SR call.
+ * Bounded by one in-flight SR call. A no-op when no worker was ever spawned
+ * (a default-constructed std::thread is not joinable).
  *
- * A lens worker can only be spawned once the weaver is READY (the PENDING
- * branch of request_display_mode returns before ever touching the mailbox),
- * so the PENDING→CANCELLED hand-off paths in both destroys need no join.
+ * Every path that deletes the struct or tears down the SDK objects must call
+ * this first (#527): std::thread's destructor calls std::terminate on a
+ * joinable thread, and a finished worker stays joinable until joined. A
+ * PENDING weaver can still own one: a #158 reconnect starts from a READY
+ * weaver that may have posted lens wishes, and the create worker itself posts
+ * a recorded 2D wish through lens_post before its READY CAS. So the reconnect
+ * worker joins before its teardown, and the create/reconnect worker joins on
+ * every CANCELLED exit before `delete`.
+ *
+ * Never call it from the lens worker itself (self-join), and never with a
+ * lock the lens worker takes: it only uses atomics plus lens_set.
  */
 void
 lens_worker_join(leiasr_d3d11 *sr)
@@ -1959,6 +1967,10 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			// iteration there is nothing to tear down, on a retry
 			// create_weaver_attempt already cleaned its own partials, and
 			// after a reconnect teardown everything is already null.
+			// #527: a lens worker may still be joinable (spawned while the
+			// weaver was READY, before a reconnect armed); `delete` on a
+			// joinable std::thread is std::terminate. No-op if none.
+			lens_worker_join(sr);
 			destroy_sdk_objects(sr);
 			delete sr;
 			return;
@@ -2091,6 +2103,7 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 		identified_ms = 0;
 		for (int i = 0; i < 50; i++) {
 			if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
+				lens_worker_join(sr); // #527: same as the loop-top exit
 				destroy_sdk_objects(sr);
 				delete sr;
 				return;
@@ -2141,6 +2154,16 @@ reconnect_worker_body(leiasr_d3d11 *sr, double max_time)
 	// without this a reconnect on that path would be the one unprotected
 	// off-thread context user. Idempotent.
 	enable_context_multithread_protection(sr->d3d11_context);
+
+	// #527: a lens worker posted while we were READY (request_display_mode on
+	// any 2D/3D switch) holds a raw sr pointer and calls into lens_v2 /
+	// lens_hint -- possibly from its 2D dwell, long after it was posted. Join
+	// it before destroy_sdk_objects frees those objects; this also leaves
+	// lens_thread non-joinable, so a CANCELLED exit below can delete sr. A
+	// no-op when no worker was spawned. Our own thread is never the lens
+	// worker and holds no lock, so neither self-join nor deadlock. The mailbox
+	// it empties is re-asserted from last_lens_wish just below.
+	lens_worker_join(sr);
 
 	// Re-assert the mode the runtime last asked for. pending_lens_wish is
 	// CONSUMED at publish so it is empty by now; last_lens_wish is the sticky
