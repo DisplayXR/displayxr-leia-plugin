@@ -250,7 +250,8 @@ if [ -n "$CONV" ]; then
     STAGED_CONV="$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so"
     install -m 0644 "$CONV" "$STAGED_CONV"
     patchelf --remove-rpath "$STAGED_CONV"
-    if objdump -p "$STAGED_CONV" | awk '/NEEDED/{print $2}' | grep -qi neurd; then
+    conv_needed="$(objdump -p "$STAGED_CONV" | awk '/NEEDED/{print $2}')"
+    if grep -qi neurd <<<"$conv_needed"; then
         echo "error: $CONV links NeurD at load time; it must only dlopen libNeurD.so (no NeurD dependency)." >&2
         exit 1
     fi
@@ -259,9 +260,12 @@ if [ -n "$CONV" ]; then
         echo "error: $CONV must export exactly xrtConversionPluginNegotiate, exports: $conv_syms" >&2
         exit 1
     fi
-    # Look-around gate: the READY log's cpu_ex text is compiled in only when the
-    # provider was built against headers declaring NeurD_convert_stream_cpu_ex.
-    if strings "$STAGED_CONV" | grep -q 'convert_stream_cpu_ex, look-around'; then
+    # Look-around gate: this log text sits inside the provider's
+    # DXR_LEIA_NEURD_HAS_CPU_EX code, so it is compiled in only when the headers
+    # declare NeurD_convert_stream_cpu_ex. Captured, not piped: `strings | grep -q`
+    # under pipefail fails on the SIGPIPE even when grep matched.
+    conv_strings="$(strings "$STAGED_CONV")"
+    if grep -qF 'NeurD_convert_stream_cpu_ex -> ' <<<"$conv_strings"; then
         echo "==> Conversion provider: NeurD_convert_stream_cpu_ex compiled in (look-around)"
     elif [ "$ALLOW_NO_LOOK_AROUND" = 1 ]; then
         echo "==> WARNING: conversion provider built WITHOUT NeurD_convert_stream_cpu_ex: fixed pair, no"
