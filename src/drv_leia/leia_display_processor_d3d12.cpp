@@ -30,6 +30,7 @@
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -333,7 +334,15 @@ struct leia_display_processor_d3d12_impl
 	//! 0 = never) and the NO_DISPLAY pass-through state last logged.
 	uint64_t display_poll_ms;
 	bool display_absent_logged;
-	ID3D12Resource *bg_shared_tex;       //!< Opened from bg_capture's shared NT handle.
+
+	//! #529: last ~1 Hz SR backend poll (GetTickCount64, 0 = never) and its
+	//! result. The runtime's D3D12 compositor never calls get_backend_state, so
+	//! process_atlas polls by itself. Atomic: written on the compositor thread,
+	//! read by get_predicted_eye_positions on the app's xrLocateViews thread.
+	//! calloc's zero is LEIA_SR_BACKEND_OK.
+	uint64_t backend_poll_ms;
+	std::atomic<uint32_t> backend_state;
+	ID3D12Resource *bg_shared_tex;      //!< Opened from bg_capture's shared NT handle.
 	ID3D12Fence *bg_fence;               //!< Opened from bg_capture's shared fence handle.
 	ID3D12RootSignature *compose_root_sig;
 	ID3D12PipelineState *compose_pso;
@@ -442,6 +451,41 @@ static inline struct leia_display_processor_d3d12_impl *
 leia_dp_d3d12(struct xrt_display_processor_d3d12 *xdp)
 {
 	return (struct leia_display_processor_d3d12_impl *)xdp;
+}
+
+/*!
+ * #529: record a backend poll result; WARN once on each edge into / out of
+ * STALE. The poll itself logs why (generation change / dead connection); this
+ * line says what the DP does about it.
+ */
+static uint32_t
+leia_dp_d3d12_store_backend_state(struct leia_display_processor_d3d12_impl *ldp, uint32_t state)
+{
+	const uint32_t prev = ldp->backend_state.exchange(state, std::memory_order_relaxed);
+	if ((prev == LEIA_SR_BACKEND_STALE) != (state == LEIA_SR_BACKEND_STALE)) {
+		U_LOG_W("Leia D3D12 DP: SR backend %s", state == LEIA_SR_BACKEND_STALE
+		                                            ? "STALE — reporting eye tracking as lost until the "
+		                                              "display processor is recreated (#529)"
+		                                            : "no longer STALE — eye tracking reported again");
+	}
+	return state;
+}
+
+/*!
+ * #529: ~1 Hz SR-platform health poll, the D3D12 twin of the D3D11 DP's #158
+ * block. The runtime's D3D12 compositor never calls get_backend_state, so
+ * without this a restarted SR platform went unnoticed and the app kept
+ * trusting frozen eye positions. Detection only on this arm — no in-place
+ * reconnect. Cheap: the generation token is cached ~1 s in the sr layer.
+ */
+static void
+leia_dp_d3d12_poll_backend(struct leia_display_processor_d3d12_impl *ldp)
+{
+	const uint64_t now_ms = GetTickCount64();
+	if (ldp->backend_poll_ms == 0 || (now_ms - ldp->backend_poll_ms) > 1000) {
+		ldp->backend_poll_ms = now_ms;
+		(void)leia_dp_d3d12_store_backend_state(ldp, leiasr_d3d12_poll_backend_state(ldp->leiasr));
+	}
 }
 
 // On a failed D3D12 resource create, detect a lost device and report the real
@@ -1608,6 +1652,9 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
+	// #529: first, so every path below (2D blit, NO_DISPLAY, weave) polls.
+	leia_dp_d3d12_poll_backend(ldp);
+
 	// ADR-021: `format` is the real atlas DXGI format (unchanged). This D3D12
 	// variant declares no color capability and no set_atlas_encoding (Model-A
 	// passthrough only); wiring EITHER + the weaver sRGB control here is a
@@ -2127,6 +2174,12 @@ leia_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xd
 		// byte (leia_sr_presence.h).
 		out_eye_pos->is_tracking =
 		    leia_sr_presence_apply(leiasr_d3d12_get_user_presence(ldp->leiasr), (dx * dx + dy * dy + dz * dz) > 1e-6f);
+	}
+	// #529: a STALE weaver keeps answering with the last positions it had
+	// before the SR platform restarted — frozen, and a SUCCESS return. Keep
+	// handing them out (better than no pose) but never as tracked.
+	if (ldp->backend_state.load(std::memory_order_relaxed) == LEIA_SR_BACKEND_STALE) {
+		out_eye_pos->is_tracking = false;
 	}
 	// In 2D mode, average L/R to a single midpoint eye.
 	if (ldp->view_count == 1 && out_eye_pos->count >= 2) {
@@ -2715,7 +2768,8 @@ leia_dp_d3d12_set_background_2d(struct xrt_display_processor_d3d12 *xdp,
  *
  * Detection only on this arm (no in-place reconnect — see the poll's doc):
  * a restarted SR platform is reported STALE, and the runtime's remedy is to
- * recreate the display processor. Computed on demand; non-blocking.
+ * recreate the display processor. Computed on demand; non-blocking. Also
+ * refreshes the state process_atlas polls by itself (#529).
  */
 static bool
 leia_dp_d3d12_get_backend_state(struct xrt_display_processor_d3d12 *xdp, uint32_t *out_state)
@@ -2724,7 +2778,7 @@ leia_dp_d3d12_get_backend_state(struct xrt_display_processor_d3d12 *xdp, uint32_
 	if (ldp == NULL || out_state == NULL) {
 		return false;
 	}
-	*out_state = leiasr_d3d12_poll_backend_state(ldp->leiasr);
+	*out_state = leia_dp_d3d12_store_backend_state(ldp, leiasr_d3d12_poll_backend_state(ldp->leiasr));
 	return true;
 }
 #endif
