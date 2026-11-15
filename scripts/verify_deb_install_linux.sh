@@ -107,6 +107,25 @@ for lib in libpipewire-0.3.so.0 libdbus-1.so.3; do
     grep -q "$lib" <<<"$out" || { echo "error: $lib not resolved on $PRETTY_NAME." >&2; fail=1; }
 done
 
+# The conversion provider (optional payload): its own deps must resolve here
+# too, it must not need NeurD to load, and the manifest must point at it.
+CONV=/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so
+CONV_MANIFEST=/usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json
+if [ -f "$CONV" ]; then
+    grep -q "$CONV" "$CONV_MANIFEST" 2>/dev/null ||
+        { echo "error: $CONV_MANIFEST missing or not pointing at $CONV." >&2; fail=1; }
+    conv_out="$(ldd -r "$CONV" 2>&1)" || true
+    if grep -E 'not found|undefined symbol' <<<"$conv_out"; then
+        echo "error: unresolved dependency in $CONV on $PRETTY_NAME." >&2
+        fail=1
+    elif grep -qi neurd <<<"$conv_out"; then
+        echo "error: $CONV loads NeurD at link time (must dlopen it)." >&2
+        fail=1
+    else
+        echo "    ldd -r $CONV: ok (no NeurD dependency)"
+    fi
+fi
+
 if command -v displayxr-cli >/dev/null 2>&1; then
     echo "=== displayxr-cli selftest (env-free; plug-in must decline, sim-display claims) ==="
     unset XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH DXR_LEIA_FORCE_PROBE

@@ -177,6 +177,39 @@ if(NOT WIN32)
         add_test(NAME test_conv_leia_posix_disabled
             COMMAND conv_leia_harness --provider $<TARGET_FILE:DisplayXR-LeiaConversion>
                     --enable 0 --expect disabled)
+        # The function-table guard (neurd_table_has): a fake 0.5.0 libNeurD.so whose
+        # table ends right before a PROT_NONE page. The provider must reach READY
+        # without reading past the table and take convert_stream_cpu_ex ONLY when
+        # NeurD_get_table_size proves it (tests/fake_neurd.c). Needs headers that
+        # have the entry.
+        if(_lc_cpu_ex)
+            foreach(_v short short_sized full full_sized)
+                set(_t conv_leia_fake_neurd_${_v})
+                add_library(${_t} SHARED tests/fake_neurd.c)
+                target_include_directories(${_t} PRIVATE "${NEURD_SDK_ROOT}/include")
+                if(_v MATCHES "^short")
+                    target_compile_definitions(${_t} PRIVATE FAKE_NEURD_SHORT)
+                endif()
+                if(_v MATCHES "_sized$")
+                    target_compile_definitions(${_t} PRIVATE FAKE_NEURD_EXPORT_SIZE)
+                endif()
+                set_target_properties(${_t} PROPERTIES
+                    OUTPUT_NAME NeurD
+                    C_VISIBILITY_PRESET hidden
+                    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fake_neurd/${_v}")
+                add_dependencies(conv_leia_harness ${_t})
+                if(_v STREQUAL "full_sized")
+                    set(_want "CPU transport: convert_stream_cpu_ex, look-around")
+                else()
+                    set(_want "CPU transport: views only, no look-around")
+                endif()
+                add_test(NAME test_conv_leia_posix_table_${_v}
+                    COMMAND conv_leia_harness --provider $<TARGET_FILE:DisplayXR-LeiaConversion>
+                            --neurd-path $<TARGET_FILE:${_t}> --expect ready)
+                set_tests_properties(test_conv_leia_posix_table_${_v} PROPERTIES
+                    PASS_REGULAR_EXPRESSION "${_want}")
+            endforeach()
+        endif()
     else()
         message(STATUS "Leia conversion provider: stb not found next to the runtime headers - harness not built")
     endif()

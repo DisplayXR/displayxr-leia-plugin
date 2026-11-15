@@ -55,6 +55,8 @@
 
 #include <dlfcn.h>
 #include <limits.h>
+#include <link.h>
+#include <stddef.h>
 #include <strings.h>
 #include <sys/stat.h>
 
@@ -71,9 +73,89 @@
 #include <string>
 #include <vector>
 
-#define LEIA_NEURD_HAS(nd, name) ((nd) != nullptr && (nd)->version >= NEURD_##name##_INTRODUCED_IN && (nd)->name != nullptr)
+//! A NeurD function-table entry the provider may call: see neurd_table_has(). The
+//! offsetof() bound is checked BEFORE the entry is read, so an entry past the end
+//! of an older library's table is never dereferenced.
+#define LEIA_NEURD_HAS(nd, name)                                                                                     \
+	(neurd_table_has((nd), NEURD_##name##_INTRODUCED_IN, offsetof(struct NeurD, name)) && (nd)->name != nullptr)
 
 namespace {
+
+/*
+ *
+ * The loaded NeurD's function-table size (the cpu_ex hazard guard).
+ *
+ * NeurD_load returns a table that only ever grows at the end; an entry is
+ * documented with the version that introduced it, and NeurD's own inline
+ * wrappers test `version >= introduced && entry != NULL`. That test reads the
+ * entry, so it is only sound when the library's table is at least as long as
+ * the caller's header says. It is not for the one version where they can
+ * disagree: a library built at version V BEFORE an entry tagged V was added
+ * (media_sdk dev was 0.5.0 both before and after NeurD_convert_stream_cpu_ex
+ * landed, and a 0.5.0 build without it exists). There the read lands past the
+ * end of the library's table, and calling what it finds segfaults.
+ *
+ * So the provider learns the table's real size and checks the entry's offset
+ * against it before reading the entry:
+ *   1. NeurD_get_table_size(), when the library exports it (the explicit query);
+ *   2. else the size of the dynamic symbol the table pointer points at, through
+ *      dladdr1(RTLD_DL_SYMENT): libNeurD.so builds without the export version
+ *      script (before media_sdk's Linux installer, every 0.4.x) export the
+ *      table object `g_NeurD` with its ELF st_size;
+ *   3. else unknown: an entry is then trusted only when the library's version
+ *      is STRICTLY newer than the entry's (a later version always carries it);
+ *      an entry introduced at exactly the library's version is treated as
+ *      absent -- the caller takes its fallback (convert_stream_cpu), never the
+ *      guess.
+ *
+ */
+
+size_t g_table_bytes = 0;            //!< 0 = unknown
+const char *g_table_src = "unknown"; //!< how g_table_bytes was learned
+
+//! NeurD exports this from the version that adds it; resolved by name, so the
+//! provider needs no header for it.
+typedef uint32_t (*PFN_neurd_get_table_size)(void);
+
+size_t
+neurd_table_size(void *lib, struct NeurD const *nd, const char **src)
+{
+	const auto fn = reinterpret_cast<PFN_neurd_get_table_size>(dlsym(lib, "NeurD_get_table_size"));
+	if (fn != nullptr) {
+		const uint32_t n = fn();
+		if (n >= sizeof(uint64_t) && n <= 65536u) {
+			*src = "NeurD_get_table_size";
+			return n;
+		}
+	}
+	Dl_info info = {};
+	void *extra = nullptr;
+	if (dladdr1(nd, &info, &extra, RTLD_DL_SYMENT) == 0) {
+		extra = nullptr;
+	}
+	const ElfW(Sym) *sym = static_cast<const ElfW(Sym) *>(extra);
+	if (sym != nullptr &&
+	    info.dli_saddr == nd && ELF64_ST_TYPE(sym->st_info) == STT_OBJECT && sym->st_size >= sizeof(uint64_t) &&
+	    sym->st_size <= 65536u) {
+		*src = "exported table object size";
+		return (size_t)sym->st_size;
+	}
+	*src = "unknown";
+	return 0;
+}
+
+//! True when the loaded table provably holds the entry at @p offset (see above).
+bool
+neurd_table_has(struct NeurD const *nd, uint64_t introduced, size_t offset)
+{
+	if (nd == nullptr || nd->version < introduced) {
+		return false;
+	}
+	if (g_table_bytes != 0) {
+		return offset + sizeof(void *) <= g_table_bytes;
+	}
+	return nd->version > introduced;
+}
 
 /*
  *
@@ -679,6 +761,15 @@ leia_lift_neurd_activate(struct leia_lift_neurd *lift)
 		        (unsigned)NEURD_GET_VERSION_PATCH(NEURD_VERSION));
 		snprintf(g.version, sizeof(g.version), "%u.%u.%u", (unsigned)NEURD_GET_VERSION_MAJOR(nd->version),
 		         (unsigned)NEURD_GET_VERSION_MINOR(nd->version), (unsigned)NEURD_GET_VERSION_PATCH(nd->version));
+		g_table_bytes = neurd_table_size(lib, nd, &g_table_src);
+		if (g_table_bytes != 0) {
+			U_LOG_W("Leia conversion: NeurD function table %zu bytes (%s; this provider's header: %zu)",
+			        g_table_bytes, g_table_src, sizeof(struct NeurD));
+		} else {
+			U_LOG_W("Leia conversion: NeurD function table size unknown (no NeurD_get_table_size, no sized table "
+			        "symbol): entries introduced in %s itself are not trusted",
+			        g.version);
+		}
 		if (nd->version < g.k.min_version) {
 			set_failed(LEIA_LIFT_MODULE_TOO_OLD, false, "NeurD %s is older than the minimum %u.%u.%u", g.version,
 			           (unsigned)NEURD_GET_VERSION_MAJOR(g.k.min_version),
@@ -773,7 +864,7 @@ leia_lift_neurd_activate(struct leia_lift_neurd *lift)
 	        (double)g.k.view_gain, (double)g.k.y_gain, g.k.offaxis ? 1 : 0, (double)g.k.relief_m,
 	        g.cpu_ex ? (g.float_depth ? "convert_stream_cpu_ex, look-around + float depth"
 	                                  : "convert_stream_cpu_ex, look-around, no float depth on this backend")
-	                 : "views only, no look-around (NeurD < 0.5.0 or provider built without cpu_ex)");
+	                 : "views only, no look-around (NeurD < 0.5.0, its table lacks cpu_ex, or provider built without cpu_ex)");
 	return g.module_status;
 }
 
@@ -978,7 +1069,7 @@ log_camera(lift_stream *s,
 	}
 	U_LOG_W("Leia conversion: stream %llu camera = %s (%s)", (unsigned long long)s->id,
 	        dimless ? "LEGACY dimensionless [convert_stream_cpu_ex]" : "FIXED pair [convert_stream_cpu, no look-around]",
-	        !g.cpu_ex        ? "NeurD has no convert_stream_cpu_ex (< 0.5.0)"
+	        !g.cpu_ex        ? "NeurD has no convert_stream_cpu_ex (< 0.5.0, or not in its function table)"
 	        : !g.k.offaxis   ? "OffAxis=0"
 	        : !g.offaxis_ok  ? "NeurD has no GL view renderer in this process"
 	                         : "the runtime passed no rect-relative viewpoint policy / rect size");
