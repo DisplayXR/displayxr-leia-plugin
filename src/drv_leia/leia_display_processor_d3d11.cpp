@@ -2863,12 +2863,16 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 	// (an all-zero mask — Tier-1 enable3D=FALSE — must collapse to 2D).
 	const bool need_eval = !ldp->zone_eval_valid || seq != ldp->zone_eval_seq;
 	if (need_eval) {
-		// Issue the copy once per generation; every later publish of the same
-		// seq only polls the map below. A mask resize mid-generation also
-		// re-issues — otherwise the scan below would read a stale-sized
-		// staging texture.
-		if (!ldp->zone_readback_pending || ldp->zone_readback_seq != seq ||
-		    ldp->zone_staging_w != mask_width || ldp->zone_staging_h != mask_height) {
+		// Issue the copy once per generation; every later publish only polls
+		// the map below. A copy in flight for an OLDER generation is NOT
+		// restarted for a newer one: it is finished and evaluated first, and the
+		// next publish then copies the newest generation. Restarting it instead
+		// starves the evaluation for good when the generation moves every frame
+		// (the copy never lands before the next restart), which left the lens
+		// unevaluated for a whole session. A mask resize still re-issues —
+		// otherwise the scan below would read a stale-sized staging texture.
+		if (!ldp->zone_readback_pending || ldp->zone_staging_w != mask_width ||
+		    ldp->zone_staging_h != mask_height) {
 			if (ldp->zone_staging == nullptr || ldp->zone_staging_w != mask_width ||
 			    ldp->zone_staging_h != mask_height) {
 				if (ldp->zone_staging != nullptr) {
@@ -2950,8 +2954,11 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 
 			const bool first_eval = !ldp->zone_eval_valid;
 			const bool verdict_changed = first_eval || ldp->zone_want_3d != any;
+			// The verdict belongs to the generation that was COPIED, which may be
+			// older than this publish's; a newer one is copied next publish.
+			const uint64_t evaluated_seq = ldp->zone_readback_seq;
 			ldp->zone_want_3d = any;
-			ldp->zone_eval_seq = seq;
+			ldp->zone_eval_seq = evaluated_seq;
 			ldp->zone_eval_valid = true;
 			ldp->zone_readback_pending = false;
 
@@ -2971,12 +2978,12 @@ leia_dp_d3d11_publish_local_zone_mask(struct xrt_display_processor_d3d11 *xdp,
 			if (verdict_changed) {
 				U_LOG_W("SR D3D11 zone: generation %llu evaluated → %s (mask %ux%u, 1x1 collapse; "
 				        "readback %.1f ms over %u poll%s%s)",
-				        (unsigned long long)seq, any ? "3D" : "2D", mask_width, mask_height, ms,
+				        (unsigned long long)evaluated_seq, any ? "3D" : "2D", mask_width, mask_height, ms,
 				        ldp->zone_readback_polls, ldp->zone_readback_polls == 1 ? "" : "s",
 				        ldp->async_zone_publish ? "" : " [blocking]");
 			} else {
 				U_LOG_I("SR D3D11 zone: generation %llu evaluated → %s (unchanged; readback %.1f ms over %u poll%s%s)",
-				        (unsigned long long)seq, any ? "3D" : "2D", ms, ldp->zone_readback_polls,
+				        (unsigned long long)evaluated_seq, any ? "3D" : "2D", ms, ldp->zone_readback_polls,
 				        ldp->zone_readback_polls == 1 ? "" : "s", ldp->async_zone_publish ? "" : " [blocking]");
 			}
 		}
