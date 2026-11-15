@@ -59,8 +59,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# #528: read-only by default; only DebRelease (tags) gets contents: write.
 permissions:
-  contents: write # the Deb job attaches release assets on tags
+  contents: read
 
 env:
   # Runtime ref the Linux arm builds against. MUST equal the CMake
@@ -837,6 +838,8 @@ jobs:
     needs: [Deb, DebInstall]
     if: needs.Deb.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release upload; nothing else in this workflow writes
     steps:
       - uses: actions/download-artifact@v4
         with:
