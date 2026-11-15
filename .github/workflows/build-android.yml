@@ -49,8 +49,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# #528: read-only by default; only AndroidRelease (tags) gets contents: write.
 permissions:
-  contents: write # release-asset attach on v* tags
+  contents: read
 
 env:
   # ADR-020 rule 5, Android track. MUST equal CMakeLists.txt's
@@ -231,6 +232,8 @@ env:
 jobs:
   Android:
     runs-on: ubuntu-latest
+    outputs:
+      have_sdk: ${{ steps.cnsdk.outputs.have_sdk }}
     steps:
       - name: Checkout plug-in
         uses: actions/checkout@v4
@@ -491,18 +494,37 @@ jobs:
             build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so
           if-no-files-found: error
 
-      # NOTE: no generate_release_notes here. build-windows.yml owns that flag
-      # exclusively in this repo -- the action folds it into `body` and appends
-      # on update, so a second flagged workflow duplicates the notes.
-      - name: Attach .so tarball to the GitHub Release (tags only)
-        if: steps.cnsdk.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.tar.gz
-          fail_on_unmatched_files: true
-
       # No DispatchVersionsBump: build-windows.yml owns it and the .so rides the
       # same versions.json[leia_plugin] tag -- same policy as build-linux.yml.
       - name: CNSDK unavailable — job skipped
         if: steps.cnsdk.outputs.have_sdk != 'yes'
         run: echo "have_sdk=no; Android build skipped (no LEIALOFT_GITHUB_TOKEN). Reporting success."
+
+  # #528: the release upload, in its own job so contents: write is granted to
+  # nothing else (the Android job builds against a third-party SDK and must
+  # not hold a write token) -- same shape as build-linux.yml's DebRelease. The
+  # tarball comes from the Android job's artifact; a same-run
+  # download-artifact@v4 needs no `actions: read`.
+  AndroidRelease:
+    needs: [Android]
+    if: needs.Android.outputs.have_sdk == 'yes' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Upload root is the workspace (common ancestor of dist/ and
+      # build-android/), so the tarball lands back at dist/*.tar.gz. The raw
+      # .so comes along under build-android/ and is not attached.
+      - uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR-Leia-CNSDK-android-${{ env.ANDROID_ABI }}
+          path: .
+
+      # NOTE: no generate_release_notes here. build-windows.yml owns that flag
+      # exclusively in this repo -- the action folds it into `body` and appends
+      # on update, so a second flagged workflow duplicates the notes.
+      - name: Attach .so tarball to the GitHub Release (tags only)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true

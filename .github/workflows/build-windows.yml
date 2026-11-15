@@ -11,8 +11,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# #528: read-only by default. Only InstallerRelease (tag pushes) gets
+# contents: write, to create the GitHub Release and attach the installer.
+# Build compiles third-party actions + PR code and must not hold a write token.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   DetectChanges:
@@ -466,17 +469,36 @@ jobs:
             _package/DisplayXRLeiaSRSetup-*.exe
           if-no-files-found: error
 
-      # Attach the Windows installer to the v* GitHub release on tag push —
-      # mirrors the runtime's pattern (DisplayXR/displayxr-runtime#290). Before
-      # this step, cutting a leia release required a manual `gh run download`
-      # + `gh release create` dance after every tag (as we did for v1.0.6).
-      # Now: tag → CI builds → installer attached automatically. The first
-      # workflow to complete on the tag creates the release; subsequent ones
-      # (none here, but the pattern matches the runtime) would append.
-      # Only the installer .exe is attached; the raw DLL stays in the CI
-      # artifact bundle for debugging access via `gh run download`.
+  # Attach the Windows installer to the v* GitHub release on tag push —
+  # mirrors the runtime's pattern (DisplayXR/displayxr-runtime#290). Before
+  # this, cutting a leia release required a manual `gh run download`
+  # + `gh release create` dance after every tag (as we did for v1.0.6).
+  # Now: tag → CI builds → installer attached automatically. The first
+  # workflow to complete on the tag creates the release; build-linux.yml's
+  # DebRelease and build-android.yml's AndroidRelease append to it.
+  # Only the installer .exe is attached; the raw DLLs stay in the CI
+  # artifact bundle for debugging access via `gh run download`.
+  #
+  # #528: its own job (was the last step of Build) so contents: write is
+  # granted to nothing but this upload — same shape as build-linux.yml's
+  # DebRelease. The installer comes from Build's artifact; a same-run
+  # download-artifact@v4 uses the runner's own token, not GITHUB_TOKEN, so
+  # it needs no `actions: read`.
+  InstallerRelease:
+    needs: [DetectChanges, Build]
+    if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Upload root is _package/ (the common ancestor of the artifact paths),
+      # so this lands the installer back at _package/DisplayXRLeiaSRSetup-*.exe.
+      - uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR-LeiaSR
+          path: _package
+
       - name: Attach Windows installer to GitHub release on tag
-        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: _package/DisplayXRLeiaSRSetup-*.exe
@@ -500,9 +522,14 @@ jobs:
   # Contract: "released = tested." A tagged release here means this
   # plug-in is intended to drop into the dev-orchestrator bundle.
   # See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
+  #
+  # Needs InstallerRelease, not just Build: the dispatch used to run after the
+  # attach step inside Build, so the runtime side always found the installer
+  # on the release. Keep that order. Authenticates with the App token below;
+  # GITHUB_TOKEN (read-only here) is not used.
   DispatchVersionsBump:
     if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-leia-plugin' }}
-    needs: [Build]
+    needs: [Build, InstallerRelease]
     runs-on: ubuntu-latest
     steps:
       - name: Mint dispatch token
