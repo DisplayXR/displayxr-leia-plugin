@@ -1943,6 +1943,22 @@ leia_dp_get_window_metrics(struct xrt_display_processor *xdp, struct xrt_window_
 	return leiasr_get_window_metrics(ldp->leiasr, (struct leiasr_window_metrics *)out_metrics);
 }
 
+/*!
+ * MANAGED (0) / MANUAL (1) eye tracking (runtime set_eye_tracking_mode). The
+ * runtime pushes the advertised default at session start and the app's
+ * xrRequestEyeTrackingModeDXR after; it only ever passes a mode
+ * get_display_info advertised, so MANUAL arrives only when the SR runtime has
+ * the tracking-loss mode. Stored on the SR wrapper, which applies it to every
+ * weaver this DP owns, now and later. Never a lens call: MANUAL never
+ * switches 2D/3D on a loss.
+ */
+static void
+leia_dp_set_eye_tracking_mode(struct xrt_display_processor *xdp, uint32_t mode)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	leiasr_set_tracking_loss_mode(ldp->leiasr, mode);
+}
+
 static bool
 leia_dp_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
 {
@@ -2349,6 +2365,7 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 	ldp->base.base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.base.get_window_metrics = leia_dp_get_window_metrics;
 	ldp->base.base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.base.set_eye_tracking_mode = leia_dp_set_eye_tracking_mode;
 	ldp->base.base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
 	ldp->base.base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.base.get_display_pixel_info = leia_dp_get_display_pixel_info;
@@ -2533,6 +2550,7 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	ldp->base.base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.base.get_window_metrics = leia_dp_get_window_metrics;
 	ldp->base.base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.base.set_eye_tracking_mode = leia_dp_set_eye_tracking_mode;
 	ldp->base.base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
 	ldp->base.base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.base.get_display_pixel_info = leia_dp_get_display_pixel_info;

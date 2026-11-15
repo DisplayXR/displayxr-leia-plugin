@@ -257,6 +257,8 @@ enum leia_sr_weaver_tracking
 	LEIA_SR_WEAVER_TRACKING_TRACKING = 1, //!< The eyes follow a viewer.
 	LEIA_SR_WEAVER_TRACKING_LOST = 2,     //!< Tracking runs but has no face (lags a real loss).
 	LEIA_SR_WEAVER_TRACKING_RESTED = 3,   //!< The weaver's tracking rests: nobody is being looked for.
+	//! MANUAL weavers only: a viewer is tracked but outside the viewing zone.
+	LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE = 4,
 };
 
 /*!
@@ -271,6 +273,38 @@ static inline enum leia_sr_presence
 leia_sr_presence_with_weaver(enum leia_sr_presence p, enum leia_sr_weaver_tracking w)
 {
 	return w == LEIA_SR_WEAVER_TRACKING_RESTED ? LEIA_SR_PRESENCE_ABSENT : p;
+}
+
+/*!
+ * The same fold for a weaver in MANUAL tracking-loss mode
+ * (XR_EYE_TRACKING_MODE_MANUAL_DXR; docs/specs/vendor/eye-tracking-modes.md).
+ *
+ * MANUAL's contract is "isTracking flips immediately", and there nothing
+ * collapses the eye pair any more (the weaver holds the last pair on a loss and
+ * passes out-of-zone eyes through), so the pair heuristic would read "tracked"
+ * for ever. The weaver's own state is therefore authoritative: TRACKING is a
+ * viewer unless this display's presence says ABSENT (the faster signal);
+ * LOST (the tracker's debounced face loss), OUT_OF_ZONE and RESTED are none.
+ * With no answer (an SR runtime without the query, no weaver yet) it is the
+ * MANAGED fold, i.e. presence, then the pair heuristic.
+ *
+ * @param manual  The weaver really is in MANUAL (the mode took), not merely
+ *                that MANUAL was asked for.
+ */
+static inline enum leia_sr_presence
+leia_sr_presence_with_weaver_mode(enum leia_sr_presence p, enum leia_sr_weaver_tracking w, bool manual)
+{
+	if (!manual) {
+		return leia_sr_presence_with_weaver(p, w);
+	}
+	switch (w) {
+	case LEIA_SR_WEAVER_TRACKING_TRACKING:
+		return p == LEIA_SR_PRESENCE_ABSENT ? LEIA_SR_PRESENCE_ABSENT : LEIA_SR_PRESENCE_PRESENT;
+	case LEIA_SR_WEAVER_TRACKING_LOST:
+	case LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE:
+	case LEIA_SR_WEAVER_TRACKING_RESTED: return LEIA_SR_PRESENCE_ABSENT;
+	default: return leia_sr_presence_with_weaver(p, w);
+	}
 }
 
 #ifdef __cplusplus

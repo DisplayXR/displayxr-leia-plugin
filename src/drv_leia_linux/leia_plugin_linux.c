@@ -309,10 +309,11 @@ leia_lnx_plugin_get_display_info(struct xrt_plugin_instance *inst,
 		}
 	}
 
-	/* MANAGED-only for v1, Windows parity (contract R-T4; R-T5 MANUAL is a
-	 * SHOULD the stub also honors as a no-op). */
-	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
-	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+	/* MANAGED always; MANUAL too when the SR runtime has the per-weaver
+	 * tracking-loss mode (R-T5). Default stays MANAGED. */
+	out_info->supported_eye_tracking_modes =
+	    leiasr_lnx_tracking_loss_mode_available() ? 3u /* MANAGED|MANUAL */ : 1u /* MANAGED_BIT */;
+	out_info->default_eye_tracking_mode = 0u; /* MANAGED */
 
 	// refresh_mhz was appended to the info struct (append-only rule) —
 	// clamp the write to the runtime's advertised struct_size.

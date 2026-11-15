@@ -21,12 +21,15 @@
 #include <sr/sr_instance.h>
 #include <sr/sr_result.h>
 #include <sr/sr_version.h>
+#include <sr/sr_weaver.h>
 #endif
 
 namespace {
 
 enum leia_sr_api g_api = LEIA_SR_API_V1;
 char g_reason[192] = "unresolved";
+//! The v2 runtime has srWeaverSetTrackingLossMode (MANUAL eye tracking).
+bool g_loss_mode = false;
 std::once_flag g_once;
 
 void
@@ -76,6 +79,21 @@ v2_runtime_usable(char *version_out, size_t version_cap)
 		snprintf(ver, sizeof(ver), "version unknown");
 	}
 	snprintf(version_out, version_cap, "%s", ver);
+
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	// MANUAL eye tracking: SR's own probe is the call with a NULL weaver after
+	// srCreateInstance. HANDLE_INVALID = the function exists; an older runtime
+	// answers FUNCTION_UNSUPPORTED. No side effect either way.
+	SrResult lm = SR_ERROR_FUNCTION_UNSUPPORTED;
+	try {
+		lm = srWeaverSetTrackingLossMode(nullptr, SR_TRACKING_LOSS_MODE_MANAGED);
+	} catch (...) {
+		lm = SR_ERROR_FUNCTION_UNSUPPORTED;
+	}
+	g_loss_mode = lm == SR_ERROR_HANDLE_INVALID;
+	U_LOG_W("SR weaver tracking-loss mode (MANUAL eye tracking): %s (probe %d)",
+	        g_loss_mode ? "supported" : "not in this SR runtime", (int)lm);
+#endif
 
 	srDestroyInstance(inst);
 	return true;
@@ -180,4 +198,10 @@ leia_sr_api_reason(void)
 {
 	(void)leia_sr_api_selected(); // ensure resolved
 	return g_reason;
+}
+
+extern "C" bool
+leia_sr_api_tracking_loss_mode_available(void)
+{
+	return leia_sr_api_selected() == LEIA_SR_API_V2 && g_loss_mode;
 }

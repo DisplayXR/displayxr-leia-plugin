@@ -63,6 +63,9 @@ struct leiasr_d3d12
 	//! monitor, so a frame-thread read never races the monitor's destroy.
 	struct leia_sr_presence_monitor *presence = nullptr;
 	std::atomic<int32_t> presence_state{0};
+	//! MANAGED/MANUAL tracking-loss mode (the runtime's set_eye_tracking_mode),
+	//! reconciled onto whichever weaver is current at each presence read.
+	struct leia_sr_v2_loss_mode_sync loss_mode;
 	//! The weaver waits at tracking policy OFF for its first 3D enable
 	//! (leia_sr_v2_weaver_apply_tracking_policy, 2D start).
 	std::atomic<bool> tracking_held_off{false};
@@ -1735,8 +1738,12 @@ leiasr_d3d12_get_user_presence(struct leiasr_d3d12 *leiasr)
 		// A rested weaver means "no viewer", ahead of the display's presence
 		// (leia_sr_presence_with_weaver). weaver_v2 is read only once READY.
 		const SrWeaver w = w_ready(leiasr) ? leiasr->weaver_v2 : nullptr;
-		return leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state),
-		                                    leia_sr_v2_weaver_tracking(w));
+		// MANUAL (XR eye-tracking mode): the weaver's own state decides
+		// (leia_sr_presence_with_weaver_mode); the mode is reconciled onto
+		// the current weaver here, so a recreated one picks it up too.
+		const bool manual = leia_sr_v2_sync_tracking_loss_mode(w, &leiasr->loss_mode, "D3D12");
+		return leia_sr_presence_with_weaver_mode(leia_sr_presence_load(leiasr->presence_state),
+		                                         leia_sr_v2_weaver_tracking(w), manual);
 	}
 #else
 	(void)leiasr;
@@ -2032,3 +2039,17 @@ leiasr_d3d12_poll_backend_state(struct leiasr_d3d12 *leiasr)
 }
 
 } // extern "C"
+
+void
+leiasr_d3d12_set_tracking_loss_mode(struct leiasr_d3d12 *leiasr, uint32_t mode)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr != nullptr) {
+		// Stored only: the next presence read applies it to the current weaver.
+		leiasr->loss_mode.wanted.store(mode == 1u ? 1u : 0u, std::memory_order_release);
+	}
+#else
+	(void)leiasr;
+	(void)mode;
+#endif
+}

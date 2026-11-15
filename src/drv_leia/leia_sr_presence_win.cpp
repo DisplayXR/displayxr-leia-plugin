@@ -329,11 +329,66 @@ leia_sr_v2_weaver_tracking(SrWeaver weaver)
 	case SR_TRACKING_STATE_TRACKING: return LEIA_SR_WEAVER_TRACKING_TRACKING;
 	case SR_TRACKING_STATE_LOST: return LEIA_SR_WEAVER_TRACKING_LOST;
 	case SR_TRACKING_STATE_RESTED: return LEIA_SR_WEAVER_TRACKING_RESTED;
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	case SR_TRACKING_STATE_OUT_OF_ZONE: return LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE;
+#endif
 	default: return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
 	}
 #else
 	(void)weaver;
 	return LEIA_SR_WEAVER_TRACKING_UNKNOWN;
+#endif
+}
+
+bool
+leia_sr_v2_sync_tracking_loss_mode(SrWeaver weaver, struct leia_sr_v2_loss_mode_sync *sync, const char *arm)
+{
+	if (sync == nullptr) {
+		return false;
+	}
+	const uint32_t wanted = sync->wanted.load(std::memory_order_acquire);
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	if (weaver == nullptr) {
+		return false;
+	}
+	// Held across the SR call only when the mode actually changes (rare);
+	// otherwise one compare.
+	std::lock_guard<std::mutex> lock(sync->mutex);
+	if (sync->applied_weaver == weaver && sync->applied_wanted == wanted) {
+		return sync->applied_manual;
+	}
+	// A new weaver (first frame, #144 recreation) or a new request.
+	const bool was_manual = sync->applied_weaver == weaver && sync->applied_manual;
+	SrResult r = SR_ERROR_HANDLE_INVALID;
+	if (wanted == 1u || was_manual) {
+		const SrTrackingLossMode m = wanted == 1u ? SR_TRACKING_LOSS_MODE_MANUAL : SR_TRACKING_LOSS_MODE_MANAGED;
+		try {
+			r = srWeaverSetTrackingLossMode(weaver, m);
+		} catch (...) {
+			r = SR_ERROR_HANDLE_INVALID;
+		}
+	} else {
+		// MANAGED on a weaver that never left it: SR's default, no call.
+		r = SR_SUCCESS;
+	}
+	sync->applied_weaver = weaver;
+	sync->applied_wanted = wanted;
+	sync->applied_manual = wanted == 1u && SR_SUCCEEDED(r);
+	if (wanted == 1u || was_manual) {
+		if (SR_SUCCEEDED(r)) {
+			U_LOG_W("SR %s weaver tracking-loss mode: %s (XR eye-tracking mode %s)", arm,
+			        sync->applied_manual ? "MANUAL" : "MANAGED", wanted == 1u ? "MANUAL" : "MANAGED");
+		} else {
+			U_LOG_W("SR %s weaver tracking-loss mode %s NOT applied: %s (%d) — the weaver stays MANAGED", arm,
+			        wanted == 1u ? "MANUAL" : "MANAGED", leia_sr_v2_result_str(r), (int)r);
+		}
+	}
+	return sync->applied_manual;
+#else
+	(void)weaver;
+	(void)arm;
+	(void)wanted;
+	return false;
 #endif
 }
 

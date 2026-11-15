@@ -225,6 +225,40 @@ test_rested_weaver_wins_over_presence(void)
 	      LEIA_SR_PRESENCE_UNKNOWN);
 }
 
+// MANUAL (XR_EYE_TRACKING_MODE_MANUAL_DXR): the weaver's own state decides,
+// because nothing collapses the eye pair any more.
+static void
+test_manual_mode_weaver_state_decides(void)
+{
+	// TRACKING is a viewer, unless the display's own presence already says gone.
+	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
+	      LEIA_SR_PRESENCE_PRESENT);
+	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
+	      LEIA_SR_PRESENCE_PRESENT);
+	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_ABSENT, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
+	      LEIA_SR_PRESENCE_ABSENT);
+	// LOST / OUT_OF_ZONE / RESTED are no viewer, whatever presence says, and
+	// whatever the (held, never collapsed) pair looks like.
+	const enum leia_sr_weaver_tracking none[] = {LEIA_SR_WEAVER_TRACKING_LOST, LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE,
+	                                              LEIA_SR_WEAVER_TRACKING_RESTED};
+	for (size_t i = 0; i < sizeof(none) / sizeof(none[0]); i++) {
+		CHECK(!leia_sr_presence_apply(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_PRESENT, none[i], true),
+		                              true));
+		CHECK(!leia_sr_presence_apply(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_UNKNOWN, none[i], true),
+		                              true));
+	}
+	// No answer from the weaver: exactly the MANAGED fold (presence, then the pair).
+	CHECK(leia_sr_presence_apply(
+	          leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_UNKNOWN, true), true));
+	CHECK(!leia_sr_presence_apply(
+	    leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_UNKNOWN, true), false));
+	// MANAGED is byte for byte today's fold, LOST still lagging behind presence.
+	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_LOST, false) ==
+	      LEIA_SR_PRESENCE_PRESENT);
+	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_RESTED, false) ==
+	      LEIA_SR_PRESENCE_ABSENT);
+}
+
 int
 main(void)
 {
@@ -235,6 +269,7 @@ main(void)
 	test_matching();
 	test_apply_unknown_is_todays_heuristic();
 	test_rested_weaver_wins_over_presence();
+	test_manual_mode_weaver_state_decides();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_presence: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

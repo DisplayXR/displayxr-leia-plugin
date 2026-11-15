@@ -41,6 +41,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -71,6 +73,14 @@ leia_sr_api_selected(void);
  */
 const char *
 leia_sr_api_reason(void);
+
+/*!
+ * The selected API is v2 AND its runtime has srWeaverSetTrackingLossMode, so
+ * the DPs can serve XR_EYE_TRACKING_MODE_MANUAL_DXR. Probed once, with the
+ * v2 runtime check. Only meaningful after leia_sr_client_bind() succeeded.
+ */
+bool
+leia_sr_api_tracking_loss_mode_available(void);
 
 #ifdef __cplusplus
 }

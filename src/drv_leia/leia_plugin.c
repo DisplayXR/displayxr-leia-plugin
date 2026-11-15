@@ -34,6 +34,7 @@
 
 #include "leia_interface.h"
 #include "leia_platform_state.h"
+#include "leia_sr_api_select.h"
 #include "leia_display_claims_win.h"
 #include "leia_display_processor.h"
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
@@ -264,10 +265,17 @@ leia_plugin_get_display_info(struct xrt_plugin_instance *inst,
                 }
         }
 
-        /* Leia: MANAGED eye tracking only — the SR SDK owns the grace
-	 * period + transition handling. */
-	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
-	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+	/*
+	 * MANAGED always (the SR runtime owns the grace period + collapse). MANUAL
+	 * too when the SR runtime has the per-weaver tracking-loss mode: the DPs
+	 * then put their weavers in MANUAL on the runtime's set_eye_tracking_mode
+	 * and report isTracking from the weaver's state. Default stays MANAGED.
+	 * The probe is an SR call, so only once the SR client DLLs are bound.
+	 */
+	out_info->supported_eye_tracking_modes =
+	    (leia_sr_client_bound() && leia_sr_api_tracking_loss_mode_available()) ? 3u /* MANAGED|MANUAL */
+	                                                                          : 1u /* MANAGED_BIT */;
+	out_info->default_eye_tracking_mode = 0u; /* MANAGED */
 
 	return any_populated;
 }
