@@ -31,6 +31,7 @@
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -69,6 +70,14 @@ struct leia_display_processor
 	//! never) and the NO_DISPLAY pass-through state last logged.
 	uint64_t display_poll_ns;
 	bool display_absent_logged;
+
+	//! #529: os_monotonic_get_ns() of the last ~1 Hz SR backend poll (0 =
+	//! never) and its result. The runtime's vk_native compositor never calls
+	//! get_backend_state, so process_atlas polls by itself. Atomic: written on
+	//! the compositor thread, read by get_predicted_eye_positions on the app's
+	//! xrLocateViews thread. calloc's zero is LEIA_SR_BACKEND_OK.
+	uint64_t backend_poll_ns;
+	std::atomic<uint32_t> backend_state;
 
 	VkRenderPass render_pass;   //!< Render pass for framebuffer compatibility.
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
@@ -178,6 +187,41 @@ static inline struct leia_display_processor *
 leia_display_processor(struct xrt_display_processor *xdp)
 {
 	return (struct leia_display_processor *)xdp;
+}
+
+/*!
+ * #529: record a backend poll result; WARN once on each edge into / out of
+ * STALE. The poll itself logs why (generation change / dead connection); this
+ * line says what the DP does about it.
+ */
+static uint32_t
+leia_dp_vk_store_backend_state(struct leia_display_processor *ldp, uint32_t state)
+{
+	const uint32_t prev = ldp->backend_state.exchange(state, std::memory_order_relaxed);
+	if ((prev == LEIA_SR_BACKEND_STALE) != (state == LEIA_SR_BACKEND_STALE)) {
+		U_LOG_W("Leia VK DP: SR backend %s", state == LEIA_SR_BACKEND_STALE
+		                                         ? "STALE — reporting eye tracking as lost until the "
+		                                           "display processor is recreated (#529)"
+		                                         : "no longer STALE — eye tracking reported again");
+	}
+	return state;
+}
+
+/*!
+ * #529: ~1 Hz SR-platform health poll, the Vulkan twin of the D3D11 DP's #158
+ * block. The runtime's vk_native compositor never calls get_backend_state, so
+ * without this a restarted SR platform went unnoticed and the app kept
+ * trusting frozen eye positions. Detection only on this arm — no in-place
+ * reconnect. Cheap: the generation token is cached ~1 s in the sr layer.
+ */
+static void
+leia_dp_vk_poll_backend(struct leia_display_processor *ldp)
+{
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (ldp->backend_poll_ns == 0 || (now_ns - ldp->backend_poll_ns) > 1000000000ull) {
+		ldp->backend_poll_ns = now_ns;
+		(void)leia_dp_vk_store_backend_state(ldp, leiasr_poll_backend_state(ldp->leiasr));
+	}
 }
 
 
@@ -1602,6 +1646,10 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	struct vk_bundle *vk = ldp->vk;
 
+	// #529: first, so every path below (off-target canvas, 2D blit,
+	// NO_DISPLAY, weave) polls.
+	leia_dp_vk_poll_backend(ldp);
+
 	/*
 	 * Multi-screen M6: a SEGMENT DP (created for one screen,
 	 * create_dp_vk_for_screen) writes only its canvas — a sibling DP may
@@ -1871,6 +1919,12 @@ leia_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xr
 	if (!leiasr_get_predicted_eye_positions(ldp->leiasr, (struct leiasr_eye_pair *)out_eye_pos)) {
 		return false;
 	}
+	// #529: a STALE weaver keeps answering with the last positions it had
+	// before the SR platform restarted — frozen, and a SUCCESS return. Keep
+	// handing them out (better than no pose) but never as tracked.
+	if (ldp->backend_state.load(std::memory_order_relaxed) == LEIA_SR_BACKEND_STALE) {
+		out_eye_pos->is_tracking = false;
+	}
 	// In 2D mode, average L/R to a single midpoint eye.
 	if (ldp->view_count == 1 && out_eye_pos->count >= 2) {
 		out_eye_pos->eyes[0].x = (out_eye_pos->eyes[0].x + out_eye_pos->eyes[1].x) * 0.5f;
@@ -2003,7 +2057,8 @@ leia_dp_vk_set_predicted_scanout(struct xrt_display_processor_vk *xdp,
  *
  * Detection only on this arm (no in-place reconnect — see the poll's doc): a
  * restarted SR platform is reported STALE, and the runtime's remedy is to
- * recreate the display processor. Computed on demand; non-blocking.
+ * recreate the display processor. Computed on demand; non-blocking. Also
+ * refreshes the state process_atlas polls by itself (#529).
  */
 static bool
 leia_dp_vk_get_backend_state(struct xrt_display_processor_vk *xdp, uint32_t *out_state)
@@ -2012,7 +2067,7 @@ leia_dp_vk_get_backend_state(struct xrt_display_processor_vk *xdp, uint32_t *out
 	if (ldp == nullptr || out_state == nullptr) {
 		return false;
 	}
-	*out_state = leiasr_poll_backend_state(ldp->leiasr);
+	*out_state = leia_dp_vk_store_backend_state(ldp, leiasr_poll_backend_state(ldp->leiasr));
 	return true;
 }
 #endif
