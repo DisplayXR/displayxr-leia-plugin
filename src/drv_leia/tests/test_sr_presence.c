@@ -230,13 +230,13 @@ test_rested_weaver_wins_over_presence(void)
 static void
 test_manual_mode_weaver_state_decides(void)
 {
-	// TRACKING is a viewer, unless the display's own presence already says gone.
+	// TRACKING is a viewer, whatever the undebounced display presence says.
 	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_UNKNOWN, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
 	      LEIA_SR_PRESENCE_PRESENT);
 	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_PRESENT, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
 	      LEIA_SR_PRESENCE_PRESENT);
 	CHECK(leia_sr_presence_with_weaver_mode(LEIA_SR_PRESENCE_ABSENT, LEIA_SR_WEAVER_TRACKING_TRACKING, true) ==
-	      LEIA_SR_PRESENCE_ABSENT);
+	      LEIA_SR_PRESENCE_PRESENT);
 	// LOST / OUT_OF_ZONE / RESTED are no viewer, whatever presence says, and
 	// whatever the (held, never collapsed) pair looks like.
 	const enum leia_sr_weaver_tracking none[] = {LEIA_SR_WEAVER_TRACKING_LOST, LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE,

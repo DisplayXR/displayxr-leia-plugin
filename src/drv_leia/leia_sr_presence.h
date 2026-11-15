@@ -282,11 +282,14 @@ leia_sr_presence_with_weaver(enum leia_sr_presence p, enum leia_sr_weaver_tracki
  * MANUAL's contract is "isTracking flips immediately", and there nothing
  * collapses the eye pair any more (the weaver holds the last pair on a loss and
  * passes out-of-zone eyes through), so the pair heuristic would read "tracked"
- * for ever. The weaver's own state is therefore authoritative: TRACKING is a
- * viewer unless this display's presence says ABSENT (the faster signal);
- * LOST (the tracker's debounced face loss), OUT_OF_ZONE and RESTED are none.
- * With no answer (an SR runtime without the query, no weaver yet) it is the
- * MANAGED fold, i.e. presence, then the pair heuristic.
+ * for ever. The weaver's own state is therefore authoritative, and alone:
+ * TRACKING is a viewer; LOST (the tracker's own per-frame face detection of
+ * this display's camera, debounced over ~3 frames so a blink is not a loss),
+ * OUT_OF_ZONE and RESTED are none. Display presence (event 20) is NOT folded
+ * in here: it is undebounced and can toggle per frame at the camera's edge,
+ * which would put back the flicker the tracker's debounce removes. With no
+ * answer (an SR runtime without the query, no weaver yet) it is the MANAGED
+ * fold, i.e. presence, then the pair heuristic.
  *
  * @param manual  The weaver really is in MANUAL (the mode took), not merely
  *                that MANUAL was asked for.
@@ -298,8 +301,7 @@ leia_sr_presence_with_weaver_mode(enum leia_sr_presence p, enum leia_sr_weaver_t
 		return leia_sr_presence_with_weaver(p, w);
 	}
 	switch (w) {
-	case LEIA_SR_WEAVER_TRACKING_TRACKING:
-		return p == LEIA_SR_PRESENCE_ABSENT ? LEIA_SR_PRESENCE_ABSENT : LEIA_SR_PRESENCE_PRESENT;
+	case LEIA_SR_WEAVER_TRACKING_TRACKING: return LEIA_SR_PRESENCE_PRESENT;
 	case LEIA_SR_WEAVER_TRACKING_LOST:
 	case LEIA_SR_WEAVER_TRACKING_OUT_OF_ZONE:
 	case LEIA_SR_WEAVER_TRACKING_RESTED: return LEIA_SR_PRESENCE_ABSENT;
