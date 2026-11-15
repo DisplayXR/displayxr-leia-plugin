@@ -2282,6 +2282,10 @@ leiasr_lnx_has_sr_snap(const char **out_reason)
  *
  */
 
+//! Defined with the MANAGED/MANUAL setter below.
+static bool
+sdk_sync_loss_mode(struct leiasr_lnx *lnx);
+
 bool
 leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
                               struct leiasr_lnx_eye_pair_mm *out_pair,
