@@ -357,6 +357,11 @@ leia_sr_v2_sync_tracking_loss_mode(SrWeaver weaver, struct leia_sr_v2_loss_mode_
 	if (sync->applied_weaver == weaver && sync->applied_wanted == wanted) {
 		return sync->applied_manual;
 	}
+	// Returned for THIS read: leaving MANUAL keeps the MANUAL rule once, because
+	// the pair this read sees is still the one MANUAL held (never collapsed),
+	// which the MANAGED fold's pair heuristic would call a tracked viewer.
+	// Seen on hardware: MANUAL->MANAGED with nobody in front gave a spurious
+	// isTracking 1->0 pair of events.
 	// A new weaver (first frame, #144 recreation) or a new request.
 	const bool was_manual = sync->applied_weaver == weaver && sync->applied_manual;
 	SrResult r = SR_ERROR_HANDLE_INVALID;
@@ -374,6 +379,7 @@ leia_sr_v2_sync_tracking_loss_mode(SrWeaver weaver, struct leia_sr_v2_loss_mode_
 	sync->applied_weaver = weaver;
 	sync->applied_wanted = wanted;
 	sync->applied_manual = wanted == 1u && SR_SUCCEEDED(r);
+	const bool this_read_manual = sync->applied_manual || was_manual;
 	if (wanted == 1u || was_manual) {
 		if (SR_SUCCEEDED(r)) {
 			U_LOG_W("SR %s weaver tracking-loss mode: %s (XR eye-tracking mode %s)", arm,
@@ -383,7 +389,7 @@ leia_sr_v2_sync_tracking_loss_mode(SrWeaver weaver, struct leia_sr_v2_loss_mode_
 			        wanted == 1u ? "MANUAL" : "MANAGED", leia_sr_v2_result_str(r), (int)r);
 		}
 	}
-	return sync->applied_manual;
+	return this_read_manual;
 #else
 	(void)weaver;
 	(void)arm;

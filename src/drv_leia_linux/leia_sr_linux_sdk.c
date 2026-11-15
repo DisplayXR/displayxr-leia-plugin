@@ -2411,6 +2411,7 @@ sdk_sync_loss_mode(struct leiasr_lnx *lnx)
 	}
 	const unsigned wanted = atomic_load(&lnx->loss_mode_wanted);
 	pthread_mutex_lock(&lnx->loss_mode_lock);
+	bool this_read_manual = lnx->loss_manual && lnx->loss_applied_weaver == lnx->weaver;
 	if (lnx->loss_applied_weaver != lnx->weaver || lnx->loss_applied_wanted != wanted) {
 		const bool was_manual = lnx->loss_applied_weaver == lnx->weaver && lnx->loss_manual;
 		SrResult r = SR_SUCCESS; /* MANAGED on a weaver that never left it: no call */
@@ -2423,10 +2424,14 @@ sdk_sync_loss_mode(struct leiasr_lnx *lnx)
 		lnx->loss_applied_weaver = lnx->weaver;
 		lnx->loss_applied_wanted = wanted;
 		lnx->loss_manual = wanted == 1u && SR_SUCCEEDED(r);
+		/* Leaving MANUAL keeps the MANUAL rule for this read: the pair is still
+		 * the held one, which the MANAGED rule would call tracked. */
+		this_read_manual = lnx->loss_manual || was_manual;
+	} else {
+		this_read_manual = lnx->loss_manual;
 	}
-	const bool manual = lnx->loss_manual;
 	pthread_mutex_unlock(&lnx->loss_mode_lock);
-	return manual;
+	return this_read_manual;
 #else
 	(void)lnx;
 	return false;
