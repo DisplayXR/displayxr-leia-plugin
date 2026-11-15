@@ -222,6 +222,34 @@ write it next to the library) is the pre-load version, the VERSIONINFO twin; the
 comes from NeurD's own `License:` log line, as on Windows; the
 `LICENSED_LOCAL_INSTALL` flag follows the same rule (#510).
 
+**Which NeurD table entries exist (the cpu_ex guard).** NeurD's table grows only at the
+end and each entry records the version that introduced it, but two builds of one version
+can differ: a NeurD 0.5.0 built before `NeurD_convert_stream_cpu_ex` was added reports
+0.5.0 too. NeurD's own `version >= introduced && entry != NULL` test reads the entry, which
+for that build is past the end of its table (the provider used to segfault there). So the
+provider learns the table's size after `NeurD_load` and checks `offsetof(entry)` against
+it before reading anything: from `NeurD_get_table_size()` when the library exports it
+(media_sdk #610), else from the ELF size of the exported table object (builds without
+NeurD's export version script, every 0.4.x), else it trusts only entries introduced
+**before** the library's own version, and takes `NeurD_convert_stream_cpu` (fixed pair)
+rather than guess. The load logs which: `NeurD function table 344 bytes
+(NeurD_get_table_size; ...)` or `NeurD function table size unknown (...)`. Look-around
+therefore needs a NeurD that exports `NeurD_get_table_size`. A plain 0.5.0 `dev` build
+works, but without look-around. The fake `libNeurD.so` in `tests/fake_neurd.c` (a 0.5.0
+table that ends right before a `PROT_NONE` page, with and without the entry and the
+export) checks this in CI.
+
+**Packaging.** `scripts/package_deb_leia.sh` ships the provider in the
+`displayxr-leia-sr` `.deb` when `NEURD_SDK_ROOT` is set (CI's Deb job fetches the
+headers; a `v*` tag refuses to package without them):
+`/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so` plus
+`050-leia-conversion-conversion-provider.json` (probe order 50, absolute
+`binary_path`). The package has no relation to NeurD: the provider loads no NeurD
+symbol at link time (the script refuses a `libNeurD` `DT_NEEDED`), and the NeurD runtime
+package is in no Ubuntu archive, so a `Recommends` would fail the install checks. Without
+NeurD the provider reports `ABSENT` and the runtime uses Open Conversion. The script also
+refuses a provider built without `cpu_ex` unless you pass `--allow-no-look-around`.
+
 **Settings** (`<id>.settings.json` / the manifest `settings` object /
 `DXR_CONV_LEIA_CONVERSION_<KEY>`): `Enable`, `NeurDPath`, `Backend`
 (`auto` / `openvino` / `cuda`), `Scale` (default **1080p** here: NeurD renders the
@@ -246,4 +274,6 @@ It prints the capability before / after warm, one line per frame and a
 summary (warm, first, median, p90 convert time). `--eye-x 0,0.02,0.04` sweeps the
 viewer's midpoint (one `<out>.<i>.png` per value), `--rect WxH` / `--no-rect` choose
 rect-relative or panel viewpoints, `--depth d.f32` requests the aux depth. Without NeurD,
-`--expect absent` / `--enable 0 --expect disabled` check the gates (CI runs both).
+`--expect absent` / `--enable 0 --expect disabled` check the gates (CI runs both), and
+`--neurd-path build/src/conv_leia/fake_neurd/<short|short_sized|full|full_sized>/libNeurD.so
+--expect ready` the table guard.
