@@ -78,10 +78,11 @@ env:
   # never committed. NOT the Windows pin (build-windows.yml / build-windows.bat
   # stay on the v0.4.10 release, which the D3D11 path needs; check_sr_pins.py
   # does not compare this one): the Linux provider needs
-  # NeurD_convert_stream_cpu_ex (look-around, float depth), which is on
-  # media_sdk dev at b8e3600f (media_sdk #594) and in no release tag yet. Move
-  # this to the first release tag that carries it.
-  NEURD_SDK_REF: b8e3600faf22be6e9b99e91e7ad5ccdf5a0e3d8c
+  # NeurD_convert_stream_cpu_ex (look-around, float depth; media_sdk #594) and
+  # NeurD_get_table_size (media_sdk #610), which the table guard needs to trust
+  # cpu_ex. v0.5.0-rc1-DEV is the first media_sdk tag carrying both; move this
+  # to the v0.5.0 release tag once it is cut.
+  NEURD_SDK_REF: v0.5.0-rc1-DEV
   # The last release's headers (no cpu_ex): the Build job's 22.04 leg compiles
   # against these, so the provider's fixed-pair fallback build stays compiled.
   NEURD_SDK_REF_FALLBACK: v0.4.10
