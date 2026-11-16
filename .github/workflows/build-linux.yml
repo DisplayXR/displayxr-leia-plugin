@@ -74,6 +74,20 @@ env:
   # v2.27.1, which owns the resampled-X11 refusal the windowless weaver
   # (multi-screen M4) no longer gets from the SR SDK.
   RUNTIME_REF: v2.66.8
+  # NeurD headers for the conversion provider's CPU arm (src/conv_leia), from the
+  # PRIVATE LeiaInc/media_sdk repo into the gitignored NeurD-SDK-<ref>/include --
+  # never committed. NOT the Windows pin (build-windows.yml / build-windows.bat
+  # stay on the v0.4.10 release, which the D3D11 path needs; check_sr_pins.py
+  # does not compare this one): the Linux provider needs
+  # NeurD_convert_stream_cpu_ex (look-around, float depth; media_sdk #594) and
+  # NeurD_get_table_size (media_sdk #610), which the table guard needs to trust
+  # cpu_ex. v0.5.0-rc1-DEV is the first media_sdk tag carrying both; move this
+  # to the v0.5.0 release tag once it is cut.
+  NEURD_SDK_REF: v0.5.0-rc1-DEV
+  # The last release's headers (no cpu_ex): the Build job's 22.04 leg compiles
+  # against these, so the provider's fixed-pair fallback build stays compiled.
+  NEURD_SDK_REF_FALLBACK: v0.4.10
+  NEURD_SDK_REPO: LeiaInc/media_sdk
 
 jobs:
   # Classify the change. Same rule as displayxr-runtime's build-linux.yml:
@@ -127,7 +141,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            git ca-certificates jq \
+            git ca-certificates jq curl \
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
@@ -171,12 +185,37 @@ jobs:
           path: displayxr-runtime
           fetch-depth: 1
 
+      # Soft: without the private headers (fork PR, no secret) the conversion
+      # provider is not built and everything else is unchanged.
+      - name: Pick the NeurD header ref (22.04 = the pre-cpu_ex fallback build)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && matrix.ubuntu == '22.04'
+        run: echo "NEURD_SDK_REF=$NEURD_SDK_REF_FALLBACK" >> "$GITHUB_ENV"
+
+      - name: Fetch NeurD headers (conversion provider, optional)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          echo "NeurD headers: $NEURD_SDK_REPO@$NEURD_SDK_REF"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::LEIALOFT_GITHUB_TOKEN absent — DisplayXR-LeiaConversion.so not built."
+            exit 0
+          fi
+          ./scripts/fetch-neurd-headers.sh "$NEURD_SDK_REPO" "$NEURD_SDK_REF" "NeurD-SDK-$NEURD_SDK_REF" ||
+            echo "::warning::NeurD headers unavailable — DisplayXR-LeiaConversion.so not built."
+
       - name: Configure
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
+          # POSIX sh (this job runs in a container): no arrays.
+          NEURD_ROOT=""
+          if [ -f "NeurD-SDK-$NEURD_SDK_REF/include/NeurD_version.h" ]; then
+            NEURD_ROOT="$GITHUB_WORKSPACE/NeurD-SDK-$NEURD_SDK_REF"
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime"
+            -DDXR_RUNTIME_SOURCE_DIR="$GITHUB_WORKSPACE/displayxr-runtime" \
+            -DNEURD_SDK_ROOT="$NEURD_ROOT"
 
       - name: Build plug-in
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -271,6 +310,55 @@ jobs:
       - name: Unit test — Windows-arm conversion provider gate + licence class (ADR-053, host-run)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_conv_leia_policy
+
+      - name: Unit test — conversion provider CPU transport (src/conv_leia)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/conv_leia/test_conv_leia_cpu
+
+      # Built only when the NeurD headers were fetched. NeurD itself is never
+      # installed on CI: the gates check the provider loads through its one
+      # export and reports ABSENT (no NeurD) / DISABLED (Enable=0) correctly.
+      - name: Conversion provider — export, symbols, ABSENT / DISABLED gates
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          SO=build/src/conv_leia/DisplayXR-LeiaConversion.so
+          if [ ! -f "$SO" ]; then
+            echo "DisplayXR-LeiaConversion.so not built (no NeurD headers) — skipped"
+            exit 0
+          fi
+          syms=$(nm -D --defined-only "$SO" | awk '{print $NF}')
+          if [ "$syms" != "xrtConversionPluginNegotiate" ]; then
+            echo "::error::unexpected exports from $SO:"; nm -D --defined-only "$SO"; exit 1
+          fi
+          if ldd -r "$SO" 2>&1 | grep -q 'undefined symbol'; then
+            echo "::error::unresolved symbols in $SO:"; ldd -r "$SO" 2>&1 | grep 'undefined symbol' | sort -u; exit 1
+          fi
+          ./build/src/conv_leia/conv_leia_harness --provider "$SO" --neurd-path "$PWD/no-such-neurd" --expect absent
+          ./build/src/conv_leia/conv_leia_harness --provider "$SO" --enable 0 --expect disabled
+
+      # The function-table guard: fake 0.5.0 libNeurD.so builds whose table ends
+      # right before a PROT_NONE page (src/conv_leia/tests/fake_neurd.c). The
+      # provider must reach READY without reading past the table (a read faults)
+      # and use convert_stream_cpu_ex only when NeurD_get_table_size proves it.
+      # Built only against headers that have the entry (not the 22.04 leg).
+      - name: Conversion provider — NeurD function-table guard (cpu_ex hazard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          FAKE=build/src/conv_leia/fake_neurd
+          if [ ! -d "$FAKE" ]; then
+            echo "No fake NeurD builds (provider not built, or headers without cpu_ex) — skipped"
+            exit 0
+          fi
+          SO=build/src/conv_leia/DisplayXR-LeiaConversion.so
+          for v in short short_sized full full_sized; do
+            want="CPU transport: views only, no look-around"
+            [ "$v" = full_sized ] && want="CPU transport: convert_stream_cpu_ex, look-around"
+            out=$(./build/src/conv_leia/conv_leia_harness --provider "$SO" --neurd-path "$FAKE/$v/libNeurD.so" --expect ready 2>&1) || {
+              echo "$out"; echo "::error::fake NeurD '$v': the harness failed or crashed"; exit 1; }
+            echo "$out" | grep -E "function table|CPU transport" || true
+            echo "$out" | grep -qF "$want" || { echo "$out"; echo "::error::fake NeurD '$v': expected '$want'"; exit 1; }
+            echo "OK $v"
+          done
 
       - name: Assert single export (ADR-019 / #496)
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -628,6 +716,23 @@ jobs:
           echo "have_sdk=yes" >> "$GITHUB_OUTPUT"
           echo "SRSDK_ROOT=$root"
 
+      # The conversion provider ships in this .deb when the NeurD headers are
+      # reachable (same token as the SR SDK). Soft on a PR/branch; a v* tag
+      # must not ship without it.
+      - name: Fetch NeurD headers (conversion provider)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          if ./scripts/fetch-neurd-headers.sh "$NEURD_SDK_REPO" "$NEURD_SDK_REF" "NeurD-SDK-$NEURD_SDK_REF"; then
+            echo "NEURD_SDK_ROOT=$GITHUB_WORKSPACE/NeurD-SDK-$NEURD_SDK_REF" >> "$GITHUB_ENV"
+          else
+            case "$GITHUB_REF" in
+              refs/tags/v*) echo "::error::NeurD headers unavailable — a release cannot ship without the conversion provider."; exit 1 ;;
+            esac
+            echo "::warning::NeurD headers unavailable — this .deb ships without the Leia conversion provider."
+          fi
+
       - name: Build Track B .deb
         if: needs.DetectChanges.outputs.docs_only != 'true' && steps.sdk.outputs.have_sdk == 'yes'
         env:
@@ -636,6 +741,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/package_deb_leia.sh
           ls -lh dist/displayxr-leia-sr_*_amd64.deb
+          dpkg-deb --contents dist/displayxr-leia-sr_*_amd64.deb | grep -E 'LeiaConversion|conversion-provider' ||
+            echo "(no conversion provider in this .deb)"
 
       # Release check (#271): the SHIPPED .so must carry srWeaverSnapToPhase.
       # v2.7.3's .deb had zero occurrences — the SDK pin predated the call and

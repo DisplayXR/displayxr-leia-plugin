@@ -1,0 +1,13 @@
+/*
+ * Single-export discipline for the Linux conversion provider .so (ADR-019 /
+ * conversion-provider-discovery.md §3.7): only xrtConversionPluginNegotiate is
+ * visible, so the statically linked aux_* copies never interpose the hosting
+ * process's own. Same shape as the runtime's
+ * src/xrt/drivers/conversion_plugin_exports.version.
+ */
+{
+    global:
+        xrtConversionPluginNegotiate;
+    local:
+        *;
+};

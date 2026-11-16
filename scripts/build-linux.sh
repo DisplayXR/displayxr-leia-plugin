@@ -48,9 +48,18 @@ if [ ! -f "$RUNTIME_DIR/CMakeLists.txt" ]; then
 fi
 
 echo "==> Configuring (runtime: $RUNTIME_DIR)"
+# The conversion provider (src/conv_leia, CPU transport) builds only with the
+# private NeurD headers: set NEURD_SDK_ROOT (a dir with include/NeurD.h +
+# NeurD_version.h, e.g. scripts/fetch-neurd-headers.sh output). Without it the
+# provider is skipped and everything else builds unchanged.
+NEURD_ARGS=()
+if [ -n "${NEURD_SDK_ROOT:-}" ]; then
+    NEURD_ARGS=(-DNEURD_SDK_ROOT="$NEURD_SDK_ROOT")
+fi
 cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Debug \
-    -DDXR_RUNTIME_SOURCE_DIR="$RUNTIME_DIR"
+    -DDXR_RUNTIME_SOURCE_DIR="$RUNTIME_DIR" \
+    "${NEURD_ARGS[@]}"
 
 echo "==> Building plug-in"
 cmake --build "$BUILD_DIR"
@@ -90,6 +99,30 @@ echo "==> Unit test: per-DP screen state (multi-screen M4)"
 
 echo "==> Unit test: SR weaver routing/binding plan + chains (multi-screen M4)"
 "$BUILD_DIR/src/drv_leia_linux/test_sr_routing_linux"
+
+echo "==> Unit test: conversion provider CPU transport (src/conv_leia)"
+"$BUILD_DIR/src/conv_leia/test_conv_leia_cpu"
+
+CONV_SO="$BUILD_DIR/src/conv_leia/DisplayXR-LeiaConversion.so"
+if [ -f "$CONV_SO" ]; then
+    echo "==> Conversion provider: single export, no unresolved symbols, ABSENT / DISABLED gates"
+    CSYMS="$(nm -D --defined-only "$CONV_SO" | awk '{print $NF}')"
+    if [ "$CSYMS" != "xrtConversionPluginNegotiate" ]; then
+        echo "error: unexpected exported symbols in $CONV_SO:" >&2
+        nm -D --defined-only "$CONV_SO" >&2
+        exit 1
+    fi
+    if ldd -r "$CONV_SO" 2>&1 | grep -q 'undefined symbol'; then
+        echo "error: unresolved symbols in $CONV_SO" >&2
+        exit 1
+    fi
+    "$BUILD_DIR/src/conv_leia/conv_leia_harness" --provider "$CONV_SO" \
+        --neurd-path "$BUILD_DIR/no-such-neurd" --expect absent >/dev/null
+    "$BUILD_DIR/src/conv_leia/conv_leia_harness" --provider "$CONV_SO" --enable 0 --expect disabled >/dev/null
+    echo "    OK: $CONV_SO"
+else
+    echo "==> Conversion provider not built (no NEURD_SDK_ROOT) — skipped"
+fi
 
 echo "==> Asserting single-export discipline (#496 / ADR-019)"
 SYMS="$(nm -D --defined-only "$SO" | awk '{print $NF}')"
