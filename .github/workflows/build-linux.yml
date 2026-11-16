@@ -585,13 +585,20 @@ jobs:
       # is Windows build.yml's run number, no longer a hash fragment. Adds
       # srWeaverSetColorEncoding, which only the D3D11 driver uses, so nothing
       # changes for drv_leia_linux. Same tarball layout.
-      SR_TAG: 1.39.0.3012
+      #
+      # 1.39.0.3495 (sr-sdk-v1.39.0.3495, q4 5066e3cfbc, prod-deb run
+      # 43805350962): adds srWeaverSetTrackingLossMode (SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE)
+      # and srWeaverGetTrackingState (SR_WEAVER_TRACKING_POLICY_AVAILABLE). Below
+      # this pin drv_leia_linux compiles out MANUAL eye tracking (#534) and the
+      # MANAGED weaver-state rule (#537); the shipped .deb is MANAGED-only. Same
+      # tarball layout.
+      SR_TAG: 1.39.0.3495
       # The exact asset and its sha256. The download is pinned to this name
       # and refused on a hash mismatch: a re-uploaded asset under the same tag
       # must be a deliberate pin change, never a silent swap. Move all three
       # together.
-      SR_SDK_ASSET: LeiaSR-SDK-1.39.0.3012-linux64.tar.gz
-      SR_SDK_SHA256: 13c783e08737e1c8e865bc71f2465680cf918ff77557d1c24f85279d2a180aa9
+      SR_SDK_ASSET: LeiaSR-SDK-1.39.0.3495-linux64.tar.gz
+      SR_SDK_SHA256: e06f60908f76210d046460a013f271115bcf9a0a805c8bbdc3a0fab3a32c4639
       # Private Leia artifact repo hosting every sr-sdk-v* release (see
       # build-windows.yml). Read with LEIALOFT_GITHUB_TOKEN.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
