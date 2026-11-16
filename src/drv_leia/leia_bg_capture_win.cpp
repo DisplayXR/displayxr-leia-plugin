@@ -115,6 +115,26 @@ struct leia_bg_capture
 
 	std::atomic<bool> has_frame;
 
+	// ---- #539 CPU readback (Vulkan DP staging-upload fallback) ------------
+	// Compositor render thread only: produced at the tail of the frame drain
+	// in leia_bg_capture_poll(), consumed by leia_bg_capture_cpu_fetch() on
+	// the same thread. Off (cpu_enabled false) unless a consumer arms it.
+	bool cpu_enabled;
+	bool cpu_broken;     //!< one-shot: a Map failure retired the producer.
+	UINT cpu_shift;      //!< mip level read back == log2 of the reduction.
+	UINT cpu_w, cpu_h;   //!< readback size (monitor >> cpu_shift).
+	ComPtr<ID3D11Texture2D> cpu_mip_tex;          //!< shift > 0 only.
+	ComPtr<ID3D11ShaderResourceView> cpu_mip_srv; //!< shift > 0 only.
+	struct
+	{
+		ComPtr<ID3D11Texture2D> tex; //!< STAGING + CPU_ACCESS_READ, cpu_w x cpu_h.
+		UINT64 gen;                  //!< capture generation queued into it.
+		bool pending;                //!< queued and not yet fetched.
+	} cpu_slot[2];
+	uint32_t cpu_write;        //!< slot the NEXT produce writes into.
+	UINT64 cpu_last_src_gen;   //!< signaled_value at the last produce.
+	UINT64 cpu_last_fetch_gen; //!< generation last handed to the consumer.
+
 #ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 	// ---- rear depth budget background preview (#224) ----------------------
 	// EVERYTHING below is touched from the compositor render thread ONLY:
@@ -679,6 +699,9 @@ leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_
 #endif // LEIA_BG_CAPTURE_HAS_PREVIEW
 
 // ---------- public API -----------------------------------------------------
+
+static void
+cpu_produce(struct leia_bg_capture *c, UINT64 gen); // #539, defined below
 
 extern "C" struct leia_bg_capture *
 leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
@@ -1261,6 +1284,17 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 		}
 	}
 
+	// #539: queue this generation's CPU readback (armed only by a consumer that
+	// cannot import the shared texture). Once per capture generation — a quiet
+	// desktop costs a compare.
+	if (c->cpu_enabled && !c->cpu_broken && c->has_frame.load(std::memory_order_acquire)) {
+		const UINT64 gen = c->signaled_value.load(std::memory_order_acquire);
+		if (gen != c->cpu_last_src_gen) {
+			c->cpu_last_src_gen = gen;
+			cpu_produce(c, gen);
+		}
+	}
+
 	if (out_fence_wait_value != nullptr) {
 		*out_fence_wait_value = c->signaled_value.load(std::memory_order_acquire);
 	}
@@ -1328,6 +1362,164 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 #endif
 
 	return ok;
+}
+
+extern "C" bool
+leia_bg_capture_enable_cpu_readback(struct leia_bg_capture *c, uint32_t shift, uint32_t *out_w, uint32_t *out_h)
+{
+	if (c == nullptr || out_w == nullptr || out_h == nullptr) {
+		return false;
+	}
+	if (shift > 3) {
+		shift = 3;
+	}
+	ID3D11Device *dev = c->d3d11_device.Get();
+	// D3D11 mip dimensions: max(1, floor(dim / 2^level)).
+	const UINT w = (c->monitor_w >> shift) > 0 ? (c->monitor_w >> shift) : 1;
+	const UINT h = (c->monitor_h >> shift) > 0 ? (c->monitor_h >> shift) : 1;
+
+	ComPtr<ID3D11Texture2D> mip_tex;
+	ComPtr<ID3D11ShaderResourceView> mip_srv;
+	if (shift > 0) {
+		D3D11_TEXTURE2D_DESC md = {};
+		md.Width = c->monitor_w;
+		md.Height = c->monitor_h;
+		md.MipLevels = shift + 1;
+		md.ArraySize = 1;
+		md.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		md.SampleDesc.Count = 1;
+		md.Usage = D3D11_USAGE_DEFAULT;
+		md.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		md.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+		HRESULT hr = dev->CreateTexture2D(&md, nullptr, mip_tex.GetAddressOf());
+		if (FAILED(hr)) {
+			U_LOG_W("leia_bg_capture #539: CPU readback mip texture create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+		vd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		vd.Texture2D.MostDetailedMip = 0;
+		vd.Texture2D.MipLevels = shift + 1;
+		hr = dev->CreateShaderResourceView(mip_tex.Get(), &vd, mip_srv.GetAddressOf());
+		if (FAILED(hr)) {
+			U_LOG_W("leia_bg_capture #539: CPU readback mip SRV create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	ComPtr<ID3D11Texture2D> slots[2];
+	for (int i = 0; i < 2; i++) {
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = w;
+		sd.Height = h;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		HRESULT hr = dev->CreateTexture2D(&sd, nullptr, slots[i].GetAddressOf());
+		if (FAILED(hr)) {
+			U_LOG_W("leia_bg_capture #539: CPU readback staging texture create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	c->cpu_mip_tex = mip_tex;
+	c->cpu_mip_srv = mip_srv;
+	for (int i = 0; i < 2; i++) {
+		c->cpu_slot[i].tex = slots[i];
+		c->cpu_slot[i].gen = 0;
+		c->cpu_slot[i].pending = false;
+	}
+	c->cpu_shift = shift;
+	c->cpu_w = w;
+	c->cpu_h = h;
+	c->cpu_write = 0;
+	c->cpu_last_src_gen = 0;
+	c->cpu_last_fetch_gen = 0;
+	c->cpu_broken = false;
+	c->cpu_enabled = true;
+	*out_w = w;
+	*out_h = h;
+	return true;
+}
+
+/*!
+ * #539: queue one generation's reduction + readback copy. The Map happens
+ * later, in leia_bg_capture_cpu_fetch, without waiting — by then (a frame or
+ * more after this Flush) the copy has normally retired.
+ */
+static void
+cpu_produce(struct leia_bg_capture *c, UINT64 gen)
+{
+	ID3D11DeviceContext *ctx = c->d3d11_context.Get();
+	auto &slot = c->cpu_slot[c->cpu_write];
+	if (c->cpu_shift == 0) {
+		ctx->CopyResource(slot.tex.Get(), c->staging_tex.Get());
+	} else {
+		ctx->CopySubresourceRegion(c->cpu_mip_tex.Get(), 0, 0, 0, 0, c->staging_tex.Get(), 0, nullptr);
+		ctx->GenerateMips(c->cpu_mip_srv.Get());
+		ctx->CopySubresourceRegion(slot.tex.Get(), 0, 0, 0, 0, c->cpu_mip_tex.Get(), c->cpu_shift, nullptr);
+	}
+	// Overwriting a still-pending slot is fine: it held an OLDER generation,
+	// and nothing maps a staging texture between fetches.
+	slot.gen = gen;
+	slot.pending = true;
+	c->cpu_write ^= 1u;
+	ctx->Flush();
+}
+
+extern "C" bool
+leia_bg_capture_cpu_fetch(struct leia_bg_capture *c, void *dst, uint32_t dst_row_bytes, uint64_t *out_gen)
+{
+	if (c == nullptr || dst == nullptr || !c->cpu_enabled || c->cpu_broken) {
+		return false;
+	}
+	// Newest pending generation first; an older one is superseded by it.
+	int pick = -1;
+	for (int i = 0; i < 2; i++) {
+		if (c->cpu_slot[i].pending && c->cpu_slot[i].gen > c->cpu_last_fetch_gen &&
+		    (pick < 0 || c->cpu_slot[i].gen > c->cpu_slot[pick].gen)) {
+			pick = i;
+		}
+	}
+	if (pick < 0) {
+		return false;
+	}
+	auto &slot = c->cpu_slot[pick];
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	HRESULT hr = c->d3d11_context->Map(slot.tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+	if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+		return false; // retried next frame
+	}
+	if (FAILED(hr)) {
+		c->cpu_broken = true;
+		U_LOG_W("leia_bg_capture #539: CPU readback Map failed: 0x%08x — readback producer DISABLED, "
+		        "the Vulkan background stops updating",
+		        (unsigned)hr);
+		return false;
+	}
+	const uint32_t row = c->cpu_w * 4u;
+	const uint32_t copy = row < dst_row_bytes ? row : dst_row_bytes;
+	const uint8_t *src = (const uint8_t *)m.pData;
+	uint8_t *d = (uint8_t *)dst;
+	for (UINT y = 0; y < c->cpu_h; y++) {
+		memcpy(d + (size_t)y * dst_row_bytes, src + (size_t)y * m.RowPitch, copy);
+	}
+	c->d3d11_context->Unmap(slot.tex.Get(), 0);
+
+	c->cpu_last_fetch_gen = slot.gen;
+	for (int i = 0; i < 2; i++) {
+		if (c->cpu_slot[i].gen <= slot.gen) {
+			c->cpu_slot[i].pending = false;
+		}
+	}
+	if (out_gen != nullptr) {
+		*out_gen = slot.gen;
+	}
+	return true;
 }
 
 extern "C" void
