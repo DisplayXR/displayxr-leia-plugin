@@ -36,6 +36,7 @@
 #include <sr/sr_weaver.h>
 
 #include <atomic>
+#include <mutex>
 #include <stdint.h>
 
 struct leia_sr_presence_monitor;
@@ -83,6 +84,35 @@ leia_sr_presence_load(const std::atomic<int32_t> &state)
  */
 enum leia_sr_weaver_tracking
 leia_sr_v2_weaver_tracking(SrWeaver weaver);
+
+/*!
+ * One DP's MANAGED/MANUAL tracking-loss mode (the runtime's
+ * set_eye_tracking_mode) and what its current weaver has actually taken.
+ *
+ * The DP's setter only stores @ref wanted. Every presence read reconciles it
+ * with @ref leia_sr_v2_sync_tracking_loss_mode on whichever weaver is current,
+ * so a weaver created later (the #144 async recreation, a segment DP, a
+ * reconnect) picks the mode up on its first frame, with no hook in any creation
+ * path and no race with one. SR documents the call as safe on a render thread.
+ */
+struct leia_sr_v2_loss_mode_sync
+{
+	std::atomic<uint32_t> wanted{0}; //!< 0 = MANAGED, 1 = MANUAL (as the runtime passes it).
+	std::mutex mutex;                //!< Guards the three fields below.
+	SrWeaver applied_weaver = nullptr;
+	uint32_t applied_wanted = 0;
+	bool applied_manual = false; //!< The weaver really is in MANUAL.
+};
+
+/*!
+ * Bring @p weaver to @p sync's wanted mode if it is not there yet; returns
+ * whether it is in MANUAL now. Cheap when nothing changed (one compare under
+ * a short lock). False for a NULL weaver, an SDK built without the
+ * call (SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE), or an SR runtime that refuses
+ * it (logged once per weaver and request).
+ */
+bool
+leia_sr_v2_sync_tracking_loss_mode(SrWeaver weaver, struct leia_sr_v2_loss_mode_sync *sync, const char *arm);
 
 /*!
  * Apply the tracking policy to a new weaver, BEFORE srInitialize (so a

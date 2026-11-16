@@ -480,3 +480,9 @@ leia_lnx_sr_active_display_id(void)
 {
 	return 0; // the stub has no SR display list
 }
+
+bool
+leiasr_lnx_tracking_loss_mode_available(void)
+{
+	return false;
+}

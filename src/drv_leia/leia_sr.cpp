@@ -78,6 +78,9 @@ struct leiasr
 	//! monitor, so a frame-thread read never races the monitor's destroy.
 	struct leia_sr_presence_monitor *presence = nullptr;
 	std::atomic<int32_t> presence_state{0};
+	//! MANAGED/MANUAL tracking-loss mode (the runtime's set_eye_tracking_mode),
+	//! reconciled onto whichever weaver is current at each presence read.
+	struct leia_sr_v2_loss_mode_sync loss_mode;
 	//! The weaver waits at tracking policy OFF for its first 3D enable
 	//! (leia_sr_v2_weaver_apply_tracking_policy, 2D start).
 	std::atomic<bool> tracking_held_off{false};
@@ -1665,10 +1668,13 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 #ifdef DXR_LEIA_HAS_SR_V2
 	// A rested weaver means "no viewer", ahead of the display's presence
 	// (leia_sr_presence_with_weaver); `weaver` is an SrWeaver iff instance_v2.
-	const enum leia_sr_weaver_tracking wt = leia_sr_v2_weaver_tracking(
-	    leiasr->instance_v2 != nullptr ? static_cast<SrWeaver>(leiasr->weaver) : nullptr);
+	const SrWeaver w = leiasr->instance_v2 != nullptr ? static_cast<SrWeaver>(leiasr->weaver) : nullptr;
+	const enum leia_sr_weaver_tracking wt = leia_sr_v2_weaver_tracking(w);
+	// MANUAL (XR eye-tracking mode): the weaver's own state decides
+	// (leia_sr_presence_with_weaver_mode); reconciled onto the current weaver.
+	const bool manual = leia_sr_v2_sync_tracking_loss_mode(w, &leiasr->loss_mode, "VK");
 	out_eye_pos->is_tracking = leia_sr_presence_apply(
-	    leia_sr_presence_with_weaver(leia_sr_presence_load(leiasr->presence_state), wt), pair_tracking);
+	    leia_sr_presence_with_weaver_mode(leia_sr_presence_load(leiasr->presence_state), wt, manual), pair_tracking);
 #else
 	out_eye_pos->is_tracking = pair_tracking;
 #endif
@@ -2080,3 +2086,17 @@ leiasr_poll_backend_state(struct leiasr *leiasr)
 }
 
 } // extern "C"
+
+void
+leiasr_set_tracking_loss_mode(struct leiasr *leiasr, uint32_t mode)
+{
+#ifdef DXR_LEIA_HAS_SR_V2
+	if (leiasr != nullptr) {
+		// Stored only: the next presence read applies it to the current weaver.
+		leiasr->loss_mode.wanted.store(mode == 1u ? 1u : 0u, std::memory_order_release);
+	}
+#else
+	(void)leiasr;
+	(void)mode;
+#endif
+}

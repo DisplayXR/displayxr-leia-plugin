@@ -164,6 +164,17 @@ leiasr_gl_weave(struct leiasr_gl *leiasr);
 enum leia_sr_presence
 leiasr_gl_get_user_presence(struct leiasr_gl *leiasr);
 
+/*!
+ * The runtime's MANAGED (0) / MANUAL (1) eye-tracking mode for this DP's
+ * weavers (XR_DXR_display_info; docs/specs/vendor/eye-tracking-modes.md).
+ * Stored; applied to the current weaver, and to every later one, at the next
+ * presence read. MANUAL needs an SR runtime with srWeaverSetTrackingLossMode
+ * (leia_sr_api_tracking_loss_mode_available); otherwise the weaver stays
+ * MANAGED and says so in the log. Any thread.
+ */
+void
+leiasr_gl_set_tracking_loss_mode(struct leiasr_gl *leiasr, uint32_t mode);
+
 bool
 leiasr_gl_get_predicted_eye_positions(struct leiasr_gl *leiasr,
                                        float out_left_eye[3],

@@ -489,12 +489,23 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 
 /*!
  * Select MANAGED vs MANUAL (R-T4/R-T5). @return false when the backend
- * doesn't support the requested mode (MANAGED-only backends are acceptable
- * for v1 — Windows parity). srSDK 1.0.0 has no stand-down toggle, so the sdk
- * backend is MANAGED-only (contract §8, R-T5 carried ask).
+ * doesn't support the requested mode. The sdk backend supports MANUAL when
+ * the installed SR runtime has srWeaverSetTrackingLossMode (see
+ * @ref leiasr_lnx_tracking_loss_mode_available): the weaver then holds the
+ * last pair on a loss, passes out-of-zone eyes through and never falls back
+ * to the left view, and is_tracking follows the weaver's own state. Applied
+ * to the current weaver and to every later one; never a lens call.
  */
 bool
 leiasr_lnx_set_eye_tracking_mode(struct leiasr_lnx *lnx, enum leiasr_lnx_tracking_mode mode);
+
+/*!
+ * The backend can serve MANUAL (R-T5): the SR runtime answers
+ * srWeaverSetTrackingLossMode. Brings the process-wide context up if needed
+ * (fails soft on a headless box). The stub: false.
+ */
+bool
+leiasr_lnx_tracking_loss_mode_available(void);
 
 
 /*

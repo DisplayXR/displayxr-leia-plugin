@@ -311,6 +311,15 @@ leiasr_get_hardware_3d_state(struct leiasr *leiasr, bool *out_is_3d);
 uint32_t
 leiasr_poll_backend_state(struct leiasr *leiasr);
 
+/*!
+ * The runtime's MANAGED (0) / MANUAL (1) eye-tracking mode for this DP's
+ * weavers. Stored; applied to the current weaver, and to every later one, at
+ * the next eye-position read. Needs an SR runtime with
+ * srWeaverSetTrackingLossMode, else the weaver stays MANAGED. Any thread.
+ */
+void
+leiasr_set_tracking_loss_mode(struct leiasr *leiasr, uint32_t mode);
+
 #ifdef __cplusplus
 }
 #endif

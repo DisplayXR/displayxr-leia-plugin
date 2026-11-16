@@ -880,6 +880,16 @@ struct leiasr_lnx
 	struct leiasr_lnx_create_info info;
 	SrWeaver weaver;
 
+	/* MANAGED/MANUAL tracking-loss mode (R-T4/R-T5): what the runtime asked
+	 * for, and what the current weaver has taken. Reconciled in
+	 * leiasr_lnx_get_predicted_eyes, so a recreated weaver picks it up. */
+	atomic_uint loss_mode_wanted; //!< 0 = MANAGED, 1 = MANUAL
+	pthread_mutex_t loss_mode_lock;
+	bool loss_mode_lock_init;
+	SrWeaver loss_applied_weaver;
+	unsigned loss_applied_wanted;
+	bool loss_manual; //!< the weaver really is in MANUAL
+
 	/* Multi-screen M4: what the weaver was actually created with (after any
 	 * fallback). An EXTERNAL-routed weaver never votes the lens, so its
 	 * creation and destruction drive the lens owner (leia_lens_owner_linux.h). */
@@ -1672,6 +1682,8 @@ leiasr_lnx_create(const struct leiasr_lnx_create_info *info, struct leiasr_lnx *
 		return LEIASR_LNX_ERROR_FAILED;
 	}
 	lnx->info = *info;
+	atomic_init(&lnx->loss_mode_wanted, 0u);
+	lnx->loss_mode_lock_init = pthread_mutex_init(&lnx->loss_mode_lock, NULL) == 0;
 
 	if (info->x11_connection != NULL) {
 		U_LOG_I("leia_sr_sdk: x11_connection has no srSDK 1.0.0 counterpart — ignored "
@@ -1839,6 +1851,9 @@ leiasr_lnx_destroy(struct leiasr_lnx *lnx)
 	sdk_flip_cache_flush(lnx);
 	if (lnx->render_pass != VK_NULL_HANDLE) {
 		vkDestroyRenderPass(lnx->info.device, lnx->render_pass, NULL);
+	}
+	if (lnx->loss_mode_lock_init) {
+		pthread_mutex_destroy(&lnx->loss_mode_lock);
 	}
 	free(lnx);
 	sr_ctx_weaver_unpin();
@@ -2267,6 +2282,10 @@ leiasr_lnx_has_sr_snap(const char **out_reason)
  *
  */
 
+//! Defined with the MANAGED/MANUAL setter below.
+static bool
+sdk_sync_loss_mode(struct leiasr_lnx *lnx);
+
 bool
 leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
                               struct leiasr_lnx_eye_pair_mm *out_pair,
@@ -2315,6 +2334,23 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 		out_pair->right_mm[2] = nz_mm;
 	}
 
+	/* MANUAL (R-T5): nothing collapses the pair any more, so the weaver's own
+	 * state is the signal — TRACKING only; LOST (the tracker's debounced face
+	 * loss), OUT_OF_ZONE and RESTED are no viewer. */
+	const bool manual = sdk_sync_loss_mode(lnx);
+#if defined(SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE)
+	if (manual && out_is_tracking != NULL) {
+		SrTrackingState st = SR_TRACKING_STATE_LOST;
+		const SrResult tr = srWeaverGetTrackingState(lnx->weaver, &st);
+		if (SR_SUCCEEDED(tr)) {
+			*out_is_tracking = st == SR_TRACKING_STATE_TRACKING && atomic_load(&g_ctx.device_ready) &&
+			                   g_ctx.tracker != NULL;
+			out_is_tracking = NULL; /* decided; skip the MANAGED rule below */
+		}
+	}
+#else
+	(void)manual;
+#endif
 	if (out_is_tracking != NULL) {
 		/* Event-latched (contract §8 R-T3): flips at raw USER_LOST, i.e.
 		 * earlier than R-T4's grace-period preference — srSDK 1.0.0
@@ -2345,19 +2381,92 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 }
 
 bool
+leiasr_lnx_tracking_loss_mode_available(void)
+{
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	static atomic_int cached = -1; /* -1 = not probed yet */
+	int v = atomic_load(&cached);
+	if (v >= 0) {
+		return v == 1;
+	}
+	if (sr_ctx_ensure(0.0) != LEIASR_LNX_SUCCESS) {
+		return false; /* headless / no SR yet: ask again next time */
+	}
+	/* SR's probe: a NULL weaver after srCreateInstance. HANDLE_INVALID = the
+	 * function exists; an older runtime answers FUNCTION_UNSUPPORTED. */
+	const SrResult r = srWeaverSetTrackingLossMode(NULL, SR_TRACKING_LOSS_MODE_MANAGED);
+	v = r == SR_ERROR_HANDLE_INVALID ? 1 : 0;
+	atomic_store(&cached, v);
+	U_LOG_W("leia_sr_sdk: weaver tracking-loss mode (MANUAL eye tracking): %s (probe %s)",
+	        v == 1 ? "supported" : "not in this SR runtime", srResultToString(r));
+	return v == 1;
+#else
+	return false;
+#endif
+}
+
+/* Bring the current weaver to the wanted mode; returns whether it is MANUAL. */
+static bool
+sdk_sync_loss_mode(struct leiasr_lnx *lnx)
+{
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	if (lnx->weaver == NULL || !lnx->loss_mode_lock_init) {
+		return false;
+	}
+	const unsigned wanted = atomic_load(&lnx->loss_mode_wanted);
+	pthread_mutex_lock(&lnx->loss_mode_lock);
+	bool this_read_manual = lnx->loss_manual && lnx->loss_applied_weaver == lnx->weaver;
+	if (lnx->loss_applied_weaver != lnx->weaver || lnx->loss_applied_wanted != wanted) {
+		const bool was_manual = lnx->loss_applied_weaver == lnx->weaver && lnx->loss_manual;
+		SrResult r = SR_SUCCESS; /* MANAGED on a weaver that never left it: no call */
+		if (wanted == 1u || was_manual) {
+			r = srWeaverSetTrackingLossMode(lnx->weaver, wanted == 1u ? SR_TRACKING_LOSS_MODE_MANUAL
+			                                                          : SR_TRACKING_LOSS_MODE_MANAGED);
+			U_LOG_W("leia_sr_sdk: weaver tracking-loss mode %s %s (%s)", wanted == 1u ? "MANUAL" : "MANAGED",
+			        SR_SUCCEEDED(r) ? "applied" : "NOT applied, the weaver stays MANAGED", srResultToString(r));
+		}
+		lnx->loss_applied_weaver = lnx->weaver;
+		lnx->loss_applied_wanted = wanted;
+		lnx->loss_manual = wanted == 1u && SR_SUCCEEDED(r);
+		/* Leaving MANUAL keeps the MANUAL rule for this read: the pair is still
+		 * the held one, which the MANAGED rule would call tracked. */
+		this_read_manual = lnx->loss_manual || was_manual;
+	} else {
+		this_read_manual = lnx->loss_manual;
+	}
+	pthread_mutex_unlock(&lnx->loss_mode_lock);
+	return this_read_manual;
+#else
+	(void)lnx;
+	return false;
+#endif
+}
+
+bool
 leiasr_lnx_set_eye_tracking_mode(struct leiasr_lnx *lnx, enum leiasr_lnx_tracking_mode mode)
 {
-	(void)lnx;
 	if (mode == LEIASR_LNX_TRACKING_MANAGED) {
-		return true; /* srSDK-native behavior — nothing to switch */
+		if (lnx != NULL) {
+			atomic_store(&lnx->loss_mode_wanted, 0u);
+		}
+		return true; /* applied at the next eye read (a no-op on a MANAGED weaver) */
 	}
-	static bool logged;
-	if (!logged) {
-		U_LOG_W("leia_sr_sdk: MANUAL tracking mode unsupported — srSDK 1.0.0 has no stand-down "
-		        "toggle (contract §8 R-T5); staying MANAGED");
-		logged = true;
+	if (!leiasr_lnx_tracking_loss_mode_available()) {
+		static bool logged;
+		if (!logged) {
+			U_LOG_W("leia_sr_sdk: MANUAL tracking mode unsupported by this SR runtime (no "
+			        "srWeaverSetTrackingLossMode); staying MANAGED");
+			logged = true;
+		}
+		return false;
 	}
-	return false;
+	if (lnx != NULL) {
+		if (!lnx->loss_mode_lock_init) {
+			return false;
+		}
+		atomic_store(&lnx->loss_mode_wanted, 1u);
+	}
+	return true;
 }
 
 
