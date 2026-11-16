@@ -2334,22 +2334,29 @@ leiasr_lnx_get_predicted_eyes(struct leiasr_lnx *lnx,
 		out_pair->right_mm[2] = nz_mm;
 	}
 
-	/* MANUAL (R-T5): nothing collapses the pair any more, so the weaver's own
-	 * state is the signal — TRACKING only; LOST (the tracker's debounced face
-	 * loss), OUT_OF_ZONE and RESTED are no viewer. */
+	/* The weaver's own state is the signal in BOTH modes when the runtime can
+	 * answer it — TRACKING only; LOST, OUT_OF_ZONE and RESTED are no viewer.
+	 * - MANUAL (R-T5): nothing collapses the pair any more; LOST is the
+	 *   tracker's debounced face loss (~3 camera frames).
+	 * - MANAGED: LOST follows SR's face-lost delay (3 s, when the eyes start
+	 *   easing to the 2D target), the same edge the Windows DPs report. The
+	 *   event-latch + sample-freshness rule below cannot see a MANAGED loss:
+	 *   SR keeps streaming eased eye samples through the fade, so "fresh"
+	 *   never lapses and isTracking stayed true for a 10 s camera cover on
+	 *   a DS1 (SR 1.39.0+3495). That rule remains the fallback for a runtime
+	 *   without srWeaverGetTrackingState. */
 	const bool manual = sdk_sync_loss_mode(lnx);
-#if defined(SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE)
-	if (manual && out_is_tracking != NULL) {
+	(void)manual; /* applied to the weaver above; the state below is per mode */
+#if defined(SR_WEAVER_TRACKING_POLICY_AVAILABLE)
+	if (out_is_tracking != NULL && lnx->weaver != NULL) {
 		SrTrackingState st = SR_TRACKING_STATE_LOST;
 		const SrResult tr = srWeaverGetTrackingState(lnx->weaver, &st);
 		if (SR_SUCCEEDED(tr)) {
 			*out_is_tracking = st == SR_TRACKING_STATE_TRACKING && atomic_load(&g_ctx.device_ready) &&
 			                   g_ctx.tracker != NULL;
-			out_is_tracking = NULL; /* decided; skip the MANAGED rule below */
+			out_is_tracking = NULL; /* decided; skip the fallback rule below */
 		}
 	}
-#else
-	(void)manual;
 #endif
 	if (out_is_tracking != NULL) {
 		/* Event-latched (contract §8 R-T3): flips at raw USER_LOST, i.e.
