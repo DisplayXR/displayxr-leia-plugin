@@ -125,11 +125,14 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: SrDispatchTable: 119 -> 122 entries, 2950's 119 an exact ordered prefix, APPENDS ONLY --
 :: multi-viewer unchanged at 110-118; 119 reserved; 120-121 pfnWeaverSetTrackingPolicy,
 :: pfnWeaverGetTrackingState (#517, SR_WEAVER_TRACKING_POLICY_AVAILABLE).
-set SR_V2_TAG=sr-sdk-v2-1.39.0.3327
-set SR_V2_DIR=LeiaSR-SDK-1.39.0+3327.85e3ac0b25-win64-Release
+:: 3493 = released q4 build: appends 122-123 pfnWeaverSetTrackingLossMode /
+:: pfnWeaverGetTrackingLossMode and SR_TRACKING_STATE_OUT_OF_ZONE
+:: (SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE; MANUAL eye tracking, #534).
+set SR_V2_TAG=sr-sdk-v2-1.39.0.3493
+set SR_V2_DIR=LeiaSR-SDK-1.39.0+3493.b6347ede48-win64-Release
 :: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC
 :: with build-windows.yml (check_sr_pins.py asserts it).
-set SR_V2_SHA256=e060c11f8b6dc8c5aecdfed6e431cd59c47488d0c2bbf703c90bd80426295505
+set SR_V2_SHA256=1c5a2a967b9ef46d3a093725560ff3d08fc12e4bae5f4457dc242aaceb77c09a
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
