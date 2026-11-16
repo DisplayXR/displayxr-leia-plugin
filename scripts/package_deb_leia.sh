@@ -297,6 +297,22 @@ fi
 # Discovery manifest — probe_order 50 (vendor), absolute INSTALLED binary_path,
 # NO force-probe (the merged presence probe, leia-plugin #99, claims when the SR
 # runtime is reachable and declines otherwise).
+#
+# "sandbox" (runtime plugin-discovery spec §3.1a): what this plug-in needs when
+# the process hosting the runtime runs inside a container (a Windows game under
+# Proton runs in the Steam Linux Runtime container). The container host reads
+# it; the runtime only checks its shape. A container has its own /usr and /etc
+# and none of the SR paths, so the plug-in declares them:
+#   filesystems     /opt/leiasr      the SR runtime libraries
+#                   /run/leiasr      SR service state (tracker endpoints, ports);
+#                                    without it lens enable crashes
+#                   /var/lib/leiasr  the SR device store: the active panel and its
+#                                    calibration; without it the weave is
+#                                    EDID-only and uncalibrated
+#   env             SR_RUNTIME_PATH  the container cannot read
+#                                    /etc/leia/sr/1/active_runtime.json
+#   host_libraries  libGLEW.so.2.2   libSimulatedRealityOpenGL.so needs it from
+#                                    the host; the Steam runtime does not ship it
 STUB_SUFFIX=""; [ "$WEAVER" = "stub" ] && STUB_SUFFIX=" (stub weaver — mechanics only)"
 cat > "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json" <<EOF
 {
@@ -307,11 +323,20 @@ cat > "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json" <<EOF
         "vendor":       "Leia Inc.",
         "version":      "$VERSION",
         "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so",
-        "probe_order":  50
+        "probe_order":  50,
+        "sandbox": {
+            "filesystems":    ["/opt/leiasr", "/run/leiasr", "/var/lib/leiasr"],
+            "env":            { "SR_RUNTIME_PATH": "/opt/leiasr/lib/libLeiaSR_runtime.so" },
+            "host_libraries": ["libGLEW.so.2.2"]
+        }
     }
 }
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json"
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$STAGE/usr/lib/displayxr/plugins/050-leia-sr.json" ||
+        { echo "error: 050-leia-sr.json is not valid JSON" >&2; exit 1; }
+fi
 
 # --- Depends: ONE .deb for Ubuntu 22.04, 24.04 and 26.04 --------------------
 # The v2.7.0 package installed on 24.04 only, and for TWO independent reasons.
