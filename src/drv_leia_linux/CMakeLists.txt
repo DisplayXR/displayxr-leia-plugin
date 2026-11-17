@@ -442,6 +442,14 @@ add_executable(test_sr_ready_rules ../drv_leia/tests/test_sr_ready_rules.c)
 target_include_directories(test_sr_ready_rules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_ready_rules COMMAND test_sr_ready_rules)
 
+# Windows-arm lens gate (leia_sr_lens_gate.h, #541: the lens belongs to its SR
+# instance, so no lens call reaches an instance being torn down or rebuilt):
+# header-only C++17 with no SR types, host-tested here for the same reason.
+add_executable(test_sr_lens_gate ../drv_leia/tests/test_sr_lens_gate.cpp)
+target_include_directories(test_sr_lens_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+target_link_libraries(test_sr_lens_gate PRIVATE pthread)
+add_test(NAME test_sr_lens_gate COMMAND test_sr_lens_gate)
+
 # Windows-arm lift viewpoint mapping (leia_lift_viewpoint.c, runtime ADR-048):
 # platform-neutral C (no NeurD / SR / D3D), host-tested here for the same reason.
 add_executable(test_lift_viewpoint

@@ -16,6 +16,7 @@
 #include "leia_interface.h" // leia_hmd_active_mode_get (#446)
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
+#include "leia_sr_lens_gate.h"   // #541: the lens belongs to its instance
 #include "util/u_logging.h"
 #include "os/os_time.h"
 
@@ -371,6 +372,36 @@ struct leiasr_d3d11
 	//! runtime#939: set by lens_worker_join on the way to a destroy/reconnect so a
 	//! worker sitting in its 2D dwell applies at once instead of finishing the wait.
 	std::atomic<bool> lens_quit{false};
+
+	// --- #541 the lens belongs to its instance ----------------------------
+	// Every SR call on the lens (lens_v2 / lens_hint, and the weaver's 2D-start
+	// hold that rides with a v2 switch) goes through lens_gate: under its lock,
+	// and only between the publish at the end of create_weaver_attempt and the
+	// retire at the top of destroy_sdk_objects. destroy_sdk_objects retires
+	// BEFORE anything on the instance goes, so srDestroyInstance can never free
+	// the lens hint under a lens call, and a lens call after the retire is a
+	// no-op that the next publish re-requests (from last_lens_wish). Before
+	// this, three paths could reach a destroyed SrInstance across a #158
+	// reconnect: a lens worker spawned by a request that passed its READY check
+	// just before the reconnect armed (so after the reconnect's
+	// lens_worker_join), the synchronous lens path, and get_hardware_3d_state
+	// (LeiaInc/LeiaSR#598).
+	//
+	// LOCK ORDER, outermost first:
+	//   the runtime's render mutex (held by some callers)
+	//     -> lens_thread_mtx
+	//       -> lens_gate's lock (a LEAF)
+	// lens_thread_mtx sits above the gate because lens_worker_join holds it
+	// while joining a worker that takes the gate, and lens_post's thread-
+	// creation fallback calls lens_set under it. So while holding the gate:
+	// never take lens_thread_mtx, never join or post the lens worker, never call
+	// into the runtime. The gate never nests with eyeMutex; async_state is an
+	// atomic, not a lock.
+	leia::lens_gate lens_gate;
+	//! The display the lens was created bound to (SR D3); 0 = the active
+	//! panel's lens. A recreate after a lens failure keeps the same binding.
+	//! Written by the create path before the publish, then only under the gate.
+	uint64_t lens_bind_display_id = 0;
 
 	void
 	bind_d3d11(void *dev, void *ctx)
@@ -798,11 +829,13 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	 */
 	const bool non_active = sr.display_bound && sr.active_display_id != 0 && sr.bind_display_id != sr.active_display_id;
 	const bool bind_lens = non_active && leia_win_sr_plan_bind_lens(&mcaps, &plan);
+	sr.lens_bind_display_id = 0;
 	if (!non_active) {
 		leia_sr_v2_create_lens(sr.instance_v2, 0, &sr.lens_v2);
 	} else if (bind_lens) {
 		leia_sr_v2_create_lens(sr.instance_v2, plan.display_id, &sr.lens_v2);
 		sr.lens_bound = sr.lens_v2 != nullptr;
+		sr.lens_bind_display_id = plan.display_id; // #541: a recreate binds the same display
 	}
 	if (sr.lens_v2 == nullptr) {
 		leia_sr_v2_weaver_tracking_no_lens(sr.weaver_v2, &sr.tracking_held_off, "D3D11");
@@ -1374,49 +1407,201 @@ w_ready(const leiasr_d3d11 *sr)
 	return sr->weaver != nullptr;
 }
 
-//! Is a lens present at all? False means 2D/3D switching is unavailable.
+/*!
+ * Is a lens present at all? False means 2D/3D switching is unavailable, and
+ * also while the lens is retired (#541: between a teardown and the publish of
+ * the rebuilt lens). Lock-free: the frame path asks this.
+ */
 bool
 lens_present(leiasr_d3d11 *sr)
 {
-#ifdef DXR_LEIA_HAS_SR_V2
-	if (sr->weaver_v2 != nullptr) {
-		return sr->lens_v2 != nullptr;
-	}
-#endif
-	return sr->lens_hint != nullptr;
+	return sr->lens_gate.present();
 }
 
-void
+#ifdef DXR_LEIA_HAS_SR_V2
+/*!
+ * #541: srLensEnable / srLensDisable on the v2 lens, recreating the lens on the
+ * CURRENT instance and retrying once when the call fails. Runs inside
+ * lens_gate.call(), so the instance is alive for the whole call.
+ *
+ * SR_ERROR_LENS_NOT_AVAILABLE is what LeiaSR#892 returns for a lens whose
+ * instance is gone, and what #845 returns for a lens with no hint; an SR runtime
+ * without #892 can fail other ways. Either way this handle cannot switch, and a
+ * new lens on the live instance is the remedy, so every failure takes the same
+ * path. One WARN per failure episode (the gate latches it), never per call.
+ */
+bool
+lens_v2_switch_locked(leiasr_d3d11 *sr, leia::lens_gate &gate, bool enable)
+{
+	SrResult first = SR_SUCCESS;
+	auto apply = [&]() {
+		const SrResult r = enable ? srLensEnable(sr->lens_v2) : srLensDisable(sr->lens_v2);
+		if (first == SR_SUCCESS) {
+			first = r;
+		}
+		return SR_SUCCEEDED(r);
+	};
+	auto recreate = [&]() {
+		// The failing handle is only freed, never disabled: srDestroyLens frees
+		// the wrapper alone and the hint stays the live instance's (a bound
+		// lens's vote is context-owned and survives it).
+		const bool was_bound = sr->lens_bound;
+		srDestroyLens(sr->lens_v2);
+		sr->lens_v2 = nullptr;
+		sr->lens_bound = false;
+		leia_sr_v2_create_lens(sr->instance_v2, sr->lens_bind_display_id, &sr->lens_v2);
+		sr->lens_bound = was_bound && sr->lens_v2 != nullptr;
+		return sr->lens_v2 != nullptr;
+	};
+	auto warn = [&]() {
+		U_LOG_W("SR D3D11 lens %s failed (%s) — recreating the lens on the current SR instance and "
+		        "retrying (#541)",
+		        enable ? "enable" : "disable", leia_sr_v2_result_str(first));
+	};
+	const bool ok = gate.apply_with_recovery(apply, recreate, warn);
+	if (!ok && sr->lens_v2 == nullptr) {
+		// No lens on this instance any more: say so once, with the switch that
+		// found out. The next rebuild (#158) publishes a fresh one.
+		U_LOG_W("SR D3D11 lens could not be recreated — 2D/3D switching unavailable until the SR "
+		        "instance is rebuilt (#541)");
+	}
+	return ok;
+}
+#endif
+
+/*!
+ * Switch the lens. #541: through the gate, so it never reaches an instance that
+ * is being torn down or is gone. Returns lens_gate_result::deferred when the lens
+ * is retired (a teardown or rebuild is under way): no SR call was made, and the
+ * publish of the rebuilt lens re-requests last_lens_wish. A v1 hint that throws
+ * comes back as failed.
+ */
+leia::lens_gate_result
 lens_set(leiasr_d3d11 *sr, bool enable)
 {
+	return sr->lens_gate.call([sr, enable](leia::lens_gate &gate) -> bool {
+		(void)gate;
+#ifdef DXR_LEIA_HAS_SR_V2
+		if (sr->weaver_v2 != nullptr) {
+			// The first 3D lifts the 2D-start hold in the same call as the lens.
+			leia_sr_v2_weaver_tracking_on_lens(sr->weaver_v2, enable, &sr->tracking_held_off, "D3D11");
+			if (sr->lens_v2 == nullptr) {
+				return true;
+			}
+			return lens_v2_switch_locked(sr, gate, enable);
+		}
+#endif
+		if (sr->lens_hint == nullptr) {
+			return true;
+		}
+		try {
+			enable ? sr->lens_hint->enable() : sr->lens_hint->disable();
+			return true;
+		} catch (...) {
+			return false;
+		}
+	});
+}
+
+/*!
+ * Read the lens's physical state for a frame-path caller. #541: through the
+ * gate, and only if no lens call holds it right now (it never waits behind an SR
+ * round trip). False = unknown: busy, retired, no lens, or the read failed.
+ */
+bool
+lens_query_3d(leiasr_d3d11 *sr, bool *out_is_3d)
+{
+	return sr->lens_gate.try_query([sr, out_is_3d]() -> bool {
+#ifdef DXR_LEIA_HAS_SR_V2
+		if (sr->weaver_v2 != nullptr) {
+			SrBool32 enabled = SR_FALSE;
+			if (sr->lens_v2 == nullptr || !SR_SUCCEEDED(srLensIsEnabled(sr->lens_v2, &enabled))) {
+				return false;
+			}
+			*out_is_3d = enabled == SR_TRUE;
+			return true;
+		}
+#endif
+		if (sr->lens_hint == nullptr) {
+			return false;
+		}
+		try {
+			*out_is_3d = sr->lens_hint->isEnabled();
+			return true;
+		} catch (...) {
+			return false;
+		}
+	});
+}
+
+/*!
+ * #541: the lens on the instance create_weaver_attempt just built is in place —
+ * open the gate. If a lens call arrived while it was retired (a request that
+ * raced the teardown), re-request the runtime's latest wish: the create worker
+ * applies pending_lens_wish right after this, on the new lens.
+ */
+void
+lens_publish(leiasr_d3d11 *sr)
+{
+	bool exists = sr->lens_hint != nullptr;
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
-		// The first 3D lifts the 2D-start hold in the same call as the lens.
-		leia_sr_v2_weaver_tracking_on_lens(sr->weaver_v2, enable, &sr->tracking_held_off, "D3D11");
-		if (sr->lens_v2 != nullptr) {
-			enable ? srLensEnable(sr->lens_v2) : srLensDisable(sr->lens_v2);
-		}
-		return;
+		exists = sr->lens_v2 != nullptr;
 	}
 #endif
-	if (sr->lens_hint != nullptr) {
-		enable ? sr->lens_hint->enable() : sr->lens_hint->disable();
+	if (sr->lens_gate.publish(exists)) {
+		const int latest = sr->last_lens_wish.load(std::memory_order_acquire);
+		if (latest >= 0) {
+			sr->pending_lens_wish.store(latest, std::memory_order_release);
+		}
+		U_LOG_W("SR D3D11 lens: a 2D/3D request raced the SR instance rebuild and was held; "
+		        "re-requesting %s on the new lens (#541)",
+		        latest == 1 ? "3D" : (latest == 0 ? "2D" : "nothing (no wish recorded)"));
 	}
 }
 
-bool
-lens_is_enabled(leiasr_d3d11 *sr)
+/*!
+ * #541: close the gate and destroy the lens handle, BEFORE anything else on the
+ * instance goes. Waits for a lens call in flight (one SR round trip at most).
+ * Idempotent.
+ */
+void
+lens_retire(leiasr_d3d11 *sr)
 {
+	sr->lens_gate.retire([sr]() {
 #ifdef DXR_LEIA_HAS_SR_V2
-	if (sr->weaver_v2 != nullptr) {
-		SrBool32 enabled = SR_FALSE;
-		if (sr->lens_v2 == nullptr || !SR_SUCCEEDED(srLensIsEnabled(sr->lens_v2, &enabled))) {
-			return false;
+		// The v2 lens must be destroyed; the v1 one must NOT. That is not
+		// because ownership inverted — v2 adds a second, smaller object that v1
+		// has no equivalent of:
+		//
+		//   v1 SwitchableLensHint : owned by the SRContext. Deleting it is a
+		//                           double-free, which is why it is only nulled.
+		//   v2 SrLens             : a thin handle WRAPPER we own, over that same
+		//                           context-owned hint. srDestroyLens frees only
+		//                           the wrapper and deliberately does not touch
+		//                           the hint underneath.
+		//
+		// So there is no double-free hazard in calling it, and skipping it leaks
+		// the wrapper (one small struct), not the lens. Confirmed against the SR
+		// runtime source — sr_lens.h documents neither.
+		if (sr->lens_v2 != nullptr) {
+			// SR D3: a bound lens's request is context-owned and survives
+			// srDestroyLens; a segment DP going away (the window left that
+			// screen) must hand the panel back to 2D explicitly. The
+			// active-display lens keeps today's behaviour (the service owns it).
+			if (sr->lens_bound) {
+				(void)srLensDisable(sr->lens_v2);
+			}
+			srDestroyLens(sr->lens_v2);
+			sr->lens_v2 = nullptr;
+			sr->lens_bound = false;
 		}
-		return enabled == SR_TRUE;
-	}
 #endif
-	return sr->lens_hint != nullptr && sr->lens_hint->isEnabled();
+		// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
+		// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
+		// Manually deleting it causes a crash (double-free).
+		sr->lens_hint = nullptr;
+	});
 }
 
 /*!
@@ -1460,7 +1645,10 @@ lens_2d_dwell_ms()
  * The #158 in-place reconnect worker tears down lens_v2 / lens_hint on its OWN
  * thread; it joins this worker first (lens_worker_join, #527), so a worker in
  * its 2D dwell lands that call on the old objects before they go rather than
- * on freed ones afterwards.
+ * on freed ones afterwards. A worker spawned AFTER that join (a request that
+ * passed its READY check just before the reconnect armed) is covered by the
+ * lens gate (#541): its call either lands before the teardown's retire, or
+ * becomes a no-op that the rebuilt lens's publish re-requests.
  */
 void
 lens_worker_body(leiasr_d3d11 *sr)
@@ -1498,21 +1686,30 @@ lens_worker_body(leiasr_d3d11 *sr)
 				LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
 				QueryPerformanceFrequency(&freq);
 				QueryPerformanceCounter(&t0);
-				if (lens_present(sr)) {
-					try {
-						lens_set(sr, wish == 1);
-						QueryPerformanceCounter(&t1);
-						const double ms =
-						    freq.QuadPart > 0
-						        ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
-						              (double)freq.QuadPart
-						        : 0.0;
+				// #541: no lens_present() pre-check here. The gate decides, under
+				// its lock: a wish that meets a retired lens (a #158 rebuild under
+				// way) is recorded as deferred, and the publish of the rebuilt lens
+				// re-requests the runtime's latest wish. Pre-checking would drop it
+				// silently instead.
+				const bool had_lens = lens_present(sr);
+				try {
+					const leia::lens_gate_result res = lens_set(sr, wish == 1);
+					QueryPerformanceCounter(&t1);
+					const double ms =
+					    freq.QuadPart > 0
+					        ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+					        : 0.0;
+					if (res == leia::lens_gate_result::applied && had_lens) {
 						U_LOG_W("SR D3D11 display mode switched to %s (async lens, SR call %.1f ms)",
 						        wish == 1 ? "3D" : "2D", ms);
-					} catch (...) {
+					} else if (res == leia::lens_gate_result::failed) {
 						U_LOG_E("Failed to switch SR D3D11 display mode to %s (async lens)",
 						        wish == 1 ? "3D" : "2D");
 					}
+					// deferred: logged once by lens_publish when the rebuild lands.
+				} catch (...) {
+					U_LOG_E("Failed to switch SR D3D11 display mode to %s (async lens)",
+					        wish == 1 ? "3D" : "2D");
 				}
 				wish = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
 			}
@@ -1551,7 +1748,9 @@ lens_worker_body(leiasr_d3d11 *sr)
  * every CANCELLED exit before `delete`.
  *
  * Never call it from the lens worker itself (self-join), and never with a
- * lock the lens worker takes: it only uses atomics plus lens_set.
+ * lock the lens worker takes: it uses atomics plus lens_set, which takes the
+ * lens gate (#541) — so never join while holding the gate (see the lock order
+ * in the struct).
  */
 void
 lens_worker_join(leiasr_d3d11 *sr)
@@ -1593,7 +1792,10 @@ lens_post(leiasr_d3d11 *sr, int wish)
 			int w = sr->lens_mailbox.exchange(-1, std::memory_order_acq_rel);
 			if (w >= 0) {
 				try {
-					lens_set(sr, w == 1);
+					// Under lens_thread_mtx: allowed, the gate sits below it.
+					if (lens_set(sr, w == 1) == leia::lens_gate_result::failed) {
+						return false;
+					}
 				} catch (...) {
 					return false;
 				}
@@ -1787,6 +1989,11 @@ create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 		}
 	}
 
+	// #541: the lens on this new instance exists — lens calls may run from here
+	// on, and nothing ran on it before. Every create (first, async, #158
+	// reconnect) comes through here, after the lens and before any READY CAS.
+	lens_publish(sr);
+
 	return true;
 }
 
@@ -1798,6 +2005,13 @@ create_weaver_attempt(leiasr_d3d11 *sr, double max_time, void *hwnd)
 void
 destroy_sdk_objects(leiasr_d3d11 *sr)
 {
+	// #541 FIRST: the lens belongs to the instance. Close the gate (waiting out a
+	// lens call in flight) and destroy the lens handle before anything on the
+	// instance goes — the weaver, the senses, and above all srDestroyInstance,
+	// which frees the hint the lens points into. From here on a lens call is a
+	// no-op that the next publish re-requests.
+	lens_retire(sr);
+
 	// The target-time latch is per WEAVER, and the #158 in-place reconnect
 	// recreates the weaver on this same struct. Reset it here so the new
 	// weaver gets its own probe + clock gate rather than inheriting a verdict
@@ -1840,34 +2054,7 @@ destroy_sdk_objects(leiasr_d3d11 *sr)
 
 #ifdef DXR_LEIA_HAS_SR_V2
 	if (sr->weaver_v2 != nullptr) {
-		// The v2 lens must be destroyed here; the v1 one must NOT. That is not
-		// because ownership inverted — it is because v2 adds a second, smaller
-		// object that v1 has no equivalent of:
-		//
-		//   v1 SwitchableLensHint : owned by the SRContext. Deleting it is a
-		//                           double-free, which is why the v1 branch
-		//                           below only nulls the pointer.
-		//   v2 SrLens             : a thin handle WRAPPER we own, over that same
-		//                           context-owned hint. srDestroyLens frees only
-		//                           the wrapper and deliberately does not touch
-		//                           the hint underneath.
-		//
-		// So there is no double-free hazard in calling it, and skipping it leaks
-		// the wrapper (one small struct), not the lens. Confirmed against the SR
-		// runtime source — sr_lens.h documents neither, so do not go looking for
-		// it there.
-		if (sr->lens_v2 != nullptr) {
-			// SR D3: a bound lens's request is context-owned and survives
-			// srDestroyLens; a segment DP going away (the window left that
-			// screen) must hand the panel back to 2D explicitly. The
-			// active-display lens keeps today's behaviour (the service owns it).
-			if (sr->lens_bound) {
-				(void)srLensDisable(sr->lens_v2);
-			}
-			srDestroyLens(sr->lens_v2);
-			sr->lens_v2 = nullptr;
-			sr->lens_bound = false;
-		}
+		// The lens (srDestroyLens) already went in lens_retire() at the top.
 		srDestroyWeaver(sr->weaver_v2);
 		sr->weaver_v2 = nullptr;
 
@@ -1879,10 +2066,8 @@ destroy_sdk_objects(leiasr_d3d11 *sr)
 	}
 #endif
 
-	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
-	// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
-	// Manually deleting it causes a crash (double-free).
-	sr->lens_hint = nullptr;
+	// The v1 lens hint was nulled (never deleted: the SRContext owns it) in
+	// lens_retire() at the top.
 
 	// Destroy weaver (SR SDK restores the app's original WndProc)
 	if (sr->weaver != nullptr) {
@@ -2028,7 +2213,9 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			// CAS is self-applied by the recorder (it re-checks state
 			// after storing), or re-driven by the next mode request.
 			// #158 seeds this from last_lens_wish before a reconnect, so
-			// a rebuilt weaver comes back in the mode the runtime asked for.
+			// a rebuilt weaver comes back in the mode the runtime asked for,
+			// and #541's lens_publish (inside create_weaver_attempt) re-seeds
+			// it when a lens call raced the teardown and was held.
 			int wish = sr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
 			if (wish == 0 && sr->async_lens && lens_present(sr)) {
 				// runtime#939: a 2D recorded while we were creating is usually a
@@ -2166,6 +2353,14 @@ reconnect_worker_body(leiasr_d3d11 *sr, double max_time)
 	// no-op when no worker was spawned. Our own thread is never the lens
 	// worker and holds no lock, so neither self-join nor deadlock. The mailbox
 	// it empties is re-asserted from last_lens_wish just below.
+	//
+	// #541: the join is not the guarantee on its own. A request that passed its
+	// READY check just before the CAS can post AFTER this join and spawn a fresh
+	// worker, and the synchronous lens path and get_hardware_3d_state never go
+	// through the worker at all. What makes all of them safe is the lens gate:
+	// destroy_sdk_objects retires it (waiting out a call in flight) before the
+	// instance goes, every later lens call is a no-op, and the publish of the
+	// rebuilt lens re-requests the latest wish.
 	lens_worker_join(sr);
 
 	// Re-assert the mode the runtime last asked for. pending_lens_wish is
@@ -2748,12 +2943,10 @@ leiasr_d3d11_snap_probe_ensure(struct leiasr_d3d11 *leiasr)
 	// presented frame ever sees the lens demoted. (We only run lazily, after 3D
 	// is already locked, so re-asserting is safe — it never forces 3D inside the
 	// SR init-settle window, unlike pre-creating the probe early.)
+	// #541: both lens touches go through the lens gate, like every other.
 	bool lens_was_3d = false;
-	if (leiasr->lens_hint != nullptr) {
-		try {
-			lens_was_3d = leiasr->lens_hint->isEnabled();
-		} catch (...) {
-		}
+	if (!lens_query_3d(leiasr, &lens_was_3d)) {
+		lens_was_3d = false;
 	}
 
 	// Bind an SR weaver to the probe window — this installs the SDK's real
@@ -2773,11 +2966,8 @@ leiasr_d3d11_snap_probe_ensure(struct leiasr_d3d11 *leiasr)
 
 	// Re-assert the pre-create lens state so the probe's creation blip never
 	// reaches a presented frame (see the capture above). Idempotent.
-	if (lens_was_3d && leiasr->lens_hint != nullptr) {
-		try {
-			leiasr->lens_hint->enable();
-		} catch (...) {
-		}
+	if (lens_was_3d) {
+		(void)lens_set(leiasr, true); // never throws: the v1 call is caught inside
 	}
 
 	leiasr->snap_probe_hwnd = hwnd;
@@ -3739,7 +3929,7 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 			int wish = leiasr->pending_lens_wish.exchange(-1, std::memory_order_acq_rel);
 			if (wish >= 0 && lens_present(leiasr)) {
 				try {
-					lens_set(leiasr, wish == 1);
+					(void)lens_set(leiasr, wish == 1); // #541: gated like every lens call
 				} catch (...) {
 				}
 			}
@@ -3759,7 +3949,19 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d)
 			LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
 			QueryPerformanceFrequency(&freq);
 			QueryPerformanceCounter(&t0);
-			lens_set(leiasr, enable_3d);
+			// #541: on the caller's thread, so this is the path most exposed to
+			// a #158 rebuild — a teardown that started after our READY check.
+			// The gate makes that a no-op (re-requested at the rebuild's publish,
+			// which is still "accepted" for a request API) instead of a call
+			// into a destroyed instance.
+			const leia::lens_gate_result res = lens_set(leiasr, enable_3d);
+			if (res == leia::lens_gate_result::deferred) {
+				return true;
+			}
+			if (res == leia::lens_gate_result::failed) {
+				U_LOG_E("Failed to switch SR D3D11 display mode to %s", enable_3d ? "3D" : "2D");
+				return false;
+			}
 			QueryPerformanceCounter(&t1);
 			const double ms = freq.QuadPart > 0
 			                      ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
@@ -3807,12 +4009,12 @@ leiasr_d3d11_get_hardware_3d_state(struct leiasr_d3d11 *leiasr, bool *out_is_3d)
 		return false;
 	}
 
-	try {
-		*out_is_3d = lens_is_enabled(leiasr);
-		return true;
-	} catch (...) {
-		return false;
-	}
+	// #541: through the gate, so a read that passed w_ready() just before a
+	// #158 reconnect armed cannot reach the instance once the teardown has begun.
+	// Non-blocking: while a lens switch holds the gate (one SR round trip) this
+	// answers "unknown" (false), which every runtime caller already treats as
+	// "no verdict this time" rather than stalling its frame behind the switch.
+	return lens_query_3d(leiasr, out_is_3d);
 }
 
 uint32_t
