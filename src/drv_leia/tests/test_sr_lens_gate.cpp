@@ -53,7 +53,10 @@ struct fake_instance
 struct fake_lens
 {
 	fake_instance *inst;
+	int serial; //!< which srCreateLens made it (a freed address can be reused)
 };
+
+int g_lens_serial = 0;
 
 //! The owner: what struct leiasr_d3d11 holds.
 struct owner
@@ -76,7 +79,7 @@ struct owner
 	{
 		instances.emplace_back(new fake_instance());
 		inst = instances.back().get();
-		lens.reset(new fake_lens{inst});
+		lens.reset(new fake_lens{inst, ++g_lens_serial});
 	}
 
 	//! srDestroyInstance: frees the hint every lens of it points into.
@@ -127,7 +130,7 @@ struct owner
 				recreates++;
 				lens.reset();
 				if (recreate_ok) {
-					lens.reset(new fake_lens{inst});
+					lens.reset(new fake_lens{inst, ++g_lens_serial});
 				}
 				return lens != nullptr;
 			};
@@ -227,7 +230,10 @@ test_rebuild_race()
 				break;
 			case leia::lens_gate_result::failed: failed++; break;
 			}
-			std::this_thread::yield();
+			// Like the real worker, which waits for the next wish: let go of
+			// the gate between calls so the rebuilding thread is not starved
+			// (std::mutex is not fair).
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
 		}
 	});
 	int republished = 0;
@@ -262,12 +268,12 @@ test_lens_not_available_recreates()
 	std::printf("SR_ERROR_LENS_NOT_AVAILABLE recreates the lens and retries, one WARN per episode\n");
 	owner o;
 	o.rebuild();
-	fake_lens *first = o.lens.get();
+	const int first = o.lens->serial;
 
 	o.fail_next = 1;
 	CHECK(o.set(true) == leia::lens_gate_result::applied);
 	CHECK(o.recreates == 1);
-	CHECK(o.lens.get() != first);
+	CHECK(o.lens->serial != first); // a NEW lens
 	CHECK(o.lens->inst == o.inst); // on the CURRENT instance
 	CHECK(o.warns == 1);
 	CHECK(o.lens_state == 1);
