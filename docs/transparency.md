@@ -10,7 +10,7 @@ This supersedes [`chroma-key-transparent-overlay.md`](chroma-key-overlay.md) as 
 |---|---|---|
 | D3D11 | compose-under-bg | Falls back to chroma-key on WGC failure. |
 | D3D12 | compose-under-bg | Queue-level shared-fence `Wait` for sync. |
-| Vulkan | compose-under-bg | D3D11 NT-handle → VK external image import. No GPU semaphore wait yet (relies on temporal separation; see [Limits](#limits)). |
+| Vulkan | compose-under-bg | D3D11 NT-handle → VK external image import. No GPU semaphore wait yet (relies on temporal separation; see [Limits](#limits)). When the import is impossible, a CPU staging upload feeds the same compose pass — see [Vulkan CPU staging-upload fallback](#vulkan-cpu-staging-upload-fallback-539). |
 | OpenGL | chroma-key only | Compose-under-bg blocked on the deferred DComp + `WGL_NV_DX_interop2` bridge. |
 | Metal (macOS) | alpha-native | SR weaver preserves alpha end-to-end (commit `e94d07292`); no compose or chroma trick needed. |
 
@@ -119,6 +119,18 @@ The producer is the internal D3D11 device inside `leia_bg_capture_win`. Consumer
 - **D3D11:** `ID3D11DeviceContext4::Wait(fence, value)` in the DP's command stream.
 - **D3D12:** `ID3D12CommandQueue::Wait(fence, value)` at the queue level before the cmd list executes.
 - **VK:** Not implemented — the VK DP relies on the temporal gap between WGC's ~60Hz producer and the consumer's ~120Hz render rate (the producer's copy is sub-ms; the chance of mid-copy sample is negligible). A proper `VK_KHR_external_semaphore_win32` import via `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT` is a follow-up.
+
+### Vulkan CPU staging-upload fallback (#539)
+
+Some Vulkan ICDs cannot import the capture's D3D11 shared texture. The Adreno X2 driver on Windows-on-ARM64 returns `VK_ERROR_OUT_OF_DEVICE_MEMORY` (-3) from `vkAllocateMemory` with the imported handle, and exposes neither `VK_KHR_external_semaphore_win32` nor `VK_KHR_win32_keyed_mutex`. Without the background image the VK DP used to stay opaque, so de-occluded regions of a transparent app (the Avatar demo) scanned out black.
+
+Zero-copy import is still tried first. The fallback engages when the device does not enable `VK_KHR_external_memory_win32`, when the import fails, or when `LEIA_DP_BG_FORCE_CPU_UPLOAD=1` is set:
+
+1. **Readback, on the capture's own D3D11 device, once per capture generation.** WGC delivery is capped at 66 ms by default (`LEIA_DP_CAPTURE_MIN_INTERVAL_MS`), so this runs at most ~15 times a second and never per weave. The monitor-sized staging texture is reduced by `2^LEIA_DP_BG_CPU_SHIFT` (default 1, half resolution, box-filtered through `GenerateMips`; 0..3) into one of two `STAGING` textures. `Map` uses `D3D11_MAP_FLAG_DO_NOT_WAIT`, so the compositor thread never stalls on the readback.
+2. **Upload.** The bytes go into one of two persistently mapped host-visible `VkBuffer`s, then `vkCmdCopyBufferToImage` copies them into a plug-in-owned `DEVICE_LOCAL` BGRA8 image. The copy is recorded into the compositor's command buffer ahead of the compose pass, between barriers, on the queue that samples the image. A `VkEvent` set right after each copy tells the DP when that buffer may be rewritten, because the DP never sees the compositor's fence.
+3. **Compose + gate as usual.** The compose-under-bg pass and the alpha-gate sample this image exactly as they sample an imported one, so the de-occlusion band of 3D content carries desktop pixels. The gate does **not** flatten the α==0 holes on this path (only `DXR_PRESENT_OPAQUE` does): they stay at α=0 and DWM shows the live desktop through them. That needs a transparent present from the runtime, and on a device whose D3D11 import fails the runtime's DComp bridge provides one through its CPU-readback route (displayxr-runtime#2708). An older runtime falls back to an `OPAQUE` `compositeAlpha` there, and its holes present black.
+
+At the default shift a 3840x2160 monitor moves ~8 MB per desktop change. A quiet desktop costs nothing, because WGC delivers only on change. One WARN names the fallback and its reason (`Leia VK DP #539: bg D3D11 import unavailable (...) — using the CPU staging-upload fallback`), and a second one marks the first upload. Neither repeats per frame. The cost is freshness, and only in the de-occlusion band: the background composed there trails the live desktop by one capture interval plus about one frame. The holes themselves are live.
 
 ## App-side recipe
 

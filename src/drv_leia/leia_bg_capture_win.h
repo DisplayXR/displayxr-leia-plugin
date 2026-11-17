@@ -146,6 +146,44 @@ bool leia_bg_capture_poll(struct leia_bg_capture *c,
                           float out_bg_uv_extent[2],
                           uint64_t *out_fence_wait_value);
 
+/*!
+ * #539 — CPU readback of the capture, for a consumer that cannot import the
+ * shared texture (the Vulkan DP on an ICD whose D3D11 shared-handle import
+ * fails, e.g. Adreno on Windows-on-ARM: vkAllocateMemory → -3).
+ *
+ * Arms a producer inside @ref leia_bg_capture_poll: once per CAPTURE
+ * generation (the WGC delivery cadence, <= 15 Hz by default — never per
+ * weave) the monitor-sized staging texture is reduced by 2^@p shift (box
+ * filter via GenerateMips; 0 = full resolution, clamped to 0..3) and copied
+ * into one of two CPU-readable STAGING textures. Nothing maps until
+ * @ref leia_bg_capture_cpu_fetch, which never blocks.
+ *
+ * @p out_w / @p out_h receive the readback size (BGRA8, top-down). The pixels
+ * cover the WHOLE monitor, so the UVs @ref leia_bg_capture_poll returns apply
+ * unchanged.
+ *
+ * @return false if the readback targets could not be created (the caller
+ *         must then treat the capture as unusable for this consumer).
+ */
+bool leia_bg_capture_enable_cpu_readback(struct leia_bg_capture *c,
+                                         uint32_t shift,
+                                         uint32_t *out_w,
+                                         uint32_t *out_h);
+
+/*!
+ * #539 — copy the newest finished readback into @p dst (rows of
+ * @p dst_row_bytes, the size from @ref leia_bg_capture_enable_cpu_readback).
+ * Non-blocking: Map uses D3D11_MAP_FLAG_DO_NOT_WAIT, so a readback the GPU has
+ * not finished yet stays pending and is retried on the next call.
+ *
+ * @return true when @p dst now holds a capture generation newer than the
+ *         last one returned (its number in @p out_gen); false when nothing
+ *         new is ready — @p dst is then untouched.
+ *
+ * Threading: the compositor render thread, like @ref leia_bg_capture_poll.
+ */
+bool leia_bg_capture_cpu_fetch(struct leia_bg_capture *c, void *dst, uint32_t dst_row_bytes, uint64_t *out_gen);
+
 #ifdef LEIA_BG_CAPTURE_HAS_PREVIEW
 /*!
  * Hand back the latest downsampled CPU preview of the desktop under the app's

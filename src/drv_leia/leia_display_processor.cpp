@@ -155,6 +155,39 @@ struct leia_display_processor
 	VkDeviceMemory bg_mem;
 	uint32_t bg_w, bg_h;
 
+	// #539 — CPU staging-upload fallback for bg_image. When the D3D11 shared
+	// texture cannot be imported (Adreno on Windows-on-ARM: vkAllocateMemory
+	// with the imported handle returns -3), bg_image is instead a plug-in-owned
+	// DEVICE_LOCAL image fed from the capture's CPU readback: Map on the
+	// capture's D3D11 device (once per capture generation, <= 15 Hz) → one of
+	// two persistently mapped host-visible VkBuffers → vkCmdCopyBufferToImage
+	// recorded into the compositor's command buffer. A VkEvent set by the GPU
+	// right after each copy tells us when that buffer may be written again
+	// (the DP records into the runtime's command buffer and never sees its
+	// fence). Function pointers are resolved locally — vk_bundle crosses the
+	// plug-in ABI and must not grow (ADR-020).
+	bool bg_cpu;             //!< bg_image is CPU-fed, not imported.
+	bool bg_cpu_initialized; //!< bg_image has left VK_IMAGE_LAYOUT_UNDEFINED.
+	bool bg_cpu_first_logged;
+	bool bg_cpu_stuck_logged;
+	bool bg_cpu_coherent;
+	uint32_t bg_cpu_row_bytes;
+	VkDeviceSize bg_cpu_buf_size;
+	struct
+	{
+		VkBuffer buf;
+		VkDeviceMemory mem;
+		void *map;
+		VkEvent ev;
+		bool in_flight;      //!< copy recorded; buffer busy until ev is SET.
+		uint64_t record_ns;  //!< os_monotonic_get_ns() when the copy was recorded.
+	} bg_cpu_buf[2];
+	PFN_vkCreateEvent pfn_create_event;
+	PFN_vkDestroyEvent pfn_destroy_event;
+	PFN_vkGetEventStatus pfn_get_event_status;
+	PFN_vkResetEvent pfn_reset_event;
+	PFN_vkCmdSetEvent pfn_cmd_set_event;
+
 	// #491 part 3 — the runtime's flattened 2D-under backdrop for the next
 	// process_atlas (set via set_background_2d). The Leia VK DP shares the
 	// compositor's VkDevice (ldp->vk), so this is sampled directly — no import
@@ -829,6 +862,415 @@ compose_import_bg_image(struct leia_display_processor *ldp)
 	return true;
 }
 
+
+/*
+ *
+ * #539 — CPU staging-upload fallback for the background image.
+ *
+ * Zero-copy import (compose_import_bg_image) stays the first choice. When it is
+ * impossible — the device does not enable VK_KHR_external_memory_win32, or the
+ * ICD rejects the D3D11 shared handle (Adreno X2 on Windows-on-ARM:
+ * vkAllocateMemory → VK_ERROR_OUT_OF_DEVICE_MEMORY) — the capture's pixels
+ * reach Vulkan through the CPU instead:
+ *
+ *   capture D3D11 device: staging tex → (GenerateMips, 1/2^shift) → STAGING
+ *     tex, queued once per capture generation (WGC cadence, <= 15 Hz)
+ *   compositor thread: Map(DO_NOT_WAIT) → host-visible VkBuffer (memcpy)
+ *   compositor cmd buffer: barrier → vkCmdCopyBufferToImage → vkCmdSetEvent
+ *     → barrier to SHADER_READ_ONLY — the same queue the compose pass samples
+ *     on, so ordinary pipeline barriers order the copy against earlier frames'
+ *     reads of bg_image.
+ *
+ * Everything downstream (compose-under-bg, the alpha-gate's bg binding) sees an
+ * ordinary bg_view and is unchanged.
+ *
+ */
+
+//! LEIA_DP_BG_FORCE_CPU_UPLOAD=1 — skip the import and use the CPU fallback
+//! (A/B testing the #539 path on a GPU whose import works).
+static bool
+env_bg_force_cpu(void)
+{
+	const char *v = getenv("LEIA_DP_BG_FORCE_CPU_UPLOAD");
+	return v != NULL && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+}
+
+//! LEIA_DP_BG_CPU_SHIFT=N — readback reduction 1/2^N (0..3). Default 1 (half
+//! resolution: a 3840x2160 monitor reads back 1920x1080, ~8 MB per update).
+static uint32_t
+env_bg_cpu_shift(void)
+{
+	const char *v = getenv("LEIA_DP_BG_CPU_SHIFT");
+	if (v == NULL || v[0] < '0' || v[0] > '3' || v[1] != '\0') {
+		return 1;
+	}
+	return (uint32_t)(v[0] - '0');
+}
+
+//! Is VK_KHR_external_memory_win32 enabled on this device? Its import
+//! direction has no entry point of its own, so the export proc stands in
+//! (the runtime's vk_has_external_memory_win32 does the same).
+static bool
+device_has_external_memory_win32(struct vk_bundle *vk)
+{
+	return vk->vkGetDeviceProcAddr(vk->device, "vkGetMemoryWin32HandleKHR") != NULL;
+}
+
+static uint32_t
+find_memory_type(struct vk_bundle *vk, uint32_t type_bits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred)
+{
+	VkPhysicalDeviceMemoryProperties mp = {};
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mp);
+	uint32_t fallback = UINT32_MAX;
+	for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+		if ((type_bits & (1u << i)) == 0) {
+			continue;
+		}
+		const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+		if ((f & required) != required) {
+			continue;
+		}
+		if ((f & preferred) == preferred) {
+			return i;
+		}
+		if (fallback == UINT32_MAX) {
+			fallback = i;
+		}
+	}
+	return fallback;
+}
+
+static void
+compose_release_bg_cpu(struct leia_display_processor *ldp)
+{
+	struct vk_bundle *vk = ldp->vk;
+	for (int i = 0; i < 2; i++) {
+		auto &b = ldp->bg_cpu_buf[i];
+		if (b.ev != VK_NULL_HANDLE && ldp->pfn_destroy_event != NULL) {
+			ldp->pfn_destroy_event(vk->device, b.ev, NULL);
+		}
+		if (b.map != NULL) {
+			vk->vkUnmapMemory(vk->device, b.mem);
+		}
+		if (b.buf != VK_NULL_HANDLE) {
+			vk->vkDestroyBuffer(vk->device, b.buf, NULL);
+		}
+		if (b.mem != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, b.mem, NULL);
+		}
+	}
+	std::memset(&ldp->bg_cpu_buf, 0, sizeof(ldp->bg_cpu_buf));
+	ldp->bg_cpu = false;
+	ldp->bg_cpu_initialized = false;
+}
+
+/*!
+ * Build the CPU-fed bg_image/bg_view + the two upload buffers, and arm the
+ * capture's readback. On failure everything created here is released and the
+ * caller stays opaque, exactly as before #539.
+ */
+static bool
+compose_create_bg_cpu(struct leia_display_processor *ldp, const char *why)
+{
+	struct vk_bundle *vk = ldp->vk;
+	VkResult res;
+
+	ldp->pfn_create_event = (PFN_vkCreateEvent)vk->vkGetDeviceProcAddr(vk->device, "vkCreateEvent");
+	ldp->pfn_destroy_event = (PFN_vkDestroyEvent)vk->vkGetDeviceProcAddr(vk->device, "vkDestroyEvent");
+	ldp->pfn_get_event_status = (PFN_vkGetEventStatus)vk->vkGetDeviceProcAddr(vk->device, "vkGetEventStatus");
+	ldp->pfn_reset_event = (PFN_vkResetEvent)vk->vkGetDeviceProcAddr(vk->device, "vkResetEvent");
+	ldp->pfn_cmd_set_event = (PFN_vkCmdSetEvent)vk->vkGetDeviceProcAddr(vk->device, "vkCmdSetEvent");
+	if (ldp->pfn_create_event == NULL || ldp->pfn_destroy_event == NULL || ldp->pfn_get_event_status == NULL ||
+	    ldp->pfn_reset_event == NULL || ldp->pfn_cmd_set_event == NULL) {
+		U_LOG_W("Leia VK DP #539: VkEvent entry points unresolved — no CPU upload fallback");
+		return false;
+	}
+
+	const uint32_t shift = env_bg_cpu_shift();
+	uint32_t w = 0, h = 0;
+	if (!leia_bg_capture_enable_cpu_readback(ldp->bg_capture, shift, &w, &h) || w == 0 || h == 0) {
+		U_LOG_W("Leia VK DP #539: capture CPU readback could not be armed — no CPU upload fallback");
+		return false;
+	}
+	uint32_t mon_w = 0, mon_h = 0;
+	leia_bg_capture_get_size(ldp->bg_capture, &mon_w, &mon_h);
+	ldp->bg_w = w;
+	ldp->bg_h = h;
+	ldp->bg_cpu = true; // from here on compose_release_bg_cpu undoes partial state
+	ldp->bg_cpu_row_bytes = w * 4u;
+	ldp->bg_cpu_buf_size = (VkDeviceSize)ldp->bg_cpu_row_bytes * h;
+
+	// Plug-in-owned sampled image, same format as the D3D11 capture (BGRA8),
+	// so the readback bytes copy straight in.
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	res = vk->vkCreateImage(vk->device, &image_ci, NULL, &ldp->bg_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_W("Leia VK DP #539: bg vkCreateImage failed: %d", res);
+		goto fail;
+	}
+	{
+		VkMemoryRequirements reqs = {};
+		vk->vkGetImageMemoryRequirements(vk->device, ldp->bg_image, &reqs);
+		VkMemoryAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .allocationSize = reqs.size,
+		    .memoryTypeIndex =
+		        find_memory_type(vk, reqs.memoryTypeBits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+		};
+		if (ai.memoryTypeIndex == UINT32_MAX) {
+			U_LOG_W("Leia VK DP #539: no memory type for the bg image");
+			goto fail;
+		}
+		res = vk->vkAllocateMemory(vk->device, &ai, NULL, &ldp->bg_mem);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: bg image vkAllocateMemory failed: %d", res);
+			goto fail;
+		}
+		res = vk->vkBindImageMemory(vk->device, ldp->bg_image, ldp->bg_mem, 0);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: bg vkBindImageMemory failed: %d", res);
+			goto fail;
+		}
+	}
+	{
+		VkImageViewCreateInfo vi = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		    .image = ldp->bg_image,
+		    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+		    .format = VK_FORMAT_B8G8R8A8_UNORM,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		res = vk->vkCreateImageView(vk->device, &vi, NULL, &ldp->bg_view);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: bg vkCreateImageView failed: %d", res);
+			goto fail;
+		}
+	}
+
+	ldp->bg_cpu_coherent = true;
+	for (int i = 0; i < 2; i++) {
+		auto &b = ldp->bg_cpu_buf[i];
+		VkBufferCreateInfo bi = {
+		    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		    .size = ldp->bg_cpu_buf_size,
+		    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		};
+		res = vk->vkCreateBuffer(vk->device, &bi, NULL, &b.buf);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: upload vkCreateBuffer failed: %d", res);
+			goto fail;
+		}
+		VkMemoryRequirements reqs = {};
+		vk->vkGetBufferMemoryRequirements(vk->device, b.buf, &reqs);
+		const uint32_t mti = find_memory_type(vk, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+		                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		if (mti == UINT32_MAX) {
+			U_LOG_W("Leia VK DP #539: no host-visible memory type for the upload buffer");
+			goto fail;
+		}
+		VkPhysicalDeviceMemoryProperties mp = {};
+		vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mp);
+		if ((mp.memoryTypes[mti].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) {
+			ldp->bg_cpu_coherent = false;
+		}
+		VkMemoryAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .allocationSize = reqs.size,
+		    .memoryTypeIndex = mti,
+		};
+		res = vk->vkAllocateMemory(vk->device, &ai, NULL, &b.mem);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: upload buffer vkAllocateMemory failed: %d", res);
+			goto fail;
+		}
+		res = vk->vkBindBufferMemory(vk->device, b.buf, b.mem, 0);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: upload vkBindBufferMemory failed: %d", res);
+			goto fail;
+		}
+		res = vk->vkMapMemory(vk->device, b.mem, 0, VK_WHOLE_SIZE, 0, &b.map);
+		if (res != VK_SUCCESS) {
+			b.map = NULL;
+			U_LOG_W("Leia VK DP #539: upload vkMapMemory failed: %d", res);
+			goto fail;
+		}
+		VkEventCreateInfo ei = {.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+		res = ldp->pfn_create_event(vk->device, &ei, NULL, &b.ev);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Leia VK DP #539: vkCreateEvent failed: %d", res);
+			goto fail;
+		}
+	}
+
+	U_LOG_W("Leia VK DP #539: bg D3D11 import unavailable (%s) — using the CPU staging-upload fallback: "
+	        "%ux%u monitor read back at %ux%u (1/%u, LEIA_DP_BG_CPU_SHIFT=%u) once per capture generation, "
+	        "uploaded via host-visible buffer + vkCmdCopyBufferToImage%s; it feeds the pre-weave compose, "
+	        "and the alpha-gate keeps the holes live (runtime #2708)",
+	        why, mon_w, mon_h, w, h, 1u << shift, shift, ldp->bg_cpu_coherent ? "" : " (non-coherent, flushed)");
+	return true;
+
+fail:
+	compose_release_bg_cpu(ldp);
+	if (ldp->bg_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, ldp->bg_view, NULL);
+		ldp->bg_view = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, ldp->bg_image, NULL);
+		ldp->bg_image = VK_NULL_HANDLE;
+	}
+	if (ldp->bg_mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, ldp->bg_mem, NULL);
+		ldp->bg_mem = VK_NULL_HANDLE;
+	}
+	return false;
+}
+
+/*!
+ * Per frame (compose path, CPU fallback only): reclaim upload buffers the GPU
+ * has finished with, upload the newest finished readback if there is one, and
+ * make sure bg_image is in SHADER_READ_ONLY_OPTIMAL before anything samples
+ * it. Recorded into @p cmd ahead of the compose pass.
+ */
+static void
+compose_bg_cpu_record(struct leia_display_processor *ldp, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = ldp->vk;
+	const uint64_t now = os_monotonic_get_ns();
+
+	// 1. Reclaim. A SET event means the copy that read this buffer executed.
+	// A buffer whose command buffer was never submitted (a dropped frame)
+	// would stay busy forever; after 2 s nothing can still be executing it.
+	int free_i = -1;
+	for (int i = 0; i < 2; i++) {
+		auto &b = ldp->bg_cpu_buf[i];
+		if (b.in_flight) {
+			const VkResult st = ldp->pfn_get_event_status(vk->device, b.ev);
+			const bool stale = (now - b.record_ns) > 2000000000ull;
+			if (st == VK_EVENT_SET || stale) {
+				if (st != VK_EVENT_SET && !ldp->bg_cpu_stuck_logged) {
+					ldp->bg_cpu_stuck_logged = true;
+					U_LOG_W("Leia VK DP #539: an upload buffer's copy never executed within 2 s "
+					        "(command buffer dropped?) — reclaiming it; not logged again");
+				}
+				ldp->pfn_reset_event(vk->device, b.ev);
+				b.in_flight = false;
+			}
+		}
+		if (!b.in_flight && free_i < 0) {
+			free_i = i;
+		}
+	}
+
+	// 2. Upload the newest finished readback, if any.
+	uint64_t gen = 0;
+	if (free_i >= 0 &&
+	    leia_bg_capture_cpu_fetch(ldp->bg_capture, ldp->bg_cpu_buf[free_i].map, ldp->bg_cpu_row_bytes, &gen)) {
+		auto &b = ldp->bg_cpu_buf[free_i];
+		if (!ldp->bg_cpu_coherent) {
+			VkMappedMemoryRange r = {
+			    .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+			    .memory = b.mem,
+			    .offset = 0,
+			    .size = VK_WHOLE_SIZE,
+			};
+			vk->vkFlushMappedMemoryRanges(vk->device, 1, &r);
+		}
+		// Host writes before vkQueueSubmit are visible to the device (the
+		// submit is an implicit host-write domain operation), so the copy
+		// needs no host barrier. The image barrier orders the copy after
+		// every earlier sample of bg_image on this queue (WAR).
+		VkImageMemoryBarrier to_dst = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .oldLayout = ldp->bg_cpu_initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+		                                         : VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = ldp->bg_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &to_dst);
+		VkBufferImageCopy region = {
+		    .bufferOffset = 0,
+		    .bufferRowLength = ldp->bg_w,
+		    .bufferImageHeight = ldp->bg_h,
+		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .imageOffset = {0, 0, 0},
+		    .imageExtent = {ldp->bg_w, ldp->bg_h, 1},
+		};
+		vk->vkCmdCopyBufferToImage(cmd, b.buf, ldp->bg_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		ldp->pfn_cmd_set_event(cmd, b.ev, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkImageMemoryBarrier to_read = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = ldp->bg_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &to_read);
+		b.in_flight = true;
+		b.record_ns = now;
+		ldp->bg_cpu_initialized = true;
+		if (!ldp->bg_cpu_first_logged) {
+			ldp->bg_cpu_first_logged = true;
+			U_LOG_W("Leia VK DP #539: first CPU background upload recorded (capture generation %llu, %ux%u)",
+			        (unsigned long long)gen, ldp->bg_w, ldp->bg_h);
+		}
+		return;
+	}
+
+	// 3. Nothing uploaded yet: give bg_image defined (black) contents and the
+	// layout every sampler expects, once.
+	if (!ldp->bg_cpu_initialized) {
+		VkImageMemoryBarrier to_dst = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = ldp->bg_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+		                         NULL, 0, NULL, 1, &to_dst);
+		VkClearColorValue black = {};
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vk->vkCmdClearColorImage(cmd, ldp->bg_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+		VkImageMemoryBarrier to_read = to_dst;
+		to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+		                         0, NULL, 0, NULL, 1, &to_read);
+		ldp->bg_cpu_initialized = true;
+	}
+}
+
 // Build compose-specific descriptor layout / pipeline layout / sampler /
 // descriptor pool / pipeline. Reuses ck_fill_rp as the render pass (same
 // R8G8B8A8_UNORM attachment). Requires ck_init_pipeline to have run first
@@ -1218,15 +1660,22 @@ compose_run_pre_weave(struct leia_display_processor *ldp,
 	float bg_extent[2] = {0.0f, 0.0f};
 	uint64_t unused = 0;
 	bool have_bg = leia_bg_capture_poll(ldp->bg_capture, bg_origin, bg_extent, &unused);
+	if (ldp->bg_cpu) {
+		// #539: upload the newest readback (and define bg_image's layout on
+		// first use) BEFORE the early-out: the post-weave gate samples bg_view
+		// even on a frame whose compose is skipped.
+		compose_bg_cpu_record(ldp, cmd);
+	}
 	if (!have_bg) {
 		return VK_NULL_HANDLE;
 	}
 
 	// First-use barrier on the imported bg image: UNDEFINED → SHADER_READ_ONLY.
 	// Subsequent frames keep it in SHADER_READ_ONLY (the D3D11 producer writes
-	// through the shared memory without going through VK layouts).
+	// through the shared memory without going through VK layouts). The #539
+	// CPU-fed image manages its own layout (compose_bg_cpu_record).
 	static thread_local bool bg_transitioned = false;
-	if (!bg_transitioned) {
+	if (!bg_transitioned && !ldp->bg_cpu) {
 		VkImageMemoryBarrier b = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		    .srcAccessMask = 0,
@@ -1518,7 +1967,15 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	push.tile_count[0] = tile_columns;
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u; // #491 part 3
-	push.flatten = (env_present_opaque() && have_bg) ? 1u : 0u; // #116
+	// #116 — opaque present flattens the holes against the captured desktop.
+	// runtime #2708 — the CPU-upload fallback does NOT force it. The runtime's
+	// DComp bridge now presents true per-pixel alpha on a device whose D3D11
+	// import fails (CPU-readback route), so the α==0 holes must stay α=0 and
+	// show the LIVE desktop through DWM; flattening them would paint a capture
+	// that lags the desktop by up to a capture interval over the whole window.
+	// The CPU-fed bg still feeds the pre-weave compose, which is what fills the
+	// de-occlusion band with desktop pixels, exactly as the import path does.
+	push.flatten = (env_present_opaque() && have_bg) ? 1u : 0u;
 	push.bg_uv_origin[0] = ldp->bg_uv_last[0];
 	push.bg_uv_origin[1] = ldp->bg_uv_last[1];
 	push.bg_uv_extent[0] = ldp->bg_uv_last[2];
@@ -1589,6 +2046,7 @@ compose_release_resources(struct leia_display_processor *ldp)
 		vk->vkDestroySampler(vk->device, ldp->compose_sampler, NULL);
 		ldp->compose_sampler = VK_NULL_HANDLE;
 	}
+	compose_release_bg_cpu(ldp); // #539 upload buffers + events (no-op when unused)
 	if (ldp->bg_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, ldp->bg_view, NULL);
 		ldp->bg_view = VK_NULL_HANDLE;
@@ -2161,13 +2619,28 @@ leia_dp_vk_set_transparent_background(struct xrt_display_processor_vk *xdp, bool
 				        (unsigned long long)cap_luid, (unsigned long long)vk_luid);
 				leia_bg_capture_destroy(ldp->bg_capture);
 				ldp->bg_capture = nullptr;
-			} else if (compose_import_bg_image(ldp)) {
-				ldp->bg_compose_enabled = true;
-				U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
-				return;
+			} else {
+				// Zero-copy import first; the #539 CPU staging upload only when
+				// the import is impossible (extension not enabled) or fails
+				// (Adreno: vkAllocateMemory -3), or when forced for A/B.
+				const bool force_cpu = env_bg_force_cpu();
+				const bool can_import = device_has_external_memory_win32(vk);
+				if (!force_cpu && can_import && compose_import_bg_image(ldp)) {
+					ldp->bg_compose_enabled = true;
+					U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC)");
+					return;
+				}
+				const char *why = force_cpu ? "forced by LEIA_DP_BG_FORCE_CPU_UPLOAD"
+				                  : !can_import ? "VK_KHR_external_memory_win32 not enabled on the device"
+				                                : "D3D11 shared-texture import failed";
+				if (compose_create_bg_cpu(ldp, why)) {
+					ldp->bg_compose_enabled = true;
+					U_LOG_W("Leia VK DP: transparency = compose-under-bg (WGC, CPU staging upload #539)");
+					return;
+				}
 			}
 			if (ldp->bg_capture != nullptr) {
-				U_LOG_W("Leia VK DP: bg image import failed — staying opaque");
+				U_LOG_W("Leia VK DP: bg image import and CPU upload fallback both failed — staying opaque");
 				leia_bg_capture_destroy(ldp->bg_capture);
 				ldp->bg_capture = nullptr;
 			}
