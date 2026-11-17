@@ -111,3 +111,33 @@ weaver on a new context is not implemented.
   the app's choice when it returns, which covers that case. On X11 nothing does.
 - `xrEndSession` asks for 2D, so a process that ends a session and begins another one owns the
   lens in the second session.
+
+## Windows D3D11: the lens belongs to its SR instance (#541)
+
+The D3D11 arm rebuilds its SR instance in place when the SR platform restarts (#158), on a
+worker thread, while the async lens worker (#215) and the runtime's own threads may still be
+switching or reading the lens. A v2 `SrLens` points into a hint that `srDestroyInstance` frees,
+so a lens call that lands during or after the teardown is a use-after-free in the SR client
+(LeiaInc/LeiaSR#598). LeiaSR#892 makes the SR side refuse such a call, but SR runtimes up to
+1.39.x do not have it.
+
+`leia_sr_lens_gate.h` makes the plug-in safe on its own:
+
+- Every lens call (switch, read, and the weaver's 2D-start hold that rides with a switch) runs
+  under one lock, and only while the gate is **live**.
+- `destroy_sdk_objects` **retires** the gate first: it waits for a lens call in flight, refuses
+  later ones, and destroys the lens handle before the weaver, the senses and the instance go.
+- `create_weaver_attempt` **publishes** the gate once the lens on the new instance exists. A
+  call that arrived while the gate was retired was a no-op; the publish re-requests the runtime's
+  latest wish on the new lens (one WARN).
+- A failing switch (`SR_ERROR_LENS_NOT_AVAILABLE`, or any failure from an SR runtime without
+  #892) recreates the lens on the current instance, with the same display binding, and retries
+  once. One WARN per failure episode.
+- `get_hardware_3d_state` never waits behind a switch: while one holds the lock it answers
+  "unknown", which the runtime already treats as no verdict.
+
+Lock order, outermost first: the runtime's render mutex, then `lens_thread_mtx`, then the gate
+(a leaf). The policy is host-tested without an SDK by `tests/test_sr_lens_gate.cpp` (Linux CI).
+The D3D12, GL and Vulkan arms do not rebuild in place: a platform restart reports STALE, and the
+display processor is destroyed (lens before instance, after joining its lens worker) and
+recreated, so they need no gate.
