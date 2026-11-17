@@ -96,6 +96,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <ImageIO/ImageIO.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -146,6 +147,17 @@ struct leia_dp_mac
 	struct leia_lens_owner lens_owner;
 
 	_Atomic int64_t last_pair_ns; //!< monotonic time of the last raw eye sample (tracking freshness)
+
+	//! Eye-tracking mode (MANAGED / MANUAL, XR_DXR_display_info) — the SR
+	//! weaver tracking-loss mode, ST-5961. The runtime's set_eye_tracking_mode
+	//! only stores the wish; the next eye read applies it to the weaver, so
+	//! every SR weaver call stays on the thread that reads eyes.
+	_Atomic uint32_t loss_mode_wanted; //!< 0 = MANAGED, 1 = MANUAL
+	pthread_mutex_t loss_mode_lock;
+	bool loss_mode_lock_init;
+	bool loss_mode_applied_once; //!< loss_mode_applied below is meaningful
+	uint32_t loss_mode_applied;  //!< the wish last applied (attempted)
+	bool loss_manual;            //!< the weaver is in MANUAL now
 	SrPoint3f last_good_l, last_good_r;
 	bool have_last_good;
 
@@ -1126,10 +1138,89 @@ leia_dp_mac_snap_window_rect(struct xrt_display_processor_metal *xdp,
 }
 #endif
 
+//! Bring the weaver to the wanted tracking-loss mode (eye-read thread).
+static void
+leia_dp_mac_sync_loss_mode(struct leia_dp_mac *ldp)
+{
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	if (ldp->weaver == NULL || !ldp->loss_mode_lock_init) {
+		return;
+	}
+	const uint32_t wanted = atomic_load(&ldp->loss_mode_wanted);
+	pthread_mutex_lock(&ldp->loss_mode_lock);
+	if (!ldp->loss_mode_applied_once || ldp->loss_mode_applied != wanted) {
+		SrResult r = SR_SUCCESS; // MANAGED on a weaver that never left it: no call
+		if (wanted == 1u || ldp->loss_manual) {
+			r = srWeaverSetTrackingLossMode(ldp->weaver, wanted == 1u ? SR_TRACKING_LOSS_MODE_MANUAL
+			                                                          : SR_TRACKING_LOSS_MODE_MANAGED);
+			U_LOG_W("leia_mac_dp:%s weaver tracking-loss mode %s %s (%s)", ldp->screen_bound ? " [segment]" : "",
+			        wanted == 1u ? "MANUAL" : "MANAGED",
+			        SR_SUCCEEDED(r) ? "applied" : "NOT applied, the weaver keeps its mode",
+			        leia_mac_sr_result_str(r));
+		}
+		ldp->loss_mode_applied_once = true;
+		ldp->loss_mode_applied = wanted;
+		if (SR_SUCCEEDED(r)) {
+			ldp->loss_manual = wanted == 1u;
+		}
+	}
+	pthread_mutex_unlock(&ldp->loss_mode_lock);
+#else
+	(void)ldp;
+#endif
+}
+
+/*!
+ * The weaver's own tracking state, when the SR runtime answers it: TRACKING is
+ * a viewer; LOST, RESTED and OUT_OF_ZONE are not. In MANAGED, LOST follows
+ * SR's face-lost delay (the edge the Windows DPs report). The freshness rule
+ * cannot see that loss: SR keeps delivering eased eye pairs through the MANAGED
+ * fade, so "fresh" never lapses (measured on the Linux arm, DS1, SR 1.39.0+3495
+ * — leia-plugin #537; this arm had the same rule). In MANUAL, LOST is the
+ * tracker's debounced face loss. Returns false when the state is unavailable
+ * (older SDK or runtime), and the caller falls back to freshness.
+ */
+static bool
+leia_dp_mac_weaver_tracking_state(struct leia_dp_mac *ldp, bool *out_tracking)
+{
+#ifdef SR_WEAVER_TRACKING_POLICY_AVAILABLE
+	if (ldp->weaver == NULL) {
+		return false;
+	}
+	SrTrackingState st = SR_TRACKING_STATE_LOST;
+	if (SR_FAILED(srWeaverGetTrackingState(ldp->weaver, &st))) {
+		return false;
+	}
+	*out_tracking = st == SR_TRACKING_STATE_TRACKING && ldp->tracker != NULL;
+	return true;
+#else
+	(void)ldp;
+	(void)out_tracking;
+	return false;
+#endif
+}
+
+static void
+leia_dp_mac_set_eye_tracking_mode(struct xrt_display_processor_metal *xdp, uint32_t mode)
+{
+	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	if (mode == 1u && !leia_mac_tracking_loss_mode_available()) {
+		static bool logged;
+		if (!logged) {
+			U_LOG_W("leia_mac_dp: MANUAL eye tracking unsupported by this SR runtime (no "
+			        "srWeaverSetTrackingLossMode); staying MANAGED");
+			logged = true;
+		}
+		return;
+	}
+	atomic_store(&ldp->loss_mode_wanted, mode == 1u ? 1u : 0u); // applied at the next eye read
+}
+
 static bool
 leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp, struct xrt_eye_positions *out)
 {
 	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
+	leia_dp_mac_sync_loss_mode(ldp);
 	SrPoint3f l = {0}, r = {0};
 	const SrResult res =
 	    ldp->weaver != NULL ? srWeaverGetPredictedEyePositions(ldp->weaver, &l, &r) : SR_ERROR_HANDLE_INVALID;
@@ -1159,7 +1250,12 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 	out->timestamp_ns = (int64_t)os_monotonic_get_ns();
 	out->valid = true;
 	const int64_t last = atomic_load(&ldp->last_pair_ns);
-	out->is_tracking = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < LEIA_MAC_EYE_FRESH_NS;
+	const bool fresh = last != 0 && ((int64_t)os_monotonic_get_ns() - last) < LEIA_MAC_EYE_FRESH_NS;
+	bool weaver_tracking = false;
+	const bool have_state = leia_dp_mac_weaver_tracking_state(ldp, &weaver_tracking);
+	// Fallback (SDK or runtime without srWeaverGetTrackingState): a raw eye
+	// pair in the last 250 ms.
+	out->is_tracking = have_state ? weaver_tracking : fresh;
 
 	// Edge-only WARN (never per frame): tracked eyes = a fresh raw pair
 	// (fresh_raw=1) AND a non-nominal weaver sample. After a panel is plugged
@@ -1170,17 +1266,18 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 		const bool tracked = out->is_tracking && plausible;
 		if (tracked && !ldp->tracking) {
 			const uint64_t from = ldp->not_tracking_since_ns != 0 ? ldp->not_tracking_since_ns : ldp->created_ns;
-			U_LOG_W("leia_mac_dp:%s eye tracking ACQUIRED (fresh_raw=1, non-nominal) %llu ms after %s",
-			        ldp->screen_bound ? " [segment]" : "", (unsigned long long)((t - from) / 1000000ull),
+			U_LOG_W("leia_mac_dp:%s eye tracking ACQUIRED (%s=1, non-nominal) %llu ms after %s",
+			        ldp->screen_bound ? " [segment]" : "", have_state ? "weaver_state" : "fresh_raw",
+			        (unsigned long long)((t - from) / 1000000ull),
 			        ldp->ever_tracked ? "it was lost" : "the DP was created");
 			ldp->tracking = true;
 			ldp->ever_tracked = true;
 			ldp->not_tracking_since_ns = 0;
 		} else if (!tracked && ldp->tracking) {
-			U_LOG_W("leia_mac_dp:%s eye tracking LOST (fresh_raw=%d, %s) — nominal / last-good eyes until it "
-			        "returns",
-			        ldp->screen_bound ? " [segment]" : "", (int)out->is_tracking,
-			        plausible ? "weaver sample ok" : "no weaver sample");
+			U_LOG_W("leia_mac_dp:%s eye tracking LOST (%s=0, fresh_raw=%d, %s) — %s until it returns",
+			        ldp->screen_bound ? " [segment]" : "", have_state ? "weaver_state" : "fresh_raw", (int)fresh,
+			        plausible ? "weaver sample ok" : "no weaver sample",
+			        ldp->loss_manual ? "MANUAL: the weaver holds the last eyes" : "nominal / last-good eyes");
 			ldp->tracking = false;
 			ldp->not_tracking_since_ns = t;
 		}
@@ -1196,8 +1293,10 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 		if (ldp->screen_bound) {
 			snprintf(tag, sizeof(tag), " [segment 0x%016llx]", (unsigned long long)ldp->screen.sr_display_id);
 		}
-		U_LOG_I("leia_mac_dp:%s weaver eyes L(%.1f %.1f %.1f) R(%.1f %.1f %.1f) mm rc=%s fresh_raw=%d", tag, l.x,
-		        l.y, l.z, r.x, r.y, r.z, leia_mac_sr_result_str(res), (int)out->is_tracking);
+		U_LOG_I("leia_mac_dp:%s weaver eyes L(%.1f %.1f %.1f) R(%.1f %.1f %.1f) mm rc=%s fresh_raw=%d "
+		        "is_tracking=%d (%s) mode=%s",
+		        tag, l.x, l.y, l.z, r.x, r.y, r.z, leia_mac_sr_result_str(res), (int)fresh, (int)out->is_tracking,
+		        have_state ? "weaver state" : "freshness", ldp->loss_manual ? "MANUAL" : "MANAGED");
 	}
 	return true;
 }
@@ -1318,6 +1417,9 @@ leia_dp_mac_destroy(struct xrt_display_processor_metal *xdp)
 	[ldp->view release];
 	[ldp->queue release];
 	[ldp->device release];
+	if (ldp->loss_mode_lock_init) {
+		pthread_mutex_destroy(&ldp->loss_mode_lock);
+	}
 	U_LOG_W("leia_mac_dp: destroyed after %llu frames", (unsigned long long)ldp->frames);
 	free(ldp);
 }
@@ -1345,6 +1447,7 @@ leia_dp_mac_create(void *metal_device,
 	struct leia_dp_mac *ldp = calloc(1, sizeof(*ldp));
 	if (ldp != NULL) {
 		ldp->created_ns = os_monotonic_get_ns();
+		ldp->loss_mode_lock_init = pthread_mutex_init(&ldp->loss_mode_lock, NULL) == 0;
 	}
 	if (ldp == NULL) {
 		return XRT_ERROR_ALLOCATION;
@@ -1459,6 +1562,7 @@ leia_dp_mac_create(void *metal_device,
 	ldp->base.struct_size = (uint32_t)sizeof(struct xrt_display_processor_metal);
 	ldp->base.process_atlas = leia_dp_mac_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_mac_get_predicted_eye_positions;
+	ldp->base.set_eye_tracking_mode = leia_dp_mac_set_eye_tracking_mode;
 	ldp->base.request_display_mode = leia_dp_mac_request_display_mode;
 	ldp->base.get_hardware_3d_state = leia_dp_mac_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_mac_get_display_dimensions;

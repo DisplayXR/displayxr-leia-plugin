@@ -158,8 +158,10 @@ fill_display_info(const struct leia_mac_display_info *info, struct xrt_plugin_di
 	// mixed-scale Mac — see srDisplayGetLocation's note).
 	out_info->display_screen_left = info->screen_left_pt;
 	out_info->display_screen_top = info->screen_top_pt;
-	out_info->supported_eye_tracking_modes = 1u; /* MANAGED_BIT */
-	out_info->default_eye_tracking_mode = 0u;    /* MANAGED */
+	// MANUAL only where the SR runtime has the weaver tracking-loss mode (ST-5961).
+	out_info->supported_eye_tracking_modes =
+	    leia_mac_tracking_loss_mode_available() ? 3u /* MANAGED|MANUAL */ : 1u /* MANAGED_BIT */;
+	out_info->default_eye_tracking_mode = 0u; /* MANAGED */
 	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
 		out_info->refresh_mhz = info->refresh_mhz;
 	}

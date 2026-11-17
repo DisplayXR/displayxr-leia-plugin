@@ -865,3 +865,29 @@ leia_mac_get_sr_caps(struct leia_mac_sr_caps *out)
 	pthread_mutex_unlock(&g_lock);
 	return ok;
 }
+
+bool
+leia_mac_tracking_loss_mode_available(void)
+{
+#ifdef SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE
+	static atomic_int cached = -1; // -1 = not probed yet
+	int v = atomic_load(&cached);
+	if (v >= 0) {
+		return v == 1;
+	}
+	pthread_mutex_lock(&g_lock);
+	const bool up = ensure_instance_locked();
+	pthread_mutex_unlock(&g_lock);
+	if (!up) {
+		return false; // no SR runtime yet: ask again next time
+	}
+	const SrResult r = srWeaverSetTrackingLossMode(NULL, SR_TRACKING_LOSS_MODE_MANAGED);
+	v = r == SR_ERROR_HANDLE_INVALID ? 1 : 0;
+	atomic_store(&cached, v);
+	U_LOG_W("leia_mac: weaver tracking-loss mode (MANUAL eye tracking): %s (probe %s)",
+	        v == 1 ? "supported" : "not in this SR runtime", leia_mac_sr_result_str(r));
+	return v == 1;
+#else
+	return false;
+#endif
+}
