@@ -1117,8 +1117,8 @@ compose_create_bg_cpu(struct leia_display_processor *ldp, const char *why)
 
 	U_LOG_W("Leia VK DP #539: bg D3D11 import unavailable (%s) — using the CPU staging-upload fallback: "
 	        "%ux%u monitor read back at %ux%u (1/%u, LEIA_DP_BG_CPU_SHIFT=%u) once per capture generation, "
-	        "uploaded via host-visible buffer + vkCmdCopyBufferToImage%s; holes are flattened against the "
-	        "captured desktop (opaque-present safe)",
+	        "uploaded via host-visible buffer + vkCmdCopyBufferToImage%s; it feeds the pre-weave compose, "
+	        "and the alpha-gate keeps the holes live (runtime #2708)",
 	        why, mon_w, mon_h, w, h, 1u << shift, shift, ldp->bg_cpu_coherent ? "" : " (non-coherent, flushed)");
 	return true;
 
@@ -1968,12 +1968,14 @@ alpha_gate_run_post_weave(struct leia_display_processor *ldp,
 	push.tile_count[1] = tile_rows;
 	push.has_backdrop = have_backdrop ? 1u : 0u; // #491 part 3
 	// #116 — opaque present flattens the holes against the captured desktop.
-	// #539 — so does the CPU-upload fallback: it is chosen exactly when the
-	// D3D11 shared-handle import fails, and the runtime's transparent present
-	// (the DComp bridge) needs that same import, so its present is then OPAQUE
-	// WSI and α==0 holes would scan out black. Flattening is also correct on a
-	// transparent present (α=1 baked desktop), only up to one capture old.
-	push.flatten = ((env_present_opaque() || ldp->bg_cpu) && have_bg) ? 1u : 0u;
+	// runtime #2708 — the CPU-upload fallback does NOT force it. The runtime's
+	// DComp bridge now presents true per-pixel alpha on a device whose D3D11
+	// import fails (CPU-readback route), so the α==0 holes must stay α=0 and
+	// show the LIVE desktop through DWM; flattening them would paint a capture
+	// that lags the desktop by up to a capture interval over the whole window.
+	// The CPU-fed bg still feeds the pre-weave compose, which is what fills the
+	// de-occlusion band with desktop pixels, exactly as the import path does.
+	push.flatten = (env_present_opaque() && have_bg) ? 1u : 0u;
 	push.bg_uv_origin[0] = ldp->bg_uv_last[0];
 	push.bg_uv_origin[1] = ldp->bg_uv_last[1];
 	push.bg_uv_extent[0] = ldp->bg_uv_last[2];
