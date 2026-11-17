@@ -134,6 +134,18 @@ bool
 leia_mac_get_sr_caps(struct leia_mac_sr_caps *out);
 
 /*!
+ * Whether the installed SR runtime has the weaver tracking-loss mode
+ * (srWeaverSetTrackingLossMode, LeiaSR ST-5961): MANUAL eye tracking, where the
+ * weaver keeps the last eyes on a face loss and the app decides. Probed once
+ * on the enumeration instance (a NULL weaver answers SR_ERROR_HANDLE_INVALID
+ * when the call exists, SR_ERROR_FUNCTION_UNSUPPORTED on an older runtime).
+ * False when this plug-in was built against an SDK without the call, or when
+ * no SR runtime is up yet (asked again next time).
+ */
+bool
+leia_mac_tracking_loss_mode_available(void);
+
+/*!
  * Who to tell when SR raises SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED (an SR
  * panel came up or went away): the runtime's
  * `xrt_plugin_host_iface::request_display_rescan`, which re-runs the
