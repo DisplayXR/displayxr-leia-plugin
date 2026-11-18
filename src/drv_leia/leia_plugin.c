@@ -462,9 +462,11 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	 * for a present-owner (phase from set_present_origin) instead of binding a
 	 * weaver to another process's window. Read from the probe instance the
 	 * enumeration above just used; the DP instance's scanout bit stays the
-	 * authority. Per-screen D3D11 weavers only (the service's path).
+	 * authority. Per-screen D3D11 weavers (the service's path) and per-screen
+	 * D3D12 weavers (the in-process texture target) — the two arms whose DP
+	 * declares the scanout bit.
 	 */
-#if defined(DXR_LEIA_HAS_SR_MULTI_WIN) && defined(XRT_HAVE_LEIA_SR_D3D11)
+#if defined(DXR_LEIA_HAS_SR_MULTI_WIN) && (defined(XRT_HAVE_LEIA_SR_D3D11) || defined(XRT_HAVE_LEIA_SR_D3D12))
 	if (leia_win_sr_probe_external_routing()) {
 		apis |= XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
 	}
