@@ -450,6 +450,15 @@ create_v2(double max_time, void *hwnd, leiasr_d3d12 &sr)
 	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, leia_win_hwnd_in_this_process(hwnd));
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
+	if (sr.screen_bound && hwnd == nullptr && !sr.needs_present_origin) {
+		// runtime ADR-060 R2: the claim hint (predicted from the probe's caps)
+		// may have told the runtime this box can phase from the present origin.
+		// SR refused EXTERNAL for this create, so this weaver cannot: it reads
+		// no window and ignores the origin — its phase is display-scoped, and
+		// the DP's scanout bit stays clear. Same WARN as the D3D11 arm.
+		U_LOG_W("SR refused EXTERNAL routing for a WINDOWLESS per-screen weaver — its phase cannot follow the "
+		        "runtime's present origin (display-scoped until the DP is recreated)");
+	}
 
 	if (oldDpiCtx != NULL) {
 		SetThreadDpiAwarenessContext(oldDpiCtx);
@@ -1306,6 +1315,13 @@ leiasr_d3d12_create_for_screen(double max_time,
 		        (unsigned long long)display_id, hwnd);
 	}
 	return ret;
+}
+
+bool
+leiasr_d3d12_phases_from_present_origin(struct leiasr_d3d12 *leiasr)
+{
+	// Written once, by the synchronous create, before the holder is handed out.
+	return leiasr != nullptr && leiasr->needs_present_origin;
 }
 
 void

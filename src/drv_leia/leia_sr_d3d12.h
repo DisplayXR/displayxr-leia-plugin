@@ -89,6 +89,19 @@ void
 leiasr_d3d12_set_present_origin(struct leiasr_d3d12 *leiasr, int32_t panel_x, int32_t panel_y);
 
 /*!
+ * runtime ADR-060 R2 (L4): does this weaver take its phase from
+ * @ref leiasr_d3d12_set_present_origin (EXTERNAL routing, no window)? The
+ * D3D12 twin of leiasr_d3d11_phases_from_present_origin. That one also
+ * reports "not known yet" for its async create; this arm's create is
+ * synchronous, so the answer is always the settled one — what SR actually
+ * accepted, after any routing fallback. False on the v1 path.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_d3d12_phases_from_present_origin(struct leiasr_d3d12 *leiasr);
+
+/*!
  * Drag phase-snap for the runtime-owned window holding this weaver
  * (runtime#2405): the D3D12 twin of leiasr_d3d11_snap_window_rect. v2 weavers
  * only; false (the caller keeps its target) on the v1 path, before the weaver
