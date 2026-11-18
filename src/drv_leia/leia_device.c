@@ -571,8 +571,10 @@ leia_hmd_create(void)
 #endif
 	hmd->base.rendering_mode_count = multi_viewer ? 3 : 2;
 
-	// Mode 0: 2D (mono, full resolution, 1×1 tile). Untracked — mode_flags
-	// stays 0 unless/until a "2D tracked" product mode is added (#29).
+	// Mode 0: 2D (mono, full resolution, 1×1 tile). The lens is off but the SR
+	// eye tracker keeps running, so the DP still reports a live viewer and a
+	// truthful isTracking in 2D → HAS_TRACKING (the runtime pins isTracking
+	// FALSE for a mode without it, which hid face loss from 2D apps).
 	hmd->base.rendering_modes[0].mode_index = LEIA_MODE_2D;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
@@ -581,7 +583,7 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[0].hardware_display_3d = false;
 	hmd->base.rendering_modes[0].tile_columns = 1;
 	hmd->base.rendering_modes[0].tile_rows = 1;
-	hmd->base.rendering_modes[0].mode_flags = 0;
+	hmd->base.rendering_modes[0].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
 
 	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from the ONE derivation in
 	// leia_view_scale_get() — the same pair leia_plugin_get_display_info() reports
