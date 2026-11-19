@@ -989,6 +989,13 @@ leiasr_gl_set_present_origin(struct leiasr_gl *leiasr, int32_t panel_x, int32_t 
 }
 
 bool
+leiasr_gl_phases_from_present_origin(struct leiasr_gl *leiasr)
+{
+	// Written once, by the synchronous create, before the holder is handed out.
+	return leiasr != nullptr && leiasr->needs_present_origin;
+}
+
+bool
 leiasr_gl_snap_window_rect(struct leiasr_gl *leiasr,
                            int32_t origin_x,
                            int32_t origin_y,

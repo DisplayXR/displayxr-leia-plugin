@@ -42,6 +42,12 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifndef XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN
+// runtime ADR-060 R2: from xrt_display_scanout.h once the runtime pin includes
+// it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value.
+#define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
+#endif
+
 // WGL_NV_DX_interop2 entry points — not declared by ogl_api.h. Mirrors the
 // runtime's comp_gl_compositor.cpp typedef block. This is the GL analogue of
 // the D3D11/D3D12/VK native shared-texture open: it brings the WGC desktop
@@ -241,6 +247,7 @@ struct leia_display_processor_gl_impl
 
 	//! HWND retained from the factory — needed for leia_bg_capture_create().
 	HWND hwnd;
+	bool screen_bound; //!< made by create_dp_gl_for_screen (multi-screen M6 / runtime ADR-060 R2)
 
 	//
 	// Compose-under-bg transparency (preferred path; chroma-key above is the
@@ -2164,6 +2171,40 @@ leia_dp_gl_set_present_origin(struct xrt_display_processor_gl *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_GL_HAS_SCANOUT_CAPS
+/*!
+ * runtime ADR-060 R2 (L4), the GL twin of leia_dp_d3d12_get_scanout_caps:
+ * canvas weave scope, plus XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN for
+ * a WINDOWLESS per-screen weaver routed EXTERNALLY (runtime#2721).
+ *
+ * OPT-IN until verified on a panel (DXR_LEIA_GL_WINDOWLESS_PHASE=1). With no
+ * window the GL weaver converts GL_VIEWPORT with the display height, so the
+ * Y origin is only right when the woven FBO is panel-tall, and a woven FBO
+ * read top-left comes out vertically flipped. A per-screen segment (a
+ * panel-sized target) is fine; a sub-rect texture target may not be. Until
+ * that is checked, the bit stays clear and the runtime keeps the anchor path.
+ */
+static bool
+leia_dp_gl_get_scanout_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_SCANOUT_CAPS_SIZE_V1) {
+		return false;
+	}
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	out_caps->weave_scope = (uint32_t)XRT_DP_WEAVE_SCOPE_CANVAS;
+	out_caps->flags = 0;
+	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
+		out_caps->reserved[i] = 0;
+	}
+	const char *opt_in = std::getenv("DXR_LEIA_GL_WINDOWLESS_PHASE");
+	const bool enabled = opt_in != nullptr && opt_in[0] == '1';
+	if (enabled && ldp->screen_bound && ldp->hwnd == nullptr && leiasr_gl_phases_from_present_origin(ldp->leiasr)) {
+		out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
+	return true;
+}
+#endif
+
 #ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
 /*!
  * runtime#2405: phase-snap the runtime-owned window the user is dragging —
@@ -2213,6 +2254,9 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 #endif
 #ifdef XRT_DP_GL_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_gl_set_present_origin; // multi-screen M6 (slot 22)
+#endif
+#ifdef XRT_DP_GL_HAS_SCANOUT_CAPS
+	ldp->base.get_scanout_caps = leia_dp_gl_get_scanout_caps; // runtime ADR-060 R2 (L4, slot 20), runtime#2721
 #endif
 #ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
 	ldp->base.snap_window_rect = leia_dp_gl_snap_window_rect; // runtime#2405 drag phase-snap (slot 24)
@@ -2414,6 +2458,7 @@ leia_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
 	ldp->leiasr = weaver;
 	ldp->view_count = 2;
 	ldp->hwnd = (HWND)window_handle; // NULL for a windowless segment: no WGC compose-under (falls back)
+	ldp->screen_bound = true;
 	const char *zone_env = std::getenv("DXR_LEIA_ASYNC_ZONE_PUBLISH");
 	ldp->async_zone_publish = !(zone_env != NULL && zone_env[0] == '0');
 	leiasr_gl_set_async_lens(ldp->leiasr, ldp->async_zone_publish);
