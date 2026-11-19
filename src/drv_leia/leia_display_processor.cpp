@@ -37,6 +37,12 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifndef XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN
+// runtime ADR-060 R2: from xrt_display_scanout.h once the runtime pin includes
+// it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value.
+#define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
+#endif
+
 // SPIR-V shaders (generated at build time by spirv_shaders()). The fullscreen
 // triangle vertex shader is shared by the compose-under-bg + alpha-gate passes.
 #include "shaders/fullscreen_tri.vert.h"
@@ -2734,6 +2740,37 @@ leia_dp_vk_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
+/*!
+ * runtime ADR-060 R2 (L4), the Vulkan twin of leia_dp_d3d12_get_scanout_caps:
+ * canvas weave scope (a GPU weaver), plus
+ * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN for a WINDOWLESS per-screen
+ * weaver routed EXTERNALLY, the one whose phase follows set_present_origin, so
+ * the runtime may use it for a window it does not hold (the texture target,
+ * runtime#2721). Same rule as D3D11 / D3D12; this arm's create is synchronous,
+ * so the answer is what SR accepted for THIS weaver. A window-bound weaver, the
+ * plain factory's DP, a v1 weaver and one SR refused EXTERNAL for leave it clear.
+ */
+static bool
+leia_dp_vk_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	if (out_caps == nullptr || out_caps->struct_size < XRT_DP_SCANOUT_CAPS_SIZE_V1) {
+		return false;
+	}
+	struct leia_display_processor *ldp = (struct leia_display_processor *)xdp;
+	out_caps->weave_scope = (uint32_t)XRT_DP_WEAVE_SCOPE_CANVAS;
+	out_caps->flags = 0;
+	for (size_t i = 0; i < sizeof(out_caps->reserved) / sizeof(out_caps->reserved[0]); i++) {
+		out_caps->reserved[i] = 0;
+	}
+	if (leiasr_is_screen_bound(ldp->leiasr) && ldp->hwnd_opaque == nullptr &&
+	    leiasr_phases_from_present_origin(ldp->leiasr)) {
+		out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
+	return true;
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
 /*
  * Appended VK-variant slot (accepts_atlas_encoding, displayxr-runtime#2340):
@@ -2864,6 +2901,9 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background; // #573 (appended slot)
 #ifdef XRT_DP_VK_HAS_PRESENT_ORIGIN
 	ldp->base.set_present_origin = leia_dp_vk_set_present_origin; // multi-screen M6 (windowless segment phase)
+#endif
+#ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
+	ldp->base.get_scanout_caps = leia_dp_vk_get_scanout_caps; // runtime ADR-060 R2 (L4), runtime#2721
 #endif
 #ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
 	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340: explicit "no" for PQ

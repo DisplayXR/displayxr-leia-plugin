@@ -90,6 +90,16 @@ bool
 leiasr_is_screen_bound(struct leiasr *leiasr);
 
 /*!
+ * runtime ADR-060 R2 (L4): does this weaver take its phase from
+ * @ref leiasr_set_present_origin (EXTERNAL routing, no window)? The Vulkan
+ * twin of leiasr_d3d12_phases_from_present_origin: this arm's create is
+ * synchronous, so the answer is always the settled one, what SR accepted
+ * after any routing fallback. False on the v1 path.
+ */
+bool
+leiasr_phases_from_present_origin(struct leiasr *leiasr);
+
+/*!
  * Destroy a leiasr instance.
  * Frees all resources.
  *
