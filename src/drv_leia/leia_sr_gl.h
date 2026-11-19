@@ -83,6 +83,14 @@ void
 leiasr_gl_set_present_origin(struct leiasr_gl *leiasr, int32_t panel_x, int32_t panel_y);
 
 /*!
+ * runtime ADR-060 R2 (L4): does this weaver take its phase from
+ * @ref leiasr_gl_set_present_origin (EXTERNAL routing, no window)? Synchronous
+ * create, so always the settled answer. False on the v1 path.
+ */
+bool
+leiasr_gl_phases_from_present_origin(struct leiasr_gl *leiasr);
+
+/*!
  * Drag phase-snap for the runtime-owned window holding this weaver
  * (runtime#2405): the GL twin of leiasr_d3d11_snap_window_rect. v2 weavers
  * only; false (the caller keeps its target) on the v1 path, before the weaver

@@ -1153,6 +1153,13 @@ leiasr_set_present_origin(struct leiasr *leiasr, int32_t panel_x, int32_t panel_
 }
 
 bool
+leiasr_phases_from_present_origin(struct leiasr *leiasr)
+{
+	// Written once, by the synchronous create, before the holder is handed out.
+	return leiasr != nullptr && leiasr->needs_present_origin;
+}
+
+bool
 leiasr_is_screen_bound(struct leiasr *leiasr)
 {
 	return leiasr != nullptr && leiasr->screen_bound;
