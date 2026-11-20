@@ -485,6 +485,85 @@ leia_sr_v2_initialize(SrInstance instance)
 	return true;
 }
 
+namespace {
+
+/*
+ * #552: after a primary-display switch SR Service can be left holding no usable
+ * device: the panel enumerates without FPC_VERIFIED and srCreateDisplay fails
+ * with SR_ERROR_DEVICE_NOT_AVAILABLE until SR Service is restarted. Each session
+ * start reads SR's display list fresh, says so once per change, and retries a
+ * DEVICE_NOT_AVAILABLE create once after a short wait.
+ */
+
+//! Bounded wait before the one srCreateDisplay retry. Session start only (the
+//! D3D11 create runs on its async worker; the others are one-shot DP creates
+//! that already wait for SR's geometry), never a per-frame path.
+constexpr DWORD DEVICE_RETRY_WAIT_MS = 300;
+
+enum sr_device_auth
+{
+	SR_DEVICE_AUTH_UNKNOWN = 0,  //!< SR's list could not be read, or does not list the bound id
+	SR_DEVICE_AUTH_VERIFIED = 1, //!< the panel is listed FPC_VERIFIED
+	SR_DEVICE_AUTH_EDID_ONLY = 2, //!< SR lists the panel, but not FPC_VERIFIED
+	SR_DEVICE_AUTH_NONE = 3,     //!< SR lists no display at all
+};
+
+//! The display scope (bind id, 0 = unbound) the EDID_ONLY WARN was last given
+//! for; UINT64_MAX = none outstanding. Keyed, so the unbound "active display"
+//! query of a bound create does not clear a bound panel's WARN.
+std::atomic<uint64_t> g_edid_only_warned_for{UINT64_MAX};
+
+/*!
+ * Read SR's display list FRESH (past the 2 s cache: a display id or its FPC
+ * state may have changed since the last session) and classify the panel this
+ * create is for: @p bind_display_id, or any SR display when unbound.
+ */
+sr_device_auth
+sr_device_auth_check(uint64_t bind_display_id)
+{
+	leia_win_sr_enumerate_refresh_next();
+	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
+	const int32_t n = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	if (n < 0) {
+		return SR_DEVICE_AUTH_UNKNOWN; // compiled out, SR runtime predates it, or SR unreachable
+	}
+	bool listed = false;
+	bool verified = false;
+	for (int32_t i = 0; i < n; i++) {
+		if (bind_display_id != 0 && displays[i].display_id != bind_display_id) {
+			continue;
+		}
+		listed = true;
+		verified = verified || displays[i].fpc_verified;
+	}
+	if (!listed) {
+		// A bound id SR no longer lists is #480's re-key, not ours to report.
+		return n == 0 ? SR_DEVICE_AUTH_NONE : SR_DEVICE_AUTH_UNKNOWN;
+	}
+	return verified ? SR_DEVICE_AUTH_VERIFIED : SR_DEVICE_AUTH_EDID_ONLY;
+}
+
+//! One WARN when the panel becomes EDID_ONLY for this scope, one when it recovers.
+void
+sr_device_auth_report(sr_device_auth st, uint64_t bind_display_id)
+{
+	if (st == SR_DEVICE_AUTH_EDID_ONLY) {
+		if (g_edid_only_warned_for.exchange(bind_display_id) != bind_display_id) {
+			U_LOG_W("SR v2: SR lists the SR panel%s without FPC_VERIFIED -- SR Service has no authenticated "
+			        "SR device right now, so this session may run unwoven. Briefly normal after a display is "
+			        "connected; if it persists (e.g. after a primary-display switch), restart SR Service (#552)",
+			        bind_display_id != 0 ? " this weaver binds" : "");
+		}
+	} else if (st == SR_DEVICE_AUTH_VERIFIED) {
+		uint64_t expected = bind_display_id;
+		if (g_edid_only_warned_for.compare_exchange_strong(expected, UINT64_MAX)) {
+			U_LOG_W("SR v2: SR lists the SR panel FPC_VERIFIED again (#552)");
+		}
+	}
+}
+
+} // namespace
+
 bool
 leia_sr_v2_query_display(SrInstance instance,
                          void *hwnd,
@@ -493,6 +572,10 @@ leia_sr_v2_query_display(SrInstance instance,
                          struct leia_sr_v2_display_info *out_info)
 {
 	*out_info = {};
+
+	// #552: a session never trusts an earlier session's view of SR's displays.
+	sr_device_auth auth = sr_device_auth_check(bind_display_id);
+	sr_device_auth_report(auth, bind_display_id);
 
 	SrDisplayCreateInfo ci{};
 	ci.sType = SR_TYPE_DISPLAY_CREATE_INFO;
@@ -516,11 +599,31 @@ leia_sr_v2_query_display(SrInstance instance,
 #endif
 
 	SrDisplay display = nullptr;
-	const SrResult cr = srCreateDisplay(instance, &ci, &display);
+	SrResult cr = srCreateDisplay(instance, &ci, &display);
+	if (cr == SR_ERROR_DEVICE_NOT_AVAILABLE) {
+		// #552: SR may still be settling a display-topology change. Wait briefly,
+		// re-read SR's list (logged when it changed) and try once more.
+		U_LOG_W("srCreateDisplay: %s (%d) -- re-enumerating SR displays in %lu ms and retrying once (#552)",
+		        leia_sr_v2_result_str(cr), (int)cr, (unsigned long)DEVICE_RETRY_WAIT_MS);
+		Sleep(DEVICE_RETRY_WAIT_MS);
+		auth = sr_device_auth_check(bind_display_id);
+		sr_device_auth_report(auth, bind_display_id);
+		display = nullptr;
+		cr = srCreateDisplay(instance, &ci, &display);
+	}
 	if (!SR_SUCCEEDED(cr) || display == nullptr) {
 		U_LOG_E("srCreateDisplay failed: %s (%d)", leia_sr_v2_result_str(cr), (int)cr);
+		if (cr == SR_ERROR_DEVICE_NOT_AVAILABLE) {
+			U_LOG_E("SR v2: SR Service reports no available SR device after a retry%s -- this session cannot "
+			        "weave. Restart SR Service to recover (#552)",
+			        auth == SR_DEVICE_AUTH_EDID_ONLY ? " (SR lists the panel without FPC_VERIFIED)"
+			        : auth == SR_DEVICE_AUTH_NONE    ? " (SR lists no display)"
+			                                         : "");
+			leia_win_sr_set_device_unavailable(true);
+		}
 		return false;
 	}
+	leia_win_sr_set_device_unavailable(false);
 
 	// Wait for the display to report a non-degenerate location. A display can
 	// exist but not yet have geometry while the service is still enumerating,

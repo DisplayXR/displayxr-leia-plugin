@@ -256,6 +256,21 @@ bool
 leia_win_claims_lookup(uint64_t monitor_id, struct leia_win_claim_binding *out);
 
 /*!
+ * #552: the last session-start srCreateDisplay ended in
+ * SR_ERROR_DEVICE_NOT_AVAILABLE even after the re-enumerate + retry: SR Service
+ * holds no usable SR device (seen after a primary-display switch; restarting SR
+ * Service recovers). Set by the SR v2 display query, cleared by its next
+ * success, read by get_screen_status. A change bumps the claim generation, so
+ * a status poller sees it. Thread-safe.
+ */
+void
+leia_win_sr_set_device_unavailable(bool unavailable);
+
+//! #552: see @ref leia_win_sr_set_device_unavailable. Thread-safe.
+bool
+leia_win_sr_device_unavailable(void);
+
+/*!
  * Which claimed monitor is THE panel get_display_info describes, when the
  * frozen-EDID-table probe could not say (displayxr-leia-plugin#430: a
  * Lenovo 3D monitor the table lacks, on a non-main monitor, SR-verified by

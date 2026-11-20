@@ -637,6 +637,28 @@ leia_plugin_get_screen_status(struct xrt_plugin_instance *inst,
 	out->lens = XRT_PLUGIN_LENS_STATE_UNKNOWN;
 	memset(out->model, 0, sizeof(out->model)); /* SR exposes no model name passively */
 	snprintf(out->serial, sizeof(out->serial), "%s", claim.fpc_verified ? claim.serial : "");
+
+	/* #552: say WHY a screen SR knows cannot weave, and the remedy, rather than
+	 * leaving the session to fall back silently. Both come from state already
+	 * published (claim table, last display create) -- still no SR call. */
+	const size_t warnings_end = offsetof(struct xrt_plugin_screen_status, warnings);
+	uint32_t nwarn = 0;
+	if (leia_win_sr_device_unavailable() &&
+	    out->struct_size >= warnings_end + (nwarn + 1) * sizeof(out->warnings[0])) {
+		struct xrt_plugin_screen_warning *w = &out->warnings[nwarn++];
+		snprintf(w->code, sizeof(w->code), "SR_DEVICE_UNAVAILABLE");
+		w->level = XRT_PLUGIN_SCREEN_WARNING_LEVEL_CRITICAL;
+		snprintf(w->text, sizeof(w->text), "SR Service reports no available SR device. Restart SR Service.");
+	}
+	if (claim.sr_display_id != 0 && !claim.fpc_verified &&
+	    out->struct_size >= warnings_end + (nwarn + 1) * sizeof(out->warnings[0])) {
+		/* SR lists the panel EDID_ONLY: briefly normal after a connect (#483). */
+		struct xrt_plugin_screen_warning *w = &out->warnings[nwarn++];
+		snprintf(w->code, sizeof(w->code), "SR_NOT_AUTHENTICATED");
+		w->level = XRT_PLUGIN_SCREEN_WARNING_LEVEL_WARN;
+		snprintf(w->text, sizeof(w->text), "SR has not authenticated this display. If it persists, restart SR Service.");
+	}
+	out->warning_count = nwarn;
 	return XRT_SUCCESS;
 }
 #endif

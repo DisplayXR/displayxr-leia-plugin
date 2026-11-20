@@ -309,6 +309,7 @@ static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct leia_win_claim_binding g_bindings[LEIA_WIN_MAX_BINDINGS];
 static uint32_t g_binding_count;
 static uint64_t g_binding_generation;
+static bool g_sr_device_unavailable; //!< #552, guarded by g_bind_lock
 
 static bool
 binding_same(const struct leia_win_claim_binding *a, const struct leia_win_claim_binding *b)
@@ -524,6 +525,26 @@ leia_win_sr_rebind_display_id(uint64_t bound,
 		}
 	}
 	return bound;
+}
+
+void
+leia_win_sr_set_device_unavailable(bool unavailable)
+{
+	BIND_LOCK();
+	if (g_sr_device_unavailable != unavailable) {
+		g_sr_device_unavailable = unavailable;
+		g_binding_generation++;
+	}
+	BIND_UNLOCK();
+}
+
+bool
+leia_win_sr_device_unavailable(void)
+{
+	BIND_LOCK();
+	const bool u = g_sr_device_unavailable;
+	BIND_UNLOCK();
+	return u;
 }
 
 uint64_t
