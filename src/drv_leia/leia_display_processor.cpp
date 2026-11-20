@@ -2740,6 +2740,26 @@ leia_dp_vk_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+/*!
+ * runtime#2405 / runtime#2726: phase-snap the window (or windowless texture
+ * target) being dragged — the Vulkan twin of the D3D11 slot 18, same body
+ * (srWeaverSnapToPhase).
+ */
+static bool
+leia_dp_vk_snap_window_rect(struct xrt_display_processor_vk *xdp,
+                            int32_t origin_x,
+                            int32_t origin_y,
+                            int32_t target_x,
+                            int32_t target_y,
+                            int32_t *out_x,
+                            int32_t *out_y)
+{
+	struct leia_display_processor *ldp = (struct leia_display_processor *)xdp;
+	return leiasr_snap_window_rect(ldp->leiasr, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
 /*!
  * runtime ADR-060 R2 (L4), the Vulkan twin of leia_dp_d3d12_get_scanout_caps:
@@ -2904,6 +2924,9 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 #endif
 #ifdef XRT_DP_VK_HAS_SCANOUT_CAPS
 	ldp->base.get_scanout_caps = leia_dp_vk_get_scanout_caps; // runtime ADR-060 R2 (L4), runtime#2721
+#endif
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+	ldp->base.snap_window_rect = leia_dp_vk_snap_window_rect; // runtime#2726 drag phase-snap (appended VK-variant slot)
 #endif
 #ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
 	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340: explicit "no" for PQ
@@ -3075,6 +3098,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	ldp->base.set_transparent_background = leia_dp_vk_set_transparent_background;
 #ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
 	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340 (vtable parity with the factory)
+#endif
+#ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
+	ldp->base.snap_window_rect = leia_dp_vk_snap_window_rect; // runtime#2726 (vtable parity with the factory)
 #endif
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.

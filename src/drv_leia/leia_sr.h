@@ -83,6 +83,21 @@ void
 leiasr_set_present_origin(struct leiasr *leiasr, int32_t panel_x, int32_t panel_y);
 
 /*!
+ * Drag phase-snap for the window holding this weaver (runtime#2405 /
+ * runtime#2726): the Vulkan twin of leiasr_d3d12_snap_window_rect. v2 weavers
+ * only; false (the caller keeps its target) on the v1 path, when the SR SDK's
+ * own drag hook already owns this window (runtime#2593), or when SR declines.
+ */
+bool
+leiasr_snap_window_rect(struct leiasr *leiasr,
+                        int32_t origin_x,
+                        int32_t origin_y,
+                        int32_t target_x,
+                        int32_t target_y,
+                        int32_t *out_x,
+                        int32_t *out_y);
+
+/*!
  * Was this instance created for one screen (@ref leiasr_create_for_screen)?
  * Such a weaver confines its output to the canvas it is given.
  */
