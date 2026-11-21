@@ -30,6 +30,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TABLE = os.path.join(ROOT, "src", "drv_leia", "leia_edid_table.h")
 TOP_CMAKE = os.path.join(ROOT, "CMakeLists.txt")
 
+# The schema-2 catalog item id (= the display processor's registered id).
+ITEM_ID = "leia-sr"
 LABEL = "Leia display plug-in"
 # Where installer/DisplayXRLeiaSRInstaller.nsi writes the installed version.
 REGISTRY_VERSION = "HKLM\\Software\\DisplayXR\\Plugins\\LeiaSR\\Version"
@@ -83,7 +85,7 @@ def build():
     with open(TABLE, encoding="utf-8") as f:
         rules = edid_rules(f.read())
     rules.append(dict(SR_REGISTRY_RULE))
-    manifest = {"schema": 1, "label": LABEL, "registry_version": REGISTRY_VERSION}
+    manifest = {"schema": 1, "id": ITEM_ID, "label": LABEL, "registry_version": REGISTRY_VERSION}
     with open(TOP_CMAKE, encoding="utf-8") as f:
         m = PIN_RE.search(f.read())
     if m:
