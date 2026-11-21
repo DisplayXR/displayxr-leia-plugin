@@ -140,7 +140,14 @@ static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
  * Reads the app's RGBA atlas + the captured desktop region behind the window,
  * composes them per-tile and outputs opaque RGB the SR weaver consumes:
  *
- *   out = lerp(bg, atlas.rgb, atlas.a),  out.a = 1
+ *   out = atlas.rgb + (1 - atlas.a) * bg,  out.a = 1
+ *
+ * The atlas is PREMULTIPLIED (the runtime's DP contract and OpenXR §10.6.2), so
+ * the blend is premultiplied "over": out = atlas.rgb + (1 - atlas.a) * bg.
+ * lerp(bg, atlas.rgb, atlas.a) multiplied the colour by alpha a second time
+ * and darkened every 0<a<1 pixel toward black — invisible on hard-edged
+ * content, a dark fringe on soft content (Gaussian splats). The Linux DP
+ * fixed the same line in #275.
  *
  * Same VS as the ck pipeline (single fullscreen triangle).
  */
@@ -262,7 +269,7 @@ float4 main(VSOut i) : SV_Target {
         float4 bd = backdrop.Sample(samp, tile_local);
         b = bd.rgb + (1.0 - bd.a) * b;
     }
-    return float4(lerp(b, a.rgb, a.a), 1.0);
+    return float4(a.rgb + (1.0 - a.a) * b, 1.0); // premultiplied over
 }
 )";
 
