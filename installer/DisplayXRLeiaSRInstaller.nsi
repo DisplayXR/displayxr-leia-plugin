@@ -21,14 +21,14 @@
 ;    are released through Windows Restart Manager (dxr-rm-close.exe), which
 ;    also restarts what it closed. See docs/installer.md.
 ;
-; When built with the conversion provider (LEIA_CONV, runtime ADR-053) it also
-; ships DisplayXR-LeiaConversion.dll and registers
-; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion (ProbeOrder 50,
-; Supersedes dp-lift, Version written LAST). That DLL is mapped only by its
-; displayxr-conversion-host.exe, so its files get their OWN Restart Manager
-; session, held under the maintenance mutex
-; Global\DisplayXR-ConvMaintenance-leia-conversion: it closes the host, never
-; the service, and starts nothing. See docs/conversion-provider.md.
+; The Leia conversion provider (DisplayXR-LeiaConversion.dll, the
+; ConversionProviders\leia-conversion row) is NOT part of this installer any
+; more: it ships in its own package. Releases of this installer that still
+; bundled it left a copy of the DLL in $INSTDIR and owned that row; an upgrade
+; or uninstall removes ONLY that leftover (the copy in $INSTDIR, and the row
+; only while it still points at that copy) and never touches a row or files
+; the separate package owns. See "Superseded conversion provider" below and
+; docs/conversion-moved.md.
 
 ;--------------------------------
 ; Build-time definitions (passed from CMake):
@@ -73,18 +73,13 @@
 ; then File-include the pre-signed uninstaller in the real pass (see .onInit
 ; and the WriteUninstaller site). INNER is RequestExecutionLevel user so it
 ; never triggers UAC when run from makensis on a non-elevated build host.
-!ifdef LEIA_CONV
-	!define INNER_CONV_DEFINE "-DLEIA_CONV=1"
-!else
-	!define INNER_CONV_DEFINE ""
-!endif
 !ifndef INNER
 	!ifdef SIGN_CMD
 		!if "${SIGN_CMD}" != ""
 			!finalize '${SIGN_CMD} "%1"'
 			; Build the inner installer (passes every define it needs to
 			; compile; OUTPUT_DIR/SIGN_CMD are deliberately omitted).
-			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "-DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}" ${INNER_CONV_DEFINE} "${__FILE__}"' = 0
+			!makensis '-DINNER "-DVERSION=${VERSION}" "-DVERSION_MAJOR=${VERSION_MAJOR}" "-DVERSION_MINOR=${VERSION_MINOR}" "-DVERSION_PATCH=${VERSION_PATCH}" "-DBUILD_NUM=${BUILD_NUM}" "-DSOURCE_DIR=${SOURCE_DIR}" "-DBIN_DIR=${BIN_DIR}" "-DSR_VK_BETA_DLL=${SR_VK_BETA_DLL}" "-DMIN_RUNTIME_VERSION=${MIN_RUNTIME_VERSION}" "${__FILE__}"' = 0
 			; Run it: .onInit writes %TEMP%\Uninstall.exe then Quit (exit 2).
 			!system '"$%TEMP%\DisplayXRLeiaSR_inner.exe"' = 2
 			; Sign the emitted uninstaller, then File it in the real pass.
@@ -396,22 +391,39 @@ FunctionEnd
 !insertmacro RM_FUNCTIONS "un."
 
 ;--------------------------------
-; Conversion provider (runtime ADR-053; discovery spec §3.8 "close the host,
-; never the service"; docs/conversion-provider.md).
+; Superseded conversion provider (handover to the separate package).
 ;
-; DisplayXR-LeiaConversion.dll is satellite-hosted: only its
-; displayxr-conversion-host.exe maps it. The update sequence:
+; Releases of this installer up to the one that dropped it shipped
+; DisplayXR-LeiaConversion.dll in $INSTDIR and wrote
+; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion with THIS
+; uninstaller in UninstallString. The provider now ships in its own package
+; (its own directory, its own uninstaller), which takes that row over when it
+; is installed. What is left for this installer and uninstaller to do:
+;
+;   - the copy in $INSTDIR is ours and is always removed;
+;   - the row is removed ONLY while its Binary still names that copy — i.e.
+;     nobody has taken it over. A row whose Binary is anywhere else belongs to
+;     the separate package (or to whatever wrote it) and is never read past
+;     that one value, never rewritten, never deleted;
+;   - a Settings subkey the user created is kept either way, so the separate
+;     package finds it again.
+;
+; Removing a registered copy follows the provider update sequence (runtime
+; conversion-provider-discovery.md §3.8), because the conversion host may have
+; it mapped:
 ;   1. create AND own Global\DisplayXR-ConvMaintenance-leia-conversion, held to
 ;      the end (the service spawns no host for the provider while it is held);
-;   2. a Restart Manager session over the provider's files only — it lists the
-;      host, which exits 20 ("closed for update"; the provider's tasks report
-;      WARMING(updating), every app session and stream stays alive);
-;   3. replace the files, write the registry row with Version LAST;
-;   4. end the session WITHOUT restarting anything (the host never registers
-;      for restart; the service respawns it on demand);
+;   2. a Restart Manager session over that one file — it lists the host, which
+;      exits 20 ("closed for update"); every app session stays alive;
+;   3. delete the row's values (Version FIRST: the "row complete" marker) and
+;      the file;
+;   4. end the session WITHOUT restarting anything;
 ;   5. release the mutex.
 ; The mutex is owned by the thread that created it, so take and release it from
 ; the same section (NSIS runs sections and their Calls on one thread).
+;
+; After this, a box that has not installed the separate package has no Leia
+; conversion: the runtime uses its next conversion provider.
 
 !define CONV_ID "leia-conversion"
 !define CONV_DLL "DisplayXR-LeiaConversion.dll"
@@ -419,14 +431,17 @@ FunctionEnd
 !define CONV_MUTEX "Global\DisplayXR-ConvMaintenance-${CONV_ID}"
 
 Var ConvMutex     ; owned maintenance mutex handle ("" = not held)
-Var ConvRmDir     ; the provider's own RM session state dir
-Var ConvRmRc      ; its closed.txt code (as $RmClosedRc)
+Var ConvRmDir     ; the superseded copy's own RM session state dir
+Var ConvRmRc      ; its closed.txt code (as $RmClosedRc); "" = no session was started
+Var ConvLegacy    ; 1 = a superseded copy of the provider is in $INSTDIR
+Var ConvRowOurs   ; 1 = the row's Binary still names that copy (the row is this installer's leftover)
 Var SvcRunning0   ; 1 = the service was running before ANY session touched it
 
 !macro CONV_FUNCTIONS PFX
 
 ; Step 1: create and own the maintenance mutex. ERROR_ALREADY_EXISTS (183) means
-; another installer (e.g. the conversion module's own) holds it: wait for it.
+; another installer (the conversion provider's own package, or the conversion
+; module's) holds it: wait for it.
 Function ${PFX}ConvMaintenanceTake
 	StrCpy $ConvMutex ""
 	System::Call 'kernel32::CreateMutexW(p 0, i 1, w "${CONV_MUTEX}") p.r0 ?e'
@@ -460,9 +475,9 @@ Function ${PFX}ConvMaintenanceRelease
 	${EndIf}
 FunctionEnd
 
-; Step 2: Restart Manager over the provider's files ONLY. No taskkill fallback:
-; nothing here may stop the service — a file still held aborts the install
-; (AllowSkipFiles off) and the bundle reports it.
+; Step 2: Restart Manager over the superseded copy ONLY. No taskkill fallback:
+; nothing here may stop the service — a file still held is removed at the next
+; reboot instead (UnDeleteHeld).
 Function ${PFX}ConvRmClose
 	StrCpy $ConvRmDir "$PLUGINSDIR\rmconv"
 	${IfNot} ${FileExists} "$RmHelper"
@@ -498,7 +513,8 @@ Function ${PFX}ConvRmClose
 	${EndIf}
 FunctionEnd
 
-; Step 4: end the session; restart NOTHING.
+; Step 4: end the session; restart NOTHING. Safe to call when no session was
+; started ($ConvRmRc is then "" or "ended").
 Function ${PFX}ConvRmEnd
 	${If} $ConvRmRc == "0"
 	${OrIf} $ConvRmRc == "1"
@@ -525,12 +541,76 @@ Function ${PFX}ConvRmPrintLog
 	Pop $RmDir
 FunctionEnd
 
+; Find the leftover: $ConvLegacy / $ConvRowOurs (see the section header).
+Function ${PFX}ConvLegacyDetect
+	StrCpy $ConvLegacy 0
+	StrCpy $ConvRowOurs 0
+	StrCpy $ConvRmRc ""
+	${If} ${FileExists} "$INSTDIR\${CONV_DLL}"
+		StrCpy $ConvLegacy 1
+	${EndIf}
+	ReadRegStr $0 HKLM "${CONV_KEY}" "Binary"
+	${If} $0 == "$INSTDIR\${CONV_DLL}"
+		StrCpy $ConvRowOurs 1
+	${ElseIf} $0 != ""
+		DetailPrint "Conversion provider ${CONV_ID} is registered at $0 (its own package): left untouched."
+	${EndIf}
+FunctionEnd
+
+; Steps 1-2, only when there is something of ours to remove.
+Function ${PFX}ConvLegacyClose
+	${If} $ConvLegacy == 1
+	${OrIf} $ConvRowOurs == 1
+		DetailPrint "Removing the conversion provider this plug-in used to bundle (it now ships in its own package)."
+		Call ${PFX}ConvMaintenanceTake
+		${If} $ConvLegacy == 1
+			Call ${PFX}ConvRmClose
+		${EndIf}
+	${EndIf}
+FunctionEnd
+
+; Step 3 (registry half): drop the registration this installer wrote, and only
+; that. Version goes first (the "row complete" marker), so the runtime never
+; sees a half-removed row as a provider; the key itself is removed only when
+; nothing else (a user's Settings subkey) is left in it.
+Function ${PFX}ConvLegacyUnregister
+	${If} $ConvRowOurs == 1
+		DeleteRegValue HKLM "${CONV_KEY}" "Version"
+		DeleteRegValue HKLM "${CONV_KEY}" "Binary"
+		DeleteRegValue HKLM "${CONV_KEY}" "DisplayName"
+		DeleteRegValue HKLM "${CONV_KEY}" "Vendor"
+		DeleteRegValue HKLM "${CONV_KEY}" "UninstallString"
+		DeleteRegValue HKLM "${CONV_KEY}" "Supersedes"
+		DeleteRegValue HKLM "${CONV_KEY}" "ProbeOrder"
+		DeleteRegKey /ifempty HKLM "${CONV_KEY}"
+		DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
+		DetailPrint "Removed this plug-in's ${CONV_ID} registration. Install the Leia conversion provider package for 2D-to-3D conversion through NeurD."
+	${EndIf}
+FunctionEnd
+
+; Steps 4-5.
+Function ${PFX}ConvLegacyDone
+	Call ${PFX}ConvRmEnd
+	Call ${PFX}ConvMaintenanceRelease
+FunctionEnd
+
 !macroend
 
-!ifdef LEIA_CONV
-	!insertmacro CONV_FUNCTIONS ""
-	!insertmacro CONV_FUNCTIONS "un."
-!endif
+!insertmacro CONV_FUNCTIONS ""
+!insertmacro CONV_FUNCTIONS "un."
+
+; Delete FILE; when a process RM could not close still maps it, remove it at
+; the next reboot rather than silently leaving it behind.
+!macro UnDeleteHeld FILE
+	ClearErrors
+	Delete "${FILE}"
+	${If} ${Errors}
+		; Still mapped by a process RM could not close: remove it at reboot
+		; rather than silently leaving it behind.
+		Delete /REBOOTOK "${FILE}"
+		DetailPrint "${FILE} is still in use; it will be removed at the next reboot."
+	${EndIf}
+!macroend
 
 ;--------------------------------
 ; Interface Settings
@@ -600,12 +680,11 @@ Section "Leia SR Plug-in" SecPlugin
 	${If} $0 == 0
 		StrCpy $SvcRunning0 1
 	${EndIf}
-!ifdef LEIA_CONV
-	; The conversion provider first, under its maintenance mutex: its session
-	; closes the conversion host only (see CONV_FUNCTIONS above).
-	Call ConvMaintenanceTake
-	Call ConvRmClose
-!endif
+	; A conversion provider left by an older release of this installer goes
+	; first, under its maintenance mutex: its session closes the conversion
+	; host only (see "Superseded conversion provider" above).
+	Call ConvLegacyDetect
+	Call ConvLegacyClose
 	Call RmClose
 	; The display plug-in's RmFinish restores the service only if it was running
 	; before; count "before" from before EITHER session.
@@ -644,12 +723,12 @@ Section "Leia SR Plug-in" SecPlugin
 	; it to release the DLL before deleting it.
 	File "${BIN_DIR}\tools\dxr-rm-close.exe"
 
-!ifdef LEIA_CONV
-	; The conversion provider (ADR-053): a separate DLL, no SR SDK, no link to
-	; DisplayXR-LeiaSR.dll. It loads the NeurD conversion module (installed by
-	; NeurD's own installer) by absolute path when the runtime warms it.
-	File "${BIN_DIR}\plugins\${CONV_DLL}"
-!endif
+	; The superseded conversion provider: unregister it (only if the row is
+	; still this installer's) and remove the copy an older release left here.
+	Call ConvLegacyUnregister
+	${If} $ConvLegacy == 1
+		!insertmacro UnDeleteHeld "$INSTDIR\${CONV_DLL}"
+	${EndIf}
 
 	; ADR-054 N4b: digests of the DLLs just written, so the enforcing provenance
 	; gate admits them even when this build is unsigned.
@@ -680,29 +759,6 @@ Section "Leia SR Plug-in" SecPlugin
 		"UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
 	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" \
 		"ProbeOrder"      50
-
-!ifdef LEIA_CONV
-	; -----------------------------------------------------------------
-	; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion
-	; (runtime docs/specs/runtime/conversion-provider-discovery.md §3.1).
-	; ProbeOrder 50 = the vendor band. Supersedes = dp-lift hides the
-	; runtime's legacy adapter over this plug-in's own display-side lift
-	; slots, so the two are never listed twice (it never affects selection
-	; among other providers: an absent NeurD still falls through).
-	; Hosting is left to the runtime default (satellite). A Settings subkey
-	; the user created survives an update. Version is written LAST: it is
-	; the "row complete" marker the runtime re-describes on, so it is
-	; removed first and rewritten after everything else.
-	; -----------------------------------------------------------------
-	DeleteRegValue HKLM "${CONV_KEY}" "Version"
-	WriteRegStr   HKLM "${CONV_KEY}" "Binary"          "$INSTDIR\${CONV_DLL}"
-	WriteRegStr   HKLM "${CONV_KEY}" "DisplayName"     "Leia conversion (NeurD)"
-	WriteRegStr   HKLM "${CONV_KEY}" "Vendor"          "Leia Inc."
-	WriteRegStr   HKLM "${CONV_KEY}" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-	WriteRegStr   HKLM "${CONV_KEY}" "Supersedes"      "dp-lift"
-	WriteRegDWORD HKLM "${CONV_KEY}" "ProbeOrder"      50
-	WriteRegStr   HKLM "${CONV_KEY}" "Version"         "${VERSION}"
-!endif
 
 	; Track our own install location for the uninstaller.
 	WriteRegStr HKLM "Software\DisplayXR\Plugins\LeiaSR" "InstallPath" "$INSTDIR"
@@ -747,12 +803,9 @@ Section "Leia SR Plug-in" SecPlugin
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRLeiaSR" \
 		"EstimatedSize" "$0"
 
-!ifdef LEIA_CONV
-	; The provider's session ends restarting nothing; then the mutex goes, and
-	; the service respawns the conversion host on demand.
-	Call ConvRmEnd
-	Call ConvMaintenanceRelease
-!endif
+	; The superseded provider's session ends restarting nothing; then the
+	; mutex goes.
+	Call ConvLegacyDone
 
 	; #461: bring back what Restart Manager closed (the service relaunches
 	; itself non-elevated with --rm-restart), or — only if RM failed — start
@@ -766,26 +819,12 @@ SectionEnd
 ; RM closed down: release the waiting helpers, the maintenance mutex, and
 ; restore the service.
 Function .onInstFailed
-!ifdef LEIA_CONV
-	Call ConvRmEnd
-	Call ConvMaintenanceRelease
-!endif
+	Call ConvLegacyDone
 	Call RmFinish
 FunctionEnd
 
 ;--------------------------------
 ; Uninstaller
-
-!macro UnDeleteHeld FILE
-	ClearErrors
-	Delete "${FILE}"
-	${If} ${Errors}
-		; Still mapped by a process RM could not close: remove it at reboot
-		; rather than silently leaving it behind.
-		Delete /REBOOTOK "${FILE}"
-		DetailPrint "${FILE} is still in use; it will be removed at the next reboot."
-	${EndIf}
-!macroend
 
 Section "Uninstall"
 	SetRegView 64
@@ -804,12 +843,10 @@ Section "Uninstall"
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\leia-sr"
 	; ADR-054 N4b: drop only the allowlist rows this installer wrote.
 	!insertmacro DXR_ALLOWLIST_REMOVE
-!ifdef LEIA_CONV
-	; The conversion provider's row (with any Settings the user set): the
-	; runtime's tasks fall through to the next provider at the next create.
-	DeleteRegKey HKLM "${CONV_KEY}"
-	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
-!endif
+	; A conversion-provider registration an older release of this installer
+	; wrote, and only that one: a row the separate package owns stays.
+	Call un.ConvLegacyDetect
+	Call un.ConvLegacyUnregister
 
 	; Release the DLL before deleting it: the service and in-process apps map
 	; it, and a plain Delete of a mapped DLL fails (it used to fail silently and
@@ -825,10 +862,7 @@ Section "Uninstall"
 	${If} $0 == 0
 		StrCpy $SvcRunning0 1
 	${EndIf}
-!ifdef LEIA_CONV
-	Call un.ConvMaintenanceTake
-	Call un.ConvRmClose
-!endif
+	Call un.ConvLegacyClose
 	Call un.RmClose
 	${If} $SvcRunning0 == 1
 		StrCpy $SvcWasRunning 1
@@ -838,16 +872,13 @@ Section "Uninstall"
 	!insertmacro UnDeleteHeld "$INSTDIR\DisplayXR-LeiaSR.dll"
 	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkanBeta.dll"
 	!insertmacro UnDeleteHeld "$INSTDIR\SimulatedRealityVulkan.dll"
-!ifdef LEIA_CONV
-	!insertmacro UnDeleteHeld "$INSTDIR\${CONV_DLL}"
-!endif
+	${If} $ConvLegacy == 1
+		!insertmacro UnDeleteHeld "$INSTDIR\${CONV_DLL}"
+	${EndIf}
 	Delete "$INSTDIR\dxr-rm-close.exe"
 	Delete "$INSTDIR\Uninstall.exe"
 
-!ifdef LEIA_CONV
-	Call un.ConvRmEnd
-	Call un.ConvMaintenanceRelease
-!endif
+	Call un.ConvLegacyDone
 
 	; Bring back what RM closed — the service comes back without the plug-in.
 	Call un.RmFinish
@@ -868,10 +899,7 @@ Section "Uninstall"
 SectionEnd
 
 Function un.onUninstFailed
-!ifdef LEIA_CONV
-	Call un.ConvRmEnd
-	Call un.ConvMaintenanceRelease
-!endif
+	Call un.ConvLegacyDone
 	Call un.RmFinish
 FunctionEnd
 

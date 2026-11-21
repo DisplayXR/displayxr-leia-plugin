@@ -66,11 +66,10 @@ BAT = REPO_ROOT / "scripts" / "build-windows.bat"
 WIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-windows.yml"
 LINUX_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-linux.yml"
 
-# The five pins that must be identical in the .bat and in build-windows.yml.
-# NEURD_SDK_REF / NEURD_SDK_REPO pin the private NeurD headers the 2D->3D lift
-# module is built against (docs/lift-neurd.md) -- same two-file duplication,
-# same drift hazard, so they ride the same check.
+# The pins that must be identical in the .bat and in build-windows.yml.
 # SR_V2_SHA256 is the sha256 of the SR_V2_DIR zip both download sites verify.
+# (The NeurD header pins left with the conversion provider: they live in the
+# displayxr-leia-conversion repo, and nothing here builds against NeurD.)
 PINS = (
     "SR_TAG",
     "SR_VKSTAMP_TAG",
@@ -78,6 +77,11 @@ PINS = (
     "SR_V2_DIR",
     "SR_V2_SHA256",
     "SR_SDK_REPO",
+)
+
+# Retired pins: a declaration left behind in either file means the removal was
+# half-applied (and that something may still be fetching private NeurD headers).
+RETIRED = (
     "NEURD_SDK_REF",
     "NEURD_SDK_REPO",
 )
@@ -170,6 +174,21 @@ def main():
             )
             continue
         agreed[key] = bat_val
+
+    # --- 1b. retired pins are gone from every file --------------------------
+    for key in RETIRED:
+        for path, text, values in (
+            (BAT, bat_text, bat_values),
+            (WIN_WORKFLOW, win_text, yaml_values),
+            (LINUX_WORKFLOW, linux_text, yaml_values),
+        ):
+            if values(text, key):
+                fail(
+                    f"{key} is still declared in {rel(path)}. The NeurD header "
+                    "pins were retired with the conversion provider (it lives in "
+                    "the displayxr-leia-conversion repo). Fix: remove the "
+                    "declaration and whatever step used it."
+                )
 
     # --- 2. build-linux.yml shares the artifact repo (not the tag) ---------
     linux_repo = one(

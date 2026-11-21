@@ -450,34 +450,6 @@ target_include_directories(test_sr_lens_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(test_sr_lens_gate PRIVATE pthread)
 add_test(NAME test_sr_lens_gate COMMAND test_sr_lens_gate)
 
-# Windows-arm lift viewpoint mapping (leia_lift_viewpoint.c, runtime ADR-048):
-# platform-neutral C (no NeurD / SR / D3D), host-tested here for the same reason.
-add_executable(test_lift_viewpoint
-    ../drv_leia/tests/test_lift_viewpoint.c
-    ../drv_leia/leia_lift_viewpoint.c)
-target_include_directories(test_lift_viewpoint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
-target_link_libraries(test_lift_viewpoint PRIVATE m)
-add_test(NAME test_lift_viewpoint COMMAND test_lift_viewpoint)
-
-# Windows-arm lift depth metadata + NeurD off-axis camera mapping (leia_lift_depth.c,
-# NeurD >= 0.4.9): same pattern — pure C, no NeurD / SR / D3D.
-add_executable(test_lift_depth
-    ../drv_leia/tests/test_lift_depth.c
-    ../drv_leia/leia_lift_depth.c)
-target_include_directories(test_lift_depth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
-target_link_libraries(test_lift_depth PRIVATE m)
-add_test(NAME test_lift_depth COMMAND test_lift_depth)
-
-# Windows conversion provider's pure decisions (src/conv_leia/leia_conv_policy.c:
-# the readiness / version gate, licence class, extents): plain C, no runtime
-# header, host-tested here like the lift helpers above.
-add_executable(test_conv_leia_policy
-    ../conv_leia/tests/test_conv_leia_policy.c
-    ../conv_leia/leia_conv_policy.c)
-target_include_directories(test_conv_leia_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../conv_leia)
-target_link_libraries(test_conv_leia_policy PRIVATE m)
-add_test(NAME test_conv_leia_policy COMMAND test_conv_leia_policy)
-
 # --- Host unit test: EDID panel list + descriptor->claim matching (M0) ----
 # Pure parse/match logic: leia_edid_probe_linux.c is linked for its EDID parser
 # (fixture blobs, no sysfs read is exercised) and leia_display_claims_linux.c
