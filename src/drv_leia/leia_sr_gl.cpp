@@ -323,16 +323,18 @@ create_v2(double max_time, void *hwnd, leiasr_gl &sr)
 	sr.display_width_m = info.width_m;
 	sr.display_height_m = info.height_m;
 	sr.display_dims_valid = true;
-	if (sr.screen_bound) {
-		// A per-screen DP describes ITS display (the runtime's segment views
-		// and window-scoped Kooima read it). The unbound DP keeps today's
-		// answer, byte-identical.
-		sr.display_pixel_width = info.pixel_width;
-		sr.display_pixel_height = info.pixel_height;
-		sr.display_screen_left = info.screen_left;
-		sr.display_screen_top = info.screen_top;
-		sr.display_pixel_dims_valid = info.pixel_width != 0 && info.pixel_height != 0;
-	}
+	// Every DP, bound or not, describes its display: the runtime's window
+	// metrics measure the window centre from the panel's desktop origin this
+	// reports (window-scoped Kooima), and a per-screen DP's segment views read
+	// it too. The unbound v2 DP used to leave it unset, so get_display_pixel_info
+	// failed and the runtime measured from (0,0) — a panel that is not the
+	// leftmost monitor (a G90XF at x=1920 beside a laptop) put every GL window
+	// one monitor-width off-centre. The v1 arm, D3D11, D3D12 and VK always set it.
+	sr.display_pixel_width = info.pixel_width;
+	sr.display_pixel_height = info.pixel_height;
+	sr.display_screen_left = info.screen_left;
+	sr.display_screen_top = info.screen_top;
+	sr.display_pixel_dims_valid = info.pixel_width != 0 && info.pixel_height != 0;
 
 	// Same DPI dance as the D3D11 arm, for the per-screen weaver only (the
 	// unbound create stays as it was): the SDK reads the HWND's geometry
