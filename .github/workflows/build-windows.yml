@@ -502,10 +502,29 @@ jobs:
           name: DisplayXR-LeiaSR
           path: _package
 
+      # displayxr-runtime#2737: the plug-in's self-description for the DisplayXR
+      # component catalog (label, registry key, runtime floor, detect rules), generated
+      # from leia_edid_table.h + the DXR_RUNTIME_GIT_TAG pin -- the same sources the
+      # plug-in and its installer read. The catalog generator ingests it; releases
+      # without it fall back to parsing those files.
+      - uses: actions/checkout@v4
+        with:
+          path: src-tree
+          sparse-checkout: |
+            scripts/gen_detect_manifest.py
+            src/drv_leia/leia_edid_table.h
+            CMakeLists.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Generate displayxr-detect.json
+        run: python3 src-tree/scripts/gen_detect_manifest.py --out _package/displayxr-detect.json
+
       - name: Attach Windows installer to GitHub release on tag
         uses: softprops/action-gh-release@v2
         with:
-          files: _package/DisplayXRLeiaSRSetup-*.exe
+          files: |
+            _package/DisplayXRLeiaSRSetup-*.exe
+            _package/displayxr-detect.json
           # ONLY this workflow may set generate_release_notes in this repo. The
           # action folds the flag into `body` before calling the API, and on
           # update does `body = existing + "\n\n" + notes` — so flagging
