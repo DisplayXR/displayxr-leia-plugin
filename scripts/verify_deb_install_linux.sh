@@ -107,24 +107,16 @@ for lib in libpipewire-0.3.so.0 libdbus-1.so.3; do
     grep -q "$lib" <<<"$out" || { echo "error: $lib not resolved on $PRETTY_NAME." >&2; fail=1; }
 done
 
-# The conversion provider (optional payload): its own deps must resolve here
-# too, it must not need NeurD to load, and the manifest must point at it.
-CONV=/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so
-CONV_MANIFEST=/usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json
-if [ -f "$CONV" ]; then
-    grep -q "$CONV" "$CONV_MANIFEST" 2>/dev/null ||
-        { echo "error: $CONV_MANIFEST missing or not pointing at $CONV." >&2; fail=1; }
-    conv_out="$(ldd -r "$CONV" 2>&1)" || true
-    if grep -E 'not found|undefined symbol' <<<"$conv_out"; then
-        echo "error: unresolved dependency in $CONV on $PRETTY_NAME." >&2
+# The Leia conversion provider belongs to the displayxr-leia-conversion package
+# (docs/conversion-moved.md): this package must not install its files, or the
+# two packages would collide.
+for f in /usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so \
+    /usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json; do
+    if dpkg-query -L "$PKG" | grep -qxF "$f"; then
+        echo "error: $PKG ships $f; it belongs to displayxr-leia-conversion." >&2
         fail=1
-    elif grep -qi neurd <<<"$conv_out"; then
-        echo "error: $CONV loads NeurD at link time (must dlopen it)." >&2
-        fail=1
-    else
-        echo "    ldd -r $CONV: ok (no NeurD dependency)"
     fi
-fi
+done
 
 if command -v displayxr-cli >/dev/null 2>&1; then
     echo "=== displayxr-cli selftest (env-free; plug-in must decline, sim-display claims) ==="

@@ -135,12 +135,6 @@ jobs:
       # Read with LEIALOFT_GITHUB_TOKEN — the same secret the Android arm uses
       # for LeiaInc/CNSDK. Fork PRs have no secret and cannot build this arm.
       SR_SDK_REPO: LeiaInc/SR-SDK-Windows-Releases-Internal-Public
-      # NeurD headers for the 2D->3D lift module (docs/lift-neurd.md), fetched
-      # from the PRIVATE LeiaInc/media_sdk repo into the gitignored
-      # NeurD-SDK-<ref>/include -- never committed. Pin a media_sdk release tag.
-      # KEEP IN SYNC with scripts/build-windows.bat (check_sr_pins.py asserts).
-      NEURD_SDK_REF: v0.4.10
-      NEURD_SDK_REPO: LeiaInc/media_sdk
       GH_TOKEN: ${{ github.token }}
       # SourceForge serves a bot-check page to CI runners, so vcpkg's pthreads
       # port (vcpkg_from_sourceforge) fails its hash on every mirror. This
@@ -233,21 +227,6 @@ jobs:
           # The two files the CMake gate keys on — fail here, not at configure.
           foreach ($f in @("include/sr/sr_instance.h", "lib/srSDK_loader.lib")) {
             if (-not (Test-Path "$env:SR_V2_DIR/$f")) { throw "SR v2 SDK missing $f" }
-          }
-
-      # SOFT: without the headers the lift module compiles out and the plug-in
-      # is otherwise identical, so a missing token or an unreachable repo must
-      # not fail the build -- it is surfaced as a warning annotation instead.
-      - name: Fetch NeurD headers
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-        run: |
-          ./scripts/fetch-neurd-headers.ps1 -Repo $env:NEURD_SDK_REPO -Ref $env:NEURD_SDK_REF -Dest "NeurD-SDK-$env:NEURD_SDK_REF"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::NeurD headers not fetched ($env:NEURD_SDK_REPO@$env:NEURD_SDK_REF) -- this build ships WITHOUT 2D->3D lift."
-            exit 1
           }
 
       # The plug-in CMake adds the runtime as a subdirectory, so we need
@@ -352,8 +331,6 @@ jobs:
         env:
           LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
           LEIASR_V2_SDKROOT: ${{ github.workspace }}/${{ env.SR_V2_DIR }}
-          # Read by src/drv_leia/CMakeLists.txt; absent dir => lift compiles out.
-          NEURD_SDK_ROOT: ${{ github.workspace }}/NeurD-SDK-${{ env.NEURD_SDK_REF }}
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DDXR_RUNTIME_SOURCE_DIR="${{ github.workspace }}/displayxr-runtime" `
@@ -414,45 +391,34 @@ jobs:
           }
           Write-Host "PASS: no static LeiaSR_runtime.dll import (lazy v2 load intact)."
 
-      # The conversion provider (src/conv_leia, ADR-053): a SEPARATE DLL from the
-      # display processor. Exactly one export (xrtConversionPluginNegotiate), no
-      # SR SDK import (it must load on a box without LeiaSR) and no static
-      # import of the vendor conversion module (loaded by absolute path, or the
-      # DLL would fail to load without it). Built only with the NeurD headers —
-      # without them it is skipped with a warning, like the lift slots.
-      - name: Assert conversion provider exports + imports
+      # 2D->3D conversion left this plug-in (docs/conversion-moved.md): the
+      # display DLL carries no NeurD module and no lift slots, and the build
+      # produces no conversion provider. Removing only one of the two would let
+      # NeurD come back through the runtime's legacy `dp-lift` adapter, so both
+      # are asserted on the artifact: the DLL must not name NeurD anywhere (the
+      # module's search paths, log lines and knob names all did), and no
+      # provider DLL may be staged for the installer.
+      - name: Assert no conversion code ships (no NeurD in the DLL, no provider)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         shell: pwsh
         run: |
-          $dll = "_package/bin/plugins/DisplayXR-LeiaConversion.dll"
-          if (-not (Test-Path $dll)) {
-            if (Test-Path "NeurD-SDK-$env:NEURD_SDK_REF/include/NeurD.h") {
-              Write-Host "::error::$dll missing although the NeurD headers were fetched."
+          $dll = "_package/bin/plugins/DisplayXR-LeiaSR.dll"
+          $bytes = [IO.File]::ReadAllBytes($dll)
+          $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+          $wide = [Text.Encoding]::Unicode.GetString($bytes)
+          foreach ($needle in @('NeurD', 'DXR_LEIA_LIFT', 'Leia lift:')) {
+            if ($ascii.Contains($needle) -or $wide.Contains($needle)) {
+              Write-Host "::error::$dll contains '$needle' -- the NeurD lift module is back in the display plug-in. Conversion belongs to the separate conversion provider (docs/conversion-moved.md)."
               exit 1
             }
-            Write-Host "::warning::NeurD headers not fetched -- DisplayXR-LeiaConversion.dll not built."
-            exit 0
           }
-          $names = @(& dumpbin /exports $dll 2>&1 | ForEach-Object {
-            if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)') { $Matches[1] }
-          })
-          if ($names.Count -ne 1 -or $names[0] -ne 'xrtConversionPluginNegotiate') {
-            Write-Host "::error::$dll exports [$($names -join ', ')] -- expected exactly xrtConversionPluginNegotiate."
+          Write-Host "PASS: no NeurD lift module in the display DLL."
+          $conv = Get-ChildItem -Recurse -Path _package -Filter 'DisplayXR-LeiaConversion*' -ErrorAction SilentlyContinue
+          if ($conv) {
+            Write-Host "::error::the build staged $($conv.FullName -join ', ') -- the conversion provider ships from its own repo, not from here."
             exit 1
           }
-          Write-Host "PASS: exactly one export, xrtConversionPluginNegotiate."
-          $imports = & dumpbin /imports $dll 2>&1 | Out-String
-          foreach ($bad in @('SimulatedReality', 'LeiaSR_runtime', 'DisplayXR-LeiaSR', 'NeurD.dll')) {
-            if ($imports -match [regex]::Escape($bad)) {
-              Write-Host "::error::$dll statically imports $bad -- the provider must load without it."
-              exit 1
-            }
-          }
-          Write-Host "PASS: no SR SDK, display-DLL or conversion-module import."
-
-      - name: Conversion provider tests
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        run: ctest --test-dir build/src/conv_leia -C Release --output-on-failure
+          Write-Host "PASS: no conversion provider in the package tree."
 
       - name: SR client DLL bind tests
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -469,7 +435,6 @@ jobs:
           name: DisplayXR-LeiaSR
           path: |
             _package/bin/plugins/DisplayXR-LeiaSR.dll
-            _package/bin/plugins/DisplayXR-LeiaConversion.dll
             _package/DisplayXRLeiaSRSetup-*.exe
           if-no-files-found: error
 

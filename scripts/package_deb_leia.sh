@@ -15,9 +15,6 @@
 #   ./scripts/package_deb_leia.sh --allow-no-capture  # permit a capture-less build
 #   ./scripts/package_deb_leia.sh --allow-no-snap     # permit a Track B build without
 #                                                     # srWeaverSnapToPhase (NOT releasable, #271)
-#   NEURD_SDK_ROOT=/path/to/NeurD-SDK-<ref> ...       # also ship the Leia conversion provider
-#   ./scripts/package_deb_leia.sh --allow-no-look-around  # permit a conversion provider built
-#                                                     # against headers without NeurD_convert_stream_cpu_ex
 #
 # Output: dist/displayxr-leia-sr_<ver>_<arch>.deb
 #
@@ -30,21 +27,16 @@
 # Payload (installed layout):
 #   /usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so     (the Leia DP plug-in)
 #   /usr/lib/displayxr/plugins/050-leia-sr.json        (discovery manifest, probe_order 50)
-#   /usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so                   (NEURD_SDK_ROOT set)
-#   /usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json  (its manifest)
 #
-# --- The conversion provider (src/conv_leia) and NeurD -------------------------
-# Built only when NEURD_SDK_ROOT points at the NeurD public headers
-# (scripts/fetch-neurd-headers.sh). It loads NO NeurD symbol at link time: it
-# finds libNeurD.so at runtime (NeurDPath setting -> /opt/immersity/neurd-runtime
-# -> NEURD_PATH -> LD_LIBRARY_PATH -> ~/.local/share/LeiaInc/NeurD-Runtime) and
-# dlopens it. So the .deb carries NO relation to NeurD -- not even a Recommends:
-# the NeurD runtime package is in no Ubuntu archive, and DebInstall checks that
-# every relation resolves there. Without NeurD the provider reports ABSENT and
-# the runtime's conversion falls back to Open Conversion. This script refuses a
-# provider that links libNeurD, exports anything but xrtConversionPluginNegotiate,
-# or (without --allow-no-look-around) was built against headers that predate
-# NeurD_convert_stream_cpu_ex (fixed pair, no look-around).
+# --- NOT in this package: the Leia conversion provider --------------------------
+# Releases before the split also shipped DisplayXR-LeiaConversion.so and
+# 050-leia-conversion-conversion-provider.json here. They now belong to the
+# separate `displayxr-leia-conversion` package, which declares Replaces / Breaks
+# against the versions of THIS package that carried them, so dpkg hands the two
+# files over on an upgrade (docs/conversion-moved.md). This script refuses to
+# stage either file: a package that ships them again would collide with that
+# one. No Depends / Recommends on it: it is in no Ubuntu archive (DebInstall
+# checks every relation resolves), and the plug-in works without conversion.
 #
 # NO postinst/postrm: the plug-in .deb just drops files into the shared
 # DisplayProcessors discovery root (`/usr/lib/displayxr/plugins`, which the
@@ -124,15 +116,13 @@ WEAVER="sdk"       # Track B (real srSDK). --stub switches to Track A.
 NO_BUILD=0
 ALLOW_NO_CAPTURE=0
 ALLOW_NO_SNAP=0
-ALLOW_NO_LOOK_AROUND=0
 for arg in "$@"; do
     case "$arg" in
     --stub) WEAVER="stub" ;;
     --no-build) NO_BUILD=1 ;;
     --allow-no-capture) ALLOW_NO_CAPTURE=1 ;;
     --allow-no-snap) ALLOW_NO_SNAP=1 ;;
-    --allow-no-look-around) ALLOW_NO_LOOK_AROUND=1 ;;
-    *) echo "Unknown option: $arg (supported: --stub --no-build --allow-no-capture --allow-no-snap --allow-no-look-around)" >&2; exit 2 ;;
+    *) echo "Unknown option: $arg (supported: --stub --no-build --allow-no-capture --allow-no-snap)" >&2; exit 2 ;;
     esac
 done
 
@@ -147,13 +137,6 @@ fi
 [ -f "$RUNTIME_DIR/CMakeLists.txt" ] || { echo "error: runtime checkout not found at $RUNTIME_DIR (set DXR_RUNTIME_SOURCE_DIR)." >&2; exit 1; }
 
 find_so() { find "$BUILD_DIR" -name "DisplayXR-LeiaSR.so" -type f 2>/dev/null | head -1; }
-find_conv() { find "$BUILD_DIR" -name "DisplayXR-LeiaConversion.so" -type f 2>/dev/null | head -1; }
-
-NEURD_ARGS=()
-if [ -n "${NEURD_SDK_ROOT:-}" ]; then
-    [ -f "$NEURD_SDK_ROOT/include/NeurD.h" ] || { echo "error: NEURD_SDK_ROOT=$NEURD_SDK_ROOT has no include/NeurD.h." >&2; exit 1; }
-    NEURD_ARGS=(-DNEURD_SDK_ROOT="$NEURD_SDK_ROOT")
-fi
 
 if [ -z "$(find_so)" ]; then
     [ "$NO_BUILD" = 0 ] || { echo "error: no build under $BUILD_DIR and --no-build set." >&2; exit 1; }
@@ -165,14 +148,9 @@ if [ -z "$(find_so)" ]; then
         -DDXR_RUNTIME_SOURCE_DIR="$RUNTIME_DIR" \
         -DDXR_LEIA_LINUX_WEAVER="$WEAVER" \
         -DDXR_LEIA_SDK_DEV_RPATH=OFF \
-        -DDXR_LEIA_LNX_ALLOW_NO_SNAP="$([ "$ALLOW_NO_SNAP" = 1 ] && echo ON || echo OFF)" \
-        "${NEURD_ARGS[@]}"
+        -DDXR_LEIA_LNX_ALLOW_NO_SNAP="$([ "$ALLOW_NO_SNAP" = 1 ] && echo ON || echo OFF)"
     echo "==> Building DisplayXR-LeiaSR.so"
     cmake --build "$BUILD_DIR" --target DisplayXR-LeiaSR
-fi
-if [ -n "${NEURD_SDK_ROOT:-}" ] && [ "$NO_BUILD" = 0 ]; then
-    echo "==> Building DisplayXR-LeiaConversion.so (NeurD headers: $NEURD_SDK_ROOT)"
-    cmake --build "$BUILD_DIR" --target DisplayXR-LeiaConversion
 fi
 
 SO="$(find_so)"
@@ -238,61 +216,6 @@ install -m 0644 "$SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so"
 STAGED_SO="$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaSR.so"
 patchelf --remove-rpath "$STAGED_SO"
 echo "==> rpath after strip: '$(patchelf --print-rpath "$STAGED_SO" 2>/dev/null)'"
-
-# The conversion provider (see header): optional, but never half-shipped.
-CONV="$(find_conv)"
-STAGED_CONV=""
-if [ -n "${NEURD_SDK_ROOT:-}" ] && [ -z "$CONV" ]; then
-    echo "error: NEURD_SDK_ROOT is set but DisplayXR-LeiaConversion.so was not built under $BUILD_DIR." >&2
-    exit 1
-fi
-if [ -n "$CONV" ]; then
-    STAGED_CONV="$STAGE/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so"
-    install -m 0644 "$CONV" "$STAGED_CONV"
-    patchelf --remove-rpath "$STAGED_CONV"
-    conv_needed="$(objdump -p "$STAGED_CONV" | awk '/NEEDED/{print $2}')"
-    if grep -qi neurd <<<"$conv_needed"; then
-        echo "error: $CONV links NeurD at load time; it must only dlopen libNeurD.so (no NeurD dependency)." >&2
-        exit 1
-    fi
-    conv_syms="$(nm -D --defined-only "$STAGED_CONV" | awk '{print $NF}')"
-    if [ "$conv_syms" != "xrtConversionPluginNegotiate" ]; then
-        echo "error: $CONV must export exactly xrtConversionPluginNegotiate, exports: $conv_syms" >&2
-        exit 1
-    fi
-    # Look-around gate: this log text sits inside the provider's
-    # DXR_LEIA_NEURD_HAS_CPU_EX code, so it is compiled in only when the headers
-    # declare NeurD_convert_stream_cpu_ex. Captured, not piped: `strings | grep -q`
-    # under pipefail fails on the SIGPIPE even when grep matched.
-    conv_strings="$(strings "$STAGED_CONV")"
-    if grep -qF 'NeurD_convert_stream_cpu_ex -> ' <<<"$conv_strings"; then
-        echo "==> Conversion provider: NeurD_convert_stream_cpu_ex compiled in (look-around)"
-    elif [ "$ALLOW_NO_LOOK_AROUND" = 1 ]; then
-        echo "==> WARNING: conversion provider built WITHOUT NeurD_convert_stream_cpu_ex: fixed pair, no"
-        echo "    look-around (--allow-no-look-around set)."
-    else
-        echo "error: $CONV was built against NeurD headers without NeurD_convert_stream_cpu_ex, so" >&2
-        echo "       Convert to 3D would ship without look-around. Fetch headers that have it" >&2
-        echo "       (media_sdk at or after the cpu_ex commit) or pass --allow-no-look-around." >&2
-        exit 1
-    fi
-    cat > "$STAGE/usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json" <<MANIFEST
-{
-    "file_format_version": "1.0",
-    "plugin": {
-        "id":           "leia-conversion",
-        "display_name": "Leia conversion (NeurD)",
-        "vendor":       "Leia Inc.",
-        "version":      "$VERSION",
-        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-LeiaConversion.so",
-        "probe_order":  50
-    }
-}
-MANIFEST
-    chmod 0644 "$STAGE/usr/lib/displayxr/plugins/050-leia-conversion-conversion-provider.json"
-else
-    echo "==> Conversion provider: not built (NEURD_SDK_ROOT unset), this .deb ships no Leia conversion"
-fi
 
 # Discovery manifest — probe_order 50 (vendor), absolute INSTALLED binary_path,
 # NO force-probe (the merged presence probe, leia-plugin #99, claims when the SR
@@ -385,7 +308,7 @@ STABLE_SONAMES=(
 command -v dpkg-shlibdeps >/dev/null 2>&1 || { echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2; exit 1; }
 
 bad=""
-for so in $(objdump -p "$STAGED_SO" $STAGED_CONV | awk '/NEEDED/{print $2}' | sort -u); do
+for so in $(objdump -p "$STAGED_SO" | awk '/NEEDED/{print $2}' | sort -u); do
     ok=0
     for s in "${STABLE_SONAMES[@]}"; do [ "$so" = "$s" ] && ok=1 && break; done
     [ "$ok" = 1 ] || bad="$bad $so"
@@ -404,7 +327,7 @@ fi
 SHLIBS_TMP="$(mktemp -d)"
 mkdir -p "$SHLIBS_TMP/debian"
 printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "$PKG" "$PKG" >"$SHLIBS_TMP/debian/control"
-LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O "$STAGED_SO" $STAGED_CONV | sed -n 's/^shlibs:Depends=//p')"
+LIB_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O "$STAGED_SO" | sed -n 's/^shlibs:Depends=//p')"
 rm -rf "$SHLIBS_TMP"
 [ -n "$LIB_DEPENDS" ] || { echo "error: dpkg-shlibdeps produced no Depends." >&2; exit 1; }
 # Versioned (multi-screen M4 review): the plug-in's Vulkan weaver is windowless,
@@ -423,8 +346,8 @@ if echo "$DEPENDS" | grep -q leiasr; then
 fi
 echo "==> Depends: $DEPENDS"
 
-GLIBC_FLOOR="$(objdump -T "$STAGED_SO" $STAGED_CONV | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
-GLIBCXX_FLOOR="$(objdump -T "$STAGED_SO" $STAGED_CONV | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+GLIBC_FLOOR="$(objdump -T "$STAGED_SO" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+GLIBCXX_FLOOR="$(objdump -T "$STAGED_SO" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
 echo "==> glibc floor: GLIBC_$GLIBC_FLOOR, GLIBCXX_${GLIBCXX_FLOOR:-none}"
 if [ -n "${DXR_DEB_MAX_GLIBC:-}" ] &&
     [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$DXR_DEB_MAX_GLIBC" | sort -V | tail -1)" != "$DXR_DEB_MAX_GLIBC" ]; then
@@ -471,15 +394,11 @@ Description: DisplayXR Leia SR display processor (Linux plug-in)
  enabled for the user; without it transparency falls back to silhouette
  intersection.
 EOF
-if [ -n "$STAGED_CONV" ]; then
-    cat >> "$STAGE/DEBIAN/control" <<EOF
- .
- Also ships the Leia conversion provider (Convert to 3D) over Leia NeurD's CPU
- path, with views that follow the tracked viewer. NeurD is not a dependency:
- the provider loads it at runtime from /opt/immersity/neurd-runtime when the
- NeurD runtime package is installed and declines without it, so the runtime
- uses its built-in conversion instead.
-EOF
+# The split's guard (see header): neither provider file may ride in this package.
+if find "$STAGE" \( -name 'DisplayXR-LeiaConversion*' -o -name '*conversion-provider*.json' \) | grep -q .; then
+    echo "error: the staged tree contains Leia conversion provider files; they belong to" >&2
+    echo "       the displayxr-leia-conversion package (docs/conversion-moved.md)." >&2
+    exit 1
 fi
 
 mkdir -p "$DIST_DIR"

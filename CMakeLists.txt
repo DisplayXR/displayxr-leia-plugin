@@ -197,11 +197,9 @@ endif()
 # the installer floor follows. v2.22.0 was the first runtime with the D3D11 DP lift slots
 # (XRT_DP_D3D11_HAS_LIFT, runtime#1781) and the lift-only factory
 # (XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY). Appended and struct_size-gated,
-# plug-in ABI still v5; an older pin compiles the NeurD lift module OUT.
-# v2.41.0 (from v2.39.0): the first runtime with the conversion-provider ABI
-# (xrt/xrt_conversion_plugin.h, XRT_CONVERSION_PLUGIN_API_VERSION 1, ADR-053) that
-# src/conv_leia (DisplayXR-LeiaConversion.dll) is built against; an older pin
-# leaves that DLL unbuilt. Display plug-in ABI unchanged (v5).
+# plug-in ABI still v5. This plug-in no longer fills them (they stay NULL; 2D->3D
+# conversion is the separate conversion provider, docs/conversion-moved.md), so
+# no pin is ever moved for lift or for the conversion-provider ABI again.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
 set(DXR_RUNTIME_GIT_TAG "v2.66.8" CACHE STRING
@@ -366,8 +364,6 @@ if(WIN32)
     message(STATUS "Leia SR SDK at ${SR_PATH}")
 
     add_subdirectory(src/drv_leia)
-    # Conversion provider (ADR-053): a separate DLL, no SR SDK dependency.
-    add_subdirectory(src/conv_leia)
     add_subdirectory(installer)
 elseif(ANDROID)
     # --- CNSDK (Android / Leia CNSDK plug-in) --------------------------
@@ -384,9 +380,6 @@ elseif(DXR_LINUX_DESKTOP)
     # find_package, no installer — the .so is discovered via a JSON
     # manifest (XRT_PLUGIN_SEARCH_PATH / XDG DisplayProcessors roots).
     add_subdirectory(src/drv_leia_linux)
-    # Conversion provider (ADR-053), CPU transport: a separate .so, no SR SDK,
-    # built only when the NeurD headers are found (NEURD_SDK_ROOT).
-    add_subdirectory(src/conv_leia)
 elseif(DXR_MACOS)
     # --- macOS (LeiaSR srSDK Metal weaver) ------------------------------
     # The runtime's Metal compositor calls create_dp_metal; the DP drives the

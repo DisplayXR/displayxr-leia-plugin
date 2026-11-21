@@ -9,9 +9,17 @@ the plug-in DLL, its two bundled Vulkan weavers and an uninstaller into
 which is the runtime's discovery contract
 ([`plugin-discovery.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/plugin-discovery.md)).
 
-The three pieces it relates to are installed independently and in any order:
-the **LeiaSR platform runtime**, the **NeurD** 2D→3D runtime, and the **DisplayXR
-runtime** (usually via the bundle). Design: DisplayXR/displayxr-runtime#1803.
+The two pieces it relates to are installed independently and in any order:
+the **LeiaSR platform runtime** and the **DisplayXR runtime** (usually via the
+bundle). Design: DisplayXR/displayxr-runtime#1803.
+
+It no longer installs the Leia conversion provider (2D→3D through NeurD), which
+ships in its own package. An upgrade or uninstall removes only what an older
+release of this installer left behind, and never a registration the separate
+package owns: [conversion-moved.md](conversion-moved.md#installer-handover-windows).
+When it has removed a working registration it then tries to fetch that package
+through the runtime's `dxr-get` (`/NOCONVERSION` skips it, `/WITHCONVERSION` asks
+for it on any install); this never fails the install.
 
 ## Prerequisites: none
 
