@@ -153,7 +153,8 @@ void main() {
         vec4 bd = texture(backdrop, tile_local);
         b = bd.rgb + (1.0 - bd.a) * b;
     }
-    frag = vec4(mix(b, a.rgb, a.a), 1.0);
+    // Premultiplied atlas: "over", not mix() (which darkens 0<a<1 pixels).
+    frag = vec4(a.rgb + (1.0 - a.a) * b, 1.0);
 }
 )";
 
