@@ -17,6 +17,9 @@ It no longer installs the Leia conversion provider (2D→3D through NeurD), whic
 ships in its own package. An upgrade or uninstall removes only what an older
 release of this installer left behind, and never a registration the separate
 package owns: [conversion-moved.md](conversion-moved.md#installer-handover-windows).
+When it has removed a working registration it then tries to fetch that package
+through the runtime's `dxr-get` (`/NOCONVERSION` skips it, `/WITHCONVERSION` asks
+for it on any install); this never fails the install.
 
 ## Prerequisites: none
 

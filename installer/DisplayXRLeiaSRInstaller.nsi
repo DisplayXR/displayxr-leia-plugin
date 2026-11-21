@@ -423,12 +423,18 @@ FunctionEnd
 ; the same section (NSIS runs sections and their Calls on one thread).
 ;
 ; After this, a box that has not installed the separate package has no Leia
-; conversion: the runtime uses its next conversion provider.
+; conversion: the runtime uses its next conversion provider. So when this
+; installer has just removed a WORKING registration it tries to bring the
+; separate package in (ConvChainPackage, at the very end of the section).
 
 !define CONV_ID "leia-conversion"
 !define CONV_DLL "DisplayXR-LeiaConversion.dll"
 !define CONV_KEY "Software\DisplayXR\ConversionProviders\${CONV_ID}"
 !define CONV_MUTEX "Global\DisplayXR-ConvMaintenance-${CONV_ID}"
+; The separate package: its component name in the DisplayXR component catalog
+; (what `dxr-get install` takes) and where a person gets it by hand.
+!define CONV_CATALOG_COMPONENT "leia_conversion"
+!define CONV_PKG_URL "https://github.com/DisplayXR/displayxr-leia-conversion/releases/latest"
 
 Var ConvMutex     ; owned maintenance mutex handle ("" = not held)
 Var ConvRmDir     ; the superseded copy's own RM session state dir
@@ -584,7 +590,7 @@ Function ${PFX}ConvLegacyUnregister
 		DeleteRegValue HKLM "${CONV_KEY}" "ProbeOrder"
 		DeleteRegKey /ifempty HKLM "${CONV_KEY}"
 		DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
-		DetailPrint "Removed this plug-in's ${CONV_ID} registration. Install the Leia conversion provider package for 2D-to-3D conversion through NeurD."
+		DetailPrint "Removed this plug-in's ${CONV_ID} registration (the provider ships in its own package now)."
 	${EndIf}
 FunctionEnd
 
@@ -598,6 +604,82 @@ FunctionEnd
 
 !insertmacro CONV_FUNCTIONS ""
 !insertmacro CONV_FUNCTIONS "un."
+
+; Chain the separate conversion-provider package (installer only).
+;
+; When: this run removed this plug-in's own, working leia-conversion
+; registration ($ConvRowOurs = 1: the box HAD Leia conversion and would lose
+; it), or the caller asked with /WITHCONVERSION. Never under /NOCONVERSION (a
+; bundle that installs the package itself passes it), and never when a
+; leia-conversion registration exists by now.
+;
+; How: `dxr-get install leia_conversion`, the runtime's fetcher (runtime
+; docs/specs/runtime/dxr-get.md): it downloads the installer named by the signed
+; component catalog, checks size, SHA-256 and the Authenticode signer, and runs
+; it silently; it never downgrades. This installer uses the copy the DisplayXR
+; runtime installs next to itself, so there is no chain on a box without a
+; runtime that has dxr-get. It runs after everything else (the maintenance mutex
+; is released, the service is back): the chained installer takes that mutex and
+; runs its own Restart Manager session.
+;
+; The catalog has to carry a `leia_conversion` component for this to fetch
+; anything. Until it does, dxr-get reports nothing fetchable and this prints
+; where to get the installer instead. Whatever happens here, the plug-in's own
+; install has already succeeded and stays successful: nothing below aborts.
+;
+; Interactive runs ask once before downloading; /S goes straight through.
+Function ConvChainPackage
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOCONVERSION" $R1
+	${IfNot} ${Errors}
+		DetailPrint "Not fetching the Leia conversion provider (/NOCONVERSION)."
+		Return
+	${EndIf}
+	StrCpy $R2 $ConvRowOurs
+	ClearErrors
+	${GetOptions} $R0 "/WITHCONVERSION" $R1
+	${IfNot} ${Errors}
+		StrCpy $R2 1
+	${EndIf}
+	${If} $R2 != 1
+		Return
+	${EndIf}
+	ReadRegStr $0 HKLM "${CONV_KEY}" "Binary"
+	${If} $0 != ""
+		DetailPrint "Leia conversion provider already registered at $0."
+		Return
+	${EndIf}
+
+	ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+	${If} $1 == ""
+	${OrIfNot} ${FileExists} "$1\dxr-get.exe"
+		DetailPrint "The Leia conversion provider (2D-to-3D through NeurD) is a separate package now; no dxr-get on this box to fetch it."
+		DetailPrint "Get it from ${CONV_PKG_URL}"
+		Return
+	${EndIf}
+
+	MessageBox MB_YESNO|MB_ICONQUESTION "2D-to-3D conversion through NeurD now ships as a separate package, the Leia conversion provider.$\r$\n$\r$\nDownload and install it now?" /SD IDYES IDYES conv_fetch
+		DetailPrint "Leia conversion provider not installed (declined). Get it later from ${CONV_PKG_URL}"
+		Return
+	conv_fetch:
+	DetailPrint "Fetching the Leia conversion provider (dxr-get install ${CONV_CATALOG_COMPONENT})..."
+	nsExec::ExecToLog '"$1\dxr-get.exe" install ${CONV_CATALOG_COMPONENT} --yes'
+	Pop $0
+	DetailPrint "  dxr-get install exit: $0"
+	ReadRegStr $2 HKLM "${CONV_KEY}" "Binary"
+	${If} $0 == "0"
+	${AndIf} $2 != ""
+		DetailPrint "Leia conversion provider installed ($2)."
+	${Else}
+		${If} $0 == "40"
+			DetailPrint "The DisplayXR component catalog does not list the Leia conversion provider (yet)."
+		${ElseIf} $0 == "10"
+			DetailPrint "The DisplayXR component catalog could not be reached."
+		${EndIf}
+		DetailPrint "Leia conversion provider NOT installed. Get it from ${CONV_PKG_URL}"
+	${EndIf}
+FunctionEnd
 
 ; Delete FILE; when a process RM could not close still maps it, remove it at
 ; the next reboot rather than silently leaving it behind.
@@ -812,6 +894,10 @@ Section "Leia SR Plug-in" SecPlugin
 	; the service via explorer.exe. Nothing is started that was not running
 	; before, and nothing at all under /NOSTART.
 	Call RmFinish
+
+	; Last, and never fatal: bring in the separate conversion-provider package
+	; when this run took a working Leia conversion away (see ConvChainPackage).
+	Call ConvChainPackage
 
 SectionEnd
 
