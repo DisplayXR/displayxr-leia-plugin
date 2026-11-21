@@ -132,30 +132,16 @@ else()
         "the DLL from the sr-sdk-v* release into the SR SDK's bin/ dir.")
 endif()
 
-# The conversion provider DLL (src/conv_leia) ships in the same installer when
-# it was built (it needs the NeurD headers); LEIA_CONV turns on its files, its
-# ConversionProviders row and its maintenance-mutex Restart Manager session.
-set(LEIA_CONV_NSIS_DEFINE "")
-if(TARGET DisplayXR-LeiaConversion)
-    set(LEIA_CONV_NSIS_DEFINE "/DLEIA_CONV=1")
-    message(STATUS "Installer: bundling DisplayXR-LeiaConversion.dll (ConversionProviders/leia-conversion row)")
-endif()
-
 # ADR-054 N4b: provenance-allowlist rows for the runtime-loaded DLLs, generated
 # from the exact bytes in BIN_DIR right before makensis runs.
 set(LEIA_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
 file(TO_NATIVE_PATH "${LEIA_ALLOWLIST_NSH}" LEIA_ALLOWLIST_NSH_NATIVE)
-set(LEIA_ALLOWLIST_SHIP_CONV "")
-if(TARGET DisplayXR-LeiaConversion)
-    set(LEIA_ALLOWLIST_SHIP_CONV "-DSHIP_CONV=1")
-endif()
 
 add_custom_target(installer
     COMMAND "${CMAKE_COMMAND}"
         "-DBIN_DIR=${DXR_BIN_DIR}"
         "-DVERSION=${DXR_LEIA_VERSION}"
         "-DOUT=${LEIA_ALLOWLIST_NSH}"
-        ${LEIA_ALLOWLIST_SHIP_CONV}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
     COMMAND "${NSIS_EXECUTABLE}"
         "/DVERSION=${DXR_LEIA_VERSION}"
@@ -169,7 +155,6 @@ add_custom_target(installer
         "/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
         "/DSIGN_CMD=${SIGN_CMD}"
-        ${LEIA_CONV_NSIS_DEFINE}
         "/DALLOWLIST_NSH=${LEIA_ALLOWLIST_NSH_NATIVE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -177,6 +162,3 @@ add_custom_target(installer
     VERBATIM
 )
 add_dependencies(installer DisplayXR-LeiaSR dxr-rm-close)
-if(TARGET DisplayXR-LeiaConversion)
-    add_dependencies(installer DisplayXR-LeiaConversion)
-endif()

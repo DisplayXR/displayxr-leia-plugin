@@ -3,7 +3,7 @@
 #
 # Generates Allowlist.nsh for DisplayXRLeiaSRInstaller.nsi: the ADR-054 N4b
 # provenance-allowlist rows for the DLLs this installer ships that the RUNTIME
-# loads (the DP plug-in and, when built, the conversion provider).
+# loads (the DP plug-in).
 #
 # Adapted from displayxr-runtime/installer/gen_allowlist_nsh.cmake; the row
 # format (value name = SHA-256 hex, data = "<file> (<who> <version>)" under
@@ -14,10 +14,10 @@
 # plug-in the runtime refuses. Digests are taken from the exact bytes packed.
 #
 # NOT listed: SimulatedRealityVulkan*.dll (the plug-in loads those, not the
-# runtime) and NeurD's files (NeurD's own installer; the plug-in loads them).
+# runtime).
 #
 #   cmake -DBIN_DIR=<_package/bin> -DVERSION=<x.y.z> -DOUT=<Allowlist.nsh>
-#         [-DSHIP_CONV=1] -P gen_allowlist_nsh.cmake
+#         -P gen_allowlist_nsh.cmake
 
 if(NOT DEFINED BIN_DIR OR NOT DEFINED OUT)
 	message(FATAL_ERROR "gen_allowlist_nsh.cmake: BIN_DIR and OUT are required")
@@ -29,9 +29,6 @@ endif()
 # Keep in sync with the runtime-loaded `File "${BIN_DIR}\plugins\..."` lines of
 # the .nsi.
 set(_shipped_plugins "${BIN_DIR}/plugins/DisplayXR-LeiaSR.dll")
-if(SHIP_CONV)
-	list(APPEND _shipped_plugins "${BIN_DIR}/plugins/DisplayXR-LeiaConversion.dll")
-endif()
 
 set(_write "")
 set(_remove "")
