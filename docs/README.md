@@ -15,10 +15,9 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 | Display processor (per API) | `leia_display_processor.{cpp,h}` (base), `leia_display_processor_d3d11.{cpp,h}`, `leia_display_processor_d3d12.{cpp,h}`, `leia_display_processor_gl.{cpp,h}` |
 | Weaver (per API) | `leia_sr.{cpp,h}` (base + eye tracking), `leia_sr_d3d11.{cpp,h}`, `leia_sr_d3d12.{cpp,h}`, `leia_sr_gl.{cpp,h}` |
 | Background capture (transparency) | `leia_bg_capture_win.{cpp,h}` |
-| 2D→3D lift (NeurD, D3D11) | `leia_lift_neurd.{cpp,h}` (+ private NeurD headers fetched at build time) |
 | Shaders | `shaders/` |
 
-`src/conv_leia/` — the **conversion provider** `DisplayXR-LeiaConversion.dll` (ADR-053), a separate DLL that reuses the NeurD module sources above: `leia_conv_plugin.cpp` (`xrtConversionPluginNegotiate`), `leia_conv_d3d11.{cpp,h}` (own device, image import), `leia_conv_policy.{c,h}` (pure, host-tested).
+2D→3D conversion (the NeurD module and the conversion provider `DisplayXR-LeiaConversion`) is **not** in this repository any more: see [conversion-moved.md](conversion-moved.md).
 
 ## Docs in this directory
 
@@ -26,8 +25,7 @@ Leia is the first 3D-display vendor integrated into DisplayXR. This directory do
 - **[Weaver internals](weaver.md)** — DX11 / DX12 / OpenGL / Vulkan weaver creation, inputs, weave() flow, DPI handling, phase math.
 - **[Transparency model](transparency.md)** — current primary path: WGC compose-under-bg on D3D11 / D3D12 / Vulkan. Replaces the older chroma-key approach for those APIs.
 - **[Chroma-key overlay (legacy / OpenGL fallback)](chroma-key-overlay.md)** — fallback path; still the only transparency path on the Leia OpenGL DP.
-- **[2D→3D lift via NeurD](lift-neurd.md)** — the D3D11 DP's `lift_*` slots: dynamic NeurD.dll load, one-per-process activation (licence network failure = *activating*, retried), the shared-texture device bridge to NeurD's own D3D11 device, tracked-eye → NeurD viewpoint mapping, the `DXR_LEIA_LIFT*` knobs, and how to verify with `displayxr-cli lift caps|probe`.
-- **[Conversion provider](conversion-provider.md)** — `DisplayXR-LeiaConversion.dll`, the separate ADR-053 provider over NeurD: capabilities (DEPTH_MONO, DEPTH_VIDEO, 2-view VIEWS_MONO + same-inference depth), the readiness / version gate (too old = `FAILED(VERSION)`, missing = `ABSENT(MODEL)`), the licence class from the module's own words, settings through `host->get_setting`, the `ConversionProviders\leia-conversion` row (`Supersedes = dp-lift`, `Version` last) and the installer's "close the host, never the service" maintenance-mutex sequence.
+- **[2D→3D conversion moved out of this plug-in](conversion-moved.md)** — the D3D11 DP no longer fills the lift slots or the lift-only factory (plug-in ABI unchanged), the conversion provider ships from its own repository and package, the installer / `.deb` handover of the `ConversionProviders\leia-conversion` row and files, the retired `DXR_LEIA_LIFT*` knobs, and the migration order.
 - **[Windows installer: install and uninstall in any order](installer.md)** — no runtime / SR prerequisite (ABI floor only when a runtime is present), Restart Manager close + restart of the service and in-process apps via `dxr-rm-close.exe`, the explorer.exe fallback (never an elevated service), `/NOSTART`, and the uninstall that works without the runtime. Also the **macOS `.pkg`** (`installer/macos/build_pkg.sh`): payload paths, the runtime-floor check, service restart, uninstall, signing, and why CI cannot build it.
 - **[Late latching](late-latching.md)** — which backends implement it (D3D11/GL automatic, VK needs our submit hook, D3D12 is a stub), what `srWeaverIsLateLatchingEnabled` hides, the once-per-frame / deferred-context contract from the shipped header, and the dot test — including why `pattern = 450` makes it lie.
 - **[SR panel readiness and late geometry](sr-readiness.md)** — the boot race (SR "default display" until the FPC serial link answers; never while the panel sleeps), the two readiness signals that actually work (`Global\sharedDeviceSerialMemory` count byte, a *fresh* valid display handle), the ONE shared startup budget (`DXR_LEIA_SR_READY_TIMEOUT_S`, default 20 s), the 1 Hz late-identification watcher that re-derives geometry and updates the live head device in place, and the `get_display_info` contract with the runtime (#266).

@@ -115,9 +115,7 @@ ADR-020 spec: [`displayxr-runtime/docs/adr/ADR-020-plugin-abi-policy.md`](https:
 | `src/drv_leia/leia_display_processor*.{cpp,h}` | Per-API display processors (D3D11, D3D12, GL). Implement `xrt_display_processor_<api>` vtables; the runtime's compositor invokes them per-frame. |
 | `src/drv_leia/leia_sr_*.{cpp,h}` | SR SDK weaver wrappers. The SDK throws `std::runtime_error` as routine internal control flow (~11/frame in some paths) — every call wrapped in try/catch. |
 | `src/drv_leia/leia_bg_capture_win.{cpp,h}` | WGC background capture for compose-under transparency (Leia transparency model). |
-| `src/drv_leia/leia_lift_neurd.{cpp,h}` | 2D→3D lift slots on the D3D11 DP, backed by a dynamically loaded NeurD.dll (absent ⇒ caps unavailable, nothing loaded). Compiles only with the private NeurD headers (fetched at build time, below) AND runtime headers with `XRT_DP_D3D11_HAS_LIFT`; otherwise the slots stay NULL. See [`docs/lift-neurd.md`](docs/lift-neurd.md). |
 | `src/drv_leia/leia_sr_delayload_win.c`, `leia_platform_state.{c,h}` | SR client DLL delay-load hook (registry-resolved full paths) + `leia_sr_client_bind()` gate; the platform state machine (READY / PLATFORM_ABSENT / PLATFORM_NOT_RUNNING / NO_DISPLAY / INCOMPATIBLE) behind `probe()`, `probe_displays()` and the runtime's `get_platform_state` slot. |
-| `src/conv_leia/` | **Conversion provider** `DisplayXR-LeiaConversion.dll` (runtime ADR-053): a SEPARATE DLL exporting only `xrtConversionPluginNegotiate`, registered at `HKLM\Software\DisplayXR\ConversionProviders\leia-conversion` (ProbeOrder 50, `Supersedes = dp-lift`, `Version` last) and hosted by the runtime's `displayxr-conversion-host.exe`. Compiles the NeurD module sources (`../drv_leia/leia_lift_neurd.cpp` + viewpoint / depth helpers) in provider mode — no activation thread, settings only via `host->get_setting` — and never links the display DLL, the SR SDK or an SR session. Built only with the NeurD headers and runtime headers >= v2.41.0. The installer takes `Global\DisplayXR-ConvMaintenance-leia-conversion` and Restart-Manages the provider's files on their own (closes the host, never the service). Tests: `ctest --test-dir build/src/conv_leia`. See [`docs/conversion-provider.md`](docs/conversion-provider.md). |
 | `src/drv_leia/leia_stereo_camera.{h,cpp}` | Stereo camera source (runtime ADR-043 / `XR_DXR_stereo_camera`, phase L1): the SR eye tracker's camera read from the SR raw-camera shared memory by POLLING (never the auto-reset event), calibration of the ACTIVE device's serial (`Global\sharedDeviceSerialMemory[0]` → `%ProgramData%\Simulated Reality\Devices\<serial>`), SR v2 eye-tracker keep-alive while open (it PREDICTS itself to count eye pairs — the v2 callback only echoes predict). Advertises the MEASURED source rate, 0 = unknown. Compiled only when the runtime headers define `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`. Platform-neutral half in `leia_stereo_camera_parse.{h,c}`, host-tested by `tests/test_stereo_camera_parse.c` (Linux CI). |
 | `src/drv_leia/leia_edid_probe.c` | EDID-based hardware detection — answers "is a Leia display attached?" before the SR SDK initializes. |
 | `src/drv_leia_linux/leia_sr_linux.h` | **Linux weaver-backend seam** — interface shaped 1:1 by `docs/leia-linux-sdk-contract.md` (every declaration cites its R-* requirement). Track B implements it against the real SDK. |
@@ -160,14 +158,15 @@ run by `.github/workflows/lint.yml` on every PR, asserts all six pins
 that `SR_V2_TAG`/`SR_V2_DIR` name the same SR v2 build. Both download sites
 refuse the SR v2 zip unless its sha256 equals `SR_V2_SHA256`.
 
-**NeurD headers (2D→3D lift) follow the same rule.** They are Leia-private
-and come from the private **`LeiaInc/media_sdk`** repo at `NEURD_SDK_REF`
-(pinned next to the SR pins in both files, also checked by
-`check_sr_pins.py`), fetched by `scripts/fetch-neurd-headers.ps1` into the
-gitignored `NeurD-SDK-<ref>/`. **Never commit or mirror them.** Your `gh`
-account (and CI's `LEIALOFT_GITHUB_TOKEN`) needs read access to
-`media_sdk`; without it the fetch fails SOFT and the plug-in builds without
-lift. Details: [`docs/lift-neurd.md`](docs/lift-neurd.md).
+**No 2D→3D conversion here.** The NeurD module, the D3D11 DP's lift slots, the
+lift-only factory and the conversion provider (`src/conv_leia`) left this repo:
+conversion is the separate `displayxr-leia-conversion` package, and NeurD is an
+external prerequisite of that one. The lift slots and `create_dp_d3d11_lift`
+stay NULL (plug-in ABI unchanged) and CI asserts the display DLL names NeurD
+nowhere. **Do not fill them again, and do not add a NeurD fetch**: a display
+plug-in with lift slots lets NeurD back into the service through the runtime's
+`dp-lift` adapter. The installer still removes what older releases left behind,
+and only that — [`docs/conversion-moved.md`](docs/conversion-moved.md).
 
 ### Linux
 ```bash
