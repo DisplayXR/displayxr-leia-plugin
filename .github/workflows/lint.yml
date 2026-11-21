@@ -33,6 +33,11 @@ jobs:
       - name: SR SDK pins agree between build-windows.bat and CI
         run: python3 scripts/check_sr_pins.py
 
+      - name: displayxr-detect.json generates from leia_edid_table.h (displayxr-runtime#2737)
+        # The release attaches it; a table edit that stops parsing must fail here,
+        # not at tag time.
+        run: python3 scripts/gen_detect_manifest.py --out "$RUNNER_TEMP/displayxr-detect.json"
+
   # macOS .pkg scripts (installer/macos): the runtime-floor gate in preinstall,
   # the restart-only-if-running rule in postinstall and the uninstaller, run
   # against a fake root with fake pkgutil / launchctl / stat / id. Pure bash,
