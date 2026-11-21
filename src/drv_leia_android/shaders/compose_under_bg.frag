@@ -5,7 +5,14 @@
 // atlas tile, outputting opaque RGB the weaver can consume. Preserves AA edges
 // and genuinely semi-transparent (0<a<1) pixels.
 //
-//   out = mix(bg, atlas.rgb, atlas.a),  out.a = 1
+//   out = atlas.rgb + (1 - atlas.a) * bg,  out.a = 1
+//
+// The atlas is PREMULTIPLIED (the runtime's DP contract and OpenXR §10.6.2), so
+// the blend is premultiplied "over": out = atlas.rgb + (1 - atlas.a) * bg.
+// lerp(bg, atlas.rgb, atlas.a) multiplied the colour by alpha a second time
+// and darkened every 0<a<1 pixel toward black — invisible on hard-edged
+// content, a dark fringe on soft content (Gaussian splats). The Linux DP
+// fixed the same line in #275.
 //
 // The background is at z=0 (display plane), so the same region is sampled into
 // every tile; per-eye parallax comes from the atlas content, not the
@@ -72,5 +79,5 @@ void main()
 		b = bd.rgb + (1.0 - bd.a) * b;
 	}
 
-	out_color = vec4(mix(b, a.rgb, a.a), 1.0);
+	out_color = vec4(a.rgb + (1.0 - a.a) * b, 1.0); // premultiplied over
 }
