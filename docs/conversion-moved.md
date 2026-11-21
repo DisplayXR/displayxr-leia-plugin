@@ -68,6 +68,29 @@ release on, this installer and its uninstaller:
   mutex and a Restart Manager session over that one file, which closes the conversion host and
   never the service, and restarts nothing).
 
+**Chaining the separate package.** When an install has just removed a working registration
+(the box had Leia conversion and would lose it), the installer tries to bring the separate
+package in at the very end, through the runtime's fetcher:
+
+```
+"<DisplayXR runtime dir>\dxr-get.exe" install leia_conversion --yes
+```
+
+`dxr-get` (runtime `docs/specs/runtime/dxr-get.md`) downloads the installer the signed component
+catalog names, checks its size, SHA-256 and Authenticode signer, and runs it silently. Rules:
+
+| | |
+|---|---|
+| Triggers | this run removed this plug-in's own `leia-conversion` row, or `/WITHCONVERSION` |
+| Never | under `/NOCONVERSION` (a bundle that installs the package itself passes it); when a `leia-conversion` row exists by then |
+| Consent | one Yes/No before downloading in an interactive run; `/S` goes straight through |
+| Needs | `dxr-get.exe` next to an installed DisplayXR runtime (this installer embeds none), network, and a **`leia_conversion` component in the catalog** with a signed Windows asset |
+| Failure | never fails the plug-in's install. It logs why (`dxr-get` exit 40 = not in the catalog, 10 = catalog unreachable, …) and where to get the installer by hand |
+
+**Today the catalog has no `leia_conversion` component** (no `versions.json` field, nothing in
+the runtime's `scripts/gen_catalog.py`), so the chain runs, gets exit 40 and prints the pointer.
+It starts fetching, with no change here, once the catalog lists the component.
+
 Order does not matter between the two **new** installers. What is not symmetrical is an **old**
 installer of this plug-in (v2.23.0 or earlier) run after the separate package: it rewrites the row
 to its own copy, and its uninstaller deletes the row. Re-run the conversion-provider installer to
@@ -91,8 +114,10 @@ the display plug-in works without conversion.
 ## Migration order
 
 1. Release the conversion-provider package (Windows `.exe` + Linux `.deb`).
-2. Runtime side: a `versions.json` field and orchestrator rows for it; decide whether the bundle
-   chains it.
+2. Runtime side: a `versions.json` field (`leia_conversion`), a `leia_conversion` component in
+   the component catalog (`scripts/gen_catalog.py`; needs a signed Windows asset) so this
+   installer's chain can fetch it, and orchestrator rows. A bundle that installs the package
+   itself passes `/NOCONVERSION` here.
 3. Merge this change and release this plug-in. That release's version is the provider `.deb`'s
    `LEIA_SR_SPLIT_VERSION` (its `Replaces` / `Breaks` bound).
 4. Bundle and orchestrator pin both.
