@@ -311,7 +311,14 @@ struct leiasr_d3d11
 	bool external_routed = false;
 	//! The SDK's WndProc drag phase-snap is live on our window, so
 	//! snap_window_rect declines (one owner per window, runtime#2593).
-	bool sdk_drag_snap = false;
+	//! Follows the window bound NOW: set at create, recomputed by every
+	//! successful w_set_window re-bind (written on the re-bind / async
+	//! worker thread, read by snap_window_rect — hence atomic).
+	std::atomic<bool> sdk_drag_snap{false};
+	//! The create-time plan's part of sdk_drag_snap
+	//! (leia_win_sr_plan_sdk_owns_drag_snap(&plan, true)): routing does not
+	//! change on a re-bind, only the window does. Written before READY.
+	bool sdk_drag_snap_plan = false;
 	bool display_bound = false;
 	bool binding_refused = false;
 	//! The weaver reads its phase from the present origin + viewport only
@@ -671,7 +678,10 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	// another process (the DisplayXR Browser's Chrome window under the
 	// service's XR_DXR_weave route) gets no SDK hook, and the caller's
 	// explicit snap is its only snapper, so it must not be declined.
-	sr.sdk_drag_snap = leia_win_sr_plan_sdk_owns_drag_snap(&plan, leia_win_hwnd_in_this_process(hwnd));
+	sr.sdk_drag_snap_plan = leia_win_sr_plan_sdk_owns_drag_snap(&plan, true);
+	sr.sdk_drag_snap.store(
+	    leia_win_sr_sdk_owns_drag_snap_after_rebind(sr.sdk_drag_snap_plan, leia_win_hwnd_in_this_process(hwnd)),
+	    std::memory_order_relaxed);
 	sr.display_bound = plan.bind_display;
 	sr.needs_present_origin = leia_win_sr_plan_needs_present_origin(&plan, hwnd != nullptr);
 	if (sr.screen_bound && hwnd == nullptr && !sr.needs_present_origin) {
@@ -1806,6 +1816,28 @@ lens_post(leiasr_d3d11 *sr, int wish)
 }
 
 /*!
+ * After a successful re-bind: the drag-snap owner follows the window bound
+ * now. The create-time answer is stale once the weaver moves to a window of
+ * another process (the service's panel DP re-bound to an IPC client's
+ * window), which the SDK cannot subclass — keeping it declines the runtime's
+ * snap with nobody snapping, and the 3D stutters while that window is
+ * dragged. One WARN per change (a lifecycle event, never per frame).
+ */
+static void
+w_rebind_update_drag_snap_owner(leiasr_d3d11 *sr, HWND hwnd)
+{
+	const bool in_process = leia_win_hwnd_in_this_process(hwnd);
+	const bool now = leia_win_sr_sdk_owns_drag_snap_after_rebind(sr->sdk_drag_snap_plan, in_process);
+	const bool was = sr->sdk_drag_snap.exchange(now, std::memory_order_relaxed);
+	if (was != now) {
+		U_LOG_W("D3D11 snap: window re-bound to hwnd=%p (%s process) - drag phase-snap owner now %s "
+		        "(sdk_drag_snap %d -> %d)",
+		        (void *)hwnd, in_process ? "this" : "another", now ? "the SDK hook" : "the runtime",
+		        (int)was, (int)now);
+	}
+}
+
+/*!
  * runtime#1008: re-point a LIVE weaver at another window, on whichever API
  * family this instance is on. Both families expose it (v1
  * IWeaverBase1::setWindowHandle, v2 srWeaverSetWindowHandle) — the SDK
@@ -1828,6 +1860,7 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 		// #158: a reconnect recreates the weaver from scratch and has no
 		// caller to take the window from — keep the record current here.
 		sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
+		w_rebind_update_drag_snap_owner(sr, hwnd);
 		return true;
 	}
 #endif
@@ -1849,6 +1882,9 @@ w_set_window(leiasr_d3d11 *sr, HWND hwnd)
 	}
 	// #158: see the v2 branch — the reconnect worker recreates from this.
 	sr->bound_hwnd.store(reinterpret_cast<uintptr_t>(hwnd), std::memory_order_relaxed);
+	// v1 never declines (sdk_drag_snap_plan stays false; only the v2 snap
+	// reads the flag), but keep the record honest on both families.
+	w_rebind_update_drag_snap_owner(sr, hwnd);
 	return true;
 }
 
