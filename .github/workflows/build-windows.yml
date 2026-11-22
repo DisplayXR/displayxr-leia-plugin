@@ -517,7 +517,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Generate displayxr-detect.json
-        run: python3 src-tree/scripts/gen_detect_manifest.py --out _package/displayxr-detect.json
+        run: python3 src-tree/scripts/gen_detect_manifest.py --require-floor --out _package/displayxr-detect.json
 
       - name: Attach Windows installer to GitHub release on tag
         uses: softprops/action-gh-release@v2
