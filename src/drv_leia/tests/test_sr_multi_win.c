@@ -260,6 +260,39 @@ test_sdk_drag_snap_owner(void)
 	CHECK(leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
 }
 
+static void
+test_sdk_drag_snap_follows_rebind(void)
+{
+	// The flag follows the window bound NOW, not the create's window.
+	// Unbound DP created on a window of this process (the service's panel DP).
+	struct leia_win_sr_weaver_plan p = leia_win_sr_plan_weaver(&k_caps_2056, false, true, AL_ID);
+	const bool plan_part = leia_win_sr_plan_sdk_owns_drag_snap(&p, true);
+	CHECK(plan_part);
+	// Create-time answer, window in this process: the SDK hook snaps.
+	CHECK(leia_win_sr_sdk_owns_drag_snap_after_rebind(plan_part, true) ==
+	      leia_win_sr_plan_sdk_owns_drag_snap(&p, true));
+	// Re-bound to another process's window (an IPC client): no SDK hook there,
+	// so the runtime's snap must not be declined.
+	CHECK(!leia_win_sr_sdk_owns_drag_snap_after_rebind(plan_part, false));
+	// Re-bound back to a window of this process: the SDK owns it again.
+	CHECK(leia_win_sr_sdk_owns_drag_snap_after_rebind(plan_part, true));
+
+	// A plan that never hooks (EXTERNAL without KEEP_DRAG_SNAP) never owns,
+	// whatever window it is re-bound to.
+	struct leia_win_sr_multi_caps no_keep = k_caps_2056;
+	no_keep.keep_drag_snap = false;
+	p = leia_win_sr_plan_weaver(&no_keep, true, true, AL_ID);
+	const bool no_hook = leia_win_sr_plan_sdk_owns_drag_snap(&p, true);
+	CHECK(!no_hook);
+	CHECK(!leia_win_sr_sdk_owns_drag_snap_after_rebind(no_hook, true));
+	CHECK(!leia_win_sr_sdk_owns_drag_snap_after_rebind(no_hook, false));
+
+	// Windowless secondary segment re-bound to a real window: its plan has no
+	// KEEP_DRAG_SNAP (nothing to snap at create), so it stays runtime-snapped.
+	p = leia_win_sr_plan_weaver(&k_caps_2056, true, false, DS1_ID);
+	CHECK(!leia_win_sr_sdk_owns_drag_snap_after_rebind(leia_win_sr_plan_sdk_owns_drag_snap(&p, true), true));
+}
+
 int
 main(void)
 {
@@ -277,6 +310,7 @@ main(void)
 	test_screen_origin_zero_is_a_real_origin();
 	test_screen_origin_unbound_keeps_the_sr_location();
 	test_sdk_drag_snap_owner();
+	test_sdk_drag_snap_follows_rebind();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_multi_win: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

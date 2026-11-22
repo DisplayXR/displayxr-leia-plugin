@@ -170,6 +170,30 @@ leia_win_sr_plan_sdk_owns_drag_snap(const struct leia_win_sr_weaver_plan *p, boo
 }
 
 /*!
+ * The drag-snap owner after the live weaver is re-bound to another window
+ * (srWeaverSetWindowHandle / setWindowHandle). leia_win_sr_plan_sdk_owns_drag_snap()
+ * is decided once, at create, against the create's window; a re-bind can move
+ * the weaver to a window of ANOTHER process (the runtime's D3D11 service
+ * creates its panel DP on a service window and re-binds it to an IPC client's
+ * window), which the SDK cannot subclass. Keeping the create-time answer then
+ * declines the runtime's snap with no snapper left, and the 3D stutters while
+ * that window is dragged.
+ *
+ * @p plan_allows_hook is the create-time plan's part of the decision, i.e.
+ * leia_win_sr_plan_sdk_owns_drag_snap(&plan, true) (routing does not change on
+ * a re-bind). @p window_in_this_process is leia_win_hwnd_in_this_process() of
+ * the window now bound (false for NULL).
+ *
+ * In-process re-binds keep "SDK owns" — whether the SDK moves its hook to the
+ * new window on a re-bind is not established for every SDK build.
+ */
+static inline bool
+leia_win_sr_sdk_owns_drag_snap_after_rebind(bool plan_allows_hook, bool window_in_this_process)
+{
+	return plan_allows_hook && window_in_this_process;
+}
+
+/*!
  * Should a screen-bound DP create a lens bound to ITS display and drive it
  * (SR D3)? Only with the display bound and the runtime reporting lens per
  * device: on an older runtime a bind to a non-active display is refused, and
