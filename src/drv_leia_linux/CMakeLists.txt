@@ -442,6 +442,10 @@ add_executable(test_sr_ready_rules ../drv_leia/tests/test_sr_ready_rules.c)
 target_include_directories(test_sr_ready_rules PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_ready_rules COMMAND test_sr_ready_rules)
 
+add_executable(test_sr_version ../drv_leia/tests/test_sr_version.c ../drv_leia/leia_sr_version.c)
+target_include_directories(test_sr_version PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+add_test(NAME test_sr_version COMMAND test_sr_version)
+
 # Windows-arm lens gate (leia_sr_lens_gate.h, #541: the lens belongs to its SR
 # instance, so no lens call reaches an instance being torn down or rebuilt):
 # header-only C++17 with no SR types, host-tested here for the same reason.

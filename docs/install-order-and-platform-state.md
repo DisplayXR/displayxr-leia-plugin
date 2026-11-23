@@ -154,3 +154,38 @@ Leia D3D11 DP: SR platform client DLLs not usable — not creating the display p
 
 Exception code `0xc06d007e` means a module was not found and `0xc06d007f`
 means an export was not found. Both are raised by the delay-load helper.
+
+## Update recommended (ADR-045 remedy)
+
+On top of the state, the plug-in can tell the runtime that the platform works
+but should be updated. With runtime headers that define
+`XRT_PLUGIN_HAS_PLATFORM_REMEDY`, `get_platform_state` sets
+`XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED` when **both** hold:
+
+- the installed LeiaSR runtime is older than **1.39.0**
+  (`LEIA_SR_RECOMMENDED_VERSION`), and
+- a Leia panel is attached (EDID table match).
+
+It also fills `installed_version`, `required_version` (`1.39.0`),
+`action_label` ("Update the LeiaSR Runtime") and `action_url`
+(`https://github.com/LeiaInc/LeiaSR-Runtime/releases/latest`), each only
+when the runtime's `struct_size` covers it. The runtime shows them in
+`displayxr-cli`, the tray and the Dashboard.
+
+The notice is advisory. Nothing else changes: the plug-in keeps weaving on
+every runtime from 1.34.8 on, and the runtime never gates on the flag.
+
+The version comes from the registry, not the SR SDK: `DisplayVersion` of the
+`Simulated Reality Platform` uninstall entry, falling back to `Simulated
+Reality` (64-bit view). That keeps the check within the platform-state budget,
+because it is a registry read with no SR connection. It also works on runtimes
+older than the C99 API, which cannot report their version at all. An
+unreadable or unparsable version raises no notice. The rule and the parser are
+in `leia_sr_version.{h,c}` and are host-tested (`tests/test_sr_version.c`).
+
+This is Windows only. The Linux LeiaSR runtime starts at 1.39, so a Linux box
+never qualifies.
+
+There is no special case for OEM-installed runtimes. The LeiaSR install-source
+marker (`HKLM\SOFTWARE\LeiaInc\LeiaSR\Install`) only exists from 1.39 on, so
+every runtime this rule flags predates it.

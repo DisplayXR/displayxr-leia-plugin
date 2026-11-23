@@ -34,6 +34,7 @@
 
 #include "leia_interface.h"
 #include "leia_platform_state.h"
+#include "leia_sr_version.h"
 #include "leia_sr_api_select.h"
 #include "leia_display_claims_win.h"
 #include "leia_display_processor.h"
@@ -573,6 +574,57 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 }
 
 
+#if defined(XRT_PLUGIN_HAS_PLATFORM_STATE) && defined(XRT_PLUGIN_HAS_PLATFORM_REMEDY)
+static void
+copy_field(char *dst, size_t cap, const char *src)
+{
+	size_t len = strlen(src);
+	if (len >= cap) {
+		len = cap - 1;
+	}
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+/*
+ * ADR-045 remedy: "update recommended" when the installed LeiaSR runtime is
+ * older than LEIA_SR_RECOMMENDED_VERSION AND a Leia panel is attached (EDID
+ * match). Advisory only: the plug-in keeps weaving on every runtime from
+ * 1.34.8 on, and the runtime never gates on the flag. Each field is written
+ * only if the runtime's struct_size covers it.
+ */
+static void
+leia_plugin_fill_remedy(struct xrt_plugin_platform_status *out_status, enum leia_platform_state st)
+{
+	if (st == LEIA_PLATFORM_ABSENT) {
+		return; // nothing installed: the hint already says "Install the LeiaSR Runtime"
+	}
+	struct leia_display_probe_result edid;
+	memset(&edid, 0, sizeof(edid));
+	if (!leia_edid_get_cached_result(&edid) || !edid.hw_found) {
+		return; // no Leia panel: nothing to recommend on this machine
+	}
+	char installed[64];
+	if (!leia_sr_installed_version(installed, sizeof(installed)) || !leia_sr_update_recommended(installed)) {
+		return;
+	}
+	out_status->flags |= XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED;
+	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, installed_version)) {
+		copy_field(out_status->installed_version, sizeof(out_status->installed_version), installed);
+	}
+	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, required_version)) {
+		copy_field(out_status->required_version, sizeof(out_status->required_version),
+		           LEIA_SR_RECOMMENDED_VERSION);
+	}
+	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_label)) {
+		copy_field(out_status->action_label, sizeof(out_status->action_label), LEIA_SR_UPDATE_LABEL);
+	}
+	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_url)) {
+		copy_field(out_status->action_url, sizeof(out_status->action_url), LEIA_SR_UPDATE_URL);
+	}
+}
+#endif
+
 #ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
 /*
  * ADR-045 platform state (runtime slot). Callable before probe(), from any
@@ -598,6 +650,9 @@ leia_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
 		memcpy(out_status->hint, hint, len);
 		out_status->hint[len] = '\0';
 	}
+#ifdef XRT_PLUGIN_HAS_PLATFORM_REMEDY
+	leia_plugin_fill_remedy(out_status, st);
+#endif
 	return true;
 }
 #endif
