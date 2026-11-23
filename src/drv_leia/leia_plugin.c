@@ -33,6 +33,7 @@
 #include "os/os_time.h"
 
 #include "leia_interface.h"
+#include "leia_multi_viewer.h"
 #include "leia_platform_state.h"
 #include "leia_sr_version.h"
 #include "leia_sr_api_select.h"
@@ -65,6 +66,16 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> /* InterlockedExchange (the MULTI_VIEWER value) */
+#endif
+
 #ifndef XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
 /* runtime ADR-060 R2: claim-mask capability hint, from xrt_plugin.h once the
  * runtime pin includes it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value. */
@@ -80,6 +91,102 @@
 
 //! One WARN with the first probe's duration (acceptance: probe() <= ~100 ms).
 static bool g_leia_probe_timing_logged = false;
+
+//! `xrt_plugin_iface::id`, and the `id` this plug-in's settings are read under.
+#define LEIA_PLUGIN_ID "leia-sr"
+
+
+/*
+ *
+ * Settings (ADR-054 decision 7: read ONLY through host->get_setting).
+ *
+ */
+
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+//! The host's setting reader, copied at negotiate (process-lifetime pointer in
+//! the runtime). NULL on a runtime that predates the slot: every setting then
+//! keeps its compiled default.
+static xrt_component_get_setting_fn_t g_leia_get_setting = NULL;
+#endif
+
+/*!
+ * The effective MULTI_VIEWER value (enum leia_multi_viewer) the weave paths
+ * apply, published by leia_plugin_resolve_multi_viewer() at each device
+ * creation. A LONG for the Interlocked functions; SYSTEM until then.
+ */
+static volatile LONG g_leia_multi_viewer_active = (LONG)LEIA_MULTI_VIEWER_SYSTEM;
+
+enum leia_multi_viewer
+leia_multi_viewer_active(void)
+{
+	return (enum leia_multi_viewer)InterlockedCompareExchange(&g_leia_multi_viewer_active, 0, 0);
+}
+
+/*!
+ * Read MULTI_VIEWER once (#446: multi-viewer weaving is a setting, not a third
+ * rendering mode, under the runtime's two-mode contract), decide whether this
+ * build and the installed SR runtime can honour it, and publish the effective
+ * value for the weavers. Called at device creation, after the SR client DLLs
+ * are bound (the capability query reaches SR). Start-up only by contract: a
+ * change takes effect at the next device creation (the next app start, or the
+ * next service start for IPC apps).
+ */
+static void
+leia_plugin_resolve_multi_viewer(void)
+{
+	char buf[64];
+	buf[0] = '\0';
+	bool set = false;
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+	if (g_leia_get_setting != NULL) {
+		set = g_leia_get_setting(LEIA_PLUGIN_ID, LEIA_MULTI_VIEWER_KEY, buf, (uint32_t)sizeof(buf));
+		buf[sizeof(buf) - 1] = '\0';
+	}
+#endif
+
+	enum leia_multi_viewer setting = LEIA_MULTI_VIEWER_SYSTEM;
+	if (set && !leia_multi_viewer_parse(buf, &setting) && buf[0] != '\0') {
+		U_LOG_W("leia_plugin: MULTI_VIEWER='%s' is not one of system|on|off -- using system", buf);
+	}
+
+	enum leia_multi_viewer effective = LEIA_MULTI_VIEWER_SYSTEM;
+	if (setting != LEIA_MULTI_VIEWER_SYSTEM) {
+		/* Asked only when it matters: the query may spin up the SR probe
+		 * instance. False when this build's SR SDK predates the feature
+		 * (compiled out), or the SR runtime does not report it. */
+		const bool supported = leia_win_sr_multi_viewer_weave_supported();
+		effective = leia_multi_viewer_effective(setting, supported);
+		if (effective != setting) {
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+			const char *why = "the installed LeiaSR runtime does not report multi-viewer weaving";
+#else
+			const char *why = "this plug-in was built against an SR SDK without multi-viewer weaving";
+#endif
+			U_LOG_W("leia_plugin: MULTI_VIEWER=%s ignored -- %s; following the LeiaSR system setting",
+			        leia_multi_viewer_name(setting), why);
+		}
+	}
+
+	U_LOG_W("leia_plugin: multi-viewer weave: %s (MULTI_VIEWER %s%s)", leia_multi_viewer_name(effective),
+	        leia_multi_viewer_name(setting), set ? "" : ", default");
+	InterlockedExchange(&g_leia_multi_viewer_active, (LONG)effective);
+}
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS
+//! What `displayxr-cli dp options leia-sr` lists (key, type, default, help).
+static const struct xrt_component_setting_desc g_leia_settings[] = {
+    {LEIA_MULTI_VIEWER_KEY, XRT_COMPONENT_SETTING_TYPE_ENUM, LEIA_MULTI_VIEWER_DEFAULT, LEIA_MULTI_VIEWER_HELP},
+};
+
+static uint32_t
+leia_plugin_describe_settings(const struct xrt_component_setting_desc **out_descs)
+{
+	if (out_descs != NULL) {
+		*out_descs = g_leia_settings;
+	}
+	return (uint32_t)(sizeof(g_leia_settings) / sizeof(g_leia_settings[0]));
+}
+#endif
 
 static xrt_result_t
 leia_plugin_probe(struct xrt_plugin_instance **out_inst)
@@ -128,6 +235,8 @@ leia_plugin_create_device(struct xrt_plugin_instance *inst, struct xrt_device **
 	if (xdev == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	/* Before any display processor (and so any weaver) exists for it. */
+	leia_plugin_resolve_multi_viewer();
 	*out_dev = xdev;
 	return XRT_SUCCESS;
 }
@@ -787,7 +896,7 @@ static struct xrt_plugin_iface g_leia_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
 
-    .id = "leia-sr",
+    .id = LEIA_PLUGIN_ID,
     .display_name = "DisplayXR Leia SR",
     .vendor = "Leia Inc.",
     .version = DXR_PLUGIN_GIT_DESC,
@@ -941,6 +1050,11 @@ static struct xrt_plugin_iface g_leia_iface = {
     .create_dp_gl_for_screen = NULL,
 #endif
 #endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS
+    /* ADR-054 decision 7: the settings read through host->get_setting (MULTI_VIEWER, #446). */
+    .describe_settings = leia_plugin_describe_settings,
+#endif
 };
 
 
@@ -977,6 +1091,16 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 	}
 #else
 	(void)host;
+#endif
+
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+	/* ADR-054 decision 7: settings come through the host (MULTI_VIEWER, #446).
+	 * Carved from reserved[]: cover-check struct_size; a runtime predating
+	 * the slot leaves it NULL and every setting keeps its default. */
+	if (host != NULL &&
+	    host->struct_size >= offsetof(struct xrt_plugin_host_iface, get_setting) + sizeof(host->get_setting)) {
+		g_leia_get_setting = host->get_setting;
+	}
 #endif
 
 	*out_iface = &g_leia_iface;
