@@ -200,9 +200,12 @@ export DXR_NOTARY_PROFILE=<notarytool keychain profile>   # or DXR_NOTARY_KEY_PA
 ./installer/macos/build_pkg.sh
 ```
 
-Stapling fetches the ticket from Apple's CloudKit and can time out right after an `Accepted`
-notarization (`stapler` error 68). The `.pkg` is then signed and notarized but not stapled;
-retry with `scripts/macos_sign_notarize.sh staple <pkg>` (it re-runs the Gatekeeper check).
+Stapling and `stapler validate` look the ticket up in Apple's CloudKit, so a dropped connection
+right after an `Accepted` notarization fails them (`stapler` error 68) even when nothing is wrong.
+The script retries `stapler validate` four times (15/30/45 s apart) before failing. If it still
+fails, the `.pkg` is signed and notarized but may not be stapled; retry with
+`scripts/macos_sign_notarize.sh staple <pkg>` (it re-runs the Gatekeeper check), and
+`verify-pkg <pkg>` checks a finished package without changing it.
 
 ## CI: none, by necessity
 
