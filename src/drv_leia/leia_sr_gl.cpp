@@ -10,7 +10,7 @@
 #include "leia_sr_gl.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
-#include "leia_interface.h" // leia_hmd_active_mode_get (#446)
+#include "leia_multi_viewer.h" // leia_multi_viewer_active (#446)
 #include "leia_sr_liveness.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
@@ -149,8 +149,8 @@ struct leiasr_gl
 	//! a fixed nominal viewer is pinned, re-applied before every weave.
 	bool viewer_pinned = false;
 #ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
-	//! #446: the rendering mode's multi-viewer override as applied to this
-	//! weaver (leia_sr_v2_apply_multiviewer). Re-arms on a new weaver handle.
+	//! #446: the MULTI_VIEWER setting's override as applied to this weaver
+	//! (leia_sr_v2_apply_multiviewer). Re-arms on a new weaver handle.
 	struct leia_sr_v2_mv_state mv = {};
 #endif
 	//! lens_v2 is bound to bind_display_id (SR D3): disabled before destroy.
@@ -775,15 +775,13 @@ w_weave(leiasr_gl *sr)
 		}
 #endif
 #ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
-		// #446: the rendering mode's multi-viewer override (mode 2 = ON, mode 1 =
-		// FOLLOW_CONFIG), applied on change only, right before the weave that
-		// uses it. A weaver pinned to a simulated viewer (an untracked secondary
-		// screen) has no tracked viewers to add and is left alone.
+		// #446: the MULTI_VIEWER setting's override (on = ON, off = OFF, system
+		// = the SDK default), applied on this weaver's first weave and on change
+		// only, right before the weave that uses it. A weaver pinned to a
+		// simulated viewer (an untracked secondary screen) has no tracked
+		// viewers to add and is left alone.
 		if (!sr->viewer_pinned) {
-			uint32_t mode_index = 0;
-			if (leia_hmd_active_mode_get(&mode_index)) {
-				leia_sr_v2_apply_multiviewer(sr->weaver_v2, mode_index, &sr->mv, "GL");
-			}
+			leia_sr_v2_apply_multiviewer(sr->weaver_v2, leia_multi_viewer_active(), &sr->mv, "GL");
 		}
 #endif
 		srWeaverWeave(sr->weaver_v2);

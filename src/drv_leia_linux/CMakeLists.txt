@@ -446,6 +446,13 @@ add_executable(test_sr_version ../drv_leia/tests/test_sr_version.c ../drv_leia/l
 target_include_directories(test_sr_version PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
 add_test(NAME test_sr_version COMMAND test_sr_version)
 
+# Windows-arm MULTI_VIEWER setting (leia_multi_viewer.c, #446: multi-viewer
+# weaving is a setting, not a third rendering mode): plain C, no SR / runtime
+# types, host-tested here for the same reason.
+add_executable(test_multi_viewer ../drv_leia/tests/test_multi_viewer.c ../drv_leia/leia_multi_viewer.c)
+target_include_directories(test_multi_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia)
+add_test(NAME test_multi_viewer COMMAND test_multi_viewer)
+
 # Windows-arm lens gate (leia_sr_lens_gate.h, #541: the lens belongs to its SR
 # instance, so no lens call reaches an instance being torn down or rebuilt):
 # header-only C++17 with no SR types, host-tested here for the same reason.

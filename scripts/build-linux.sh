@@ -100,6 +100,9 @@ echo "==> Unit test: per-DP screen state (multi-screen M4)"
 echo "==> Unit test: SR weaver routing/binding plan + chains (multi-screen M4)"
 "$BUILD_DIR/src/drv_leia_linux/test_sr_routing_linux"
 
+echo "==> Unit test: Windows-arm MULTI_VIEWER setting parse + resolve (#446)"
+"$BUILD_DIR/src/drv_leia_linux/test_multi_viewer"
+
 echo "==> Unit test: conversion provider CPU transport (src/conv_leia)"
 "$BUILD_DIR/src/conv_leia/test_conv_leia_cpu"
 
