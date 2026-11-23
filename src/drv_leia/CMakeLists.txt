@@ -47,6 +47,11 @@ set(LEIA_SOURCES
     leia_platform_state.h
     leia_platform_state.c
     leia_sr_delayload_win.c
+    # Installed LeiaSR version + the "update recommended" rule behind the
+    # ADR-045 remedy fields. Plain C, host-tested (tests/test_sr_version.c,
+    # run by the Linux CI job).
+    leia_sr_version.h
+    leia_sr_version.c
 
     # Stereo camera source (runtime ADR-043, L1). Listed unconditionally: the
     # provider TU is inside #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA (the
