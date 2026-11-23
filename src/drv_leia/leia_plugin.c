@@ -1160,7 +1160,8 @@ static struct xrt_plugin_iface g_leia_iface = {
 #ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS
     /* ADR-054 decision 7: the settings read through host->get_setting (MULTI_VIEWER, #446). */
     .describe_settings = leia_plugin_describe_settings,
-#endif#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
     .get_setting_status = leia_plugin_get_setting_status,
 #endif
 };
