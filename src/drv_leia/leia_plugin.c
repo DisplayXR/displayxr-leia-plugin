@@ -574,7 +574,62 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 }
 
 
-#if defined(XRT_PLUGIN_HAS_PLATFORM_STATE) && defined(XRT_PLUGIN_HAS_PLATFORM_REMEDY)
+#ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
+/*
+ * ADR-045 remedy fields (displayxr-runtime#2765, ADR-045 amendment
+ * 2026-11-22), mirrored here so the plug-in fills them WITHOUT re-pinning
+ * DXR_RUNTIME_GIT_TAG: a re-pin would raise the installer's derived
+ * MIN_RUNTIME_VERSION floor for an advisory notice. The layout is the
+ * runtime's: four char arrays appended directly after `reserved[8]`. Each is
+ * written only when the runtime's struct_size covers it, so an older runtime
+ * (smaller struct_size) gets exactly what it got before. The flag bit is
+ * likewise the runtime's value; an older runtime ignores unknown flag bits.
+ * With headers that carry the fields, the static asserts below pin the mirror
+ * to them.
+ */
+#define LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED (1u << 1)
+
+struct leia_platform_status_remedy
+{
+	/* The ADR-045 prefix, field for field as every runtime header has it. */
+	uint32_t struct_size;
+	uint32_t state;
+	uint32_t flags;
+	uint32_t reserved_0;
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+	uint64_t reserved[8];
+	/* The remedy fields appended after it. */
+	char installed_version[32];
+	char required_version[32];
+	char action_label[64];
+	char action_url[256];
+};
+
+#ifdef XRT_PLUGIN_HAS_PLATFORM_REMEDY
+/* Compile-time checks (portable to MSVC C): a negative array size fails the build. */
+typedef char leia_remedy_hint_mirror[(offsetof(struct leia_platform_status_remedy, reserved) ==
+                                      offsetof(struct xrt_plugin_platform_status, reserved))
+                                         ? 1
+                                         : -1];
+typedef char leia_remedy_flag_mirror[(LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED == XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED) ? 1 : -1];
+typedef char leia_remedy_installed_mirror[(offsetof(struct leia_platform_status_remedy, installed_version) ==
+                                           offsetof(struct xrt_plugin_platform_status, installed_version))
+                                              ? 1
+                                              : -1];
+typedef char leia_remedy_url_mirror[(offsetof(struct leia_platform_status_remedy, action_url) ==
+                                     offsetof(struct xrt_plugin_platform_status, action_url))
+                                        ? 1
+                                        : -1];
+typedef char leia_remedy_size_mirror[(sizeof(struct leia_platform_status_remedy) ==
+                                      sizeof(struct xrt_plugin_platform_status))
+                                         ? 1
+                                         : -1];
+#endif
+
+#define LEIA_REMEDY_HAS(st, field)                                                                                     \
+	((size_t)(st)->struct_size >=                                                                                  \
+	 offsetof(struct leia_platform_status_remedy, field) + sizeof(((struct leia_platform_status_remedy *)0)->field))
+
 static void
 copy_field(char *dst, size_t cap, const char *src)
 {
@@ -587,11 +642,10 @@ copy_field(char *dst, size_t cap, const char *src)
 }
 
 /*
- * ADR-045 remedy: "update recommended" when the installed LeiaSR runtime is
- * older than LEIA_SR_RECOMMENDED_VERSION AND a Leia panel is attached (EDID
- * match). Advisory only: the plug-in keeps weaving on every runtime from
- * 1.34.8 on, and the runtime never gates on the flag. Each field is written
- * only if the runtime's struct_size covers it.
+ * "Update recommended" when the installed LeiaSR runtime is older than
+ * LEIA_SR_RECOMMENDED_VERSION AND a Leia panel is attached (EDID match).
+ * Advisory only: the plug-in keeps weaving on every runtime from 1.34.8 on,
+ * and the runtime never gates on the flag.
  */
 static void
 leia_plugin_fill_remedy(struct xrt_plugin_platform_status *out_status, enum leia_platform_state st)
@@ -608,19 +662,19 @@ leia_plugin_fill_remedy(struct xrt_plugin_platform_status *out_status, enum leia
 	if (!leia_sr_installed_version(installed, sizeof(installed)) || !leia_sr_update_recommended(installed)) {
 		return;
 	}
-	out_status->flags |= XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED;
-	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, installed_version)) {
-		copy_field(out_status->installed_version, sizeof(out_status->installed_version), installed);
+	out_status->flags |= LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED;
+	struct leia_platform_status_remedy *r = (struct leia_platform_status_remedy *)out_status;
+	if (LEIA_REMEDY_HAS(out_status, installed_version)) {
+		copy_field(r->installed_version, sizeof(r->installed_version), installed);
 	}
-	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, required_version)) {
-		copy_field(out_status->required_version, sizeof(out_status->required_version),
-		           LEIA_SR_RECOMMENDED_VERSION);
+	if (LEIA_REMEDY_HAS(out_status, required_version)) {
+		copy_field(r->required_version, sizeof(r->required_version), LEIA_SR_RECOMMENDED_VERSION);
 	}
-	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_label)) {
-		copy_field(out_status->action_label, sizeof(out_status->action_label), LEIA_SR_UPDATE_LABEL);
+	if (LEIA_REMEDY_HAS(out_status, action_label)) {
+		copy_field(r->action_label, sizeof(r->action_label), LEIA_SR_UPDATE_LABEL);
 	}
-	if (XRT_PLUGIN_PLATFORM_STATUS_HAS(out_status, action_url)) {
-		copy_field(out_status->action_url, sizeof(out_status->action_url), LEIA_SR_UPDATE_URL);
+	if (LEIA_REMEDY_HAS(out_status, action_url)) {
+		copy_field(r->action_url, sizeof(r->action_url), LEIA_SR_UPDATE_URL);
 	}
 }
 #endif
@@ -650,9 +704,7 @@ leia_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
 		memcpy(out_status->hint, hint, len);
 		out_status->hint[len] = '\0';
 	}
-#ifdef XRT_PLUGIN_HAS_PLATFORM_REMEDY
 	leia_plugin_fill_remedy(out_status, st);
-#endif
 	return true;
 }
 #endif

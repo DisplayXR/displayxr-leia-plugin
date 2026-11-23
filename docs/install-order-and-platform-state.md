@@ -158,8 +158,7 @@ means an export was not found. Both are raised by the delay-load helper.
 ## Update recommended (ADR-045 remedy)
 
 On top of the state, the plug-in can tell the runtime that the platform works
-but should be updated. With runtime headers that define
-`XRT_PLUGIN_HAS_PLATFORM_REMEDY`, `get_platform_state` sets
+but should be updated (displayxr-runtime#2765). `get_platform_state` sets
 `XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED` when **both** hold:
 
 - the installed LeiaSR runtime is older than **1.39.0**
@@ -169,7 +168,12 @@ but should be updated. With runtime headers that define
 It also fills `installed_version`, `required_version` (`1.39.0`),
 `action_label` ("Update the LeiaSR Runtime") and `action_url`
 (`https://github.com/LeiaInc/LeiaSR-Runtime/releases/latest`), each only
-when the runtime's `struct_size` covers it. The runtime shows them in
+when the runtime's `struct_size` covers it. The plug-in mirrors the field
+layout locally, with compile-time checks against headers that carry it, so
+it fills them without re-pinning `DXR_RUNTIME_GIT_TAG`. A re-pin would raise
+the installer's `MIN_RUNTIME_VERSION` floor just for an advisory notice. An
+older runtime passes a smaller `struct_size`, so it receives none of the new
+fields and ignores the unknown flag bit. The runtime shows them in
 `displayxr-cli`, the tray and the Dashboard.
 
 The notice is advisory. Nothing else changes: the plug-in keeps weaving on
