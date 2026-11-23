@@ -562,16 +562,21 @@ sr_device_auth_report(sr_device_auth st, uint64_t bind_display_id)
 	}
 }
 
-} // namespace
-
+/*!
+ * The body of @ref leia_sr_v2_query_display. @p out_create receives the last
+ * srCreateDisplay result, so @ref leia_sr_v2_query_display_bound can tell a
+ * dead display id (#567) from every other failure.
+ */
 bool
-leia_sr_v2_query_display(SrInstance instance,
-                         void *hwnd,
-                         double max_time,
-                         uint64_t bind_display_id,
-                         struct leia_sr_v2_display_info *out_info)
+query_display_impl(SrInstance instance,
+                   void *hwnd,
+                   double max_time,
+                   uint64_t bind_display_id,
+                   struct leia_sr_v2_display_info *out_info,
+                   SrResult *out_create)
 {
 	*out_info = {};
+	*out_create = SR_SUCCESS;
 
 	// #552: a session never trusts an earlier session's view of SR's displays.
 	sr_device_auth auth = sr_device_auth_check(bind_display_id);
@@ -611,6 +616,7 @@ leia_sr_v2_query_display(SrInstance instance,
 		display = nullptr;
 		cr = srCreateDisplay(instance, &ci, &display);
 	}
+	*out_create = cr;
 	if (!SR_SUCCEEDED(cr) || display == nullptr) {
 		U_LOG_E("srCreateDisplay failed: %s (%d)", leia_sr_v2_result_str(cr), (int)cr);
 		if (cr == SR_ERROR_DEVICE_NOT_AVAILABLE) {
@@ -709,6 +715,114 @@ leia_sr_v2_query_display(SrInstance instance,
 	// benefit — v1 did not hold one either.
 	srDestroyDisplay(display);
 	return true;
+}
+
+//! #567: the dead id the "no replacement" WARN was last given for (0 = none), so it is once per id.
+std::atomic<uint64_t> g_rematch_failed_warned{0};
+//! #567: the dead id the probe instance was last re-made for (0 = none), so it is re-made once per id.
+std::atomic<uint64_t> g_rematch_reset_for{0};
+
+/*!
+ * #567: srCreateDisplay refused @p dead with SR_ERROR_DISPLAY_NOT_FOUND. Read
+ * SR's lists fresh and find the panel's current id (see
+ * @ref leia_win_sr_rematch_display_id); 0 when none is known.
+ */
+uint64_t
+rematch_dead_display(uint64_t dead,
+                     const struct leia_win_screen_origin *origin,
+                     uint16_t *io_edid_manufacturer,
+                     uint16_t *io_edid_product,
+                     uint32_t *io_edid_serial,
+                     const char *api)
+{
+	const bool has_memo = io_edid_manufacturer != nullptr && io_edid_product != nullptr && io_edid_serial != nullptr;
+	uint16_t edid_manufacturer = has_memo ? *io_edid_manufacturer : 0;
+	uint16_t edid_product = has_memo ? *io_edid_product : 0;
+	uint32_t edid_serial = has_memo ? *io_edid_serial : 0;
+
+	struct leia_win_sr_display displays[LEIA_WIN_SR_MAX_DISPLAYS];
+	leia_win_sr_enumerate_refresh_next();
+	int32_t display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	if (leia_win_sr_display_listed(dead, displays, display_count) &&
+	    g_rematch_reset_for.exchange(dead) != dead) {
+		// The probe instance lists an id a fresh instance cannot create: its view may
+		// predate the SR Service restart or the resume. Read once through a new one.
+		U_LOG_W("SR %s per-screen weaver: SR still lists display 0x%016llx that srCreateDisplay cannot find -- "
+		        "re-reading SR's displays through a new client (#567)",
+		        api, (unsigned long long)dead);
+		leia_win_sr_enumerate_reset();
+		display_count = leia_win_sr_enumerate_displays(displays, LEIA_WIN_SR_MAX_DISPLAYS);
+	}
+	leia_win_sr_note_display_edid(dead, displays, display_count, &edid_manufacturer, &edid_product, &edid_serial);
+	if (has_memo) {
+		*io_edid_manufacturer = edid_manufacturer;
+		*io_edid_product = edid_product;
+		*io_edid_serial = edid_serial;
+	}
+	struct leia_win_sr_monitor monitors[LEIA_WIN_SR_MAX_MONITORS];
+	const int32_t monitor_count =
+	    display_count >= 0 ? leia_win_sr_enumerate_monitors(monitors, LEIA_WIN_SR_MAX_MONITORS) : -1;
+	const bool has_origin = origin != nullptr && origin->bound;
+	const int32_t left = has_origin ? origin->left : 0;
+	const int32_t top = has_origin ? origin->top : 0;
+	const uint64_t id = leia_win_sr_rematch_display_id(dead, has_origin, left, top, edid_manufacturer, edid_product,
+	                                                   edid_serial, displays, display_count, monitors, monitor_count);
+	if (id != 0) {
+		g_rematch_failed_warned.store(0);
+		g_rematch_reset_for.store(0);
+		U_LOG_W("SR %s per-screen weaver: srCreateDisplay cannot find SR display 0x%016llx; re-matched the panel "
+		        "at (%d,%d) (edid=0x%04X/0x%04X) to SR display 0x%016llx -- binding that (#567)",
+		        api, (unsigned long long)dead, left, top, edid_manufacturer, edid_product,
+		        (unsigned long long)id);
+	} else if (g_rematch_failed_warned.exchange(dead) != dead) {
+		U_LOG_W("SR %s per-screen weaver: srCreateDisplay cannot find SR display 0x%016llx and SR lists no "
+		        "other display for the panel at (%d,%d) (edid=0x%04X/0x%04X; %d SR display(s)) -- the weaver is "
+		        "not created; every later create attempt re-reads SR's displays (#567)",
+		        api, (unsigned long long)dead, left, top, edid_manufacturer, edid_product, (int)display_count);
+	}
+	return id;
+}
+
+} // namespace
+
+bool
+leia_sr_v2_query_display(SrInstance instance,
+                         void *hwnd,
+                         double max_time,
+                         uint64_t bind_display_id,
+                         struct leia_sr_v2_display_info *out_info)
+{
+	SrResult cr = SR_SUCCESS;
+	return query_display_impl(instance, hwnd, max_time, bind_display_id, out_info, &cr);
+}
+
+bool
+leia_sr_v2_query_display_bound(SrInstance instance,
+                               void *hwnd,
+                               double max_time,
+                               uint64_t *io_bind_display_id,
+                               const struct leia_win_screen_origin *origin,
+                               uint16_t *io_edid_manufacturer,
+                               uint16_t *io_edid_product,
+                               uint32_t *io_edid_serial,
+                               const char *api,
+                               struct leia_sr_v2_display_info *out_info)
+{
+	const uint64_t bound = *io_bind_display_id;
+	SrResult cr = SR_SUCCESS;
+	if (query_display_impl(instance, hwnd, max_time, bound, out_info, &cr)) {
+		return true;
+	}
+	if (bound == 0 || cr != SR_ERROR_DISPLAY_NOT_FOUND) {
+		return false;
+	}
+	const uint64_t id =
+	    rematch_dead_display(bound, origin, io_edid_manufacturer, io_edid_product, io_edid_serial, api);
+	if (id == 0) {
+		return false;
+	}
+	*io_bind_display_id = id;
+	return query_display_impl(instance, hwnd, max_time, id, out_info, &cr);
 }
 
 uint64_t
@@ -1604,6 +1718,22 @@ extern "C" void
 leia_win_sr_enumerate_refresh_next(void)
 {
 	AcquireSRWLockExclusive(&g_enum_lock);
+	g_force_refresh = true;
+#ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
+	g_mon_force_refresh = true;
+#endif
+	ReleaseSRWLockExclusive(&g_enum_lock);
+}
+
+extern "C" void
+leia_win_sr_enumerate_reset(void)
+{
+	AcquireSRWLockExclusive(&g_enum_lock);
+	// The caps were answered by the SR runtime, not by this instance: keep them logged once.
+	const bool caps_logged = g_caps_logged;
+	probe_instance_drop_locked();
+	g_caps_logged = caps_logged;
+	g_last_create_fail_ns = 0; // make the new instance now, not after a create backoff
 	g_force_refresh = true;
 #ifdef DXR_LEIA_HAS_SR_MONITOR_ENUM
 	g_mon_force_refresh = true;

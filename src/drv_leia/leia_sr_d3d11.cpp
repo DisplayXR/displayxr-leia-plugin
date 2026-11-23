@@ -269,6 +269,12 @@ struct leiasr_d3d11
 	//! create was still PENDING. Applied by the worker at publish, exactly
 	//! like @ref pending_lens_wish. 0 = none.
 	std::atomic<uintptr_t> pending_hwnd{0};
+	//! #567: create attempts that failed since the weaver last went PENDING (the
+	//! worker resets it at entry). Read by leiasr_d3d11_wait_ready: a failing create
+	//! is retrying, so a caps query no longer waits for it.
+	std::atomic<uint32_t> create_failures{0};
+	//! #567: a caps query already waited (or declined to) once; later ones never wait.
+	std::atomic<bool> caps_waited{false};
 
 	// --- #158 SR platform hot reconnect -----------------------------------
 	// The SR platform can restart underneath a long-lived process (a LeiaSR
@@ -590,7 +596,18 @@ create_v2(double max_time, void *hwnd, leiasr_d3d11 &sr)
 	}
 
 	leia_sr_v2_display_info info{};
-	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, plan.bind_display ? plan.display_id : 0, &info)) {
+	// #567: a bound query whose id srCreateDisplay cannot find re-matches the panel and
+	// retries once; the plan (and so the weaver's binding below) takes the id it found.
+	const bool queried =
+	    plan.bind_display
+	        ? leia_sr_v2_query_display_bound(sr.instance_v2, hwnd, max_time, &plan.display_id, &sr.bind_origin,
+	                                         &sr.bind_edid_manufacturer, &sr.bind_edid_product,
+	                                         &sr.bind_edid_serial, "D3D11", &info)
+	        : leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, 0, &info);
+	if (plan.bind_display) {
+		sr.bind_display_id = plan.display_id;
+	}
+	if (!queried) {
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
 		return false;
@@ -2185,6 +2202,7 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 	uint32_t attempt = 0;
 	//! #468: when the last retry wait was ended by SR identifying the panel (0 = it was not).
 	uint64_t identified_ms = 0;
+	sr->create_failures.store(0, std::memory_order_release); // #567
 	for (;;) {
 		if (sr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_CANCELLED) {
 			// Idempotent, and needed on every path: on the first create
@@ -2316,6 +2334,8 @@ async_create_worker_body(leiasr_d3d11 *sr, double max_time, bool reconnect, uint
 			return;
 		}
 
+		// #567: a caps query waiting for this create stops waiting now.
+		sr->create_failures.fetch_add(1, std::memory_order_acq_rel);
 		U_LOG_W("Leia D3D11 %s weaver: create attempt %u failed — retrying in 5 s, or as soon as SR identifies "
 		        "the panel",
 		        reconnect ? "reconnect" : "async", attempt);
@@ -4164,8 +4184,22 @@ leiasr_d3d11_wait_ready(struct leiasr_d3d11 *leiasr, uint32_t timeout_ms)
 	if (leiasr == nullptr) {
 		return false;
 	}
+	// #567: wait only on the first query, and only while the create has not failed
+	// yet. The service's weave path re-asks on every submit until it gets an answer,
+	// so a wait here on a weaver stuck in its retry loop cost every frame 10 s.
+	const bool waited_before = leiasr->caps_waited.exchange(true, std::memory_order_acq_rel);
 	const uint64_t deadline = GetTickCount64() + timeout_ms;
 	while (leiasr->async_state.load(std::memory_order_acquire) == LEIASR_ASYNC_PENDING) {
+		const uint32_t failures = leiasr->create_failures.load(std::memory_order_acquire);
+		if (!leiasr_caps_query_may_wait(waited_before, failures)) {
+			if (!waited_before) {
+				// Once per weaver: the first query found the create already retrying.
+				U_LOG_W("Leia D3D11 weaver: still being created (%u failed attempt(s)) — capability query "
+				        "answers 'not ready' without waiting (#567)",
+				        failures);
+			}
+			return false;
+		}
 		if (GetTickCount64() >= deadline) {
 			return false;
 		}

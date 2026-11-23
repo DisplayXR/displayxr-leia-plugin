@@ -148,6 +148,32 @@ leia_sr_v2_current_display_id(uint64_t bound,
                               const char *api);
 
 /*!
+ * #567: @ref leia_sr_v2_query_display for a screen-bound weaver, binding
+ * @p *io_bind_display_id. When srCreateDisplay answers
+ * SR_ERROR_DISPLAY_NOT_FOUND for it (seen after an SR Service restart that
+ * identified the panel late, then a suspend/resume — the id can stay in SR's
+ * list while no longer creatable), SR's displays are read fresh, the panel is
+ * re-matched by origin and EDID (@ref leia_win_sr_rematch_display_id), and
+ * the query is retried ONCE with the new id, which is written back so the
+ * weaver binds it too. No wait is added; the caller's retry cadence throttles
+ * the re-read. Other failures return false as before.
+ *
+ * @param origin, io_edid_manufacturer, io_edid_product, io_edid_serial As for
+ *        @ref leia_sr_v2_current_display_id.
+ */
+bool
+leia_sr_v2_query_display_bound(SrInstance instance,
+                               void *hwnd,
+                               double max_time,
+                               uint64_t *io_bind_display_id,
+                               const struct leia_win_screen_origin *origin,
+                               uint16_t *io_edid_manufacturer,
+                               uint16_t *io_edid_product,
+                               uint32_t *io_edid_serial,
+                               const char *api,
+                               struct leia_sr_v2_display_info *out_info);
+
+/*!
  * Multi-screen M6: srGetRuntimeCapabilities with the routing + binding
  * capability structs chained. `out->known` is false when the SDK headers
  * predate the structs or the query failed.

@@ -305,6 +305,33 @@ leiasr_pending_episode_starts(uint64_t now_ms, uint64_t prev_demand_ms)
 	return !leiasr_pending_refresher_wanted(now_ms, prev_demand_ms);
 }
 
+/*
+ *
+ * #567: a capability query never waits on a failing create.
+ *
+ * The D3D11 DP's zone-caps query waits (bounded, 10 s) for a pending async
+ * weaver, because the in-process compositors ask once at create and cache the
+ * answer. The service's weave path asks again on every submit until it gets an
+ * answer, so with a per-screen weaver whose create kept failing (a dead SR
+ * display id) each xrWeaveSubmitDXR waited the full 10 s, once per DP. The wait
+ * is now worth it only for the first create attempt in flight: once an attempt
+ * has failed the weaver is in its retry loop and will not be up within any
+ * bound worth blocking a frame for, and a DP waits at most once in its life.
+ *
+ */
+
+/*!
+ * May a capability query wait for the pending weaver? Only the DP's first
+ * query (@p waited_before false), and only while no create attempt has failed
+ * since the weaver went pending (@p failed_attempts 0). Re-checked at every
+ * tick of the wait, so a wait in progress ends at the first failure.
+ */
+static inline bool
+leiasr_caps_query_may_wait(bool waited_before, uint32_t failed_attempts)
+{
+	return !waited_before && failed_attempts == 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

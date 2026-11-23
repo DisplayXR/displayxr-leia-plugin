@@ -193,6 +193,33 @@ create synchronously and have no pending state):
   flat-blit wait — which is what it is: the panel is there, and the window is
   shown flat on it until the weaver is up.
 
+## After a resume: a per-screen weaver's dead display id (#567)
+
+A per-screen weaver binds an SR display id (`SrDisplayBindingInfo`). After
+an SR Service restart with the panel asleep (SR identifies it late, e.g. as
+`0x2`) and then a suspend/resume, `srCreateDisplay` refuses that id with
+`SR_ERROR_DISPLAY_NOT_FOUND` while SR's display list can still hold it, so
+the #480 re-resolve (which keeps an id SR lists) kept retrying the dead id
+every 5 s. Window-bound weavers bind by window and never hit it.
+
+- **Re-match on DISPLAY_NOT_FOUND.** `leia_sr_v2_query_display_bound` (all
+  four backends' v2 create) reads SR's displays and monitors fresh, through a
+  new probe instance when the current one still lists the dead id (once per
+  id), and re-matches the panel: by the DP's desktop origin and EDID as in
+  #480, else the one SR display with the panel's EDID, else the only SR
+  display SR lists. Never the dead id, never a guess between twins. The query
+  is retried once with the new id, which the weaver then binds. Pure rule:
+  `leia_win_sr_rematch_display_id`, host-tested in
+  `tests/test_display_claims_win.c`. The D3D11 create retry throttles it to
+  one re-read per attempt (5 s); D3D12, GL and Vulkan create once per DP.
+- **The submit path never waits on a failing create.** The D3D11 DP's
+  zone-caps query waited up to 10 s for a pending weaver (for the in-process
+  compositors, which ask once). The service's weave path asks on every submit
+  until it gets an answer, so `xrWeaveSubmitDXR` blocked 10 s per DP per
+  frame. Now only a weaver's first query waits, and only until a create
+  attempt fails (`leiasr_caps_query_may_wait`). Meanwhile the DP flat-blits
+  view 0, as for any pending weaver.
+
 ## Contract with the runtime (plugin_api 5 — no new ABI fields)
 
 1. `get_display_info` is cheap and non-blocking once the startup budget is

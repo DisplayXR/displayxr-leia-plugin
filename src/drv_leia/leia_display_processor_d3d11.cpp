@@ -2829,9 +2829,10 @@ leia_dp_d3d11_get_local_zone_caps(struct xrt_display_processor_d3d11 *xdp, struc
 	//
 	// #144: the in-process compositors query zone caps ONCE at their own
 	// create and cache the answer — a pending async weaver would freeze
-	// "no zones" permanently. Bounded wait on the caller's (app) thread;
-	// the SERVICE compositor never calls this slot, so the service critical
-	// path is unaffected.
+	// "no zones" permanently. Bounded wait on the caller's (app) thread.
+	// #567: the service's weave path DOES call this slot, from every submit
+	// until it gets an answer, so only the first call waits, and not once a
+	// create attempt has failed (leiasr_d3d11_wait_ready).
 	if (!leiasr_d3d11_wait_ready(ldp->leiasr, 10000)) {
 		return false;
 	}

@@ -793,6 +793,82 @@ test_rebind_requires_the_same_panel(void)
 }
 
 /*!
+ * #567: SR Service restarted with the panel asleep, identified it late as 0x2, then a
+ * suspend/resume: srCreateDisplay(0x2) answers SR_ERROR_DISPLAY_NOT_FOUND while SR
+ * may still list 0x2. The rematch never returns the dead id and finds the panel by
+ * origin, else by a unique EDID, else as the only SR display.
+ */
+static void
+test_rematch_display_id(void)
+{
+	const uint64_t dead = 0x2;
+	const uint64_t hmon_ds1 = 0x30151u;
+
+	// SR still lists the dead id (the rebind keeps it) next to the panel's new id at the origin.
+	struct leia_win_sr_display both[2] = {
+	    srd(dead, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true),
+	    srd(0x3, "ACR", DS1_PROD, true, "QI012321D10111", -3840, 0, true),
+	};
+	CHECK(leia_win_sr_rebind_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, 2, NULL, -1) == dead);
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, 2, NULL, -1) == 0x3);
+	// ...also when SR's monitor join still names the dead id.
+	struct leia_win_sr_monitor lagging[1] = {srm(hmon_ds1, -3840, ACR_ID, DS1_PROD, dead)};
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, 2, lagging, 1) == 0x3);
+
+	// SR lists only the dead id: nothing to bind; the caller retries as before.
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, 1, NULL, -1) == 0);
+
+	// The panel came back at another origin (or not desktop-global): its EDID finds it when unique.
+	struct leia_win_sr_display moved[2] = {
+	    srd(0x7, "AUO", B194_PROD, true, "QALA2137AL0011", 0, 0, true),
+	    srd(0x4, "ACR", DS1_PROD, true, "QI012321D10111", 0, 0, false),
+	};
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, moved, 2, NULL, -1) == 0x4);
+	// ...never another model,
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, 0x0002u, 0, moved, 2, NULL, -1) == 0);
+	// ...and twins of one model are not guessed between,
+	struct leia_win_sr_display twins[2] = {
+	    srd(0x4, "ACR", DS1_PROD, true, "QI0000000000004", 0, 0, false),
+	    srd(0x5, "ACR", DS1_PROD, true, "QI0000000000005", 3840, 0, false),
+	};
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, twins, 2, NULL, -1) == 0);
+	// ...unless the EDID serial number tells them apart.
+	twins[0].edid_serial = 841937063u;
+	twins[1].edid_serial = 841937064u;
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 841937064u, twins, 2, NULL, -1) ==
+	      0x5);
+
+	// SR lists the panel without an EDID of its own: the monitor join names it.
+	struct leia_win_sr_display bare[2] = {
+	    srd(0x7, "AUO", B194_PROD, true, "QALA2137AL0011", 0, 0, true),
+	    srd(0x4, "ACR", DS1_PROD, true, "QI012321D10111", 0, 0, false),
+	};
+	bare[1].manufacturer_id = 0;
+	bare[1].product_id = 0;
+	struct leia_win_sr_monitor joined[2] = {
+	    srm(0x10001u, 0, AUO_ID, B194_PROD, 0x7),
+	    srm(hmon_ds1, 3840, ACR_ID, DS1_PROD, 0x4),
+	};
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, bare, 2, joined, 2) == 0x4);
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, bare, 2, NULL, -1) == 0);
+	// ...but a join naming the dead id is no answer.
+	joined[1].sr_display_id = dead;
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, bare, 2, joined, 2) == 0);
+
+	// No EDID noted (a one-shot create): only a lone SR display is taken.
+	struct leia_win_sr_display lone[1] = {srd(0x4, "ACR", DS1_PROD, true, "QI012321D10111", 0, 0, false)};
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, 0, 0, 0, lone, 1, NULL, -1) == 0x4);
+	CHECK(leia_win_sr_rematch_display_id(dead, false, 0, 0, 0, 0, 0, lone, 1, NULL, -1) == 0x4);
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, 0, 0, 0, moved, 2, NULL, -1) == 0);
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, 0, 0, 0, both, 1, NULL, -1) == 0);
+
+	// Unavailable lists, or an unbound DP: nothing.
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, NULL, -1, NULL, -1) == 0);
+	CHECK(leia_win_sr_rematch_display_id(dead, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, -1, NULL, -1) == 0);
+	CHECK(leia_win_sr_rematch_display_id(0, true, -3840, 0, ACR_ID, DS1_PROD, 0, both, 2, NULL, -1) == 0);
+}
+
+/*!
  * #483: the change that asks the runtime for a claim sweep. The same G16 replug:
  * SR listed the DS1 EDID_ONLY under a hash id, then FPC_VERIFIED as 0x1 once the
  * FPC paired, with no OS display event in between.
@@ -1040,6 +1116,7 @@ main(void)
         test_panel_pick_rules();
 	test_rebind_display_id();
 	test_rebind_requires_the_same_panel();
+	test_rematch_display_id();
 	test_sr_authenticated();
 	test_sr_auth_watch();
         if (g_failures != 0) {

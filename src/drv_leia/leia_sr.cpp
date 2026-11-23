@@ -445,7 +445,18 @@ create_v2(double max_time,
 	}
 
 	leia_sr_v2_display_info info{};
-	if (!leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, plan.bind_display ? plan.display_id : 0, &info)) {
+	// #567: a bound query whose id srCreateDisplay cannot find re-matches the panel and
+	// retries once; the plan (and so the weaver's binding below) takes the id it found.
+	const bool queried =
+	    plan.bind_display
+	        ? leia_sr_v2_query_display_bound(sr.instance_v2, hwnd, max_time, &plan.display_id, &sr.bind_origin,
+	                                         &sr.bind_edid_manufacturer, &sr.bind_edid_product,
+	                                         &sr.bind_edid_serial, "Vulkan", &info)
+	        : leia_sr_v2_query_display(sr.instance_v2, hwnd, max_time, 0, &info);
+	if (plan.bind_display) {
+		sr.bind_display_id = plan.display_id;
+	}
+	if (!queried) {
 		srDestroyInstance(sr.instance_v2);
 		sr.instance_v2 = nullptr;
 		return false;

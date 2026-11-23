@@ -351,6 +351,41 @@ leia_win_sr_rebind_display_id(uint64_t bound,
                               const struct leia_win_sr_monitor *monitors,
                               int32_t monitor_count);
 
+/*!
+ * #567: the SR display that replaces @p dead, an id srCreateDisplay has just
+ * refused with SR_ERROR_DISPLAY_NOT_FOUND. Stronger evidence than
+ * @ref leia_win_sr_rebind_display_id has (SR's list may still hold @p dead:
+ * after an SR Service restart and a suspend/resume the id is listed but no
+ * longer creatable), so @p dead itself is never an answer, and the panel is
+ * looked for by identity when its origin does not find it. In order:
+ * - the monitor (SR's join), then the desktop-global SR display, at the DP's
+ *   origin with the panel's EDID, as in the rebind;
+ * - with the panel's EDID known (@p edid_manufacturer non-zero): the ONE SR
+ *   display with that EDID (serial number too when both sides have one), else
+ *   the ONE SR display id SR's monitor join gives a monitor with that EDID;
+ * - with no EDID known: the only SR display SR lists, when it lists one.
+ * Two candidates are never guessed between (twins of one model at origins
+ * that moved).
+ *
+ * Pure: the caller passes SR's enumerations, read fresh. A count < 0 means
+ * that enumeration is unavailable.
+ *
+ * @return the replacement id, or 0 when none is known (the caller retries
+ *         @p dead as before).
+ */
+uint64_t
+leia_win_sr_rematch_display_id(uint64_t dead,
+                               bool has_origin,
+                               int32_t left,
+                               int32_t top,
+                               uint16_t edid_manufacturer,
+                               uint16_t edid_product,
+                               uint32_t edid_serial,
+                               const struct leia_win_sr_display *displays,
+                               int32_t display_count,
+                               const struct leia_win_sr_monitor *monitors,
+                               int32_t monitor_count);
+
 //! #480: does SR's display list (@p count < 0 = unavailable) hold @p id?
 bool
 leia_win_sr_display_listed(uint64_t id, const struct leia_win_sr_display *displays, int32_t count);
@@ -497,6 +532,15 @@ leia_win_sr_enumerate_shutdown(void);
  */
 void
 leia_win_sr_enumerate_refresh_next(void);
+
+/*!
+ * #567: as @ref leia_win_sr_enumerate_refresh_next, and the next read also goes
+ * through a NEW probe instance: the current one listed a display id that a
+ * fresh instance's srCreateDisplay could not find, so its view may predate an
+ * SR Service restart or a resume. Any thread; callers throttle it.
+ */
+void
+leia_win_sr_enumerate_reset(void);
 
 /*!
  * #483: who to tell when SR authenticates a panel it listed EDID_ONLY (see
