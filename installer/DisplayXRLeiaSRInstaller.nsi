@@ -1031,6 +1031,11 @@ Function .onInit
 	; runtime ${MIN_RUNTIME_VERSION} headers, so installing it over an older
 	; runtime guarantees that silent fallback.
 	;
+	; The floor is the higher of that ABI pin and a behaviour floor
+	; (installer/CMakeLists.txt, DXR_LEIA_BEHAVIOUR_MIN_RUNTIME): a runtime
+	; that loads the plug-in but still routes 2D-to-3D conversion to the
+	; display driver, which this plug-in no longer serves.
+	;
 	; The meta-bundle installs the matching pair and can't reach this state,
 	; but it only compares VERSIONS, never ABI — so a standalone run of this
 	; installer on an older runtime is the one path left. Refuse it here,
@@ -1056,7 +1061,7 @@ Function .onInit
 		${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $R0
 		${If} $1 != ""
 		${AndIf} $R0 == 2
-			!insertmacro AbortWithReason 5 "DisplayXR runtime $1 is too old for this plug-in.$\r$\n$\r$\nLeia SR ${VERSION} is built against runtime ${MIN_RUNTIME_VERSION} and needs ${MIN_RUNTIME_VERSION} or later. Installing it on $1 would leave the runtime unable to load it — 3D would silently fall back to the simulated display.$\r$\n$\r$\nUpdate the runtime (or install the DisplayXR bundle, which keeps the pair matched):$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+			!insertmacro AbortWithReason 5 "DisplayXR runtime $1 is too old for this plug-in.$\r$\n$\r$\nLeia SR ${VERSION} needs runtime ${MIN_RUNTIME_VERSION} or later. On $1 the 3D display or 2D-to-3D conversion would not work.$\r$\n$\r$\nUpdate the runtime (or install the DisplayXR bundle, which keeps the pair matched):$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
 		${EndIf}
 	!endif
 FunctionEnd

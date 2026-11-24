@@ -88,6 +88,23 @@ else()
         "Release builds must pin a release tag.")
 endif()
 
+# Behaviour floor, on top of the ABI floor above. The ABI pin says which
+# runtime can LOAD this plug-in; this says which runtime behaves right next
+# to it. From 2.24.0 the plug-in leaves the D3D11 lift slots NULL (2D->3D
+# conversion is the separate conversion provider). A runtime older than
+# v2.70.5 still lists its built-in "dp-lift" adapter ahead of every other
+# converter whenever a Leia display driver is active, so on such a runtime
+# conversion requests go to an adapter that can no longer serve them
+# (runtime#2783 lists it only when the driver offers lift).
+# A hand-written literal on purpose: it is not derivable from the pin, and
+# it only ever moves UP. Applied only when the ABI floor exists, so a build
+# against a branch or SHA runtime keeps shipping without a version gate.
+set(DXR_LEIA_BEHAVIOUR_MIN_RUNTIME "2.70.5")
+if(MIN_RUNTIME_VERSION AND MIN_RUNTIME_VERSION VERSION_LESS DXR_LEIA_BEHAVIOUR_MIN_RUNTIME)
+    message(STATUS "Installer minimum runtime floor raised: ${MIN_RUNTIME_VERSION} -> ${DXR_LEIA_BEHAVIOUR_MIN_RUNTIME} (behaviour floor)")
+    set(MIN_RUNTIME_VERSION "${DXR_LEIA_BEHAVIOUR_MIN_RUNTIME}")
+endif()
+
 # Optional code-signing command, sourced from the SIGN_CMD environment
 # variable at configure time. Empty on any machine without it (clones,
 # GitHub-hosted CI) -> installer + uninstaller build unsigned. On a
