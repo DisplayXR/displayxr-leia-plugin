@@ -2038,6 +2038,7 @@ struct xrt_plugin_stereo_camera
 	int64_t still_ts_boot{0};
 	int64_t still_eye_mono[2]{};
 	uint64_t still_request{0};
+	bool still_lossy{false}; //!< the still came through the JPEG outputs
 	leia_scam_capture_state still_res{};
 	bool still_have_res{false};
 
@@ -3634,6 +3635,7 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 		c->jpeg[0].clear();
 		c->jpeg[1].clear();
 		c->still = jpeg ? still_state::WAIT_JPEG : still_state::GRAB;
+		c->still_lossy = jpeg;
 	}
 	if (jpeg) {
 		std::lock_guard<std::mutex> lk(c->cam_mu);
@@ -4288,6 +4290,21 @@ leia_stereo_camera_android_get_control_caps(struct xrt_plugin_instance *inst,
 	c.exposure_compensation_min_ev = cc.exposure_compensation_min_ev;
 	c.exposure_compensation_max_ev = cc.exposure_compensation_max_ev;
 	c.exposure_compensation_step_ev = cc.exposure_compensation_step_ev;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_CONTROL_CAPS_HAS_DEFAULT_FOCUS
+	// What the source holds with no focus control set (written only within
+	// the runtime's struct_size, by the memcpy below). A pair whose lens
+	// focuses: AF off at desc.default_focus_d (FIXED), or the HAL's own AF with
+	// debug.dxr.leia.scam_hal_af=1 (AUTO). A fixed-focus lens (the front pair)
+	// has no focus control and min_focus_distance 0 already says so: UNKNOWN.
+	const pair_desc &pd = g_pairs[index];
+	if ((cc.supported_controls & LEIA_SCAM_CTL_FOCUS_MODE) != 0) {
+		c.default_focus = pd.hal_af ? XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_AUTO
+		                            : XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED;
+		c.default_focus_distance_diopters = pd.hal_af ? 0.0f : pd.default_focus_d;
+	} else {
+		c.default_focus = XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_UNKNOWN;
+	}
+#endif
 	const uint32_t sz = out->struct_size;
 	memcpy(out, &c, std::min<size_t>(sz, sizeof(c)));
 	out->struct_size = sz;
@@ -4443,6 +4460,11 @@ leia_stereo_camera_android_poll_still(struct xrt_plugin_stereo_camera *c,
 	s.pitches[0] = s.pitches[1] = 2 * c->still_w;
 	s.time_ns = c->still_eye_mono[0];
 	s.time_is_exposure = 1;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_STILL_HAS_FLAGS
+	// The 4096x3072 still went through one JPEG per lens (quality 95); a still
+	// from stream pairs did not.
+	s.flags = c->still_lossy ? XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE : 0u;
+#endif
 	const uint32_t sz = out->struct_size;
 	memcpy(out, &s, std::min<size_t>(sz, sizeof(s)));
 	out->struct_size = sz;

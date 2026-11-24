@@ -451,7 +451,10 @@ stream pair, at 1280x720 or 1280x960: no session change, no tracking gap.
   distance (~3.2 m), so at 2 m the depth of field spans ~1.2–5.3 m, the range
   people and tabletop scenes are shot at, at the cost of sharpness at
   infinity (0.31 D would cover ~1.6 m–∞). LOCKED, and MANUAL without a
-  distance, keep the distance in force. There is no HAL signal that tells
+  distance, keep the distance in force. The caps say so:
+  `default_focus = FIXED`, `default_focus_distance_diopters = 0.5` (AUTO with
+  HAL AF; UNKNOWN on the fixed-focus front pair, whose minimum focus distance
+  0 already tells). There is no HAL signal that tells
   whether its AF drives both lenses of a logical pair, so this is the default
   for every pair; `debug.dxr.leia.scam_hal_af=1` opts a device back into the
   HAL's AF (CONTINUOUS_AUTO, AUTO_ONCE with one `AF_TRIGGER_START` per
@@ -510,7 +513,9 @@ happens, so the bit stays clear and `captureTime` is the only time.
   still fails, the stream-pair stills work). The JPEGs are requested with
   `JPEG_ORIENTATION` 0 (pixels as captured, no EXIF turn) and quality 95
   (`debug.dxr.leia.scam_still_quality`); RGBA → NV12 is full-range BT.601,
-  like the camera's own YUV. The JPEG round trip is lossy (quality 95).
+  like the camera's own YUV. The JPEG round trip is lossy (quality 95), so the
+  still carries `XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE` (runtime
+  `XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR`); stills from stream pairs do not.
 - **Memory.** The 4096x3072 NV12 pair is 37.7 MB, freed at `release_still`.
   While a still is decoded: the two JPEGs (~5–10 MB each), one RGBA eye
   (50 MB, the eyes are decoded one after the other) and the NV12 pair. The
