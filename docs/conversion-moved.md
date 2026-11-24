@@ -1,6 +1,6 @@
 # 2D→3D conversion moved out of this plug-in
 
-Up to and including **v2.23.0** this repository carried Leia's 2D→3D conversion (the NeurD
+Up to and including **v2.23.4** this repository carried Leia's 2D→3D conversion (the NeurD
 module) in two places:
 
 - behind the **D3D11 display processor's `lift_*` slots** and the lift-only factory
@@ -9,7 +9,7 @@ module) in two places:
 - as the **conversion provider** `DisplayXR-LeiaConversion.{dll,so}` (`src/conv_leia`, runtime
   ADR-053), shipped inside this plug-in's Windows installer and Linux `.deb`.
 
-Both are gone from here. Conversion lives only in the conversion provider, which now has its own
+Both are gone from here as of **v2.24.0**, the first release without them. Conversion lives only in the conversion provider, which now has its own
 repository and its own package (`displayxr-leia-conversion`: `DisplayXRLeiaConversionSetup-*.exe`,
 `displayxr-leia-conversion_*.deb`). The NeurD runtime itself was never part of this repository and
 is not part of that one either: it is an external prerequisite the provider detects.
@@ -87,12 +87,26 @@ catalog names, checks its size, SHA-256 and Authenticode signer, and runs it sil
 | Needs | `dxr-get.exe` next to an installed DisplayXR runtime (this installer embeds none), network, and a **`leia_conversion` component in the catalog** with a signed Windows asset |
 | Failure | never fails the plug-in's install. It logs why (`dxr-get` exit 40 = not in the catalog, 10 = catalog unreachable, …) and where to get the installer by hand |
 
-**Today the catalog has no `leia_conversion` component** (no `versions.json` field, nothing in
-the runtime's `scripts/gen_catalog.py`), so the chain runs, gets exit 40 and prints the pointer.
-It starts fetching, with no change here, once the catalog lists the component.
+**Today the package is released, but the published catalog does not list it yet.** The runtime
+pins it (`versions.json`: `leia_conversion`) and its catalog generator has the component, but only
+in the newer catalog document, which is not published; the catalog that installed `dxr-get` builds
+read still has no `leia_conversion`. So the chain runs, `dxr-get` exits 40 ("not in the catalog"),
+and the installer prints where to get the package:
+<https://github.com/DisplayXR/displayxr-leia-conversion/releases>. The same pointer is printed when
+the box has no `dxr-get` at all. It starts fetching, with no change here, once the published
+catalog carries the component. (A silent `/S` run shows no details window: the box simply has no
+Leia conversion until the package is installed.)
+
+**The running service.** The row is removed while the DisplayXR service is closed: the display
+plug-in's own Restart Manager session closes the service (it maps the plug-in DLL) before any file
+or row changes, and restarts it at the end, so the restarted service reads the registrations as
+they are after the upgrade. Two cases do not restart it: `/NOSTART` (a bundle passes it and
+restarts the service once after its whole chain), and a service that was running without the
+plug-in's files mapped. A package the chain installs afterwards registers itself with the service
+already back up.
 
 Order does not matter between the two **new** installers. What is not symmetrical is an **old**
-installer of this plug-in (v2.23.0 or earlier) run after the separate package: it rewrites the row
+installer of this plug-in (v2.23.4 or earlier) run after the separate package: it rewrites the row
 to its own copy, and its uninstaller deletes the row. Re-run the conversion-provider installer to
 take it back. Hence the migration order.
 
@@ -105,7 +119,8 @@ versions that shipped the two files, so dpkg moves them between the packages:
 sudo apt install ./displayxr-leia-conversion_*.deb ./displayxr-leia-sr_*.deb
 ```
 
-Upgrade both in one transaction on a box that has an older `displayxr-leia-sr`. Upgrading only
+Upgrade both in one transaction on a box that has an older `displayxr-leia-sr` (the bound is
+`<< 2.24.0~`, so 2.24.0 is the first version that can sit next to the other package). Upgrading only
 `displayxr-leia-sr` is also fine: the provider files leave with it, and the box has no Leia
 conversion until the other package is installed. This package declares no relation to the other
 one: it is in no Ubuntu archive (the install check verifies that every relation resolves), and
@@ -113,13 +128,14 @@ the display plug-in works without conversion.
 
 ## Migration order
 
-1. Release the conversion-provider package (Windows `.exe` + Linux `.deb`).
-2. Runtime side: a `versions.json` field (`leia_conversion`), a `leia_conversion` component in
-   the component catalog (`scripts/gen_catalog.py`; needs a signed Windows asset) so this
-   installer's chain can fetch it, and orchestrator rows. A bundle that installs the package
-   itself passes `/NOCONVERSION` here.
-3. Merge this change and release this plug-in. That release's version is the provider `.deb`'s
-   `LEIA_SR_SPLIT_VERSION` (its `Replaces` / `Breaks` bound).
+1. Release the conversion-provider package (Windows `.exe` + Linux `.deb`). **Done:** v0.1.0.
+2. Runtime side: a `versions.json` field (`leia_conversion`, **done**), a `leia_conversion`
+   component in the component catalog (`scripts/gen_catalog.py`; in the generator, **not yet in
+   the published catalog**) so this installer's chain can fetch it, and orchestrator rows. A
+   bundle that installs the package itself passes `/NOCONVERSION` here.
+3. Merge this change and release this plug-in as **v2.24.0**. That version is the provider
+   `.deb`'s `LEIA_SR_SPLIT_VERSION` (its `Replaces` / `Breaks` bound, `displayxr-leia-sr (<< 2.24.0~)`),
+   so it must not be released under any other number.
 4. Bundle and orchestrator pin both.
 
 Between 1 and 3, do not cut a plug-in release from the old line onto boxes that already have the

@@ -393,8 +393,8 @@ FunctionEnd
 ;--------------------------------
 ; Superseded conversion provider (handover to the separate package).
 ;
-; Releases of this installer up to the one that dropped it shipped
-; DisplayXR-LeiaConversion.dll in $INSTDIR and wrote
+; Releases of this installer up to v2.23.4 (v2.24.0 is the first without it)
+; shipped DisplayXR-LeiaConversion.dll in $INSTDIR and wrote
 ; HKLM\Software\DisplayXR\ConversionProviders\leia-conversion with THIS
 ; uninstaller in UninstallString. The provider now ships in its own package
 ; (its own directory, its own uninstaller), which takes that row over when it
@@ -434,7 +434,7 @@ FunctionEnd
 ; The separate package: its component name in the DisplayXR component catalog
 ; (what `dxr-get install` takes) and where a person gets it by hand.
 !define CONV_CATALOG_COMPONENT "leia_conversion"
-!define CONV_PKG_URL "https://github.com/DisplayXR/displayxr-leia-conversion/releases/latest"
+!define CONV_PKG_URL "https://github.com/DisplayXR/displayxr-leia-conversion/releases"
 
 Var ConvMutex     ; owned maintenance mutex handle ("" = not held)
 Var ConvRmDir     ; the superseded copy's own RM session state dir
@@ -622,10 +622,13 @@ FunctionEnd
 ; is released, the service is back): the chained installer takes that mutex and
 ; runs its own Restart Manager session.
 ;
-; The catalog has to carry a `leia_conversion` component for this to fetch
-; anything. Until it does, dxr-get reports nothing fetchable and this prints
-; where to get the installer instead. Whatever happens here, the plug-in's own
-; install has already succeeded and stays successful: nothing below aborts.
+; The PUBLISHED catalog has to carry a `leia_conversion` component for this to
+; fetch anything. The package itself is released, but the catalog an installed
+; dxr-get reads does not list it yet: dxr-get then exits 40 ("not in the
+; catalog") and this prints where to get the installer (CONV_PKG_URL) instead.
+; It starts fetching, with no change here, once the catalog carries the
+; component. Whatever happens here, the plug-in's own install has already
+; succeeded and stays successful: nothing below aborts.
 ;
 ; Interactive runs ask once before downloading; /S goes straight through.
 Function ConvChainPackage

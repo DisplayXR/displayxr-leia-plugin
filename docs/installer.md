@@ -19,7 +19,10 @@ release of this installer left behind, and never a registration the separate
 package owns: [conversion-moved.md](conversion-moved.md#installer-handover-windows).
 When it has removed a working registration it then tries to fetch that package
 through the runtime's `dxr-get` (`/NOCONVERSION` skips it, `/WITHCONVERSION` asks
-for it on any install); this never fails the install.
+for it on any install); this never fails the install. Until the published
+component catalog lists that package, the fetch finds nothing and the installer
+prints where to get it: <https://github.com/DisplayXR/displayxr-leia-conversion/releases>.
+The first release without the provider is **v2.24.0**.
 
 ## Prerequisites: none
 
