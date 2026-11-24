@@ -657,6 +657,40 @@ and accepted gap.
   1920x1440 capture is refused (BUSY): it is a cut of a capture that is not
   running.
 
+## Opening after a policy refusal
+
+`openCamera` returning **−10012** is `ACAMERA_ERROR_CAMERA_DISABLED`. From
+AOSP CameraService (knowledge, not verified on this OEM build) that comes
+from one of three checks: a device-policy camera disable, sensor privacy, or
+the caller not counting as active ("can't open camera from background"). The
+runtime satellite has no foreground-service type: it may use the camera
+because the binding app's while-in-use capability reaches it through
+`BIND_INCLUDE_CAPABILITIES` (runtime `Client.bindService`), and right after
+the app comes to the front that state lags. Device runs: the camera app's
+rear open was refused for 3.7–4.9 s; the probe app mostly went straight
+through.
+
+The front pair's first `openCamera` comes later in its own start (after
+the tracking hand-over and the wait for the tracking service to release its
+lens), so it reaches the camera service after part of that lag has passed;
+that explains a shift of up to about a second, not a 3–4 s difference. The
+logs below are there to settle it.
+
+Retry: the first retry after a refusal comes 250 ms later (was 500 ms), then
+every 250 ms for 10 s, and **at once** when the camera service reports an
+access-priority change (`onCameraAccessPrioritiesChanged`) or a camera
+opens or closes (extended availability callbacks).
+
+Logged for every start (WARN): each open attempt (reason, trigger, ms after
+the stream start); each refusal (attempt, ms since the first refusal, and the
+process state: `ActivityManager.getMyMemoryState()` importance,
+`PowerManager.isInteractive()`, `KeyguardManager.isKeyguardLocked()`); the
+open that got through (refusals, duration, trigger, process state); the first
+published pair (ms after the stream start, first attempt, open through,
+lens-phase lock time). A refusal while importance stays at 100–125 and the
+screen is interactive points at the camera service's own uid state rather than
+the process state.
+
 ## Watchdog
 
 The pair counts as stalled when no frame pair has arrived for 1.5 s. A stall

@@ -291,6 +291,71 @@ has_camera_permission(jni_env &j)
 }
 
 /*!
+ * This process's state as the platform sees it, for the refusal log:
+ * ActivityManager.getMyMemoryState() importance (100 FOREGROUND, 125
+ * FOREGROUND_SERVICE, 200 VISIBLE, 230 PERCEPTIBLE, 300 SERVICE, 400 CACHED),
+ * PowerManager.isInteractive() and KeyguardManager.isKeyguardLocked().
+ * "?" for what could not be read. No permission needed.
+ */
+std::string
+process_state_str()
+{
+	int importance = -1, interactive = -1, keyguard = -1;
+	jni_env j;
+	if (j.acquire()) {
+		JNIEnv *env = j.env;
+		env->PushLocalFrame(16);
+		jclass am = env->FindClass("android/app/ActivityManager");
+		jclass info = env->FindClass("android/app/ActivityManager$RunningAppProcessInfo");
+		if (j.ok() && am != nullptr && info != nullptr) {
+			jmethodID ctor = env->GetMethodID(info, "<init>", "()V");
+			jmethodID get = env->GetStaticMethodID(am, "getMyMemoryState",
+			                                       "(Landroid/app/ActivityManager$RunningAppProcessInfo;)V");
+			jfieldID imp = env->GetFieldID(info, "importance", "I");
+			if (j.ok() && ctor != nullptr && get != nullptr && imp != nullptr) {
+				jobject o = env->NewObject(info, ctor);
+				if (j.ok() && o != nullptr) {
+					env->CallStaticVoidMethod(am, get, o);
+					if (j.ok()) {
+						importance = env->GetIntField(o, imp);
+					}
+				}
+			}
+		}
+		j.ok();
+		jclass ctx_cls = env->FindClass("android/content/Context");
+		jmethodID gs = j.ok() && ctx_cls != nullptr
+		                   ? env->GetMethodID(ctx_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;")
+		                   : nullptr;
+		if (gs != nullptr && j.ok()) {
+			jobject pm = env->CallObjectMethod(j.ctx, gs, env->NewStringUTF("power"));
+			jclass pm_cls = j.ok() ? env->FindClass("android/os/PowerManager") : nullptr;
+			jmethodID ii = pm_cls != nullptr && j.ok() ? env->GetMethodID(pm_cls, "isInteractive", "()Z") : nullptr;
+			if (pm != nullptr && ii != nullptr && j.ok()) {
+				const jboolean b = env->CallBooleanMethod(pm, ii);
+				if (j.ok()) {
+					interactive = b ? 1 : 0;
+				}
+			}
+			jobject km = j.ok() ? env->CallObjectMethod(j.ctx, gs, env->NewStringUTF("keyguard")) : nullptr;
+			jclass km_cls = j.ok() ? env->FindClass("android/app/KeyguardManager") : nullptr;
+			jmethodID kl = km_cls != nullptr && j.ok() ? env->GetMethodID(km_cls, "isKeyguardLocked", "()Z") : nullptr;
+			if (km != nullptr && kl != nullptr && j.ok()) {
+				const jboolean b = env->CallBooleanMethod(km, kl);
+				if (j.ok()) {
+					keyguard = b ? 1 : 0;
+				}
+			}
+		}
+		j.ok();
+		env->PopLocalFrame(nullptr);
+	}
+	char buf[96];
+	snprintf(buf, sizeof(buf), "importance %d, interactive %d, keyguard %d", importance, interactive, keyguard);
+	return buf;
+}
+
+/*!
  * Bytes of the characteristics key of @p cam_id named @p full_name, else of
  * the first listed key whose name ends with @p suffix. Vendor keys are usually
  * NOT in getKeys() (measured on a Lume Pad 2), so the named lookup comes
@@ -1169,6 +1234,42 @@ avail_off(void *, const char *id)
 
 ACameraManager_AvailabilityCallbacks g_avail_cb{nullptr, avail_on, avail_off};
 
+/*
+ * Retry triggers after a policy refusal (ACAMERA_ERROR_CAMERA_DISABLED): the
+ * camera service calls onCameraAccessPrioritiesChanged when the access
+ * priorities of camera clients change (AOSP: on process-state changes of
+ * monitored uids; stated from knowledge, not verified on this OEM build), and
+ * the availability callbacks fire when a camera is opened or closed. Each
+ * bumps a generation; a refused open retries at once when one moved, and the
+ * 250 ms poll stays as the fallback.
+ */
+std::atomic<uint64_t> g_access_gen{0};
+std::atomic<uint64_t> g_avail_gen{0};
+
+void
+access_changed(void *)
+{
+	g_access_gen++;
+}
+
+void
+avail_on_ext(void *ctx, const char *id)
+{
+	avail_on(ctx, id);
+	g_avail_gen++;
+}
+
+void
+avail_off_ext(void *ctx, const char *id)
+{
+	avail_off(ctx, id);
+	g_avail_gen++;
+}
+
+//! Zero-initialised storage, filled field by field in mgr(): the
+//! physical-camera members are API 30 and are never named (they stay NULL).
+ACameraManager_ExtendedAvailabilityCallbacks g_ext_cb;
+
 ACameraManager *
 mgr()
 {
@@ -1176,7 +1277,14 @@ mgr()
 		g_mgr = ACameraManager_create();
 		// Registered once, long before any open (enumerate scans first), so the
 		// initial status of every camera has arrived by the time it is needed.
-		if (g_mgr != nullptr && ACameraManager_registerAvailabilityCallback(g_mgr, &g_avail_cb) != ACAMERA_OK) {
+		// Extended (API 29): availability + access-priority changes (retry
+		// triggers after a refusal). The plain callbacks if it is refused.
+		g_ext_cb.availabilityCallbacks.context = nullptr;
+		g_ext_cb.availabilityCallbacks.onCameraAvailable = avail_on_ext;
+		g_ext_cb.availabilityCallbacks.onCameraUnavailable = avail_off_ext;
+		g_ext_cb.onCameraAccessPrioritiesChanged = access_changed;
+		if (g_mgr != nullptr && ACameraManager_registerExtendedAvailabilityCallback(g_mgr, &g_ext_cb) != ACAMERA_OK &&
+		    ACameraManager_registerAvailabilityCallback(g_mgr, &g_avail_cb) != ACAMERA_OK) {
 			SCAM_LOG_W("leia stereo camera (android): no camera availability callback; lenses are not checked "
 			           "before an open");
 		}
@@ -2108,6 +2216,18 @@ struct xrt_plugin_stereo_camera
 	std::atomic<uint32_t> phase_pairs_held{0}; //!< pairs held back this session
 	uint32_t phase_results{0};                 //!< stream results seen this session (res_mu)
 	int open_attempts{0};
+	// Start timeline (spec v8 diagnostics): when the stream asked for frames
+	// (ensure_started), the first open attempt, the first refusal, the open
+	// that got through, the first published pair.
+	int64_t stream_start_ns{0};
+	int64_t first_attempt_ns{0};
+	int64_t first_refusal_ns{0};
+	int64_t opened_ok_ns{0};
+	int refusals{0};
+	uint64_t access_gen_seen{0}, avail_gen_seen{0};
+	const char *retry_trigger{"first open"};
+	const char *retry_trigger_used{"first open"}; //!< the trigger of the attempt in progress
+	std::atomic<bool> first_pair_logged{false};
 	// Still watch: medians before a still, and the window after it.
 	std::atomic<bool> still_watch{false};
 	uint64_t still_watch_id{0};
@@ -2439,6 +2559,15 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_l
 	}
 	c->ready = slot;
 	c->pairs++;
+	if (!c->first_pair_logged.exchange(true)) {
+		const int64_t t = clock_ns(CLOCK_MONOTONIC);
+		auto ms = [](int64_t a, int64_t b) { return a != 0 && b != 0 ? (double)(b - a) / 1e6 : -1.0; };
+		SCAM_LOG_W("leia stereo camera (android): first pair published %.0f ms after the stream start (first open "
+		           "attempt at %.0f ms, open through at %.0f ms, %d open attempt(s); lens-phase lock %.0f ms of the "
+		           "last session)",
+		           ms(c->stream_start_ns, t), ms(c->stream_start_ns, c->first_attempt_ns),
+		           ms(c->stream_start_ns, c->opened_ok_ns), c->open_attempts, ms(c->phase_t0, t));
+	}
 	const int64_t now = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(now);
 	if (c->rate_n == 0) {
@@ -3663,13 +3792,23 @@ start_locked(xrt_plugin_stereo_camera *c)
 	const char *left = c->lsub ? c->desc.sub_id : c->desc.main_id;
 	const char *right = c->lsub ? c->desc.main_id : c->desc.sub_id;
 	c->open_attempts++;
-	SCAM_LOG_W("leia stereo camera (android): %s pair open attempt %d (%s), mode %u, %ux%u per lens",
+	const int64_t t_att = clock_ns(CLOCK_MONOTONIC);
+	if (c->first_attempt_ns == 0) {
+		c->first_attempt_ns = t_att;
+	}
+	c->access_gen_seen = g_access_gen.load();
+	c->avail_gen_seen = g_avail_gen.load();
+	SCAM_LOG_W("leia stereo camera (android): %s pair open attempt %d (%s; trigger: %s), %.0f ms after the stream "
+	           "start, mode %u, %ux%u per lens",
 	           c->desc.front ? "front" : "rear", c->open_attempts,
 	           c->phase_restarting                ? "lens-phase restart"
 	           : c->open_attempts == 1            ? "first open"
 	           : c->open_refused                  ? "retry after a policy refusal"
 	                                              : "watchdog re-open",
+	           c->retry_trigger, c->stream_start_ns != 0 ? (double)(t_att - c->stream_start_ns) / 1e6 : 0.0,
 	           c->mode_index, c->cap_w, c->cap_h);
+	c->retry_trigger_used = c->retry_trigger;
+	c->retry_trigger = "poll";
 
 	// Into in-app tracking first, so the tracking service lets go of its lens;
 	// back out if the open does not get through. Not after a refused open while
@@ -3711,8 +3850,19 @@ start_locked(xrt_plugin_stereo_camera *c)
 			// Every refusal (the camera service refuses a process in the
 			// background or with the screen off), so a run that never streams
 			// says why.
-			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) refused by policy (%d), attempt %d%s",
-			           c->desc.logical_id, (int)st, c->open_attempts,
+			// -10012 = ACAMERA_ERROR_CAMERA_DISABLED. AOSP CameraService returns
+			// it for a device-policy camera disable, sensor privacy, or a caller
+			// it does not consider active ("can't open camera from background"):
+			// the process state is logged with it to tell them apart.
+			const int64_t t = clock_ns(CLOCK_MONOTONIC);
+			c->refusals++;
+			if (c->first_refusal_ns == 0) {
+				c->first_refusal_ns = t;
+			}
+			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) refused by policy (%d = CAMERA_DISABLED), "
+			           "attempt %d, refusal %d, %.0f ms after the first refusal; %s%s",
+			           c->desc.logical_id, (int)st, c->open_attempts, c->refusals,
+			           (double)(t - c->first_refusal_ns) / 1e6, process_state_str().c_str(),
 			           c->open_refused ? "" : "; tracking stays with the tracking service until an open gets through");
 		} else {
 			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) failed (%d)", c->desc.logical_id, (int)st);
@@ -3723,9 +3873,15 @@ start_locked(xrt_plugin_stereo_camera *c)
 		handover_locked(c, false);
 		return false;
 	}
+	c->opened_ok_ns = clock_ns(CLOCK_MONOTONIC);
 	if (c->open_refused) {
-		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) let through after refusals", c->desc.logical_id);
+		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) let through after %d refusal(s) over %.0f ms "
+		           "(trigger: %s); %s",
+		           c->desc.logical_id, c->refusals, (double)(c->opened_ok_ns - c->first_refusal_ns) / 1e6,
+		           c->retry_trigger_used, process_state_str().c_str());
 		c->open_refused = false;
+		c->refusals = 0;
+		c->first_refusal_ns = 0;
 	}
 	if (!hand_first) {
 		handover_locked(c, true);
@@ -4184,6 +4340,18 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 		*out_gave_up = true;
 		return false;
 	}
+	// After a policy refusal, an access-priority or availability change is a
+	// reason to try at once (the poll below stays as the fallback).
+	const bool access_moved = g_access_gen.load() != c->access_gen_seen;
+	const bool avail_moved = g_avail_gen.load() != c->avail_gen_seen;
+	if (c->open_refused && (access_moved || avail_moved) && now < c->next_reopen_ns) {
+		c->retry_trigger = access_moved ? "access-priorities callback" : "camera availability change";
+		c->next_reopen_ns = now;
+	} else if (now >= c->next_reopen_ns && c->open_refused) {
+		c->retry_trigger = "poll (250 ms)";
+	} else if (now >= c->next_reopen_ns) {
+		c->retry_trigger = "watchdog back-off";
+	}
 	if (now >= c->next_reopen_ns) {
 		std::lock_guard<std::mutex> lk(c->cam_mu);
 		c->reopens++;
@@ -4291,6 +4459,7 @@ ensure_started(xrt_plugin_stereo_camera *c)
 		return;
 	}
 	c->started = true;
+	c->stream_start_ns = clock_ns(CLOCK_MONOTONIC);
 	bool ok;
 	{
 		std::lock_guard<std::mutex> lk(c->cam_mu);
@@ -4299,8 +4468,10 @@ ensure_started(xrt_plugin_stereo_camera *c)
 	if (!ok) {
 		SCAM_LOG_W("leia stereo camera (android): open failed; the watchdog keeps retrying");
 		c->down_since_ns = clock_ns(CLOCK_MONOTONIC);
-		c->next_reopen_ns = c->down_since_ns + kReopenFirstNs;
-		c->backoff_ns = kReopenFirstNs;
+		// A policy refusal is polled at the refusal cadence from the start (it
+		// was the 500 ms first back-off), and retried at once on a trigger.
+		c->backoff_ns = c->open_refused ? kReopenRefusedNs : kReopenFirstNs;
+		c->next_reopen_ns = c->down_since_ns + c->backoff_ns;
 	}
 	c->stats_ns = clock_ns(CLOCK_MONOTONIC);
 }
