@@ -2090,6 +2090,17 @@ struct xrt_plugin_stereo_camera
 	// and per lens IMAGE stamp - PHYSICAL stamp of the same pair.
 	leia_scam_skew_window phys_dt{};
 	leia_scam_skew_window img_vs_phys[2]{};
+	// Lens phase lock (leia_scam_phase_*; state under res_mu).
+	leia_scam_phase_cfg phase_cfg{};
+	leia_scam_phase_lock phase{};
+	bool phase_enabled{true};
+	bool phase_device_level{false}; //!< restart = re-open the device (else only the capture session)
+	int64_t phase_t0{0};
+	std::atomic<int> phase_shift{0};          //!< right eye taken this many frames after the left
+	std::atomic<bool> phase_hold{false};      //!< hold pairs back (WAITING) while locking a start
+	std::atomic<bool> phase_reopen_due{false};
+	std::atomic<int64_t> period_atomic{0};
+	bool phase_restarting{false}; //!< start_locked runs for a lens-phase restart
 	// Still watch: medians before a still, and the window after it.
 	std::atomic<bool> still_watch{false};
 	uint64_t still_watch_id{0};
@@ -2368,6 +2379,12 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_l
 		return;
 	}
 	grab_still_locked(c, vl, vr, ts_l, ts_r);
+	if (c->phase_hold.load(std::memory_order_relaxed)) {
+		// Locking the lens phase of a start: nothing is published, so the
+		// camera stays WAITING and consumers see one clean start.
+		c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
+		return;
+	}
 	if ((uint32_t)vl.w != c->cap_w || (uint32_t)vl.h != c->cap_h || (uint32_t)vr.w != c->cap_w ||
 	    (uint32_t)vr.h != c->cap_h) {
 		// The tail of a session switch (an image of the previous capture size):
@@ -2484,7 +2501,13 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 			c->frame_period_ns = ts - c->last_img_ts[eye];
 		}
 		c->last_img_ts[eye] = ts;
+		c->period_atomic.store(c->frame_period_ns, std::memory_order_relaxed);
 		const int64_t tol = leia_scam_pair_tolerance_ns(c->pair_tol_cfg_ns, c->frame_period_ns);
+		// Lens phase (leia_scam_phase_*): with a shift of n frames the left
+		// image at t pairs with the right image at t + n P, the frame nearest
+		// in real exposure time. The image stamps are synthesized and periodic.
+		const int shift = c->phase_shift.load(std::memory_order_relaxed);
+		const int64_t target = leia_scam_phase_partner_ts(ts, eye == 0, shift, c->frame_period_ns);
 		int64_t cand[kPendingPerEye + 1];
 		size_t nc = 0;
 		for (const pending_img &q : other) {
@@ -2492,20 +2515,22 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 				cand[nc++] = q.ts;
 			}
 		}
-		const int pick = leia_scam_pair_pick(cand, nc, ts, tol);
+		const int pick = leia_scam_pair_pick(cand, nc, target, tol);
 		if (pick >= 0) {
 			auto it = other.begin() + pick;
 			const int64_t pts = it->ts;
 			AImage *l = eye == 0 ? img : it->img;
 			AImage *r = eye == 0 ? it->img : img;
-			pack_pair_locked(c, l, r, eye == 0 ? ts : pts, eye == 0 ? pts : ts);
+			const int64_t lt = eye == 0 ? ts : pts, rt = eye == 0 ? pts : ts;
+			pack_pair_locked(c, l, r, lt, rt);
 			AImage_delete(img);
-			// Drop the partner and everything older on both sides; an older
-			// image that never paired counts as dropped unpaired on its lens.
-			const int64_t cut = std::max(ts, pts);
+			// Drop the partner and everything older on its own side (each side
+			// against its own image of the pair: with a shift they differ); an
+			// older image that never paired counts as dropped unpaired.
+			const int64_t cut[2] = {lt, rt};
 			for (int side = 0; side < 2; side++) {
 				auto &q = c->pend[side];
-				while (!q.empty() && q.front().ts <= cut) {
+				while (!q.empty() && q.front().ts <= cut[side]) {
 					if (!(side == 1 - eye && q.front().ts == pts)) {
 						c->unpaired[side]++;
 					}
@@ -2515,8 +2540,11 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 			}
 			continue;
 		}
-		if (!other.empty()) {
-			c->rejected++; // the other lens has images, none within the tolerance
+		// Rejected = the partner can no longer come: the other lens already
+		// delivered images past it (with a shift of +1 the left image simply
+		// waits for the next right one, which is not a rejection).
+		if (!other.empty() && other.back().ts > target + tol) {
+			c->rejected++;
 		}
 		mine.push_back({img, ts});
 		while (mine.size() > kPendingPerEye) {
@@ -2832,6 +2860,58 @@ read_hal_result(const ACameraMetadata *m, leia_scam_hal_result *r, int64_t *ts)
  * (exposure, ISO, LENS_STATE, SENSOR_TIMESTAMP). Also counts whether the two
  * lenses' stamps are ever different (leia_scam_eye_times_tracker).
  */
+/*!
+ * Under res_mu, HAL thread: one stream request's result into the lens-phase
+ * lock (leia_scam_phase_*). On a decision: the pairing shift takes effect,
+ * frames are released (or a restart is due), and one WARN says what happened.
+ */
+void
+phase_feed_locked(xrt_plugin_stereo_camera *c, const hal_rec &rec)
+{
+	const leia_scam_phase_action before = c->phase.state;
+	if (before != LEIA_SCAM_PHASE_MEASURING) {
+		return;
+	}
+	const int64_t period = c->period_atomic.load(std::memory_order_relaxed);
+	leia_scam_phase_action after;
+	if (rec.have_left && rec.have_right && rec.left.have_timestamp && rec.right.have_timestamp) {
+		after = leia_scam_phase_feed(&c->phase, rec.right.timestamp - rec.left.timestamp, period);
+	} else {
+		after = leia_scam_phase_pair_without_sample(&c->phase);
+	}
+	if (after == LEIA_SCAM_PHASE_MEASURING) {
+		return;
+	}
+	const leia_scam_phase_lock &l = c->phase;
+	const double ms = (double)(clock_ns(CLOCK_MONOTONIC) - c->phase_t0) / 1e6;
+	switch (after) {
+	case LEIA_SCAM_PHASE_REOPEN:
+		SCAM_LOG_W("leia stereo camera (android): lens phase: R-L gap %.3f ms over %u pairs (re-paired %+d frame -> "
+		           "%.3f ms) exceeds %.2f ms; restart %u of %u (%s) to re-roll it",
+		           (double)l.gap_ns / 1e6, l.n, l.shift, (double)l.residual_ns / 1e6,
+		           (double)l.cfg.threshold_ns / 1e6, l.reopens, l.cfg.max_reopens,
+		           c->phase_device_level ? "device" : "session");
+		c->phase_reopen_due.store(true);
+		break;
+	case LEIA_SCAM_PHASE_UNKNOWN:
+		SCAM_LOG_W("leia stereo camera (android): lens phase: the HAL publishes no per-lens stamps; pairs as "
+		           "delivered, no lock (%.0f ms)",
+		           ms);
+		break;
+	default:
+		SCAM_LOG_W("leia stereo camera (android): lens phase %s: R-L gap %.3f ms, right eye %+d frame -> accepted "
+		           "%.3f ms after %u restart(s) (threshold %.2f ms, best seen %.3f ms, %.0f ms this session)",
+		           after == LEIA_SCAM_PHASE_LOCKED ? "LOCKED" : "ACCEPTED over the threshold",
+		           (double)l.gap_ns / 1e6, l.shift, (double)l.residual_ns / 1e6, l.reopens,
+		           (double)l.cfg.threshold_ns / 1e6, (double)l.best_abs_ns / 1e6, ms);
+		break;
+	}
+	c->phase_shift.store(after == LEIA_SCAM_PHASE_REOPEN ? 0 : l.shift);
+	if (after != LEIA_SCAM_PHASE_REOPEN) {
+		c->phase_hold.store(false);
+	}
+}
+
 void
 capture_completed(xrt_plugin_stereo_camera *c,
                   bool from_still,
@@ -2868,6 +2948,9 @@ capture_completed(xrt_plugin_stereo_camera *c,
 	}
 	rec.ts = ts;
 	std::lock_guard<std::mutex> lk(c->res_mu);
+	if (!from_still) {
+		phase_feed_locked(c, rec);
+	}
 	if (!from_still && rec.have_left && rec.have_right && rec.left.have_timestamp && rec.right.have_timestamp) {
 		leia_scam_eye_times_observe(&c->eye_times, rec.left.timestamp, rec.right.timestamp);
 		leia_scam_skew_push(&c->phys_dt, rec.right.timestamp - rec.left.timestamp);
@@ -2946,8 +3029,13 @@ capture_state_of(xrt_plugin_stereo_camera *c,
                  bool still,
                  leia_scam_capture_state *out)
 {
-	hal_rec r;
-	const bool have = lookup_result(c, ts_boot, &r, still);
+	// Each eye from the result of ITS OWN request: with a lens-phase shift the
+	// right eye's image is of another request than the left's (its image stamp
+	// is that request's); the logical fields (focus) follow the left eye.
+	hal_rec rl, rr;
+	const bool have_l = lookup_result(c, img_ts != nullptr ? img_ts[0] : ts_boot, &rl, still);
+	const bool have_r = img_ts != nullptr && img_ts[1] != img_ts[0] ? lookup_result(c, img_ts[1], &rr, still)
+	                                                                : (rr = rl, have_l);
 	bool indep;
 	{
 		std::lock_guard<std::mutex> lk(c->res_mu);
@@ -2955,17 +3043,18 @@ capture_state_of(xrt_plugin_stereo_camera *c,
 		// Diagnostics: each lens's IMAGE stamp against its own PHYSICAL result
 		// stamp. Equal image stamps beside different physical ones = the HAL
 		// synthesizes the image stamps, and pairing by them cannot see a slip.
-		if (have && img_ts != nullptr && !still) {
-			if (r.have_left && r.left.have_timestamp) {
-				leia_scam_skew_push(&c->img_vs_phys[0], img_ts[0] - r.left.timestamp);
+		if (img_ts != nullptr && !still) {
+			if (have_l && rl.have_left && rl.left.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[0], img_ts[0] - rl.left.timestamp);
 			}
-			if (r.have_right && r.right.have_timestamp) {
-				leia_scam_skew_push(&c->img_vs_phys[1], img_ts[1] - r.right.timestamp);
+			if (have_r && rr.have_right && rr.right.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[1], img_ts[1] - rr.right.timestamp);
 			}
 		}
 	}
-	leia_scam_capture_state_from_hal(have && r.have_left ? &r.left : nullptr, have && r.have_right ? &r.right : nullptr,
-	                                 have && r.have_logical ? &r.logical : nullptr, c->desc.fixed_focus,
+	leia_scam_capture_state_from_hal(have_l && rl.have_left ? &rl.left : nullptr,
+	                                 have_r && rr.have_right ? &rr.right : nullptr,
+	                                 have_l && rl.have_logical ? &rl.logical : nullptr, c->desc.fixed_focus,
 	                                 c->desc.hal_af, holding_focus(c), indep, boot_minus_mono_ns(), out);
 }
 
@@ -3515,6 +3604,39 @@ handover_locked(xrt_plugin_stereo_camera *c, bool on)
 	}
 }
 
+//! How a capture session began, for the lens-phase lock.
+enum class phase_start
+{
+	START,   //!< a start (open, watchdog re-open): lock from scratch, frames held back
+	RESTART, //!< a restart the lock asked for: measure again, keep the restart count, frames held back
+	MODE,    //!< a mode reconfigure: re-pair only (no restart, no hold: the 500 ms switch budget)
+};
+
+//! A capture session just started: (re)arm the lens-phase lock.
+void
+phase_session_started(xrt_plugin_stereo_camera *c, phase_start kind)
+{
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	if (kind == phase_start::START) {
+		leia_scam_phase_init(&c->phase, &c->phase_cfg);
+	} else {
+		leia_scam_phase_restart(&c->phase);
+		c->phase.cfg = c->phase_cfg;
+		if (kind == phase_start::MODE) {
+			c->phase.cfg.reopen = false;
+		}
+	}
+	c->phase_t0 = clock_ns(CLOCK_MONOTONIC);
+	c->phase_shift.store(0);
+	c->phase_reopen_due.store(false);
+	if (!c->phase_enabled) {
+		c->phase.state = LEIA_SCAM_PHASE_LOCKED;
+		c->phase_hold.store(false);
+		return;
+	}
+	c->phase_hold.store(kind != phase_start::MODE);
+}
+
 //! Under cam_mu: open the device and start the repeating request of the running mode.
 bool
 start_locked(xrt_plugin_stereo_camera *c)
@@ -3588,6 +3710,7 @@ start_locked(xrt_plugin_stereo_camera *c)
 		handover_locked(c, false);
 		return false;
 	}
+	phase_session_started(c, c->phase_restarting ? phase_start::RESTART : phase_start::START);
 	c->opened_ns = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(0);
 	SCAM_LOG_W("leia stereo camera (android): %s pair streaming: logical %s, L=%s R=%s, %ux%u YUV per lens -> %ux%u "
@@ -3638,8 +3761,18 @@ report_pairing(xrt_plugin_stereo_camera *c)
 		c->rejected = c->unpaired[0] = c->unpaired[1] = 0;
 	}
 	bool indep;
+	char phase[160];
 	{
 		std::lock_guard<std::mutex> lk(c->res_mu);
+		const leia_scam_phase_lock &l = c->phase;
+		snprintf(phase, sizeof(phase), "lens phase %s, right eye %+d frame, accepted R-L %.3f ms (session gap %.3f ms, "
+		         "%u restart(s))",
+		         l.state == LEIA_SCAM_PHASE_MEASURING  ? "measuring"
+		         : l.state == LEIA_SCAM_PHASE_LOCKED    ? "locked"
+		         : l.state == LEIA_SCAM_PHASE_ACCEPTED  ? "accepted over threshold"
+		         : l.state == LEIA_SCAM_PHASE_UNKNOWN   ? "unknown (no per-lens stamps)"
+		                                                : "restarting",
+		         l.shift, (double)l.residual_ns / 1e6, (double)l.gap_ns / 1e6, l.reopens);
 		phys = skew_str(c->phys_dt);
 		ivp_l = skew_str(c->img_vs_phys[0]);
 		ivp_r = skew_str(c->img_vs_phys[1]);
@@ -3650,10 +3783,10 @@ report_pairing(xrt_plugin_stereo_camera *c)
 	}
 	SCAM_LOG_W("leia stereo camera (android): pairing (10 s): R-L image stamp min/med/max %s; R-L physical result "
 	           "stamp %s; image-physical L %s, R %s; tolerance %.2f ms (period %.3f ms); %llu rejected over "
-	           "tolerance; dropped unpaired L %llu R %llu; per-eye times %s",
+	           "tolerance; dropped unpaired L %llu R %llu; per-eye times %s; %s",
 	           img.c_str(), phys.c_str(), ivp_l.c_str(), ivp_r.c_str(), (double)tol / 1e6, (double)period / 1e6,
 	           (unsigned long long)rej, (unsigned long long)un_l, (unsigned long long)un_r,
-	           indep ? "REPORTED (independent stamps)" : "withheld (stamps not independent)");
+	           indep ? "REPORTED (independent stamps)" : "withheld (stamps not independent)", phase);
 }
 
 //! Before a still: the medians the still is compared against.
@@ -4049,6 +4182,44 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 
 
 /*!
+ * Camera thread: the restart the lens-phase lock asked for. Level (from
+ * debug.dxr.leia.scam_phase_restart): "session" closes and recreates only the
+ * capture session on the open device (the HAL reconfigures and restarts both
+ * sensors' streaming; whether that re-rolls their phase is what the next
+ * device run tests), "device" closes and re-opens the logical camera (the
+ * sensors are powered down and up: a sure re-roll, ~2x the cost). On the
+ * front pair a restart also stops the tracking feed for its duration (one
+ * CNSDK predictor reset each, > 70 ms gap; the hand-over itself is kept), so
+ * it is off there by default.
+ */
+void
+phase_restart(xrt_plugin_stereo_camera *c)
+{
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+	bool ok;
+	{
+		std::lock_guard<std::mutex> lk(c->cam_mu);
+		if (c->phase_device_level) {
+			c->phase_restarting = true;
+			ok = start_locked(c);
+			c->phase_restarting = false;
+		} else {
+			ok = c->dev != nullptr && build_session_locked(c, c->cap_w, c->cap_h, false);
+			if (ok) {
+				phase_session_started(c, phase_start::RESTART);
+			}
+		}
+	}
+	c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
+	if (!ok) {
+		c->device_failed = true; // the watchdog re-opens it (a fresh lock)
+	}
+	SCAM_LOG_W("leia stereo camera (android): lens phase: %s restart %s in %.1f ms", c->phase_device_level ? "device"
+	                                                                                                           : "session",
+	           ok ? "done" : "FAILED", (double)(clock_ns(CLOCK_MONOTONIC) - t0) / 1e6);
+}
+
+/*!
  * Spec v8 §9b: the capture session starts on the first wait_frame or
  * set_mode, not at open (a set_mode right after open then costs nothing).
  * A failed start hands over to the watchdog, exactly as a failed open did.
@@ -4226,6 +4397,29 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	c->still_cb.onLogicalCameraCaptureCompleted = on_still_capture_completed;
 #endif
 	{
+		// Lens phase lock (docs/android-stereo-camera.md, "Lens phase").
+		auto num = [](const char *name, double dflt) {
+			const std::string v = prop_str(name, "");
+			return v.empty() ? dflt : atof(v.c_str());
+		};
+		leia_scam_phase_cfg pc{};
+		pc.samples = (uint32_t)std::max(1.0, std::min(32.0, num("debug.dxr.leia.scam_phase_samples", 12)));
+		pc.threshold_ns = (int64_t)(std::max(0.0, num("debug.dxr.leia.scam_phase_max_ms", 3.0)) * 1e6);
+		pc.max_reopens = (uint32_t)std::max(0.0, std::min(16.0, num("debug.dxr.leia.scam_phase_restarts", 4)));
+		pc.repair = prop_bool("debug.dxr.leia.scam_phase_repair", true);
+		pc.reopen = c->desc.front ? prop_bool("debug.dxr.leia.scam_phase_restart_front", false)
+		                          : prop_bool("debug.dxr.leia.scam_phase_restart_rear", true);
+		// The rear pair's JPEG stills take both eyes from one request: lock on the raw gap.
+		pc.judge_raw_gap = c->desc.still_out >= 0;
+		c->phase_cfg = pc;
+		c->phase_device_level = prop_str("debug.dxr.leia.scam_phase_restart", "session") == "device";
+#ifdef LEIA_SCAM_V8
+		c->phase_enabled = prop_bool("debug.dxr.leia.scam_phase", true);
+#else
+		c->phase_enabled = false; // pre-v8 builds register no per-lens result callbacks
+#endif
+	}
+	{
 		const std::string t = prop_str("debug.dxr.leia.scam_pair_tol_ms", "");
 		const double v = t.empty() ? -1.0 : atof(t.c_str());
 		c->pair_tol_cfg_ns = v > 0.0 && v < 100.0 ? (int64_t)(v * 1e6) : kPairTolDefaultNs;
@@ -4262,6 +4456,9 @@ leia_stereo_camera_android_wait_frame(struct xrt_plugin_stereo_camera *c,
 	ensure_started(c);
 	const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + std::max<int64_t>(timeout_ns, 0);
 	for (;;) {
+		if (c->phase_reopen_due.exchange(false)) {
+			phase_restart(c);
+		}
 		const int64_t now = clock_ns(CLOCK_MONOTONIC);
 		bool gave_up = false;
 		const bool up = supervise(c, now, &gave_up);
@@ -4449,6 +4646,9 @@ leia_stereo_camera_android_set_mode(struct xrt_plugin_stereo_camera *c, uint32_t
 	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
 	set_geom(m.geom, mode_index);
 	if (build_session_locked(c, m.geom.cap_w, m.geom.cap_h, false)) {
+		// A new session re-rolls the lens phase: measure and re-pair again,
+		// without a restart or a hold (the switch must stay within 500 ms).
+		phase_session_started(c, phase_start::MODE);
 		c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC)); // the watchdog counts from the switch
 		SCAM_LOG_W("leia stereo camera (android): %s pair mode %u = %ux%u per eye: session reconfigured to %ux%u "
 		           "YUV per lens in %.1f ms (frames resume after the HAL's first-frame latency)",
@@ -4459,6 +4659,8 @@ leia_stereo_camera_android_set_mode(struct xrt_plugin_stereo_camera *c, uint32_t
 	set_geom(old, old_index);
 	if (!build_session_locked(c, old.cap_w, old.cap_h, false)) {
 		c->device_failed = true; // the watchdog re-opens it in the old mode
+	} else {
+		phase_session_started(c, phase_start::MODE);
 	}
 	c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
 	SCAM_LOG_W("leia stereo camera (android): %s pair mode %u (%ux%u per lens) failed; staying in mode %u",

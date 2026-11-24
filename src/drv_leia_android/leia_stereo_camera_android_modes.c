@@ -694,3 +694,111 @@ leia_scam_skew_summary(const struct leia_scam_skew_window *w, int64_t *out_min, 
 	*out_max = tmp[w->n - 1];
 	return true;
 }
+
+void
+leia_scam_phase_init(struct leia_scam_phase_lock *l, const struct leia_scam_phase_cfg *cfg)
+{
+	memset(l, 0, sizeof(*l));
+	l->cfg = *cfg;
+	if (l->cfg.samples == 0) {
+		l->cfg.samples = 1;
+	}
+	if (l->cfg.samples > LEIA_SCAM_PHASE_MAX_SAMPLES) {
+		l->cfg.samples = LEIA_SCAM_PHASE_MAX_SAMPLES;
+	}
+	l->state = LEIA_SCAM_PHASE_MEASURING;
+}
+
+void
+leia_scam_phase_restart(struct leia_scam_phase_lock *l)
+{
+	l->state = LEIA_SCAM_PHASE_MEASURING;
+	l->n = 0;
+	l->pairs = 0;
+	l->gap_ns = 0;
+	l->shift = 0;
+	l->residual_ns = 0;
+}
+
+static int64_t
+median_i64(int64_t *v, uint32_t n)
+{
+	for (uint32_t i = 1; i < n; i++) { // insertion sort: n <= 32
+		const int64_t x = v[i];
+		uint32_t j = i;
+		while (j > 0 && v[j - 1] > x) {
+			v[j] = v[j - 1];
+			j--;
+		}
+		v[j] = x;
+	}
+	return v[n / 2];
+}
+
+enum leia_scam_phase_action
+leia_scam_phase_feed(struct leia_scam_phase_lock *l, int64_t gap_ns, int64_t period_ns)
+{
+	if (l->state != LEIA_SCAM_PHASE_MEASURING) {
+		return l->state;
+	}
+	l->pairs++;
+	l->g[l->n++] = gap_ns;
+	if (l->n < l->cfg.samples) {
+		return l->state;
+	}
+	int64_t tmp[LEIA_SCAM_PHASE_MAX_SAMPLES];
+	memcpy(tmp, l->g, sizeof(int64_t) * l->n);
+	const int64_t G = median_i64(tmp, l->n);
+	l->gap_ns = G;
+	int shift = 0;
+	if (l->cfg.repair && period_ns > 0) {
+		const double f = -(double)G / (double)period_ns;
+		shift = (int)floor(f + 0.5);
+		shift = shift > 1 ? 1 : (shift < -1 ? -1 : shift);
+	}
+	l->shift = shift;
+	l->residual_ns = G + (int64_t)shift * period_ns;
+	const int64_t judged = l->cfg.judge_raw_gap ? G : l->residual_ns;
+	const int64_t a = judged < 0 ? -judged : judged;
+	if (!l->have_best || a < l->best_abs_ns) {
+		l->have_best = true;
+		l->best_abs_ns = a;
+	}
+	if (a <= l->cfg.threshold_ns) {
+		l->state = LEIA_SCAM_PHASE_LOCKED;
+	} else if (l->cfg.reopen && l->reopens < l->cfg.max_reopens) {
+		l->reopens++;
+		l->state = LEIA_SCAM_PHASE_REOPEN;
+	} else {
+		l->state = LEIA_SCAM_PHASE_ACCEPTED;
+	}
+	return l->state;
+}
+
+enum leia_scam_phase_action
+leia_scam_phase_pair_without_sample(struct leia_scam_phase_lock *l)
+{
+	if (l->state != LEIA_SCAM_PHASE_MEASURING) {
+		return l->state;
+	}
+	l->pairs++;
+	if (l->pairs >= 3 * l->cfg.samples && l->n < l->cfg.samples) {
+		l->state = LEIA_SCAM_PHASE_UNKNOWN;
+		l->shift = 0;
+		l->residual_ns = 0;
+	}
+	return l->state;
+}
+
+bool
+leia_scam_phase_holding(const struct leia_scam_phase_lock *l)
+{
+	return l->state == LEIA_SCAM_PHASE_MEASURING || l->state == LEIA_SCAM_PHASE_REOPEN;
+}
+
+int64_t
+leia_scam_phase_partner_ts(int64_t t, bool left, int shift, int64_t period_ns)
+{
+	const int64_t d = (int64_t)shift * period_ns;
+	return left ? t + d : t - d;
+}

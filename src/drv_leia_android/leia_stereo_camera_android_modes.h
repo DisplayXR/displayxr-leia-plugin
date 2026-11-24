@@ -535,6 +535,100 @@ leia_scam_skew_push(struct leia_scam_skew_window *w, int64_t v);
 bool
 leia_scam_skew_summary(const struct leia_scam_skew_window *w, int64_t *out_min, int64_t *out_median, int64_t *out_max);
 
+/*
+ *
+ * Lens phase lock. The two sensors of a logical pair whose sync type is
+ * APPROXIMATE free-run with a phase fixed for a session and re-rolled at
+ * each start (device runs: R - L physical start of exposure 0, -6.5, -39.1,
+ * -40.6 ms over four opens of the tablet's rear pair). The HAL stamps both
+ * images with one synthesized time, so pairing by image stamp pairs the two
+ * buffers of one REQUEST, whatever their real exposure times.
+ *
+ * Two remedies, in order:
+ *  1. re-pair to the nearest frame: both lenses run at the same period P, so
+ *     with a gap G (R - L, same request) the right frame k + n with
+ *     n = round(-G / P) (clamped to +-1) is nearer in time to left frame k;
+ *     the residual is G + n P, |residual| <= P / 2, no restart;
+ *  2. if the residual still exceeds the threshold, restart the session (or
+ *     the device) to re-roll the phase, a bounded number of times.
+ *
+ */
+
+struct leia_scam_phase_cfg
+{
+	uint32_t samples;      //!< pairs measured per session (the calibration app uses 12)
+	int64_t threshold_ns;  //!< accepted |residual| (default 3 ms)
+	uint32_t max_reopens;  //!< restarts at most (default 4)
+	bool repair;           //!< re-pair to the nearest frame
+	bool reopen;           //!< restarts allowed (rear default; front only on request)
+	//! Judge the RAW gap G, not the re-paired residual: the camera also takes
+	//! stills whose two eyes come from ONE request (the rear pair's JPEG
+	//! outputs), which no re-pairing can shift. Streams still re-pair.
+	bool judge_raw_gap;
+};
+
+enum leia_scam_phase_action
+{
+	LEIA_SCAM_PHASE_MEASURING = 0, //!< still measuring this session: hold frames back
+	LEIA_SCAM_PHASE_LOCKED = 1,    //!< |residual| <= threshold: done
+	LEIA_SCAM_PHASE_REOPEN = 2,    //!< restart to re-roll the phase, then measure again
+	LEIA_SCAM_PHASE_ACCEPTED = 3,  //!< over the threshold but no restart left / allowed: done
+	LEIA_SCAM_PHASE_UNKNOWN = 4,   //!< the HAL publishes no per-lens stamps: done, no shift
+};
+
+#define LEIA_SCAM_PHASE_MAX_SAMPLES 32u
+
+struct leia_scam_phase_lock
+{
+	struct leia_scam_phase_cfg cfg;
+	enum leia_scam_phase_action state;
+	uint32_t reopens;   //!< restarts done (kept across them)
+	uint32_t n;         //!< gap samples this session
+	uint32_t pairs;     //!< pairs seen this session (samples or not)
+	int64_t g[LEIA_SCAM_PHASE_MAX_SAMPLES];
+	int64_t gap_ns;      //!< this session's measured gap G (R - L, same request), median
+	int shift;           //!< frames the right eye is taken later than the left (-1, 0, +1)
+	int64_t residual_ns; //!< R - L real exposure gap of a pair after the shift
+	bool have_best;
+	int64_t best_abs_ns; //!< smallest |residual| seen over the sessions (log only: a restart re-rolls it)
+};
+
+//! A fresh lock (first start): no restarts yet.
+void
+leia_scam_phase_init(struct leia_scam_phase_lock *l, const struct leia_scam_phase_cfg *cfg);
+
+//! A new session of the same open (after a REOPEN, or a mode reconfigure): measure again, keep the restart count.
+void
+leia_scam_phase_restart(struct leia_scam_phase_lock *l);
+
+/*!
+ * One pair's R - L physical start-of-exposure gap @p gap_ns (both from ONE
+ * request's results), at frame period @p period_ns (0 = unknown: no re-pair).
+ * Returns the state after it. A decided lock ignores further samples.
+ */
+enum leia_scam_phase_action
+leia_scam_phase_feed(struct leia_scam_phase_lock *l, int64_t gap_ns, int64_t period_ns);
+
+/*!
+ * One pair published without a usable gap sample (no physical stamps). After
+ * 3 x cfg.samples such pairs with too few samples the lock gives up: UNKNOWN,
+ * no shift (the HAL publishes nothing to lock on).
+ */
+enum leia_scam_phase_action
+leia_scam_phase_pair_without_sample(struct leia_scam_phase_lock *l);
+
+//! True while frames are held back (MEASURING or REOPEN pending).
+bool
+leia_scam_phase_holding(const struct leia_scam_phase_lock *l);
+
+/*!
+ * The image stamp the partner of an image must carry when pairs are shifted
+ * by @p shift frames of @p period_ns: a LEFT image at @p t pairs with the right
+ * image at t + shift P, a RIGHT image at @p t with the left at t - shift P.
+ */
+int64_t
+leia_scam_phase_partner_ts(int64_t t, bool left, int shift, int64_t period_ns);
+
 #ifdef __cplusplus
 }
 #endif

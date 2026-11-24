@@ -545,6 +545,64 @@ therefore always report no per-eye times, even when the offset is constant.
 Image − physical per lens is the decisive number: equal image stamps beside
 a physical skew mean the HAL synthesizes the image stamps.
 
+### Lens phase
+
+**Measured** (dev runtime, rear pair at 1920x1440, the 10 s pairing WARN):
+`R-L image stamp 0.000/0.000/0.000 ms; R-L physical result stamp
+-40.615/-40.615/-40.615 ms; image-physical L -40.615, R 0.000`. Over four
+opens of the tablet's rear pair the R − L gap between the two lenses'
+start of exposure was **0, −6.5, −39.1 and −40.6 ms**: fixed within a
+session, re-rolled at each open, unchanged by a still. The two sensors
+free-run (sync type APPROXIMATE) and the HAL stamps both images with one
+time (here the right lens's), so pairing by image stamp pairs the two
+buffers of one REQUEST, whatever their real exposure times. The calibration
+session measured the same on a phone's front pair (0 ms in about half the
+opens, else up to 40 ms; visible as depth error when the device rotates).
+It is a real exposure-time offset between the eyes.
+
+**Lock** (`leia_scam_phase_*`, after every start):
+
+1. Measure the gap G = R − L of the two lenses' physical `SENSOR_TIMESTAMP`
+   of one request over the first 12 pairs (median).
+2. **Re-pair to the nearest frame**: both lenses run at the same period P, so
+   the right frame `k + n`, `n = round(−G/P)` (±1 at most), is nearer in time
+   to left frame `k`. No per-lens buffer matching is needed: the image stamps
+   are one per request and periodic, so the right image of request `k + n`
+   carries stamp `t + n·P`. The residual is `G + n·P`, at most P/2
+   (−40.6 ms → right eye one frame later → −7.06 ms). Costs `n = +1` one frame
+   of latency. Each eye's capture result (exposure, ISO, per-eye time) then
+   comes from its own request.
+3. If the judged gap still exceeds 3 ms, **restart** to re-roll the phase,
+   at most 4 times, then accept the last session as it is (a restart re-rolls
+   the phase, so an earlier better session cannot be restored; the log gives
+   the best seen). One WARN per restart (gap, re-paired residual, attempt) and
+   a final `lens phase LOCKED | ACCEPTED ...` line.
+4. **Judged on**: the rear pair, whose JPEG stills take both eyes from one
+   request (no re-pairing possible for them), is judged on the raw gap G; a
+   pair without same-request stills (the front) on the re-paired residual.
+
+While a start locks, no pair is published: the camera stays WAITING and
+consumers see one clean start (~12 frames, 400 ms, plus any restart).
+After a mode reconfigure (a new session, so a new phase) the lock re-measures
+and re-pairs but neither restarts nor holds frames, to keep the switch inside
+its 500 ms budget. A HAL with no per-lens stamps: no lock (after 36 pairs).
+
+**Restart level** (`debug.dxr.leia.scam_phase_restart`): `session`
+(default) recreates only the capture session on the open device; the HAL
+reconfigures and restarts both sensors' streaming, which should re-roll the
+phase (the next device run decides). `device` closes and re-opens the
+logical camera (sensors powered down and up: a sure re-roll, ~2× the cost).
+
+**Front pair**: re-pairing only by default. A restart there stops the
+tracking feed for its duration (a session restart ~200–250 ms, a device
+restart more, plus the lens-free wait): each one is a CNSDK predictor reset
+(gap > 70 ms); the in-app hand-over itself is kept, since a restart never
+hands tracking back. `debug.dxr.leia.scam_phase_restart_front=1` enables it.
+
+The accepted gap reaches the runtime as the per-eye capture times (once the
+stamps proved independent); the 10 s WARN ends with the lock's state, shift
+and accepted gap.
+
 ### Stills
 
 | Still | How | Stream | Expected latency |
@@ -610,6 +668,13 @@ On either, the source:
 | `debug.dxr.leia.scam_max_still=WxH` | v8: largest still from the JPEG output (default 4096 wide) |
 | `debug.dxr.leia.scam_still=0` | v8: no JPEG still outputs (stills from stream pairs only) |
 | `debug.dxr.leia.scam_still_template=preview\|zsl` | v8: template of the still request (default preview) |
+| `debug.dxr.leia.scam_phase=0` | no lens-phase lock (pairs as delivered) |
+| `debug.dxr.leia.scam_phase_samples=<n>` | pairs measured per session (default 12) |
+| `debug.dxr.leia.scam_phase_max_ms=<ms>` | accepted lens-phase gap (default 3) |
+| `debug.dxr.leia.scam_phase_restarts=<n>` | restarts at most (default 4) |
+| `debug.dxr.leia.scam_phase_restart=session\|device` | restart level (default session) |
+| `debug.dxr.leia.scam_phase_repair=0` | no nearest-frame re-pairing |
+| `debug.dxr.leia.scam_phase_restart_rear=0` / `_front=1` | restarts on the rear (default on) / front (default off) pair |
 | `debug.dxr.leia.scam_pair_tol_ms=<ms>` | pairing tolerance between the two lenses' image stamps (default 8; always capped at 0.3 frame period) |
 | `debug.dxr.leia.scam_still_quality=<50..100>` | v8: JPEG quality of the still (default 95) |
 | `debug.dxr.leia.scam_hal_af=1` | v8: use the HAL's AF (continuous, tap-to-focus) instead of AF off + one distance |

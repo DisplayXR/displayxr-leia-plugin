@@ -722,9 +722,136 @@ test_pairing(void)
 	CHECK(w.n == LEIA_SCAM_SKEW_WINDOW && leia_scam_skew_summary(&w, &lo, &med, &hi) && lo == 488 && hi == 999);
 }
 
+static void
+feed_n(struct leia_scam_phase_lock *l, int64_t gap, int64_t period, uint32_t n, enum leia_scam_phase_action *last)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		*last = leia_scam_phase_feed(l, gap, period);
+	}
+}
+
+static void
+test_phase_lock(void)
+{
+	const int64_t P = 33558000, ms = 1000000;
+	const struct leia_scam_phase_cfg rear = {12, 3 * ms, 4, true, true, false};
+	const struct leia_scam_phase_cfg front = {12, 3 * ms, 4, true, false, false};
+	struct leia_scam_phase_lock l;
+	enum leia_scam_phase_action a = LEIA_SCAM_PHASE_MEASURING;
+
+	// The device runs' four phases (R - L, ms) on the rear defaults.
+	// 0: locked at once, no shift.
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, 0, P, 11, &a);
+	CHECK(a == LEIA_SCAM_PHASE_MEASURING && leia_scam_phase_holding(&l));
+	feed_n(&l, 0, P, 1, &a);
+	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.shift == 0 && l.residual_ns == 0 && !leia_scam_phase_holding(&l));
+	// -6.5: re-pairing cannot help (n = 0), over 3 ms -> reopen.
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, -6495000, P, 12, &a);
+	CHECK(a == LEIA_SCAM_PHASE_REOPEN && l.shift == 0 && l.reopens == 1 && leia_scam_phase_holding(&l));
+	// -40.6: re-pair one frame later on the right -> -7.06 ms, still over 3 -> reopen.
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, -40615000, P, 12, &a);
+	CHECK(l.shift == 1 && l.residual_ns == -40615000 + P && a == LEIA_SCAM_PHASE_REOPEN);
+	// -31.0: re-paired to +2.56 ms -> locked without a restart.
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, -31000 * 1000, P, 12, &a);
+	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.shift == 1 && l.residual_ns == -31000000 + P);
+	// +31.0: the other way (right eye one frame earlier).
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, 31000000, P, 12, &a);
+	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.shift == -1 && l.residual_ns == 31000000 - P);
+	// A sequence of restarts: -40.6, -6.5, +12, then 1.2 -> locked on the 4th session.
+	leia_scam_phase_init(&l, &rear);
+	const int64_t seq[4] = {-40615000, -6495000, 12000000, 1200000};
+	for (int i = 0; i < 4; i++) {
+		if (i > 0) {
+			leia_scam_phase_restart(&l);
+		}
+		feed_n(&l, seq[i], P, 12, &a);
+	}
+	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.reopens == 3 && l.residual_ns == 1200000);
+	CHECK(l.have_best && l.best_abs_ns == 1200000);
+	// Never under the threshold: 4 restarts, then the 5th session is accepted as is.
+	leia_scam_phase_init(&l, &rear);
+	for (int i = 0; i < 5; i++) {
+		if (i > 0) {
+			leia_scam_phase_restart(&l);
+		}
+		feed_n(&l, -6000000 - i * 1000000, P, 12, &a);
+	}
+	CHECK(a == LEIA_SCAM_PHASE_ACCEPTED && l.reopens == 4 && l.residual_ns == -10000000);
+	CHECK(l.best_abs_ns == 6000000);
+	// The front default: re-pair only, never a restart.
+	leia_scam_phase_init(&l, &front);
+	feed_n(&l, -40615000, P, 12, &a);
+	CHECK(a == LEIA_SCAM_PHASE_ACCEPTED && l.shift == 1 && l.reopens == 0);
+	// Median, not mean: one outlier stamp (stage 0 saw single half-frame jumps).
+	leia_scam_phase_init(&l, &rear);
+	feed_n(&l, 0, P, 11, &a);
+	feed_n(&l, -16000000, P, 1, &a);
+	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.gap_ns == 0);
+	// Re-pairing off: the raw gap decides.
+	{
+		struct leia_scam_phase_cfg c = rear;
+		c.repair = false;
+		leia_scam_phase_init(&l, &c);
+		feed_n(&l, -31000000, P, 12, &a);
+		CHECK(a == LEIA_SCAM_PHASE_REOPEN && l.shift == 0);
+	}
+	// A camera with same-request stills (rear JPEG outputs): judged on the raw
+	// gap. -31 ms re-pairs to +2.56 ms for the stream but a still would be 31 ms
+	// apart: restart; 1.5 ms raw locks.
+	{
+		struct leia_scam_phase_cfg c = rear;
+		c.judge_raw_gap = true;
+		leia_scam_phase_init(&l, &c);
+		feed_n(&l, -31000000, P, 12, &a);
+		CHECK(a == LEIA_SCAM_PHASE_REOPEN && l.shift == 1 && l.residual_ns == -31000000 + P);
+		leia_scam_phase_restart(&l);
+		feed_n(&l, 1500000, P, 12, &a);
+		CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.shift == 0);
+	}
+	// Unknown period: no re-pair.
+	leia_scam_phase_init(&l, &front);
+	feed_n(&l, -31000000, 0, 12, &a);
+	CHECK(l.shift == 0 && a == LEIA_SCAM_PHASE_ACCEPTED);
+	// No per-lens stamps at all: give up after 36 pairs, no shift.
+	leia_scam_phase_init(&l, &rear);
+	for (int i = 0; i < 35; i++) {
+		a = leia_scam_phase_pair_without_sample(&l);
+	}
+	CHECK(a == LEIA_SCAM_PHASE_MEASURING);
+	a = leia_scam_phase_pair_without_sample(&l);
+	CHECK(a == LEIA_SCAM_PHASE_UNKNOWN && !leia_scam_phase_holding(&l) && l.shift == 0);
+	// A decided lock ignores further samples.
+	CHECK(leia_scam_phase_feed(&l, -40000000, P) == LEIA_SCAM_PHASE_UNKNOWN);
+
+	// Nearest-frame pairing with the shift (synthesized, periodic image stamps):
+	// shift +1: left k (stamp t) pairs with right k+1 (stamp t + P), and the
+	// right image at t + P looks for the left at t.
+	const int64_t t = 5000 * ms;
+	CHECK(leia_scam_phase_partner_ts(t, true, 1, P) == t + P);
+	CHECK(leia_scam_phase_partner_ts(t + P, false, 1, P) == t);
+	CHECK(leia_scam_phase_partner_ts(t, true, -1, P) == t - P);
+	CHECK(leia_scam_phase_partner_ts(t, true, 0, P) == t);
+	{
+		// The right queue holds frames k-1, k, k+1: the shift picks k+1, never k.
+		const int64_t right[3] = {t - P, t, t + P};
+		const int64_t tol = leia_scam_pair_tolerance_ns(8 * ms, P);
+		CHECK(leia_scam_pair_pick(right, 3, leia_scam_phase_partner_ts(t, true, 1, P), tol) == 2);
+		CHECK(leia_scam_pair_pick(right, 3, leia_scam_phase_partner_ts(t, true, 0, P), tol) == 1);
+		// Stamps a little jittered (1.3 ms, stage 0's interval std at 1920x1440): still the right one.
+		const int64_t jit[3] = {t - P + 1300000, t - 1300000, t + P - 1300000};
+		CHECK(leia_scam_pair_pick(jit, 3, leia_scam_phase_partner_ts(t, true, 1, P), tol) == 2);
+	}
+}
+
 int
 main(void)
 {
+	test_phase_lock();
 	test_pairing();
 	test_regions();
 	test_rear_modes();
