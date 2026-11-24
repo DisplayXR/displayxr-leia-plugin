@@ -88,6 +88,23 @@ else()
         "Release builds must pin a release tag.")
 endif()
 
+# Behaviour floor, on top of the ABI floor above. The ABI pin says which
+# runtime can LOAD this plug-in; this says which runtime behaves right next
+# to it. From 2.24.0 the plug-in leaves the D3D11 lift slots NULL (2D->3D
+# conversion is the separate conversion provider). A runtime older than
+# v2.70.5 still lists its built-in "dp-lift" adapter ahead of every other
+# converter whenever a Leia display driver is active, so on such a runtime
+# conversion requests go to an adapter that can no longer serve them
+# (runtime#2783 lists it only when the driver offers lift).
+# A hand-written literal on purpose: it is not derivable from the pin, and
+# it only ever moves UP. Applied only when the ABI floor exists, so a build
+# against a branch or SHA runtime keeps shipping without a version gate.
+set(DXR_LEIA_BEHAVIOUR_MIN_RUNTIME "2.70.5")
+if(MIN_RUNTIME_VERSION AND MIN_RUNTIME_VERSION VERSION_LESS DXR_LEIA_BEHAVIOUR_MIN_RUNTIME)
+    message(STATUS "Installer minimum runtime floor raised: ${MIN_RUNTIME_VERSION} -> ${DXR_LEIA_BEHAVIOUR_MIN_RUNTIME} (behaviour floor)")
+    set(MIN_RUNTIME_VERSION "${DXR_LEIA_BEHAVIOUR_MIN_RUNTIME}")
+endif()
+
 # Optional code-signing command, sourced from the SIGN_CMD environment
 # variable at configure time. Empty on any machine without it (clones,
 # GitHub-hosted CI) -> installer + uninstaller build unsigned. On a
@@ -132,30 +149,16 @@ else()
         "the DLL from the sr-sdk-v* release into the SR SDK's bin/ dir.")
 endif()
 
-# The conversion provider DLL (src/conv_leia) ships in the same installer when
-# it was built (it needs the NeurD headers); LEIA_CONV turns on its files, its
-# ConversionProviders row and its maintenance-mutex Restart Manager session.
-set(LEIA_CONV_NSIS_DEFINE "")
-if(TARGET DisplayXR-LeiaConversion)
-    set(LEIA_CONV_NSIS_DEFINE "/DLEIA_CONV=1")
-    message(STATUS "Installer: bundling DisplayXR-LeiaConversion.dll (ConversionProviders/leia-conversion row)")
-endif()
-
 # ADR-054 N4b: provenance-allowlist rows for the runtime-loaded DLLs, generated
 # from the exact bytes in BIN_DIR right before makensis runs.
 set(LEIA_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
 file(TO_NATIVE_PATH "${LEIA_ALLOWLIST_NSH}" LEIA_ALLOWLIST_NSH_NATIVE)
-set(LEIA_ALLOWLIST_SHIP_CONV "")
-if(TARGET DisplayXR-LeiaConversion)
-    set(LEIA_ALLOWLIST_SHIP_CONV "-DSHIP_CONV=1")
-endif()
 
 add_custom_target(installer
     COMMAND "${CMAKE_COMMAND}"
         "-DBIN_DIR=${DXR_BIN_DIR}"
         "-DVERSION=${DXR_LEIA_VERSION}"
         "-DOUT=${LEIA_ALLOWLIST_NSH}"
-        ${LEIA_ALLOWLIST_SHIP_CONV}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
     COMMAND "${NSIS_EXECUTABLE}"
         "/DVERSION=${DXR_LEIA_VERSION}"
@@ -169,7 +172,6 @@ add_custom_target(installer
         "/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
         "/DSIGN_CMD=${SIGN_CMD}"
-        ${LEIA_CONV_NSIS_DEFINE}
         "/DALLOWLIST_NSH=${LEIA_ALLOWLIST_NSH_NATIVE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRLeiaSRInstaller.nsi"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -177,6 +179,3 @@ add_custom_target(installer
     VERBATIM
 )
 add_dependencies(installer DisplayXR-LeiaSR dxr-rm-close)
-if(TARGET DisplayXR-LeiaConversion)
-    add_dependencies(installer DisplayXR-LeiaConversion)
-endif()

@@ -63,28 +63,20 @@ leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_
 #endif
 
 /*
- * 2D->3D lift (runtime feat/lift-ext, XRT_DP_D3D11_HAS_LIFT) — four appended
- * slots backed by NeurD (leia_lift_neurd.cpp, docs/lift-neurd.md). Same
- * coupled-addition pattern: against older runtime headers the slots compile out
- * and struct_size tells the runtime they are absent. The NeurD module also
- * needs the real NeurD headers, fetched at build time from the private
- * media_sdk repo (DXR_LEIA_HAS_NEURD); without them the slots stay NULL and the
- * runtime reports lift unavailable. Even when built, NeurD.dll is loaded only
- * when a lift slot is first called.
+ * No 2D->3D lift here. The runtime's D3D11 lift slots (XRT_DP_D3D11_HAS_LIFT,
+ * frozen as dead ABI under plug-in API 5) and the lift-only factory stay NULL:
+ * struct_size covers them, the runtime's slot helpers read NULL as "absent",
+ * and its legacy `dp-lift` adapter reports ABSENT. Leia's 2D->3D conversion
+ * is the separate conversion provider (leia-conversion), in its own package —
+ * docs/conversion-moved.md. Do not fill these slots again.
  */
-#if defined(XRT_DP_D3D11_HAS_LIFT) && defined(DXR_LEIA_HAS_NEURD)
-#define DXR_LEIA_DP_D3D11_LIFT 1
-#include "leia_lift_depth.h"
-#include "leia_lift_neurd.h"
-#include "leia_lift_viewpoint.h"
-#include "leia_sr_ready.h" // leiasr_geometry_get: nominal viewing distance = lift z reference
+#include "leia_sr_ready.h"
 #include <cstddef> // offsetof
 
 #ifndef XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN
 // runtime ADR-060 R2: from xrt_display_scanout.h once the runtime pin includes
 // it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value.
 #define XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN (1u << 1)
-#endif
 #endif
 
 
@@ -722,12 +714,6 @@ struct leia_display_processor_d3d11_impl
 	//! DXR_WEAVE_GPU_TIMING=1 diagnostic state (P0 "2D under the lens");
 	//! allocated on first use only when the knob is on, else NULL.
 	struct leia_dp_timing *timing;
-
-#ifdef DXR_LEIA_DP_D3D11_LIFT
-	//! NeurD 2D->3D lift handle (owned; created at factory time — cheap, no
-	//! DLL load — destroyed in leia_dp_d3d11_destroy). NULL only on OOM.
-	struct leia_lift_neurd *lift;
-#endif
 };
 
 static inline struct leia_display_processor_d3d11_impl *
@@ -3481,250 +3467,6 @@ leia_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_h
 }
 #endif
 
-#ifdef DXR_LEIA_DP_D3D11_LIFT
-/*
- * 2D->3D lift slots. Thin translation of the runtime's xrt_dp_lift_* contract
- * onto leia_lift_neurd; every size-versioned struct is read only as far as its
- * struct_size covers (ADR-020 append-only rule), so a runtime that grows these
- * structs keeps working against this plug-in and vice versa.
- */
-static_assert(LEIA_LIFT_MODE_DEPTH == XRT_DP_LIFT_MODE_DEPTH && LEIA_LIFT_MODE_SBS == XRT_DP_LIFT_MODE_SBS &&
-                  LEIA_LIFT_MODE_NVIEW == XRT_DP_LIFT_MODE_NVIEW,
-              "lift mode bits must match the runtime's XRT_DP_LIFT_MODE_*");
-static_assert(LEIA_LIFT_STATE_UNAVAILABLE == XRT_DP_LIFT_STATE_UNAVAILABLE &&
-                  LEIA_LIFT_STATE_ACTIVATING == XRT_DP_LIFT_STATE_ACTIVATING &&
-                  LEIA_LIFT_STATE_READY == XRT_DP_LIFT_STATE_READY,
-              "lift states must match the runtime's XRT_DP_LIFT_STATE_*");
-#ifdef XRT_DP_LIFT_HAS_VIEWPOINT_POLICY
-static_assert(LEIA_LIFT_AXIS_X == XRT_DP_LIFT_AXIS_X && LEIA_LIFT_AXIS_XY == XRT_DP_LIFT_AXIS_XY &&
-                  LEIA_LIFT_AXIS_XYZ == XRT_DP_LIFT_AXIS_XYZ,
-              "lift axis modes must match the runtime's XRT_DP_LIFT_AXIS_*");
-#endif
-static_assert(LEIA_LIFT_DEPTH_UNITS_RELATIVE == XRT_DP_LIFT_DEPTH_RELATIVE &&
-                  LEIA_LIFT_DEPTH_UNITS_METRIC == XRT_DP_LIFT_DEPTH_METRIC,
-              "lift depth semantics must match the runtime's XRT_DP_LIFT_DEPTH_*");
-#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
-static_assert(LEIA_LIFT_AUX_DEPTH == XRT_DP_LIFT_AUX_DEPTH, "aux output bit must match XRT_DP_LIFT_AUX_DEPTH");
-static_assert(LEIA_LIFT_DEPTH_ENCODING_LINEAR == XRT_DP_LIFT_DEPTH_ENCODING_LINEAR &&
-                  LEIA_LIFT_DEPTH_ENCODING_INVERSE == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE,
-              "depth encodings must match the runtime's XRT_DP_LIFT_DEPTH_ENCODING_*");
-#endif
-#ifdef XRT_DP_LIFT_HAS_APP_RIG
-static_assert(LEIA_LIFT_VIEWPOINTS_TRACKED == XRT_DP_LIFT_VIEWPOINTS_TRACKED &&
-                  LEIA_LIFT_VIEWPOINTS_EXPLICIT == XRT_DP_LIFT_VIEWPOINTS_EXPLICIT &&
-                  LEIA_LIFT_VIEWPOINTS_DISPLAY_RIG == XRT_DP_LIFT_VIEWPOINTS_DISPLAY_RIG &&
-                  LEIA_LIFT_VIEWPOINTS_CAMERA_RIG == XRT_DP_LIFT_VIEWPOINTS_CAMERA_RIG,
-              "viewpoint sources must match the runtime's XRT_DP_LIFT_VIEWPOINTS_*");
-#endif
-
-#define LEIA_LIFT_COVERS(ptr, type, field)                                                                     \
-	((ptr)->struct_size >= offsetof(type, field) + sizeof(((type *)0)->field))
-
-static bool
-leia_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
-{
-	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	if (out == NULL || out->struct_size < offsetof(struct xrt_dp_lift_caps, state) + sizeof(uint32_t)) {
-		return false;
-	}
-	struct leia_lift_neurd_caps c = {};
-	if (!leia_lift_neurd_get_caps(ldp->lift, &c)) {
-		return false;
-	}
-	struct xrt_dp_lift_caps full = {};
-	full.struct_size = out->struct_size;
-	full.modes = c.modes;
-	full.max_streams = c.max_streams;
-	full.max_views = c.max_views;
-	full.depth_semantics = c.depth_semantics;
-	full.state = c.state;
-	full.typical_latency_ns = c.typical_latency_ns;
-#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
-	// Appended (ADR-048 Addendum A): copied out only as far as struct_size
-	// covers.
-	full.aux_outputs = c.aux_outputs;
-	full.aux_depth_semantics = c.aux_depth_semantics;
-#endif
-	static_assert(sizeof(full.backend) <= sizeof(c.backend), "backend name buffers");
-	memcpy(full.backend, c.backend, sizeof(full.backend));
-	full.backend[sizeof(full.backend) - 1] = '\0';
-#ifdef XRT_DP_LIFT_HAS_MODULE_INFO
-	// Which NeurD, and why it is (not) usable: diagnostics for the dashboard.
-	full.module_status = c.module_status;
-	static_assert(sizeof(full.module_version) == sizeof(c.module_version), "module version buffers");
-	static_assert(sizeof(full.module_detail) == sizeof(c.module_detail), "module detail buffers");
-	memcpy(full.module_version, c.module_version, sizeof(full.module_version));
-	full.module_version[sizeof(full.module_version) - 1] = '\0';
-	memcpy(full.module_detail, c.module_detail, sizeof(full.module_detail));
-	full.module_detail[sizeof(full.module_detail) - 1] = '\0';
-#endif
-	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
-	return true;
-}
-
-static bool
-leia_dp_d3d11_lift_stream_create(struct xrt_display_processor_d3d11 *xdp,
-                                 const struct xrt_dp_lift_stream_info *info,
-                                 uint64_t *out_id)
-{
-	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-	if (info == NULL || out_id == NULL || !LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, mode)) {
-		return false;
-	}
-	struct leia_lift_neurd_stream_desc d = {};
-	d.mode = info->mode;
-	d.content_hint = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, content_hint) ? info->content_hint : 0;
-	d.input_scale = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, input_scale) ? info->input_scale : 0.0f;
-#ifdef XRT_DP_LIFT_HAS_AUX_DEPTH
-	d.aux_outputs = LEIA_LIFT_COVERS(info, struct xrt_dp_lift_stream_info, aux_outputs) ? info->aux_outputs : 0u;
-#endif
-	return leia_lift_neurd_stream_create(ldp->lift, &d, out_id);
-}
-
-static void
-leia_dp_d3d11_lift_stream_destroy(struct xrt_display_processor_d3d11 *xdp, uint64_t id)
-{
-	leia_lift_neurd_stream_destroy(leia_dp_d3d11(xdp)->lift, id);
-}
-
-static bool
-leia_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
-                           uint64_t id,
-                           void *d3d11_context,
-                           void *input_resource,
-                           uint32_t w,
-                           uint32_t h,
-                           const struct xrt_dp_lift_params *p,
-                           const float *viewpoints_xyz,
-                           uint32_t viewpoint_floats,
-                           void **out_resource,
-                           uint32_t *out_w,
-                           uint32_t *out_h,
-                           uint32_t *out_format)
-{
-	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
-
-	struct leia_lift_neurd_params lp = {-1.0f, 1.0f, 0, 2};
-	if (p != NULL) {
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, convergence)) {
-			lp.convergence = p->convergence;
-		}
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, strength)) {
-			lp.strength = p->strength;
-		}
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, inpaint)) {
-			lp.inpaint = p->inpaint;
-		}
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, view_count)) {
-			lp.view_count = p->view_count;
-		}
-#ifdef XRT_DP_LIFT_HAS_VIEWPOINT_POLICY
-		// Viewpoint policy (runtime ADR-048): the runtime already rebased,
-		// scaled, masked, clamped and eased the viewpoints; we translate units.
-		// viewpoint_frame is the LAST appended field, so covering it means the
-		// runtime filled the whole block. A shorter struct = legacy behaviour.
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, viewpoint_frame)) {
-			lp.has_policy = true;
-			lp.rect_width_m = p->rect_width_m;
-			lp.rect_height_m = p->rect_height_m;
-			lp.baseline_m = p->baseline_m;
-			lp.axis_mode = p->axis_mode;
-			lp.max_offset_m = p->max_offset_m;
-			lp.viewpoint_frame = p->viewpoint_frame;
-			// z reference: the runtime pins z to its nominal viewing distance,
-			// which it takes from this plug-in's own display info — the same
-			// cached panel geometry read here (0 / unknown -> the shared 0.5 m).
-			struct leiasr_geometry geom = {};
-			if (leiasr_geometry_get(&geom) && geom.nominal_z_m > 0.0f) {
-				lp.ref_z_m = geom.nominal_z_m;
-			}
-		}
-#endif
-#ifdef XRT_DP_LIFT_HAS_APP_RIG
-		// App rig (ADR-048 Addendum A): where the viewpoints came from
-		// + the runtime's reference distance. nominal_z_m is the LAST
-		// appended field.
-		if (LEIA_LIFT_COVERS(p, struct xrt_dp_lift_params, nominal_z_m)) {
-			lp.has_app_rig = true;
-			lp.viewpoint_source = p->viewpoint_source;
-			lp.nominal_z_m = p->nominal_z_m;
-		}
-#endif
-	}
-
-	// Tracked eyes (metres, display space) — the same source the runtime's
-	// get_predicted_eye_positions slot reads; the wrapper is exception-safe.
-	// Only consulted when the runtime did not pass explicit viewpoints.
-	float left[3] = {0, 0, 0}, right[3] = {0, 0, 0};
-	bool eyes_valid = false;
-	if ((viewpoints_xyz == NULL || viewpoint_floats == 0) && ldp->leiasr != NULL &&
-	    leiasr_d3d11_get_predicted_eye_positions(ldp->leiasr, left, right)) {
-		const float dx = right[0] - left[0], dy = right[1] - left[1], dz = right[2] - left[2];
-		eyes_valid = (dx * dx + dy * dy + dz * dz) > 1e-6f; // same tracking-loss test as the eye slot
-	}
-
-	return leia_lift_neurd_convert(ldp->lift, id, d3d11_context, input_resource, w, h, &lp,
-	                               (viewpoint_floats > 0) ? viewpoints_xyz : NULL, viewpoint_floats, left, right,
-	                               eyes_valid, out_resource, out_w, out_h, out_format);
-}
-
-#if defined(XRT_DP_D3D11_HAS_LIFT_DEPTH) && defined(XRT_DP_LIFT_HAS_AUX_DEPTH)
-/*
- * Slot 33 lift_get_depth (ADR-048 Addendum A): the depth of the conversion
- * lift_convert just returned, bridged during that convert (same inference,
- * NeurD >= 0.4.9). Non-blocking.
- */
-static bool
-leia_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
-                             uint64_t id,
-                             void *d3d11_context,
-                             struct xrt_dp_lift_depth *out)
-{
-	(void)d3d11_context; // the depth was staged on the caller's device during
-	                     // lift_convert
-	if (out == NULL || !LEIA_LIFT_COVERS(out, struct xrt_dp_lift_depth, height)) {
-		return false;
-	}
-	struct leia_lift_neurd_depth d = {};
-	if (!leia_lift_neurd_get_depth(leia_dp_d3d11(xdp)->lift, id, &d)) {
-		return false;
-	}
-	struct xrt_dp_lift_depth full = {};
-	full.struct_size = out->struct_size;
-	full.format = d.format;
-	full.resource = d.resource;
-	full.width = d.width;
-	full.height = d.height;
-	full.units = d.units;
-	full.encoding = d.encoding;
-	full.value_scale = d.value_scale;
-	full.value_offset = d.value_offset;
-	full.source_width = d.source_width;
-	full.source_height = d.source_height;
-	full.focal_x_px = d.focal_x_px;
-	full.focal_y_px = d.focal_y_px;
-	full.principal_x_px = d.principal_x_px;
-	full.principal_y_px = d.principal_y_px;
-	full.near_depth = d.near_depth;
-	full.far_depth = d.far_depth;
-	full.convergence_depth = d.convergence_depth;
-	full.same_inference = d.same_inference;
-	full.vendor_frame_id = d.vendor_frame_id;
-#ifdef XRT_DP_LIFT_HAS_DEPTH_RELIEF
-	// ADR-046 Amendment 1: the runtime's depth cursor places on this.
-	full.relief_valid = d.relief_valid;
-	full.relief_scale = d.relief_scale;
-	full.relief_offset = d.relief_offset;
-#endif
-	memcpy(out, &full, out->struct_size < sizeof(full) ? out->struct_size : sizeof(full));
-	return true;
-}
-#define LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp) ((ldp)->base.lift_get_depth = leia_dp_d3d11_lift_get_depth)
-#else
-#define LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp) ((void)0)
-#endif
-#endif // DXR_LEIA_DP_D3D11_LIFT
-
 static void
 leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
@@ -3742,12 +3484,6 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (ldp->blit_cb != NULL) {
 		ldp->blit_cb->Release();
 	}
-
-#ifdef DXR_LEIA_DP_D3D11_LIFT
-	// Before the weaver: lift streams hold bridge resources on the service
-	// device; the NeurD instance itself stays up for the process (see module).
-	leia_lift_neurd_destroy(&ldp->lift);
-#endif
 
 	compose_release_resources(ldp);
 	ck_release_resources(ldp);
@@ -3908,21 +3644,6 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 #endif
 #ifdef DXR_LEIA_DP_D3D11_BACKEND_STATE
 	ldp->base.get_backend_state = leia_dp_d3d11_get_backend_state; // #158 SR restart self-heal (slot 21)
-#endif
-#ifdef DXR_LEIA_DP_D3D11_LIFT
-	ldp->base.lift_get_caps = leia_dp_d3d11_lift_get_caps; // 2D->3D lift (NeurD)
-	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
-	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
-	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
-	LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp);   // slot 33, when the runtime headers carry it
-	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
-	U_LOG_W("Leia D3D11 DP: lift slots WIRED (NeurD, loaded on first use)");
-#else
-#if !defined(XRT_DP_D3D11_HAS_LIFT)
-	U_LOG_W("Leia D3D11 DP: lift slots NOT COMPILED (runtime headers predate XRT_DP_D3D11_HAS_LIFT)");
-#else
-	U_LOG_W("Leia D3D11 DP: lift slots NOT COMPILED (NeurD headers were not fetched at build time)");
-#endif
 #endif
 }
 
@@ -4210,59 +3931,6 @@ leia_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_
 	leiasr_d3d11_set_present_origin(ldp->leiasr, panel_x, panel_y);
 }
 #endif
-
-
-#ifdef DXR_LEIA_DP_D3D11_LIFT
-/*
- *
- * Lift-only factory — xrt_plugin_iface::create_dp_d3d11_lift (ADR-042).
- *
- * The runtime creates exactly one of these per process on a dedicated device
- * and drives ONLY the lift_* slots on it, from its lift thread, always with
- * explicit viewpoints. So: no SR weaver (a second weaver on the shared SR
- * context perturbs the lens), no window, no tracker, no lens control, no blit
- * shaders — just the NeurD lift handle. Every non-lift slot stays NULL, which
- * the runtime's slot helpers read as "absent". NeurD itself is still loaded
- * lazily, on the first lift call.
- *
- */
-
-extern "C" xrt_result_t
-leia_dp_factory_d3d11_lift(void *d3d11_device,
-                           void *d3d11_context,
-                           void *window_handle,
-                           struct xrt_display_processor_d3d11 **out_xdp)
-{
-	(void)d3d11_context;
-	(void)window_handle; // always NULL for the lift DP
-	if (out_xdp == NULL) {
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-	struct leia_display_processor_d3d11_impl *ldp =
-	    (struct leia_display_processor_d3d11_impl *)calloc(1, sizeof(*ldp));
-	if (ldp == NULL) {
-		return XRT_ERROR_ALLOCATION;
-	}
-	ldp->base.struct_size = static_cast<uint32_t>(sizeof(struct xrt_display_processor_d3d11));
-	ldp->base.destroy = leia_dp_d3d11_destroy; // NULL-safe for every member left unset here
-	ldp->base.lift_get_caps = leia_dp_d3d11_lift_get_caps;
-	ldp->base.lift_stream_create = leia_dp_d3d11_lift_stream_create;
-	ldp->base.lift_stream_destroy = leia_dp_d3d11_lift_stream_destroy;
-	ldp->base.lift_convert = leia_dp_d3d11_lift_convert;
-	LEIA_DP_D3D11_WIRE_LIFT_DEPTH(ldp); // slot 33, when the runtime headers carry it
-	// lift_convert_blob (GAUSSIANS) stays NULL: NeurD has no splat path.
-	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
-	ldp->lift = leia_lift_neurd_create(); // reads DXR_LEIA_LIFT* once; loads nothing
-	ldp->view_count = 2;
-	ldp->async_zone_publish = true;
-	// leiasr stays NULL: lift_convert then uses only the runtime's explicit
-	// viewpoints (or NeurD's default pattern) — never a tracker.
-
-	*out_xdp = &ldp->base;
-	U_LOG_W("Created Leia D3D11 LIFT-ONLY display processor (no weaver, no window; NeurD loaded on first use)");
-	return XRT_SUCCESS;
-}
-#endif // DXR_LEIA_DP_D3D11_LIFT
 
 
 /*

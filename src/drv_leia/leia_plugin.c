@@ -1076,18 +1076,13 @@ static struct xrt_plugin_iface g_leia_iface = {
 #endif
 
     /*
-     * ADR-042 lift-only D3D11 DP: no weaver / window / tracker, only the NeurD
-     * lift slots (docs/lift-neurd.md). Needs the runtime header's field AND the
-     * NeurD headers (DXR_LEIA_HAS_NEURD); otherwise the field is absent or NULL
-     * and the runtime has no lift from this plug-in. The iface header carrying
-     * this field implies its DP header carries XRT_DP_D3D11_HAS_LIFT.
+     * ADR-042 lift-only D3D11 factory: deliberately NULL. This plug-in carries
+     * no 2D->3D conversion; Leia's is the separate conversion provider
+     * (docs/conversion-moved.md). NULL here plus NULL lift slots on the D3D11
+     * DP is what makes the runtime's legacy `dp-lift` adapter report ABSENT.
      */
 #if defined(XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY)
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(DXR_LEIA_HAS_NEURD)
-    .create_dp_d3d11_lift = leia_dp_factory_d3d11_lift,
-#else
     .create_dp_d3d11_lift = NULL,
-#endif
 #endif
 
 #ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
