@@ -98,6 +98,11 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_stereo_camera_android.h
     leia_stereo_camera_android_calib.c
     leia_stereo_camera_android_calib.h
+    # Spec v8 (modes, controls, stills): mode list, metering mapping, control
+    # caps / request plan, capture results. Pure C, host-tested
+    # (tests/test_stereo_camera_android_modes.c, Linux CI).
+    leia_stereo_camera_android_modes.c
+    leia_stereo_camera_android_modes.h
     # The calibration app's user rotation (schema-1 record): parse, SHA-256 of
     # the factory block, checks. Pure C, host-tested
     # (tests/test_stereo_camera_android_user_calib.c, Linux CI).
@@ -157,6 +162,8 @@ target_link_libraries(dxrp050_leia_cnsdk
         vulkan
         camera2ndk
         mediandk
+        # dlopen of libjnigraphics.so (AImageDecoder, API 30+) for the JPEG stills.
+        dl
 )
 
 # Debug-log + ATrace gating: when XRT_DEBUG_ANDROID_VERBOSE is defined,

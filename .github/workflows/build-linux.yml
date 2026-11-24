@@ -218,6 +218,10 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_stereo_camera_android_calib
 
+      - name: Unit test — Android stereo camera spec v8 (modes, controls, stills)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/src/drv_leia_linux/test_stereo_camera_android_modes
+
       - name: Unit test — Android stereo camera user calibration (calibration app record)
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/src/drv_leia_linux/test_stereo_camera_android_user_calib

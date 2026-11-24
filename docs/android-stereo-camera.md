@@ -358,6 +358,168 @@ in the same directory (Y8, 640×480, sensor-native: the engine rotates it).
 Y stride, non-zero rotation) are not on this path. Nothing here changes when
 the pin moves to CNSDK ≥ 0.10.88.
 
+## Capture modes, controls and stills (runtime `XR_DXR_stereo_camera` v8)
+
+The eight v8 slots (runtime PR #2803, spec §5.5–§5.7 and §9b) are compiled
+only against runtime headers that define `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES`,
+`_CONTROLS` and `_STILL`. Built against older headers (the pinned Android tag),
+the source behaves as before: one mode, no controls, the template's focus.
+The pure-C half (mode list, metering mapping, control plan, capture result)
+is `leia_stereo_camera_android_modes.{h,c}`, host-tested by
+`tests/test_stereo_camera_android_modes.c`.
+
+The numbers below come from the stage 0 measurements on an NP02J rear pair
+(DisplayXR Camera, `docs/STAGE0.md`): 29.80 fps in every mode that keeps up
+(never 30.0), YUV at full rate up to 3264x2448 per lens, 4000x3000 and
+4208x3120 YUV at ~27.4 fps with ~220 ms latency.
+
+### Modes
+
+Every mode has the default eye's **horizontal** field of view about the same
+optical axis, with square pixels; only the vertical extent differs. That is
+what lets the runtime derive each mode's calibration from the default's
+(§5.5: `s = w / w_default`, `f' = f s`, `cx' = (cx + ½) s − ½`,
+`cy' = (cy + ½ − h_default/2) s + h/2 − ½`). For a listed size the HAL serves
+the centred region of its aspect; the eye keeps exactly the default's columns
+of it (a whole, even number, centred at an even offset) and either every row
+or the default's 16:9 cut. 16:9 capture sizes see the whole array width
+(4208 columns on the rear pair) while the 4:3 default sees 4160, so they never
+become modes of their own.
+
+| Pair | Mode | Capture per lens | Flags | Switching to it |
+|---|---|---|---|---|
+| both | **1280x720** (default) | 1280x960 YUV | stream, still | — |
+| both | 1280x960 | 1280x960 YUV | stream, still | new crop of the running capture: no frame lost |
+| rear | 1920x1080 | 1920x1440 YUV | stream | session reconfigure |
+| rear | 1920x1440 | 1920x1440 YUV | stream | session reconfigure (free between 1920x1080 and 1920x1440) |
+| rear | 4096x3072 | JPEG output, 4096x3072 | still | none: the JPEG outputs are in every rear session |
+
+- **One further stream capture only**: the largest listed YUV size within the
+  stream cap (default 1920x1440, `debug.dxr.leia.scam_max_stream`) whose
+  listed minimum frame duration is at most 1/30 s. The runtime serves any size
+  in between by downscaling, so more captures would only add reconfigures.
+- **Reconfigure** (rear, `set_mode` to the other capture): the device stays
+  open, the new session replaces the old one (stage 0: 86–124 ms to
+  configure, ~85 ms to the first frame at 1920x1440), the sequence keeps
+  counting. One WARN per switch gives the time. A failed switch rebuilds the
+  previous capture and returns BUSY; if that also fails the watchdog re-opens.
+- **Lazy session**: `open` no longer starts the capture; the first `wait_frame`
+  or `set_mode` does, so a `set_mode` right after open opens straight into the
+  wanted mode.
+- `maxFrameRate` is the **measured** rate of the mode's capture (the default
+  capture's or the further capture's, once it has run), else 0. The HAL lists
+  33.33 ms for every size, including the ones that deliver 27.4 fps, so its
+  table is never reported.
+- A turned pair (phone held upright) lists the default only: its published
+  horizontal is the sensor's vertical.
+
+**The calibration is pixel-centre aware** (changed with v8, also for older
+runtimes): the array → stream step is `c' = (c − offset + ½)·s − ½` (pixel
+centres at integer coordinates, as the block's OpenCV numbers and the
+runtime's rule use) instead of `c' = c·s`. The two differ by `(s − 1)/2`
+pixels, about −0.35 px for 1280 of a 4208-column array; with the old rule the
+runtime's derivation would put a 4096x3072 still's principal point ~1.1 px off.
+The host test checks, for every listed mode on the tablets' numbers, that the
+runtime's rule applied to the default calibration equals the calibration
+computed for the mode directly from the factory block. The tracker's 640x480
+intrinsics keep the old rule (unchanged).
+
+### Front pair (shared with head tracking)
+
+The front pair lists only the default and 1280x960: both are cuts of the same
+1280x960 capture, so a mode switch changes nothing for the camera session and
+nothing for the **tracking feed** (the 640x480 frame is cut from every
+tracking-lens image of that capture, before pairing, whatever the mode). No
+larger stream mode (a reconfigure stops the feed for well over CNSDK's 70 ms
+predictor window) and no JPEG output (an extra output on the tracking lens
+changes its session; not measured). A still on the front pair is the next
+stream pair, at 1280x720 or 1280x960: no session change, no tracking gap.
+
+### Controls
+
+`get_control_caps` advertises what the source can apply:
+
+- **Focus.** On a pair whose lens focuses, the source runs the AF state
+  machine **OFF** and drives both lenses with one logical
+  `LENS_FOCUS_DISTANCE`. Stage 0: one logical distance moves both lenses
+  (they agree within ~0.03 D, settled ~260 ms after the request), while
+  continuous AF and an AF trigger move lens 0 only, and the HAL lists no
+  per-lens request keys. So only **MANUAL** and **LOCKED** are advertised;
+  the app focuses from the stereo pair itself. With no focus control set
+  (`valid_controls == 0`, or the focus bits clear) the source's default is a
+  fixed **0.5 D (2 m)**: the lens's ~0.31 D floor is about its hyperfocal
+  distance (~3.2 m), so at 2 m the depth of field spans ~1.2–5.3 m, the range
+  people and tabletop scenes are shot at, at the cost of sharpness at
+  infinity (0.31 D would cover ~1.6 m–∞). LOCKED, and MANUAL without a
+  distance, keep the distance in force. There is no HAL signal that tells
+  whether its AF drives both lenses of a logical pair, so this is the default
+  for every pair; `debug.dxr.leia.scam_hal_af=1` opts a device back into the
+  HAL's AF (CONTINUOUS_AUTO, AUTO_ONCE with one `AF_TRIGGER_START` per
+  `focus_trigger` change, LOCKED = AUTO without a trigger).
+- **Metering point**: one `AE_REGIONS` rectangle (and `AF_REGIONS` with HAL
+  AF), 5 % of the logical array's shorter side, centred on the point. The
+  point arrives normalised in the raw left eye of the delivered frame; it is
+  mapped through the turn (if any) and the centred crop into the capture, then
+  through the HAL's array → stream step into the lens's active array, and
+  proportionally into the logical camera's array (regions are relative to it).
+  No mirror: the published frames are sensor images. Mapped once when the
+  controls arrive, so a later crop change keeps pointing at the same spot.
+- **Exposure compensation**: the HAL's range and step (rounded, clamped).
+- **Front pair**: fixed-focus lenses, and metering / compensation would move
+  the exposure the tracker sees, so it advertises **no controls** unless
+  `debug.dxr.leia.scam_front_controls=1` (metering + compensation).
+
+A cleared bit puts back the request template's own value (or removes the
+tag). The state is applied to the repeating request at once and to every
+session built later (mode switch, watchdog re-open; with HAL AF and
+AUTO_ONCE a re-open searches again).
+
+**Capture result** (`get_capture_result`, only what the HAL reported), from
+`ACaptureSessionLogicalCamera` callbacks:
+
+| Field | Source |
+|---|---|
+| focus distance | the logical result (it commands both lenses). With APPROXIMATE calibration it may be the commanded value, not a sensed one |
+| focus state | AF off: the two lenses' `LENS_STATE`, MOVING on either = SEARCHING, both STATIONARY = LOCKED. HAL AF: the logical `AF_STATE`. Fixed focus: FIXED |
+| exposure, ISO | the left eye lens's physical result, else the logical one |
+| per-eye exposure start | the two physical `SENSOR_TIMESTAMP`s, **only once they have proved independent** |
+
+Per-eye times: stage 0 found this HAL stamps both lenses with one synthesized
+time on 99.7 % of frames, although lens 2's buffers arrive 12–16 ms after
+lens 0's. Equal stamps are therefore not evidence of sync. The source sets
+the per-eye bit only after 60 frames with both stamps of which at least one in
+ten differed (`leia_scam_eye_times_tracker`); on the NP02J that never
+happens, so the bit stays clear and `captureTime` is the only time.
+
+### Stills
+
+| Still | How | Stream | Expected latency |
+|---|---|---|---|
+| 1280x720 / 1280x960 (both pairs) | the next stream pair, packed at the still's crop | no frame lost | ~1 frame |
+| 4096x3072 (rear) | one request on the running session targeting the stream outputs **and** one JPEG output per lens (`TEMPLATE_ZERO_SHUTTER_LAG`; `debug.dxr.leia.scam_still_template=preview` for `TEMPLATE_PREVIEW`), then each JPEG decoded (`AImageDecoder`) and converted to NV12 | no frame lost | ~320 ms to both JPEGs (stage 0) + decode/convert, ~0.6–0.8 s to READY (estimate, not measured) |
+
+- **Never a reconfigure** for a still (stage 0: 1.35 s without frames) and
+  never `TEMPLATE_STILL_CAPTURE` on the live stream (a ~400 ms freeze).
+- **Why JPEG.** The HAL takes exactly one YUV output per lens (a second one
+  aborts it), and the runtime wants a RAW pair in GRAY8 / NV12 / BGRA8. With
+  YUV stream outputs the still output per lens has to be JPEG, decoded here.
+  Moving the stream outputs to PRIVATE (the AHardwareBuffer transport step)
+  would allow a YUV still output instead; not this change.
+- **Decode.** `AImageDecoder` is API 30; the plug-in targets API 29, so it is
+  looked up in `libjnigraphics.so` at run time (an API 29 system: the JPEG
+  still fails, the stream-pair stills work). The JPEGs are requested with
+  `JPEG_ORIENTATION` 0 (pixels as captured, no EXIF turn) and quality 95
+  (`debug.dxr.leia.scam_still_quality`); RGBA → NV12 is full-range BT.601,
+  like the camera's own YUV. The JPEG round trip is lossy (quality 95).
+- **Memory.** The 4096x3072 NV12 pair is 37.7 MB, freed at `release_still`.
+  While a still is decoded: the two JPEGs (~5–10 MB each), one RGBA eye
+  (50 MB, the eyes are decoded one after the other) and the NV12 pair. The
+  rear session also carries two JPEG readers of 2 images each.
+- `debug.dxr.leia.scam_still=0` drops the JPEG outputs (stream-pair stills only).
+- A still of the default capture asked while the rear stream runs its
+  1920x1440 capture is refused (BUSY): it is a cut of a capture that is not
+  running.
+
 ## Watchdog
 
 The pair counts as stalled when no frame pair has arrived for 1.5 s. A stall
@@ -387,3 +549,12 @@ On either, the source:
 | `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |
 | `debug.dxr.leia.scam_calib_ref=auto\|array\|WxH` | the size the factory block's intrinsics are expressed at (auto: see *Reference size*) |
 | `debug.dxr.leia.scam_served_calib=0` | ignore the served display config record (provider / factory only) |
+| `debug.dxr.leia.scam_modes=0` | v8: list the default mode only |
+| `debug.dxr.leia.scam_max_stream=WxH` | v8: largest mode on a further stream capture (rear; default 1920x1440). The front pair never reconfigures |
+| `debug.dxr.leia.scam_max_still=WxH` | v8: largest still from the JPEG output (default 4096 wide) |
+| `debug.dxr.leia.scam_still=0` | v8: no JPEG still outputs (stills from stream pairs only) |
+| `debug.dxr.leia.scam_still_template=zsl\|preview` | v8: template of the still request (default zsl) |
+| `debug.dxr.leia.scam_still_quality=<50..100>` | v8: JPEG quality of the still (default 95) |
+| `debug.dxr.leia.scam_hal_af=1` | v8: use the HAL's AF (continuous, tap-to-focus) instead of AF off + one distance |
+| `debug.dxr.leia.scam_default_focus_d=<D>` | v8: the fixed focus distance with no focus control set (default 0.5 D) |
+| `debug.dxr.leia.scam_front_controls=1` | v8: metering point + exposure compensation on the front (tracking) pair |

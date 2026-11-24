@@ -414,6 +414,26 @@ static struct xrt_plugin_iface g_leia_android_iface = {
     .stereo_camera_release_frame = leia_stereo_camera_android_release_frame,
     .stereo_camera_close = leia_stereo_camera_android_close,
 #endif
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES
+    /*
+     * Stereo camera spec v8 (runtime #2803): capture modes (the default's
+     * horizontal field of view only), controls + per-frame capture state,
+     * stills. Each group only against runtime headers that announce it; an
+     * older runtime's struct_size stops before them and keeps the v7 camera.
+     */
+    .stereo_camera_enumerate_modes = leia_stereo_camera_android_enumerate_modes,
+    .stereo_camera_set_mode = leia_stereo_camera_android_set_mode,
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS
+    .stereo_camera_get_control_caps = leia_stereo_camera_android_get_control_caps,
+    .stereo_camera_set_controls = leia_stereo_camera_android_set_controls,
+    .stereo_camera_get_capture_result = leia_stereo_camera_android_get_capture_result,
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
+    .stereo_camera_request_still = leia_stereo_camera_android_request_still,
+    .stereo_camera_poll_still = leia_stereo_camera_android_poll_still,
+    .stereo_camera_release_still = leia_stereo_camera_android_release_still,
+#endif
 };
 
 
