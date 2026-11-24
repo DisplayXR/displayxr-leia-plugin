@@ -33,7 +33,9 @@
 #include "os/os_time.h"
 
 #include "leia_interface.h"
+#include "leia_multi_viewer.h"
 #include "leia_platform_state.h"
+#include "leia_sr_version.h"
 #include "leia_sr_api_select.h"
 #include "leia_display_claims_win.h"
 #include "leia_display_processor.h"
@@ -64,6 +66,16 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> /* InterlockedExchange (the MULTI_VIEWER value) */
+#endif
+
 #ifndef XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
 /* runtime ADR-060 R2: claim-mask capability hint, from xrt_plugin.h once the
  * runtime pin includes it (XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT). Same value. */
@@ -79,6 +91,208 @@
 
 //! One WARN with the first probe's duration (acceptance: probe() <= ~100 ms).
 static bool g_leia_probe_timing_logged = false;
+
+//! `xrt_plugin_iface::id`, and the `id` this plug-in's settings are read under.
+#define LEIA_PLUGIN_ID "leia-sr"
+
+
+/*
+ *
+ * Settings (ADR-054 decision 7: read ONLY through host->get_setting).
+ *
+ */
+
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+//! The host's setting reader, copied at negotiate (process-lifetime pointer in
+//! the runtime). NULL on a runtime that predates the slot: every setting then
+//! keeps its compiled default.
+static xrt_component_get_setting_fn_t g_leia_get_setting = NULL;
+#endif
+
+/*!
+ * The effective MULTI_VIEWER value (enum leia_multi_viewer) the weave paths
+ * apply, published by leia_plugin_resolve_multi_viewer() at each device
+ * creation. A LONG for the Interlocked functions; SYSTEM until then.
+ */
+static volatile LONG g_leia_multi_viewer_active = (LONG)LEIA_MULTI_VIEWER_SYSTEM;
+
+enum leia_multi_viewer
+leia_multi_viewer_active(void)
+{
+	return (enum leia_multi_viewer)InterlockedCompareExchange(&g_leia_multi_viewer_active, 0, 0);
+}
+
+/*!
+ * Read MULTI_VIEWER once (#446: multi-viewer weaving is a setting, not a third
+ * rendering mode, under the runtime's two-mode contract), decide whether this
+ * build and the installed SR runtime can honour it, and publish the effective
+ * value for the weavers. Called at device creation, after the SR client DLLs
+ * are bound (the capability query reaches SR). Start-up only by contract: a
+ * change takes effect at the next device creation (the next app start, or the
+ * next service start for IPC apps).
+ */
+static void
+leia_plugin_resolve_multi_viewer(void)
+{
+	char buf[64];
+	buf[0] = '\0';
+	bool set = false;
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+	if (g_leia_get_setting != NULL) {
+		set = g_leia_get_setting(LEIA_PLUGIN_ID, LEIA_MULTI_VIEWER_KEY, buf, (uint32_t)sizeof(buf));
+		buf[sizeof(buf) - 1] = '\0';
+	}
+#endif
+
+	enum leia_multi_viewer setting = LEIA_MULTI_VIEWER_SYSTEM;
+	if (set && !leia_multi_viewer_parse(buf, &setting) && buf[0] != '\0') {
+		U_LOG_W("leia_plugin: MULTI_VIEWER='%s' is not one of system|on|off -- using system", buf);
+	}
+
+	enum leia_multi_viewer effective = LEIA_MULTI_VIEWER_SYSTEM;
+	if (setting != LEIA_MULTI_VIEWER_SYSTEM) {
+		/* Asked only when it matters: the query may spin up the SR probe
+		 * instance. False when this build's SR SDK predates the feature
+		 * (compiled out), or the SR runtime does not report it. */
+		const bool supported = leia_win_sr_multi_viewer_weave_supported();
+		effective = leia_multi_viewer_effective(setting, supported);
+		if (effective != setting) {
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+			const char *why = "the installed LeiaSR runtime does not report multi-viewer weaving";
+#else
+			const char *why = "this plug-in was built against an SR SDK without multi-viewer weaving";
+#endif
+			U_LOG_W("leia_plugin: MULTI_VIEWER=%s ignored -- %s; following the LeiaSR system setting",
+			        leia_multi_viewer_name(setting), why);
+		}
+	}
+
+	U_LOG_W("leia_plugin: multi-viewer weave: %s (MULTI_VIEWER %s%s)", leia_multi_viewer_name(effective),
+	        leia_multi_viewer_name(setting), set ? "" : ", default");
+	InterlockedExchange(&g_leia_multi_viewer_active, (LONG)effective);
+}
+
+/*
+ * Setting status (displayxr-runtime #2773): tells `displayxr-cli dp options`
+ * and the DisplayXR Dashboard whether "Several viewers" (MULTI_VIEWER) can
+ * take effect on this machine. It cannot when the installed LeiaSR runtime
+ * has no multi-viewer weaving (plain LeiaSR 1.39 rc1), or when this plug-in
+ * was built against an SR SDK without it. The Dashboard then shows "Not
+ * supported here" with the note below, instead of a choice that silently
+ * does nothing.
+ *
+ * Mirrored like the platform remedy, so the plug-in reports it WITHOUT
+ * re-pinning DXR_RUNTIME_GIT_TAG (a re-pin raises the installer's derived
+ * MIN_RUNTIME_VERSION floor). The status struct's layout and the iface
+ * slot's offset are the runtime's, checked at compile time against headers
+ * that carry them (XRT_PLUGIN_IFACE_HAS_SETTING_STATUS).
+ */
+#define LEIA_SETTING_STATE_APPLIES 1u
+#define LEIA_SETTING_STATE_NOT_SUPPORTED 2u
+
+struct leia_setting_status
+{
+	uint32_t struct_size;
+	uint32_t state;
+	char effective_value[64];
+	char note[160];
+	uint64_t reserved[4];
+};
+
+#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
+/* Compile-time checks (portable to MSVC C): a negative array size fails the build. */
+typedef char leia_setting_status_mirror_size[(sizeof(struct leia_setting_status) ==
+                                              sizeof(struct xrt_component_setting_status))
+                                                 ? 1
+                                                 : -1];
+typedef char leia_setting_status_mirror_note[(offsetof(struct leia_setting_status, note) ==
+                                              offsetof(struct xrt_component_setting_status, note))
+                                                 ? 1
+                                                 : -1];
+typedef char leia_setting_state_mirror[(LEIA_SETTING_STATE_NOT_SUPPORTED ==
+                                            XRT_COMPONENT_SETTING_STATE_NOT_SUPPORTED &&
+                                        LEIA_SETTING_STATE_APPLIES == XRT_COMPONENT_SETTING_STATE_APPLIES)
+                                           ? 1
+                                           : -1];
+#endif
+
+static void
+leia_status_copy(char *dst, size_t cap, const char *src)
+{
+	size_t len = strlen(src);
+	if (len >= cap) {
+		len = cap - 1;
+	}
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+#define LEIA_STATUS_HAS(st, field)                                                                                     \
+	((size_t)(st)->struct_size >= offsetof(struct leia_setting_status, field) + sizeof((st)->field))
+
+static bool
+leia_plugin_get_setting_status_impl(const char *key, struct leia_setting_status *out)
+{
+	if (key == NULL || out == NULL || strcmp(key, LEIA_MULTI_VIEWER_KEY) != 0 || !LEIA_STATUS_HAS(out, state)) {
+		return false;
+	}
+	/* Answer only when SR is installed and its service is up: otherwise the
+	 * platform state (and its hint) already says what is wrong, and a
+	 * capability query would only fail. */
+	const enum leia_platform_state st = leia_platform_state_refresh(2000);
+	if (st != LEIA_PLATFORM_READY && st != LEIA_PLATFORM_NO_DISPLAY) {
+		return false;
+	}
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+	if (leia_win_sr_multi_viewer_weave_supported()) {
+		out->state = LEIA_SETTING_STATE_APPLIES;
+		return true;
+	}
+	const char *note = "This LeiaSR runtime shows 3D to one viewer at a time. "
+	                   "Install a LeiaSR build with multi-viewer weaving to use this option.";
+#else
+	const char *note = "This Leia plug-in was built without multi-viewer support. "
+	                   "Update the DisplayXR Leia plug-in to use this option.";
+#endif
+	out->state = LEIA_SETTING_STATE_NOT_SUPPORTED;
+	if (LEIA_STATUS_HAS(out, effective_value)) {
+		leia_status_copy(out->effective_value, sizeof(out->effective_value), LEIA_MULTI_VIEWER_DEFAULT);
+	}
+	if (LEIA_STATUS_HAS(out, note)) {
+		leia_status_copy(out->note, sizeof(out->note), note);
+	}
+	return true;
+}
+
+#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
+static bool
+leia_plugin_get_setting_status(const char *key, struct xrt_component_setting_status *out)
+{
+	return leia_plugin_get_setting_status_impl(key, (struct leia_setting_status *)out);
+}
+#else
+static bool
+leia_plugin_get_setting_status(const char *key, struct leia_setting_status *out)
+{
+	return leia_plugin_get_setting_status_impl(key, out);
+}
+#endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS
+//! What `displayxr-cli dp options leia-sr` lists (key, type, default, help).
+static const struct xrt_component_setting_desc g_leia_settings[] = {
+    {LEIA_MULTI_VIEWER_KEY, XRT_COMPONENT_SETTING_TYPE_ENUM, LEIA_MULTI_VIEWER_DEFAULT, LEIA_MULTI_VIEWER_HELP},
+};
+
+static uint32_t
+leia_plugin_describe_settings(const struct xrt_component_setting_desc **out_descs)
+{
+	if (out_descs != NULL) {
+		*out_descs = g_leia_settings;
+	}
+	return (uint32_t)(sizeof(g_leia_settings) / sizeof(g_leia_settings[0]));
+}
+#endif
 
 static xrt_result_t
 leia_plugin_probe(struct xrt_plugin_instance **out_inst)
@@ -127,6 +341,8 @@ leia_plugin_create_device(struct xrt_plugin_instance *inst, struct xrt_device **
 	if (xdev == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	/* Before any display processor (and so any weaver) exists for it. */
+	leia_plugin_resolve_multi_viewer();
 	*out_dev = xdev;
 	return XRT_SUCCESS;
 }
@@ -575,6 +791,111 @@ leia_plugin_probe_displays(struct xrt_plugin_instance *inst,
 
 #ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
 /*
+ * ADR-045 remedy fields (displayxr-runtime#2765, ADR-045 amendment
+ * 2026-11-22), mirrored here so the plug-in fills them WITHOUT re-pinning
+ * DXR_RUNTIME_GIT_TAG: a re-pin would raise the installer's derived
+ * MIN_RUNTIME_VERSION floor for an advisory notice. The layout is the
+ * runtime's: four char arrays appended directly after `reserved[8]`. Each is
+ * written only when the runtime's struct_size covers it, so an older runtime
+ * (smaller struct_size) gets exactly what it got before. The flag bit is
+ * likewise the runtime's value; an older runtime ignores unknown flag bits.
+ * With headers that carry the fields, the static asserts below pin the mirror
+ * to them.
+ */
+#define LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED (1u << 1)
+
+struct leia_platform_status_remedy
+{
+	/* The ADR-045 prefix, field for field as every runtime header has it. */
+	uint32_t struct_size;
+	uint32_t state;
+	uint32_t flags;
+	uint32_t reserved_0;
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+	uint64_t reserved[8];
+	/* The remedy fields appended after it. */
+	char installed_version[32];
+	char required_version[32];
+	char action_label[64];
+	char action_url[256];
+};
+
+#ifdef XRT_PLUGIN_HAS_PLATFORM_REMEDY
+/* Compile-time checks (portable to MSVC C): a negative array size fails the build. */
+typedef char leia_remedy_hint_mirror[(offsetof(struct leia_platform_status_remedy, reserved) ==
+                                      offsetof(struct xrt_plugin_platform_status, reserved))
+                                         ? 1
+                                         : -1];
+typedef char leia_remedy_flag_mirror[(LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED == XRT_PLUGIN_PLATFORM_FLAG_UPDATE_RECOMMENDED) ? 1 : -1];
+typedef char leia_remedy_installed_mirror[(offsetof(struct leia_platform_status_remedy, installed_version) ==
+                                           offsetof(struct xrt_plugin_platform_status, installed_version))
+                                              ? 1
+                                              : -1];
+typedef char leia_remedy_url_mirror[(offsetof(struct leia_platform_status_remedy, action_url) ==
+                                     offsetof(struct xrt_plugin_platform_status, action_url))
+                                        ? 1
+                                        : -1];
+typedef char leia_remedy_size_mirror[(sizeof(struct leia_platform_status_remedy) ==
+                                      sizeof(struct xrt_plugin_platform_status))
+                                         ? 1
+                                         : -1];
+#endif
+
+#define LEIA_REMEDY_HAS(st, field)                                                                                     \
+	((size_t)(st)->struct_size >=                                                                                  \
+	 offsetof(struct leia_platform_status_remedy, field) + sizeof(((struct leia_platform_status_remedy *)0)->field))
+
+static void
+copy_field(char *dst, size_t cap, const char *src)
+{
+	size_t len = strlen(src);
+	if (len >= cap) {
+		len = cap - 1;
+	}
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+/*
+ * "Update recommended" when the installed LeiaSR runtime is older than
+ * LEIA_SR_RECOMMENDED_VERSION AND a Leia panel is attached (EDID match).
+ * Advisory only: the plug-in keeps weaving on every runtime from 1.34.8 on,
+ * and the runtime never gates on the flag.
+ */
+static void
+leia_plugin_fill_remedy(struct xrt_plugin_platform_status *out_status, enum leia_platform_state st)
+{
+	if (st == LEIA_PLATFORM_ABSENT) {
+		return; // nothing installed: the hint already says "Install the LeiaSR Runtime"
+	}
+	struct leia_display_probe_result edid;
+	memset(&edid, 0, sizeof(edid));
+	if (!leia_edid_get_cached_result(&edid) || !edid.hw_found) {
+		return; // no Leia panel: nothing to recommend on this machine
+	}
+	char installed[64];
+	if (!leia_sr_installed_version(installed, sizeof(installed)) || !leia_sr_update_recommended(installed)) {
+		return;
+	}
+	out_status->flags |= LEIA_REMEDY_FLAG_UPDATE_RECOMMENDED;
+	struct leia_platform_status_remedy *r = (struct leia_platform_status_remedy *)out_status;
+	if (LEIA_REMEDY_HAS(out_status, installed_version)) {
+		copy_field(r->installed_version, sizeof(r->installed_version), installed);
+	}
+	if (LEIA_REMEDY_HAS(out_status, required_version)) {
+		copy_field(r->required_version, sizeof(r->required_version), LEIA_SR_RECOMMENDED_VERSION);
+	}
+	if (LEIA_REMEDY_HAS(out_status, action_label)) {
+		copy_field(r->action_label, sizeof(r->action_label), LEIA_SR_UPDATE_LABEL);
+	}
+	if (LEIA_REMEDY_HAS(out_status, action_url)) {
+		copy_field(r->action_url, sizeof(r->action_url), LEIA_SR_UPDATE_URL);
+	}
+}
+#endif
+
+#ifdef XRT_PLUGIN_HAS_PLATFORM_STATE
+/*
  * ADR-045 platform state (runtime slot). Callable before probe(), from any
  * thread, at any time: presence checks only. The EDID enumeration re-runs at
  * most every 2 s (or on a monitor-topology change); the registry key and the
@@ -598,6 +919,7 @@ leia_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
 		memcpy(out_status->hint, hint, len);
 		out_status->hint[len] = '\0';
 	}
+	leia_plugin_fill_remedy(out_status, st);
 	return true;
 }
 #endif
@@ -680,7 +1002,7 @@ static struct xrt_plugin_iface g_leia_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
     .reserved_0 = 0,
 
-    .id = "leia-sr",
+    .id = LEIA_PLUGIN_ID,
     .display_name = "DisplayXR Leia SR",
     .vendor = "Leia Inc.",
     .version = DXR_PLUGIN_GIT_DESC,
@@ -834,7 +1156,41 @@ static struct xrt_plugin_iface g_leia_iface = {
     .create_dp_gl_for_screen = NULL,
 #endif
 #endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS
+    /* ADR-054 decision 7: the settings read through host->get_setting (MULTI_VIEWER, #446). */
+    .describe_settings = leia_plugin_describe_settings,
+#endif
+#ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
+    .get_setting_status = leia_plugin_get_setting_status,
+#endif
 };
+
+#if defined(XRT_PLUGIN_HAS_PLATFORM_STATE) && !defined(XRT_PLUGIN_IFACE_HAS_SETTING_STATUS)
+/*
+ * Older runtime headers (the DXR_RUNTIME_GIT_TAG pin) end the iface before
+ * the setting-status slot, so the plug-in hands the runtime an extended copy.
+ * The runtime's layout puts get_license_state and activate right after the
+ * pinned header's last slot (both left NULL: no licence here), then
+ * get_setting_status. struct_size tells a runtime that knows the slot that it
+ * is filled; an older runtime reads only what its own struct_size covers.
+ * Checked for the v2.66.8 pin (x64: iface 280 bytes, slot at 296). Re-check
+ * when DXR_RUNTIME_GIT_TAG moves to a tag that still lacks the slot.
+ */
+struct leia_plugin_iface_ext
+{
+	struct xrt_plugin_iface base;
+	void *get_license_state; /* NULL: no licence */
+	void *activate;          /* NULL */
+	bool (*get_setting_status)(const char *key, struct leia_setting_status *out);
+};
+typedef char leia_iface_ext_pin_check[(sizeof(void *) == 8 && sizeof(struct xrt_plugin_iface) == 280 &&
+                                       offsetof(struct leia_plugin_iface_ext, get_setting_status) == 296)
+                                          ? 1
+                                          : -1];
+static struct leia_plugin_iface_ext g_leia_iface_ext;
+#endif
+
 
 
 /*
@@ -872,6 +1228,23 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 	(void)host;
 #endif
 
+#ifdef XRT_PLUGIN_HOST_HAS_GET_SETTING
+	/* ADR-054 decision 7: settings come through the host (MULTI_VIEWER, #446).
+	 * Carved from reserved[]: cover-check struct_size; a runtime predating
+	 * the slot leaves it NULL and every setting keeps its default. */
+	if (host != NULL &&
+	    host->struct_size >= offsetof(struct xrt_plugin_host_iface, get_setting) + sizeof(host->get_setting)) {
+		g_leia_get_setting = host->get_setting;
+	}
+#endif
+
+#if defined(XRT_PLUGIN_HAS_PLATFORM_STATE) && !defined(XRT_PLUGIN_IFACE_HAS_SETTING_STATUS)
+	g_leia_iface_ext.base = g_leia_iface;
+	g_leia_iface_ext.base.struct_size = (uint32_t)sizeof(g_leia_iface_ext);
+	g_leia_iface_ext.get_setting_status = leia_plugin_get_setting_status;
+	*out_iface = &g_leia_iface_ext.base;
+#else
 	*out_iface = &g_leia_iface;
+#endif
 	return XRT_SUCCESS;
 }

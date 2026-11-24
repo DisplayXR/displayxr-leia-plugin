@@ -37,6 +37,50 @@ is shaped as a *request* (returning `XR_SUCCESS` on acceptance, not on physical 
 On Android, `leia_core_set_backlight` is direct: enabling the backlight engages the lightfield
 optics, disabling it returns the panel to conventional 2D.
 
+## Two rendering modes; multi-viewer weaving is a setting (Windows)
+
+The device declares exactly two rendering modes on every platform: **mode 0 = 2D** (one view,
+1×1, lens off) and **mode 1 = LeiaSR** (two views, 2×1). That is the runtime's two-mode
+contract (displayxr-runtime#2766: a display driver exposes 2D and 3D at run time; any other
+choice is a per-driver setting).
+
+On Windows, multi-viewer weaving (#446) used to be a third mode, "LeiaSR multi-viewer": the
+same atlas as mode 1, with the SR v2 weaver told `srWeaverSetMultiViewerMode(ON)`. It is now the
+`MULTI_VIEWER` setting of the `leia-sr` display processor:
+
+```bat
+displayxr-cli dp options leia-sr               REM lists MULTI_VIEWER, its value and where it came from
+displayxr-cli dp set leia-sr MULTI_VIEWER on   REM per user; --machine for every user (admin)
+displayxr-cli dp unset leia-sr MULTI_VIEWER    REM back to the default
+```
+
+| Value | Weaver override | Was |
+|---|---|---|
+| `system` (default) | none: the weaver follows the LeiaSR system setting (SDK default `FOLLOW_CONFIG`) | mode 1 |
+| `on` | `SR_MULTI_VIEWER_MODE_ON` | mode 2 |
+| `off` | `SR_MULTI_VIEWER_MODE_OFF` | (new) |
+
+- **How it is read.** Only through the runtime's `host->get_setting("leia-sr", "MULTI_VIEWER")`
+  (ADR-054 decision 7), so the runtime's precedence applies: `DXR_DP_LEIA_SR_MULTI_VIEWER` in the
+  **hosting** process's environment, then the per-user store, then the machine store. Words are
+  case-insensitive; anything else logs one WARN and means `system`.
+- **When.** Once per Leia device creation (`leia_plugin_resolve_multi_viewer`, `leia_plugin.c`),
+  so a change takes effect at the next app start, or, for IPC apps, the next start of
+  `displayxr-service` (it hosts the device, and reads its own environment, not the client's).
+  There is no live re-read.
+- **Where it applies.** Every SR v2 weaver (D3D11, D3D12, GL, Vulkan) gets the override on its
+  first weave, right before the weave (`leia_sr_v2_apply_multiviewer`); a recreated weaver gets it
+  again. `system` costs no SR call. The override is a weaver option, independent of the 2D/3D
+  mode; in 2D the lens is off, so it has no visible effect there. Weavers pinned to a simulated
+  viewer (untracked secondary screens) are left alone, as before.
+- **When it cannot apply.** If the plug-in was built against an SR SDK without
+  `srWeaverSetMultiViewerMode`, or the installed LeiaSR runtime does not report
+  `multiViewerWeave`, a non-default value is ignored with one WARN at device creation. The D3D12
+  and GL weavers refuse `on` (`SR_ERROR_FEATURE_NOT_SUPPORTED`) and weave the primary viewer, with
+  one WARN per weaver, as mode 2 did.
+- **Log lines.** `leia_plugin: multi-viewer weave: <effective> (MULTI_VIEWER <value>[, default])`
+  at device creation, and `Leia <backend>: multi-viewer weave ON|OFF` when a weaver takes it.
+
 ## Hardware vs processing (runtime ADR-028, runtime#542)
 
 `request_display_mode` is **hardware-only**: it drives the lens hint / backlight and nothing

@@ -31,6 +31,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "leia_multi_viewer.h" // enum leia_multi_viewer (#446, plain C)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -414,11 +416,13 @@ leia_sr_v2_log_target_accepted(const char *arm,
 /* ------------------------------------------------------------------ *
  * Multi-viewer weaving (#446) -- ONE body for every backend.
  *
- * The rendering mode is the switch: mode 2 ("LeiaSR multi-viewer") sets the
- * weaver's override to SR_MULTI_VIEWER_MODE_ON, mode 1 ("LeiaSR") sets it back
- * to SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG (explicitly -- a weaver coming back from
- * mode 2 must not keep ON), mode 0 (2D) leaves it alone. The override is
- * sticky per weaver, so it is applied on CHANGE only.
+ * The MULTI_VIEWER setting is the switch (leia_multi_viewer.h; it was
+ * rendering mode 2 until the runtime's two-mode contract): `on` sets the
+ * weaver's override to SR_MULTI_VIEWER_MODE_ON, `off` to
+ * SR_MULTI_VIEWER_MODE_OFF, `system` leaves the SDK default
+ * (SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG) and costs no call. The value is
+ * resolved once per device creation; the override is sticky per weaver, so it
+ * is applied on a weaver's first weave (and on CHANGE only after that).
  *
  * The SR runtime decides what a backend can do: the D3D11 and Vulkan weavers
  * weave several viewers; D3D12 and GL refuse ON (SR_ERROR_FEATURE_NOT_SUPPORTED)
@@ -430,31 +434,34 @@ leia_sr_v2_log_target_accepted(const char *arm,
 /*!
  * Per-weaver multi-viewer bookkeeping. Zero-initialise it next to the weaver
  * handle; it re-arms itself when it sees a different handle (a recreated
- * weaver starts from the SDK default, FOLLOW_CONFIG, and gets the current
- * mode on its first weave).
+ * weaver starts from the SDK default, FOLLOW_CONFIG, and gets the setting on
+ * its first weave).
  */
 struct leia_sr_v2_mv_state
 {
 	SrWeaver weaver;   //!< the weaver the fields below describe; NULL = none yet
 	int32_t applied;   //!< SrMultiViewerMode in effect on `weaver`
-	int32_t failed;    //!< mode whose set failed for another reason; not retried until the mode changes
+	int32_t failed;    //!< mode whose set failed for another reason; not retried until the value changes
 	bool on_refused;   //!< ON refused (backend weaves one viewer): never asked again on this weaver
 	bool unsupported;  //!< SR runtime predates the function: never called again on this weaver
 };
 
 /*!
- * Apply the rendering mode's multi-viewer override to @p w if it changed.
- * Call right before the weave, on the weave thread, with the mode read from
- * leia_hmd_active_mode_get(). Never throws; never logs per frame (one WARN per
- * actual change, one per refusal).
+ * Apply the MULTI_VIEWER override to @p w if it is not in effect yet. Call
+ * right before the weave, on the weave thread, with leia_multi_viewer_active().
+ * Never throws; never logs per frame (one WARN per actual change, one per
+ * refusal).
  *
- * @param w          The v2 weaver about to weave; NULL = no-op.
- * @param mode_index The Leia head device's active rendering mode.
- * @param st         This weaver's state.
- * @param backend    "D3D11" / "D3D12" / "GL" / "Vulkan", for the log.
+ * @param w        The v2 weaver about to weave; NULL = no-op.
+ * @param setting  The effective MULTI_VIEWER value.
+ * @param st       This weaver's state.
+ * @param backend  "D3D11" / "D3D12" / "GL" / "Vulkan", for the log.
  */
 void
-leia_sr_v2_apply_multiviewer(SrWeaver w, uint32_t mode_index, struct leia_sr_v2_mv_state *st, const char *backend);
+leia_sr_v2_apply_multiviewer(SrWeaver w,
+                             enum leia_multi_viewer setting,
+                             struct leia_sr_v2_mv_state *st,
+                             const char *backend);
 #endif // DXR_LEIA_HAS_SR_MULTI_VIEWER
 
 #ifdef __cplusplus

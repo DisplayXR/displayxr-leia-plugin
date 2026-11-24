@@ -8,7 +8,7 @@
 
 #include "leia_sr_v2_common.h"
 #include "leia_display_claims_win.h" // #480: SR display / monitor enumeration (plain C)
-#include "leia_interface.h"    // LEIA_MODE_* (#446)
+#include "leia_multi_viewer.h" // MULTI_VIEWER setting values (#446)
 #include "leia_sr_multi_win.h" // multi-screen M6 caps (plain C)
 #include "leia_sr_presence.h"  // per-display user presence values (plain C)
 
@@ -363,14 +363,17 @@ mv_mode_str(int32_t m)
 }
 
 void
-leia_sr_v2_apply_multiviewer(SrWeaver w, uint32_t mode_index, struct leia_sr_v2_mv_state *st, const char *backend)
+leia_sr_v2_apply_multiviewer(SrWeaver w,
+                             enum leia_multi_viewer setting,
+                             struct leia_sr_v2_mv_state *st,
+                             const char *backend)
 {
 	if (w == nullptr || st == nullptr) {
 		return;
 	}
 	if (st->weaver != w) {
 		// A weaver we have not touched (first weave, or a recreated weaver):
-		// it starts at the SDK default, so a mode-1 session costs no call.
+		// it starts at the SDK default, so MULTI_VIEWER=system costs no call.
 		st->weaver = w;
 		st->applied = SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG;
 		st->failed = -1;
@@ -382,12 +385,11 @@ leia_sr_v2_apply_multiviewer(SrWeaver w, uint32_t mode_index, struct leia_sr_v2_
 	}
 
 	SrMultiViewerMode want;
-	if (mode_index == LEIA_MODE_3D_MULTI_VIEWER) {
-		want = SR_MULTI_VIEWER_MODE_ON;
-	} else if (mode_index == LEIA_MODE_3D) {
-		want = SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG;
-	} else {
-		return; // 2D: the lens is off; leave the weaver's override as it is.
+	switch (setting) {
+	case LEIA_MULTI_VIEWER_ON: want = SR_MULTI_VIEWER_MODE_ON; break;
+	case LEIA_MULTI_VIEWER_OFF: want = SR_MULTI_VIEWER_MODE_OFF; break;
+	case LEIA_MULTI_VIEWER_SYSTEM:
+	default: want = SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG; break;
 	}
 	if ((int32_t)want == st->applied || (int32_t)want == st->failed ||
 	    (want == SR_MULTI_VIEWER_MODE_ON && st->on_refused)) {
@@ -424,10 +426,10 @@ leia_sr_v2_apply_multiviewer(SrWeaver w, uint32_t mode_index, struct leia_sr_v2_
 	}
 	st->failed = (int32_t)want;
 	if (threw) {
-		U_LOG_W("Leia %s: srWeaverSetMultiViewerMode(%s) threw -- not retried until the mode changes", backend,
+		U_LOG_W("Leia %s: srWeaverSetMultiViewerMode(%s) threw -- not retried on this weaver", backend,
 		        mv_mode_str((int32_t)want));
 	} else {
-		U_LOG_W("Leia %s: srWeaverSetMultiViewerMode(%s) failed: %s (%d) -- not retried until the mode changes",
+		U_LOG_W("Leia %s: srWeaverSetMultiViewerMode(%s) failed: %s (%d) -- not retried on this weaver",
 		        backend, mv_mode_str((int32_t)want), leia_sr_v2_result_str(r), (int)r);
 	}
 }
@@ -1472,7 +1474,7 @@ namespace {
  * OWN (same reasoning as query_user_presence_cap): whatever an older runtime
  * makes of a structure tag it does not know, it cannot cost the routing /
  * binding answers. An older runtime leaves the struct untouched, so
- * multiViewerWeave stays SR_FALSE and the mode is not offered.
+ * multiViewerWeave stays SR_FALSE and the MULTI_VIEWER setting is ignored.
  *
  * @return 1 / 0 for an SR answer, -1 when the query itself failed.
  */
@@ -1492,8 +1494,8 @@ query_multi_viewer_weave_locked()
 		caps.pNext = &mv_caps;
 		const SrResult r = srGetRuntimeCapabilities(g_probe_instance, &caps);
 		if (SR_FAILED(r)) {
-			U_LOG_W("leia_plugin: srGetRuntimeCapabilities (multi-viewer) failed: %s (%d) -- multi-viewer mode "
-			        "not offered",
+			U_LOG_W("leia_plugin: srGetRuntimeCapabilities (multi-viewer) failed: %s (%d) -- MULTI_VIEWER "
+			        "setting ignored",
 			        leia_sr_v2_result_str(r), (int)r);
 			return -1;
 		}
@@ -1503,7 +1505,7 @@ query_multi_viewer_weave_locked()
 		        (unsigned)mv_caps.supportedModes, (unsigned)mv_caps.configWritable);
 		return mv_caps.multiViewerWeave == SR_TRUE ? 1 : 0;
 	} catch (...) {
-		U_LOG_W("leia_plugin: SR multi-viewer capability query threw -- multi-viewer mode not offered");
+		U_LOG_W("leia_plugin: SR multi-viewer capability query threw -- MULTI_VIEWER setting ignored");
 		return -1;
 	}
 }

@@ -128,11 +128,17 @@ set SR_VKSTAMP_TAG=sr-sdk-v1.36.4.17537-vkstamp
 :: 3493 = released q4 build: appends 122-123 pfnWeaverSetTrackingLossMode /
 :: pfnWeaverGetTrackingLossMode and SR_TRACKING_STATE_OUT_OF_ZONE
 :: (SR_WEAVER_TRACKING_LOSS_MODE_AVAILABLE; MANUAL eye tracking, #534).
-set SR_V2_TAG=sr-sdk-v2-1.39.0.3493
-set SR_V2_DIR=LeiaSR-SDK-1.39.0+3493.b6347ede48-win64-Release
+:: 3666 = ST-5879 multi-viewer rebased onto q4 92e0c8c02 (= LeiaSR v1.39.0-rc1-QA) at 5e31c7e71
+:: (sr-sdk-v2-1.39.0.3666, run 45112335055). A superset of 3493: same dispatch-table prefix
+:: (tracking-loss mode 122-123 kept), multi-viewer 110-118 declared and live again, so
+:: DXR_LEIA_HAS_SR_MULTI_VIEWER is lit and MULTI_VIEWER=on works on a multi-viewer runtime.
+:: 3493 (q4 headers) had compiled the multi-viewer code out. On a plain q4/rc1 runtime the
+:: multi-viewer slots are reserved NULLs, so the plug-in reports multi-viewer 'not offered'.
+set SR_V2_TAG=sr-sdk-v2-1.39.0.3666
+set SR_V2_DIR=LeiaSR-SDK-1.39.0+3666.5e31c7e710-win64-Release
 :: sha256 of the SR_V2_DIR zip -- the download is refused on a mismatch. KEEP IN SYNC
 :: with build-windows.yml (check_sr_pins.py asserts it).
-set SR_V2_SHA256=1c5a2a967b9ef46d3a093725560ff3d08fc12e4bae5f4457dc242aaceb77c09a
+set SR_V2_SHA256=d60785bfdb6aacbdb242e17235dd9745da99db259906788f67d794771cddb19c
 set TARGET=%~1
 if "%TARGET%"=="" set TARGET=all
 
