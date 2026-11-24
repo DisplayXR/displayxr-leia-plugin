@@ -140,6 +140,10 @@ leiasr_d3d11_destroy_async(struct leiasr_d3d11 **leiasr_ptr);
  * For one-shot capability queries that must see the real weaver (e.g. the
  * in-process compositors' create-time zone-caps probe).
  *
+ * #567: only the weaver's FIRST call waits, and only while no create attempt
+ * has failed (leiasr_caps_query_may_wait); every other call answers at once.
+ * A caller that re-asks per frame (the service's weave path) never blocks.
+ *
  * @return true if the weaver is ready and usable.
  *
  * @ingroup drv_leia

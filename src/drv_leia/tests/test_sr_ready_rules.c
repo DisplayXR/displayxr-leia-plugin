@@ -230,6 +230,16 @@ test_heartbeat(void)
 	CHECK(LEIASR_HEARTBEAT_REFRESH_MS > LEIASR_PENDING_SNAPSHOT_MAX_AGE_MS);
 }
 
+//! #567: a capability query waits only for a DP's first create attempt in flight.
+static void
+test_caps_query_wait(void)
+{
+	CHECK(leiasr_caps_query_may_wait(false, 0)); // the in-process create-time query
+	CHECK(!leiasr_caps_query_may_wait(false, 1)); // an attempt failed: the weaver is retrying
+	CHECK(!leiasr_caps_query_may_wait(true, 0));  // the DP already waited once
+	CHECK(!leiasr_caps_query_may_wait(true, 3));
+}
+
 int
 main(void)
 {
@@ -238,6 +248,7 @@ main(void)
 	test_pick();
 	test_pending_snapshot();
 	test_heartbeat();
+	test_caps_query_wait();
 	if (g_failures != 0) {
 		fprintf(stderr, "test_sr_ready_rules: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;
