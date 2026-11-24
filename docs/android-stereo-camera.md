@@ -91,16 +91,75 @@ runtime then fetches the calibration and sends
 `XrEventDataStereoCamerasChangedDXR`, and the browser lists "3D Camera".
 While any pair is pending, none is listed, so indices stay stable.
 
-**Calibration source, in order:**
+**Calibration source, in order** (one WARN per pair names the source that
+won and why each higher one was skipped, and again whenever it changes):
 
-1. The calibration app's record (schema >= 1, keyed to the block's SHA-256),
-   which replaces R only.
-2. The factory block.
-3. Nothing: raw only, an ideal parallel pair downstream.
+1. **The served display config record**: the `stereoCalibrations` entry of
+   the pair in the display config the display-config service
+   (`com.leialoft.display.config`, `/sdcard/displayConfig.json`) serves,
+   as CNSDK (>= 0.10.91) parses it (`leia_device_config_get_stereo_calibration`,
+   looked up at run time; the struct is mirrored with CNSDK's layout
+   asserts). The first CNSDK core of the process snapshots it when it reads
+   its device config (`CNSDK display config stereoCalibrations: ...` WARN).
+2. **The calibration app's provider** (`content://com.leiainc.calibrationapp.stereo/pairs/<logical id>`,
+   column `json`, schema 1, keyed to the block's SHA-256) or its cached
+   copy: R only, as before. Only a fallback now: the OEM's auto-launch policy
+   blocks a cold start of that provider, so it answers only while the
+   calibration app is alive, and a shipped camera cannot depend on it.
+3. **The factory block.**
+4. Nothing: raw only, an ideal parallel pair downstream.
 
-The record refines the block, so it is not usable without the block. Every
-final description logs the source that won and why the higher ones were
-skipped.
+**Which served entry, and what it replaces.** The entry is matched by
+`pair.logicalCameraId` (the last entry of an id wins, as in CNSDK), then by
+`pair.lensIds` against the block's main and sub lens: `[main, sub]` as is,
+`[sub, main]` with the two lenses swapped and the extrinsics inverted
+(R ← Rᵀ, T ← −Rᵀ T), no ids = `[main, sub]` (the writer puts the main lens
+first), other ids refused. Tablet front: `["1","3"]`, lens0 = camera 1 =
+main, lens1 = camera 3 (the tracking lens) = sub. Phone front: `["1","0"]`,
+main = camera 1. R and T keep the record's meaning, `x1 = R·x0 + T` in
+each sensor's native (unturned) OpenCV frame, so lens0/lens1 is the block's
+main/sub and the SBS left eye is decided afterwards from the geometry,
+exactly as for the block.
+
+Two writers fill the section (leia-calibration-suite `StereoConfigSection`),
+and CNSDK serves neither `source` nor `method`, so the block SHA-256 tells
+them apart:
+
+- **mirror record** (`source: "mirror"`, `factory: null`): both lenses FITTED
+  at the pair streams' size (`imageSize`, 1280x960 on the tablet), R and a
+  metric T solved jointly with them. It replaces the **whole lens model**
+  (intrinsics, distortion, R, T). Taking only its R and T on top of the
+  factory intrinsics would mix two solutions: R trades off against the
+  principal points in a fit, and T's scale against the focal lengths.
+- **user record** (`source: "user"`, keyed to the block's SHA-256):
+  R re-estimated against the factory intrinsics. It replaces **R only**, and
+  only on the block it was made against (as the provider's record does).
+
+The mirror record's intrinsics go to the active array through the HAL's
+array → stream step inverted per axis: the 1280x960 stream is the centred
+region of its aspect (the whole 3264x2448 front array; 4160x3120 of a
+4208x3120 rear array), `s_x = width / region.w`, `s_y = height / region.h`,
+pixel-centre aware like the record (OpenCV): `c_array = x0 + (c + ½)/s − ½`.
+The two ratios are equal up to the stated size's rounding; scaling the record
+straight to the whole array (4208/1280 vs 3120/960) would stretch it by
+1.2 %. From there the usual pipeline brings it to each stream, so at the
+1280x960 capture the eyes carry exactly the record's numbers. A mirror record
+whose eye order contradicts the HAL's lens poses is refused (never silently
+mirrored); one whose R is more than 5° from the block's is refused; without a
+factory block a mirror record still calibrates a side-by-side pair.
+
+**When a new calibration is seen.** CNSDK reads the device config once, at
+core init. A calibration saved later is seen after the next start of the
+process that hosts the plug-in (the runtime service). Until the first core of
+the process has read its config, the pair uses the provider / factory and
+re-checks on every enumerate. The runtime keeps a camera's first calibration
+until it re-reads it, so a record that appears after the camera was first
+described reaches clients after the next camera open or service restart.
+`debug.dxr.leia.scam_served_calib=0` ignores the served record.
+
+The rear pair has no entry today: it stays on the factory block, and the log
+says so (`served display config record skipped (the served display config has
+no stereoCalibrations entry for logical 4)`).
 
 Layout, version 1. Byte 0 is the version. Every value after it is a
 little-endian IEEE-754 double:
@@ -327,3 +386,4 @@ On either, the source:
 | `debug.dxr.leia.scam_calib_key_prefix` | vendor key prefix of the factory block |
 | `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |
 | `debug.dxr.leia.scam_calib_ref=auto\|array\|WxH` | the size the factory block's intrinsics are expressed at (auto: see *Reference size*) |
+| `debug.dxr.leia.scam_served_calib=0` | ignore the served display config record (provider / factory only) |

@@ -566,6 +566,32 @@ leia_cnsdk_face_poll_counters(uint64_t *out_polls, uint64_t *out_faces);
 bool
 leia_cnsdk_get_tracking_camera_id(char *out, size_t cap);
 
+struct leia_scam_served_stereo;
+
+//! Result of leia_cnsdk_find_stereo_calibration.
+enum leia_cnsdk_served_lookup
+{
+	//! No core of this process has read its display config yet: ask again later.
+	LEIA_CNSDK_SERVED_UNKNOWN = 0,
+	//! The config was read and has no "stereoCalibrations" entry for the pair.
+	LEIA_CNSDK_SERVED_NONE = 1,
+	//! @p out holds the pair's entry.
+	LEIA_CNSDK_SERVED_FOUND = 2,
+	//! The CNSDK on the device predates 0.10.91 (no stereo-calibration accessor).
+	LEIA_CNSDK_SERVED_UNSUPPORTED = 3,
+};
+
+/*!
+ * The display config's "stereoCalibrations" entry of logical camera
+ * @p logical_id (the served record of the calibration suite, schema 1, as
+ * CNSDK >= 0.10.91 parses it), from the snapshot the first core of this
+ * process took when it read its device config (leia_device_config is read
+ * once, at core init: a calibration saved later is seen after the next start
+ * of the process). Returns an enum leia_cnsdk_served_lookup.
+ */
+int
+leia_cnsdk_find_stereo_calibration(const char *logical_id, struct leia_scam_served_stereo *out);
+
 /*!
  * The JavaVM and an Android Context of the hosting process (the class-host
  * Context when the runtime provides one, else the Activity/Service), for

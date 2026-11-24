@@ -84,6 +84,10 @@ struct leia_scam_stream_calib
  *  2. capture -> output (@p width x @p height): the plug-in's own centre crop,
  *     at even offsets (pack_eye).
  * @p cap_w / @p cap_h 0 = the output is captured directly (step 2 is a no-op).
+ * Step 1 is pixel-centre aware (c' = (c - offset + 1/2) s - 1/2, pixel centres
+ * at integer coordinates like the block's OpenCV numbers), so it composes
+ * exactly with the runtime's per-mode rule (XR_DXR_stereo_camera v8 §5.5);
+ * before v8 it was c' = c s, (s - 1) / 2 px off (-0.35 px on the tablets).
  * Then orient the pair: the lens whose centre lies at -x of the other (the
  * camera's own left) becomes the left eye.
  *

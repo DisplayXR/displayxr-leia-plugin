@@ -601,3 +601,159 @@ leia_scam_sha256_hex(const uint8_t digest[32], char out[65])
 	}
 	out[64] = '\0';
 }
+
+/*
+ *
+ * The served record (display config "stereoCalibrations").
+ *
+ */
+
+const char *
+leia_scam_served_verdict_str(enum leia_scam_served_verdict v)
+{
+	switch (v) {
+	case LEIA_SCAM_SERVED_FULL: return "full lens model (mirror record)";
+	case LEIA_SCAM_SERVED_ROTATION: return "rotation only (user record of this factory block)";
+	case LEIA_SCAM_SERVED_OTHER_LENSES: return "pair.lensIds name other lenses";
+	case LEIA_SCAM_SERVED_BAD_SIZE: return "imageSize missing";
+	case LEIA_SCAM_SERVED_BAD_LENS: return "implausible intrinsics or distortion";
+	case LEIA_SCAM_SERVED_NOT_ROTATION: return "R_1_from_0 is not a rotation";
+	case LEIA_SCAM_SERVED_BAD_BASELINE: return "|T| outside 1..200 mm";
+	case LEIA_SCAM_SERVED_BLOCK_CHANGED: return "made against another factory block";
+	case LEIA_SCAM_SERVED_TOO_FAR: return "R more than 5 deg from the factory R";
+	}
+	return "?";
+}
+
+static bool
+lens_plausible(double fx, double fy, double cx, double cy, const double d[8], double w, double h)
+{
+	if (!isfinite(fx) || !isfinite(fy) || !isfinite(cx) || !isfinite(cy) || fx <= 1.0 || fy <= 1.0 || cx <= 0.0 ||
+	    cy <= 0.0 || cx >= w || cy >= h) {
+		return false;
+	}
+	for (int i = 0; i < 8; i++) {
+		if (!isfinite(d[i]) || fabs(d[i]) > 1e4) {
+			return false;
+		}
+	}
+	return true;
+}
+
+enum leia_scam_served_verdict
+leia_scam_served_to_factory(const struct leia_scam_served_stereo *s,
+                            const char *main_id,
+                            const char *sub_id,
+                            uint32_t array_w,
+                            uint32_t array_h,
+                            const struct leia_scam_factory_calib *block,
+                            const uint8_t *block_sha256,
+                            struct leia_scam_factory_calib *out,
+                            double *out_delta_deg)
+{
+	if (out_delta_deg != NULL) {
+		*out_delta_deg = 0.0;
+	}
+	// Lens order: [main, sub] as is, [sub, main] swapped, none named = [main, sub].
+	bool swap = false;
+	const bool named = s->lens_ids[0][0] != '\0' || s->lens_ids[1][0] != '\0';
+	if (named) {
+		const bool direct = main_id != NULL && sub_id != NULL && strcmp(s->lens_ids[0], main_id) == 0 &&
+		                    strcmp(s->lens_ids[1], sub_id) == 0;
+		const bool reversed = main_id != NULL && sub_id != NULL && strcmp(s->lens_ids[0], sub_id) == 0 &&
+		                      strcmp(s->lens_ids[1], main_id) == 0;
+		if (!direct && !reversed) {
+			return LEIA_SCAM_SERVED_OTHER_LENSES;
+		}
+		swap = reversed;
+	}
+	if (!is_rotation(s->R)) {
+		return LEIA_SCAM_SERVED_NOT_ROTATION;
+	}
+	const double b = sqrt(s->T_mm[0] * s->T_mm[0] + s->T_mm[1] * s->T_mm[1] + s->T_mm[2] * s->T_mm[2]);
+	if (!(b >= 1.0 && b <= 200.0)) {
+		return LEIA_SCAM_SERVED_BAD_BASELINE;
+	}
+	// Into the block's naming: main = lens0, x_sub = R x_main + T.
+	double R[3][3], T[3];
+	memcpy(R, s->R, sizeof(R));
+	memcpy(T, s->T_mm, sizeof(T));
+	const int i_main = swap ? 1 : 0, i_sub = swap ? 0 : 1;
+	if (swap) {
+		for (int i = 0; i < 3; i++) {
+			T[i] = 0.0;
+			for (int j = 0; j < 3; j++) {
+				R[i][j] = s->R[j][i];
+				T[i] -= s->R[j][i] * s->T_mm[j];
+			}
+		}
+	}
+	if (block != NULL) {
+		const double d = angle_between_deg(R, block->R);
+		if (out_delta_deg != NULL) {
+			*out_delta_deg = d;
+		}
+		if (d > LEIA_SCAM_USER_CALIB_MAX_DELTA_DEG) {
+			return LEIA_SCAM_SERVED_TOO_FAR;
+		}
+	}
+
+	if (s->block_sha256[0] != '\0') {
+		// A user record: R only, on the very block it was made against.
+		char hex[65];
+		if (block == NULL || block_sha256 == NULL) {
+			return LEIA_SCAM_SERVED_BLOCK_CHANGED;
+		}
+		leia_scam_sha256_hex(block_sha256, hex);
+		for (int i = 0; i < 64; i++) {
+			if (tolower((unsigned char)s->block_sha256[i]) != hex[i]) {
+				return LEIA_SCAM_SERVED_BLOCK_CHANGED;
+			}
+		}
+		*out = *block;
+		memcpy(out->R, R, sizeof(out->R));
+		return LEIA_SCAM_SERVED_ROTATION;
+	}
+
+	// A mirror record: the full model, from imageSize to the array, per axis.
+	if (s->width <= 0 || s->height <= 0 || array_w == 0 || array_h == 0) {
+		return LEIA_SCAM_SERVED_BAD_SIZE;
+	}
+	const double aw = array_w, ah = array_h, w = s->width, h = s->height;
+	double rw, rh, x0, y0;
+	if (w * ah >= h * aw) {
+		rw = aw;
+		rh = aw * h / w;
+	} else {
+		rh = ah;
+		rw = ah * w / h;
+	}
+	x0 = (aw - rw) / 2.0;
+	y0 = (ah - rh) / 2.0;
+	// Per axis against the REGION the stream was cut from (Camera2: a stream of
+	// another aspect is the centred region of its aspect, never stretched).
+	// The two ratios are then equal up to the size's rounding; scaling the
+	// record straight to the array (4208/1280 vs 3120/960 on the rear lenses)
+	// would stretch it by 1.2 %.
+	const double sx = w / rw, sy = h / rh;
+	struct leia_scam_factory_calib f;
+	memset(&f, 0, sizeof(f));
+	struct leia_scam_lens *dst[2] = {&f.main, &f.sub};
+	const int src[2] = {i_main, i_sub};
+	for (int k = 0; k < 2; k++) {
+		const double *d = s->lens[src[k]].dist;
+		if (!lens_plausible(s->lens[src[k]].fx, s->lens[src[k]].fy, s->lens[src[k]].cx, s->lens[src[k]].cy, d, w,
+		                    h)) {
+			return LEIA_SCAM_SERVED_BAD_LENS;
+		}
+		dst[k]->fx = s->lens[src[k]].fx / sx;
+		dst[k]->fy = s->lens[src[k]].fy / sy;
+		dst[k]->cx = x0 + (s->lens[src[k]].cx + 0.5) / sx - 0.5;
+		dst[k]->cy = y0 + (s->lens[src[k]].cy + 0.5) / sy - 0.5;
+		memcpy(dst[k]->d, d, sizeof(dst[k]->d));
+	}
+	memcpy(f.R, R, sizeof(f.R));
+	memcpy(f.T, T, sizeof(f.T));
+	*out = f;
+	return LEIA_SCAM_SERVED_FULL;
+}
