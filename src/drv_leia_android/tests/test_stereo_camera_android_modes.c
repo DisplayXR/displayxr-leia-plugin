@@ -683,9 +683,49 @@ test_results(void)
 	CHECK(t.both == 60);
 }
 
+static void
+test_pairing(void)
+{
+	const int64_t ms = 1000000;
+	// 29.80 fps: the 8 ms default stands (cap 10.07 ms); a larger setting is capped.
+	CHECK(leia_scam_pair_tolerance_ns(8 * ms, 33558000) == 8 * ms);
+	CHECK(leia_scam_pair_tolerance_ns(20 * ms, 33558000) == 33558000 * 3 / 10);
+	CHECK(leia_scam_pair_tolerance_ns(20 * ms, 0) == 20 * ms); // period unknown
+	// A constant -6.5 ms lens offset pairs; the next frame (one period on) never does.
+	const int64_t t0 = 1000 * ms;
+	const int64_t other[3] = {t0 - 33558000 - 6495000, t0 - 6495000, t0 + 33558000 - 6495000};
+	const int64_t tol = leia_scam_pair_tolerance_ns(8 * ms, 33558000);
+	CHECK(leia_scam_pair_pick(other, 3, t0, tol) == 1);
+	// -39.1 ms (one period + 5.6 ms, the run after a still): pairs with the
+	// frame 5.6 ms away, never with the one 39.1 ms away.
+	const int64_t far[2] = {t0 - 39133000, t0 - 39133000 + 33558000};
+	CHECK(leia_scam_pair_pick(far, 2, t0, tol) == 1);
+	const int64_t none[1] = {t0 - 39133000};
+	CHECK(leia_scam_pair_pick(none, 1, t0, tol) == -1);
+	// Closest wins.
+	const int64_t two[2] = {t0 + 3 * ms, t0 - 1 * ms};
+	CHECK(leia_scam_pair_pick(two, 2, t0, 8 * ms) == 1);
+	CHECK(leia_scam_pair_pick(NULL, 0, t0, tol) == -1);
+
+	static struct leia_scam_skew_window w;
+	leia_scam_skew_reset(&w);
+	int64_t lo, med, hi;
+	CHECK(!leia_scam_skew_summary(&w, &lo, &med, &hi));
+	for (int i = 0; i < 101; i++) {
+		leia_scam_skew_push(&w, (i % 2 == 0) ? -6495000 : -6495000 + i);
+	}
+	CHECK(leia_scam_skew_summary(&w, &lo, &med, &hi));
+	CHECK(lo == -6495000 && hi == -6495000 + 99 && med == -6495000);
+	for (int i = 0; i < 1000; i++) {
+		leia_scam_skew_push(&w, i); // the window keeps the last 512
+	}
+	CHECK(w.n == LEIA_SCAM_SKEW_WINDOW && leia_scam_skew_summary(&w, &lo, &med, &hi) && lo == 488 && hi == 999);
+}
+
 int
 main(void)
 {
+	test_pairing();
 	test_regions();
 	test_rear_modes();
 	test_front_modes();

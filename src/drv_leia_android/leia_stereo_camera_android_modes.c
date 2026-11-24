@@ -9,6 +9,7 @@
 #include "leia_stereo_camera_android_modes.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 void
@@ -625,4 +626,71 @@ leia_scam_eye_times_independent(const struct leia_scam_eye_times_tracker *t)
 {
 	return t != NULL && t->both >= LEIA_SCAM_EYE_TIMES_MIN_FRAMES &&
 	       (uint64_t)t->differ * LEIA_SCAM_EYE_TIMES_DIFF_DIV >= t->both;
+}
+
+int64_t
+leia_scam_pair_tolerance_ns(int64_t configured_ns, int64_t frame_period_ns)
+{
+	int64_t tol = configured_ns > 0 ? configured_ns : 0;
+	if (frame_period_ns > 0) {
+		const int64_t cap = frame_period_ns * 3 / 10;
+		if (tol > cap) {
+			tol = cap;
+		}
+	}
+	return tol;
+}
+
+int
+leia_scam_pair_pick(const int64_t *ts, size_t n, int64_t t, int64_t tol_ns)
+{
+	int best = -1;
+	int64_t best_d = 0;
+	for (size_t i = 0; ts != NULL && i < n; i++) {
+		const int64_t d = ts[i] > t ? ts[i] - t : t - ts[i];
+		if (d <= tol_ns && (best < 0 || d < best_d)) {
+			best = (int)i;
+			best_d = d;
+		}
+	}
+	return best;
+}
+
+void
+leia_scam_skew_reset(struct leia_scam_skew_window *w)
+{
+	w->n = 0;
+	w->next = 0;
+}
+
+void
+leia_scam_skew_push(struct leia_scam_skew_window *w, int64_t v)
+{
+	w->v[w->next] = v;
+	w->next = (w->next + 1) % LEIA_SCAM_SKEW_WINDOW;
+	if (w->n < LEIA_SCAM_SKEW_WINDOW) {
+		w->n++;
+	}
+}
+
+static int
+cmp_i64(const void *a, const void *b)
+{
+	const int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+bool
+leia_scam_skew_summary(const struct leia_scam_skew_window *w, int64_t *out_min, int64_t *out_median, int64_t *out_max)
+{
+	if (w == NULL || w->n == 0) {
+		return false;
+	}
+	int64_t tmp[LEIA_SCAM_SKEW_WINDOW];
+	memcpy(tmp, w->v, sizeof(int64_t) * w->n);
+	qsort(tmp, w->n, sizeof(int64_t), cmp_i64);
+	*out_min = tmp[0];
+	*out_median = tmp[w->n / 2];
+	*out_max = tmp[w->n - 1];
+	return true;
 }

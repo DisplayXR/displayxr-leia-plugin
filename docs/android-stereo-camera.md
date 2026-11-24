@@ -494,12 +494,63 @@ the per-eye bit only after 60 frames with both stamps of which at least one in
 ten differed (`leia_scam_eye_times_tracker`); on the NP02J that never
 happens, so the bit stays clear and `captureTime` is the only time.
 
+### Pairing and per-eye times
+
+Two different clocks are in play, and they disagree on this HAL:
+
+- **Image stamps** (`AImage_getTimestamp`, one per lens): what **pairing** uses.
+  On the NP02J they are equal for both lenses (stage 0: one synthesized stamp,
+  interval std 0.000 ms), although lens 2's buffers arrive 12–16 ms later.
+- **Physical result stamps** (`SENSOR_TIMESTAMP` in each lens's physical
+  result of an `ACaptureSessionLogicalCamera` callback): what the per-eye
+  capture times report, and only once they have proved independent.
+
+A pair is the left image with the right image whose stamp is the closest
+within the tolerance (default 8 ms, `debug.dxr.leia.scam_pair_tol_ms`,
+always capped at 0.3 of the frame period measured from each lens's own
+consecutive stamps), so a constant lens offset of a few ms still pairs and two
+different frames (one period, 33.56 ms, apart) never do. Before v8 the rule
+was the first image within 1 ms.
+
+**What stamps cannot show.** Because the image stamps are synthesized, a
+pair whose lenses delivered DIFFERENT sensor frames under one request would
+still carry equal image stamps and pair. The physical stamps are the only
+witness. Device runs of this branch saw them at a constant −6.5 ms (R − L)
+in one stream (a plausible sensor phase: reported, and harmless to pairing)
+and, in another, jump to −39.1 ms (one period + 5.6 ms) right after a
+ZSL still and stay there: that would be a one-frame temporal mismatch in
+every later pair if the physical stamps are right. The still request
+therefore uses `TEMPLATE_PREVIEW` by default; whether ZSL really slips a
+lens, and whether the pixels follow the physical stamps, needs the
+diagnostics below and an optical check (a moving object or a stopwatch on a
+screen in both eyes of one pair).
+
+The still request's results come through their own callbacks and never
+stand in for a stream frame's result, nor count towards the per-eye-time
+decision. Per-eye times stay withheld until 60 frames had both physical
+stamps and at least one in ten differed; the first ~60 frames of a stream
+therefore always report no per-eye times, even when the offset is constant.
+
+**Diagnostics** (WARN):
+
+- at each stream start: the pairing tolerance;
+- every 10 s: min/median/max of R − L image stamp over the paired frames, of
+  R − L physical result stamp, and of image − physical stamp per lens; the
+  candidates rejected for exceeding the tolerance; images dropped unpaired
+  per lens; whether per-eye times are reported;
+- once 30 pairs followed a still: `after still <id>: R-L median image stamp
+  a -> b ms, physical result stamp c -> d ms`, flagged `CHANGED` when either
+  median moved by more than 1 ms.
+
+Image − physical per lens is the decisive number: equal image stamps beside
+a physical skew mean the HAL synthesizes the image stamps.
+
 ### Stills
 
 | Still | How | Stream | Expected latency |
 |---|---|---|---|
 | 1280x720 / 1280x960 (both pairs) | the next stream pair, packed at the still's crop | no frame lost | ~1 frame |
-| 4096x3072 (rear) | one request on the running session targeting the stream outputs **and** one JPEG output per lens (`TEMPLATE_ZERO_SHUTTER_LAG`; `debug.dxr.leia.scam_still_template=preview` for `TEMPLATE_PREVIEW`), then each JPEG decoded (`AImageDecoder`) and converted to NV12 | no frame lost | ~320 ms to both JPEGs (stage 0) + decode/convert, ~0.6–0.8 s to READY (estimate, not measured) |
+| 4096x3072 (rear) | one request on the running session targeting the stream outputs **and** one JPEG output per lens (`TEMPLATE_PREVIEW`; `debug.dxr.leia.scam_still_template=zsl` for `TEMPLATE_ZERO_SHUTTER_LAG`, see *Pairing* below), then each JPEG decoded (`AImageDecoder`) and converted to NV12 | no frame lost | ~320 ms to both JPEGs (stage 0) + decode/convert, ~0.6–0.8 s to READY (estimate, not measured) |
 
 - **Never a reconfigure** for a still (stage 0: 1.35 s without frames) and
   never `TEMPLATE_STILL_CAPTURE` on the live stream (a ~400 ms freeze).
@@ -558,7 +609,8 @@ On either, the source:
 | `debug.dxr.leia.scam_max_stream=WxH` | v8: largest mode on a further stream capture (rear; default 1920x1440). The front pair never reconfigures |
 | `debug.dxr.leia.scam_max_still=WxH` | v8: largest still from the JPEG output (default 4096 wide) |
 | `debug.dxr.leia.scam_still=0` | v8: no JPEG still outputs (stills from stream pairs only) |
-| `debug.dxr.leia.scam_still_template=zsl\|preview` | v8: template of the still request (default zsl) |
+| `debug.dxr.leia.scam_still_template=preview\|zsl` | v8: template of the still request (default preview) |
+| `debug.dxr.leia.scam_pair_tol_ms=<ms>` | pairing tolerance between the two lenses' image stamps (default 8; always capped at 0.3 frame period) |
 | `debug.dxr.leia.scam_still_quality=<50..100>` | v8: JPEG quality of the still (default 95) |
 | `debug.dxr.leia.scam_hal_af=1` | v8: use the HAL's AF (continuous, tap-to-focus) instead of AF off + one distance |
 | `debug.dxr.leia.scam_default_focus_d=<D>` | v8: the fixed focus distance with no focus control set (default 0.5 D) |

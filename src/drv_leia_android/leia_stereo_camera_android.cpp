@@ -126,7 +126,14 @@ constexpr int64_t kGiveUpNs = 15000 * kNsPerMs;     //!< device gone this long -
 constexpr int64_t kEarlyFailNs = 3000 * kNsPerMs;   //!< a loss this soon after open counts as an open failure
 constexpr int kEarlyFailMax = 2;                    //!< consecutive open failures -> ERROR, no more reopens
 constexpr int64_t kLensFreeNs = 3000 * kNsPerMs;    //!< how long the tracking service gets to release its lens
-constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;  //!< measured skew is 0; be lenient
+//! Capture-result lookup: a result belongs to a pair when its logical stamp is
+//! this close to the pair's (the logical stamp is the primary lens's).
+constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;
+//! Pairing tolerance between the two lenses' IMAGE stamps (default; capped at 0.3
+//! of the frame period, leia_scam_pair_tolerance_ns): a constant lens offset of a
+//! few ms still pairs, two different frames never do.
+//! debug.dxr.leia.scam_pair_tol_ms overrides it.
+constexpr int64_t kPairTolDefaultNs = 8 * kNsPerMs;
 constexpr uint32_t kTrackW = 640, kTrackH = 480;    //!< the in-app detector accepts only this
 constexpr int kEyeMaxImages = 4;
 //! Readers of a large capture (kStreamMaxDefault raised by the knob): kPendingPerEye + 1.
@@ -1923,6 +1930,7 @@ struct sbs_buf
 	//! eye's own start of exposure on CLOCK_MONOTONIC.
 	int64_t ts_boot{0};
 	int64_t eye_mono_ns[2]{};
+	int64_t eye_ts_boot[2]{}; //!< each eye's own IMAGE stamp (BOOTTIME)
 };
 
 struct pending_img
@@ -1936,6 +1944,9 @@ struct hal_rec
 {
 	int64_t ts{0}; //!< logical result's SENSOR_TIMESTAMP (BOOTTIME), 0 = empty slot
 	bool have_logical{false}, have_left{false}, have_right{false};
+	//! The result of a still request (excluded from the stream's lookups and
+	//! from the per-eye-time and skew statistics).
+	bool from_still{false};
 	leia_scam_hal_result logical{}, left{}, right{};
 };
 constexpr size_t kResultRing = 16;
@@ -2021,6 +2032,7 @@ struct xrt_plugin_stereo_camera
 	bool region_ok{false};
 	int32_t region[5]{};
 	ACameraCaptureSession_logicalCamera_captureCallbacks cap_cb{};
+	ACameraCaptureSession_logicalCamera_captureCallbacks still_cb{}; //!< the still request's (from_still)
 	std::mutex res_mu;
 	hal_rec res_ring[kResultRing];
 	size_t res_next{0};
@@ -2066,6 +2078,24 @@ struct xrt_plugin_stereo_camera
 	std::condition_variable cv;
 	std::atomic<int64_t> last_pair_ns{0};
 	std::atomic<uint64_t> pairs{0}, drops{0}, singles{0};
+	// Pairing diagnostics (pair_mu): tolerance, frame period, rejected
+	// candidates and images dropped unpaired per lens (0 = left, 1 = right),
+	// and right - left IMAGE stamp of every pair.
+	int64_t pair_tol_cfg_ns{0};
+	int64_t frame_period_ns{0};
+	int64_t last_img_ts[2]{};
+	uint64_t rejected{0}, unpaired[2]{};
+	leia_scam_skew_window img_dt{};
+	// Capture-result diagnostics (res_mu): right - left PHYSICAL result stamp,
+	// and per lens IMAGE stamp - PHYSICAL stamp of the same pair.
+	leia_scam_skew_window phys_dt{};
+	leia_scam_skew_window img_vs_phys[2]{};
+	// Still watch: medians before a still, and the window after it.
+	std::atomic<bool> still_watch{false};
+	uint64_t still_watch_id{0};
+	bool pre_img_have{false}, pre_phys_have{false};
+	int64_t pre_img_med{0}, pre_phys_med{0};
+	leia_scam_skew_window post_img_dt{}, post_phys_dt{};
 	int64_t rate_t0{0};
 	int rate_n{0};
 	//! Per eye: each reader thread uses only its own, so a lens re-pick that
@@ -2373,6 +2403,12 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_l
 	b.ts_boot = ts_boot;
 	b.eye_mono_ns[0] = ts_l - off;
 	b.eye_mono_ns[1] = ts_r - off;
+	b.eye_ts_boot[0] = ts_l;
+	b.eye_ts_boot[1] = ts_r;
+	leia_scam_skew_push(&c->img_dt, ts_r - ts_l);
+	if (c->still_watch) {
+		leia_scam_skew_push(&c->post_img_dt, ts_r - ts_l);
+	}
 	if (c->ready >= 0) {
 		c->drops++; // previous never fetched: latest wins
 	}
@@ -2442,28 +2478,52 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 		}
 		auto &mine = c->pend[eye];
 		auto &other = c->pend[1 - eye];
-		auto it = std::find_if(other.begin(), other.end(),
-		                       [ts](const pending_img &p) { return std::llabs(p.ts - ts) <= kPairToleranceNs; });
-		if (it != other.end()) {
+		// The frame period from this lens's own consecutive stamps, so the
+		// tolerance can never span two frames (leia_scam_pair_tolerance_ns).
+		if (c->last_img_ts[eye] != 0 && ts > c->last_img_ts[eye] && ts - c->last_img_ts[eye] < 200 * kNsPerMs) {
+			c->frame_period_ns = ts - c->last_img_ts[eye];
+		}
+		c->last_img_ts[eye] = ts;
+		const int64_t tol = leia_scam_pair_tolerance_ns(c->pair_tol_cfg_ns, c->frame_period_ns);
+		int64_t cand[kPendingPerEye + 1];
+		size_t nc = 0;
+		for (const pending_img &q : other) {
+			if (nc < sizeof(cand) / sizeof(cand[0])) {
+				cand[nc++] = q.ts;
+			}
+		}
+		const int pick = leia_scam_pair_pick(cand, nc, ts, tol);
+		if (pick >= 0) {
+			auto it = other.begin() + pick;
+			const int64_t pts = it->ts;
 			AImage *l = eye == 0 ? img : it->img;
 			AImage *r = eye == 0 ? it->img : img;
-			pack_pair_locked(c, l, r, eye == 0 ? ts : it->ts, eye == 0 ? it->ts : ts);
+			pack_pair_locked(c, l, r, eye == 0 ? ts : pts, eye == 0 ? pts : ts);
 			AImage_delete(img);
-			// Drop the partner and everything older on both sides.
-			const int64_t cut = ts;
-			for (auto *q : {&mine, &other}) {
-				while (!q->empty() && q->front().ts <= cut + kPairToleranceNs) {
-					AImage_delete(q->front().img);
-					q->pop_front();
+			// Drop the partner and everything older on both sides; an older
+			// image that never paired counts as dropped unpaired on its lens.
+			const int64_t cut = std::max(ts, pts);
+			for (int side = 0; side < 2; side++) {
+				auto &q = c->pend[side];
+				while (!q.empty() && q.front().ts <= cut) {
+					if (!(side == 1 - eye && q.front().ts == pts)) {
+						c->unpaired[side]++;
+					}
+					AImage_delete(q.front().img);
+					q.pop_front();
 				}
 			}
 			continue;
+		}
+		if (!other.empty()) {
+			c->rejected++; // the other lens has images, none within the tolerance
 		}
 		mine.push_back({img, ts});
 		while (mine.size() > kPendingPerEye) {
 			AImage_delete(mine.front().img);
 			mine.pop_front();
 			c->singles++;
+			c->unpaired[eye]++;
 		}
 	}
 }
@@ -2773,16 +2833,15 @@ read_hal_result(const ACameraMetadata *m, leia_scam_hal_result *r, int64_t *ts)
  * lenses' stamps are ever different (leia_scam_eye_times_tracker).
  */
 void
-on_capture_completed(void *ctx,
-                     ACameraCaptureSession *,
-                     ACaptureRequest *,
-                     const ACameraMetadata *result,
-                     size_t n,
-                     const char **ids,
-                     const ACameraMetadata **phys)
+capture_completed(xrt_plugin_stereo_camera *c,
+                  bool from_still,
+                  const ACameraMetadata *result,
+                  size_t n,
+                  const char **ids,
+                  const ACameraMetadata **phys)
 {
-	auto *c = (xrt_plugin_stereo_camera *)ctx;
 	hal_rec rec;
+	rec.from_still = from_still;
 	int64_t ts = 0;
 	if (result != nullptr) {
 		rec.have_logical = true;
@@ -2809,11 +2868,42 @@ on_capture_completed(void *ctx,
 	}
 	rec.ts = ts;
 	std::lock_guard<std::mutex> lk(c->res_mu);
-	if (rec.have_left && rec.have_right) {
+	if (!from_still && rec.have_left && rec.have_right && rec.left.have_timestamp && rec.right.have_timestamp) {
 		leia_scam_eye_times_observe(&c->eye_times, rec.left.timestamp, rec.right.timestamp);
+		leia_scam_skew_push(&c->phys_dt, rec.right.timestamp - rec.left.timestamp);
+		if (c->still_watch) {
+			leia_scam_skew_push(&c->post_phys_dt, rec.right.timestamp - rec.left.timestamp);
+		}
 	}
 	c->res_ring[c->res_next] = rec;
 	c->res_next = (c->res_next + 1) % kResultRing;
+}
+
+//! Stream requests' results.
+void
+on_capture_completed(void *ctx,
+                     ACameraCaptureSession *,
+                     ACaptureRequest *,
+                     const ACameraMetadata *result,
+                     size_t n,
+                     const char **ids,
+                     const ACameraMetadata **phys)
+{
+	capture_completed((xrt_plugin_stereo_camera *)ctx, false, result, n, ids, phys);
+}
+
+//! The still request's results (its own callbacks: a ZSL still can carry the
+//! stamp of a stream frame, and must never stand in for that frame's result).
+void
+on_still_capture_completed(void *ctx,
+                           ACameraCaptureSession *,
+                           ACaptureRequest *,
+                           const ACameraMetadata *result,
+                           size_t n,
+                           const char **ids,
+                           const ACameraMetadata **phys)
+{
+	capture_completed((xrt_plugin_stereo_camera *)ctx, true, result, n, ids, phys);
 }
 
 void
@@ -2821,12 +2911,13 @@ on_capture_failed(void *, ACameraCaptureSession *, ACaptureRequest *, ALogicalCa
 {}
 #endif
 
+//! The result of the pair at @p ts: a still's own result when @p still, else a stream request's.
 [[maybe_unused]] bool
-lookup_result(xrt_plugin_stereo_camera *c, int64_t ts, hal_rec *out)
+lookup_result(xrt_plugin_stereo_camera *c, int64_t ts, hal_rec *out, bool still = false)
 {
 	std::lock_guard<std::mutex> lk(c->res_mu);
 	for (const hal_rec &r : c->res_ring) {
-		if (r.ts != 0 && std::llabs(r.ts - ts) <= kPairToleranceNs) {
+		if (r.ts != 0 && r.from_still == still && std::llabs(r.ts - ts) <= kPairToleranceNs) {
 			*out = r;
 			return true;
 		}
@@ -2849,14 +2940,29 @@ holding_focus(const xrt_plugin_stereo_camera *c)
  * synthesized time, so they never do there).
  */
 [[maybe_unused]] void
-capture_state_of(xrt_plugin_stereo_camera *c, int64_t ts_boot, leia_scam_capture_state *out)
+capture_state_of(xrt_plugin_stereo_camera *c,
+                 int64_t ts_boot,
+                 const int64_t *img_ts,
+                 bool still,
+                 leia_scam_capture_state *out)
 {
 	hal_rec r;
-	const bool have = lookup_result(c, ts_boot, &r);
+	const bool have = lookup_result(c, ts_boot, &r, still);
 	bool indep;
 	{
 		std::lock_guard<std::mutex> lk(c->res_mu);
 		indep = leia_scam_eye_times_independent(&c->eye_times);
+		// Diagnostics: each lens's IMAGE stamp against its own PHYSICAL result
+		// stamp. Equal image stamps beside different physical ones = the HAL
+		// synthesizes the image stamps, and pairing by them cannot see a slip.
+		if (have && img_ts != nullptr && !still) {
+			if (r.have_left && r.left.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[0], img_ts[0] - r.left.timestamp);
+			}
+			if (r.have_right && r.right.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[1], img_ts[1] - r.right.timestamp);
+			}
+		}
 	}
 	leia_scam_capture_state_from_hal(have && r.have_left ? &r.left : nullptr, have && r.have_right ? &r.right : nullptr,
 	                                 have && r.have_logical ? &r.logical : nullptr, c->desc.fixed_focus,
@@ -3278,8 +3384,8 @@ add_output(xrt_plugin_stereo_camera *c,
  * (desc.still_out, the rear pair), ONE JPEG output per lens at that still's
  * size (stage 0 §4b: YUV stream + JPEG still per lens is accepted by the HAL
  * and a still request on it loses no stream frame). The stream request
- * targets the YUV outputs only; the still request (TEMPLATE_ZERO_SHUTTER_LAG,
- * or TEMPLATE_PREVIEW with debug.dxr.leia.scam_still_template=preview; never
+ * targets the YUV outputs only; the still request (TEMPLATE_PREVIEW, or
+ * TEMPLATE_ZERO_SHUTTER_LAG with debug.dxr.leia.scam_still_template=zsl; never
  * STILL_CAPTURE, which freezes the stream ~400 ms) targets all four. Then the
  * repeating request starts with the controls in force.
  *
@@ -3309,8 +3415,13 @@ build_session_locked(xrt_plugin_stereo_camera *c, uint32_t cap_w, uint32_t cap_h
 	ok = ok && ACaptureSessionOutputContainer_create(&c->outputs) == ACAMERA_OK &&
 	     ACameraDevice_createCaptureRequest(c->dev, TEMPLATE_PREVIEW, &c->req) == ACAMERA_OK;
 	if (ok && sm != nullptr) {
-		const bool preview = prop_str("debug.dxr.leia.scam_still_template", "zsl") == "preview";
-		ok = ACameraDevice_createCaptureRequest(c->dev, preview ? TEMPLATE_PREVIEW : TEMPLATE_ZERO_SHUTTER_LAG,
+		// PREVIEW by default: a device run saw the right lens's physical result
+		// stamp jump to one frame + 5.6 ms before the left's right after a ZSL
+		// still and stay there, while the image stamps (which pairing uses) stayed
+		// equal; ZSL picks each lens's buffer from its own queue. Stage 0 measured
+		// PREVIEW just as lossless for the stream (~320 ms to both JPEGs).
+		const bool zsl = prop_str("debug.dxr.leia.scam_still_template", "preview") == "zsl";
+		ok = ACameraDevice_createCaptureRequest(c->dev, zsl ? TEMPLATE_ZERO_SHUTTER_LAG : TEMPLATE_PREVIEW,
 		                                        &c->still_req) == ACAMERA_OK;
 	}
 	if (ok) {
@@ -3480,10 +3591,131 @@ start_locked(xrt_plugin_stereo_camera *c)
 	c->opened_ns = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(0);
 	SCAM_LOG_W("leia stereo camera (android): %s pair streaming: logical %s, L=%s R=%s, %ux%u YUV per lens -> %ux%u "
-	           "eyes (mode %u, turned %u deg cw), tracking %s",
+	           "eyes (mode %u, turned %u deg cw), tracking %s; pairing by image stamp, tolerance %.2f ms "
+	           "(debug.dxr.leia.scam_pair_tol_ms; capped at 0.3 frame period, so never across frames)",
 	           c->desc.front ? "front" : "rear", c->desc.logical_id, left, right, c->cap_w, c->cap_h, c->w, c->h,
-	           c->mode_index, c->rot, c->track ? "640x480 from the tracking lens (unturned)" : "not handed over");
+	           c->mode_index, c->rot, c->track ? "640x480 from the tracking lens (unturned)" : "not handed over",
+	           (double)c->pair_tol_cfg_ns / 1e6);
 	return true;
+}
+
+/*
+ *
+ * Pairing / skew diagnostics (every 10 s from the watchdog, and once after
+ * each still).
+ *
+ */
+
+//! "min/median/max ms" of @p w, or "none".
+std::string
+skew_str(const leia_scam_skew_window &w)
+{
+	int64_t lo = 0, med = 0, hi = 0;
+	if (!leia_scam_skew_summary(&w, &lo, &med, &hi)) {
+		return "none";
+	}
+	char b[80];
+	snprintf(b, sizeof(b), "%.3f/%.3f/%.3f ms (n %u)", (double)lo / 1e6, (double)med / 1e6, (double)hi / 1e6, w.n);
+	return b;
+}
+
+//! Camera thread, every 10 s: one WARN with the pairing and skew picture, then reset.
+void
+report_pairing(xrt_plugin_stereo_camera *c)
+{
+	std::string img, phys, ivp_l, ivp_r;
+	uint64_t rej, un_l, un_r;
+	int64_t tol, period;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		img = skew_str(c->img_dt);
+		rej = c->rejected;
+		un_l = c->unpaired[0];
+		un_r = c->unpaired[1];
+		tol = leia_scam_pair_tolerance_ns(c->pair_tol_cfg_ns, c->frame_period_ns);
+		period = c->frame_period_ns;
+		leia_scam_skew_reset(&c->img_dt);
+		c->rejected = c->unpaired[0] = c->unpaired[1] = 0;
+	}
+	bool indep;
+	{
+		std::lock_guard<std::mutex> lk(c->res_mu);
+		phys = skew_str(c->phys_dt);
+		ivp_l = skew_str(c->img_vs_phys[0]);
+		ivp_r = skew_str(c->img_vs_phys[1]);
+		indep = leia_scam_eye_times_independent(&c->eye_times);
+		leia_scam_skew_reset(&c->phys_dt);
+		leia_scam_skew_reset(&c->img_vs_phys[0]);
+		leia_scam_skew_reset(&c->img_vs_phys[1]);
+	}
+	SCAM_LOG_W("leia stereo camera (android): pairing (10 s): R-L image stamp min/med/max %s; R-L physical result "
+	           "stamp %s; image-physical L %s, R %s; tolerance %.2f ms (period %.3f ms); %llu rejected over "
+	           "tolerance; dropped unpaired L %llu R %llu; per-eye times %s",
+	           img.c_str(), phys.c_str(), ivp_l.c_str(), ivp_r.c_str(), (double)tol / 1e6, (double)period / 1e6,
+	           (unsigned long long)rej, (unsigned long long)un_l, (unsigned long long)un_r,
+	           indep ? "REPORTED (independent stamps)" : "withheld (stamps not independent)");
+}
+
+//! Before a still: the medians the still is compared against.
+[[maybe_unused]] void
+snapshot_pre_still(xrt_plugin_stereo_camera *c)
+{
+	int64_t lo, hi;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->pre_img_have = leia_scam_skew_summary(&c->img_dt, &lo, &c->pre_img_med, &hi);
+	}
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	c->pre_phys_have = leia_scam_skew_summary(&c->phys_dt, &lo, &c->pre_phys_med, &hi);
+}
+
+//! After a still: collect the next pairs' skews (check_still_watch compares).
+[[maybe_unused]] void
+arm_still_watch(xrt_plugin_stereo_camera *c, uint64_t request_id)
+{
+	std::lock_guard<std::mutex> l1(c->pair_mu);
+	std::lock_guard<std::mutex> l2(c->res_mu);
+	leia_scam_skew_reset(&c->post_img_dt);
+	leia_scam_skew_reset(&c->post_phys_dt);
+	c->still_watch_id = request_id;
+	c->still_watch = true;
+}
+
+/*!
+ * Camera thread: once 30 pairs followed a still, ONE WARN comparing the R-L
+ * image and physical skew medians before and after it ("CHANGED" when either
+ * moved by more than 1 ms; a device run saw the physical skew jump to
+ * -39.1 ms right after a still).
+ */
+void
+check_still_watch(xrt_plugin_stereo_camera *c)
+{
+	if (!c->still_watch.load()) {
+		return;
+	}
+	int64_t lo, hi, img_med = 0, phys_med = 0;
+	bool img_have, phys_have;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		if (c->post_img_dt.n < 30) {
+			return;
+		}
+		img_have = leia_scam_skew_summary(&c->post_img_dt, &lo, &img_med, &hi);
+	}
+	{
+		std::lock_guard<std::mutex> lk(c->res_mu);
+		phys_have = leia_scam_skew_summary(&c->post_phys_dt, &lo, &phys_med, &hi);
+	}
+	c->still_watch = false;
+	auto moved = [](bool a, int64_t x, bool b, int64_t y) { return a != b || (a && std::llabs(x - y) > kNsPerMs); };
+	const bool changed = moved(c->pre_img_have, c->pre_img_med, img_have, img_med) ||
+	                     moved(c->pre_phys_have, c->pre_phys_med, phys_have, phys_med);
+	SCAM_LOG_W("leia stereo camera (android): after still %llu: R-L median image stamp %.3f -> %.3f ms, physical "
+	           "result stamp %.3f -> %.3f ms%s",
+	           (unsigned long long)c->still_watch_id, c->pre_img_have ? (double)c->pre_img_med / 1e6 : 0.0,
+	           img_have ? (double)img_med / 1e6 : 0.0, c->pre_phys_have ? (double)c->pre_phys_med / 1e6 : 0.0,
+	           phys_have ? (double)phys_med / 1e6 : 0.0,
+	           changed ? " -- CHANGED by the still" : " (unchanged)");
 }
 
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
@@ -3629,6 +3861,7 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
 	const bool jpeg = m.source == LEIA_SCAM_SRC_STILL_OUTPUT;
 	std::string why;
+	snapshot_pre_still(c);
 	{
 		std::lock_guard<std::mutex> lk(c->pair_mu);
 		c->still_geom = m.geom;
@@ -3643,7 +3876,7 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 			why = "the source is not streaming";
 		} else {
 			const camera_status_t st =
-			    ACameraCaptureSession_logicalCamera_capture(c->session, &c->cap_cb, 1, &c->still_req, nullptr);
+			    ACameraCaptureSession_logicalCamera_capture(c->session, &c->still_cb, 1, &c->still_req, nullptr);
 			if (st != ACAMERA_OK) {
 				why = "the still request was refused (" + std::to_string((int)st) + ")";
 			}
@@ -3701,9 +3934,10 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 	}
 	if (why.empty()) {
 		std::lock_guard<std::mutex> lk(c->cam_mu); // c->ctl
-		capture_state_of(c, c->still_ts_boot, &c->still_res);
+		capture_state_of(c, c->still_ts_boot, nullptr, jpeg, &c->still_res);
 	}
 	const int64_t t_end = clock_ns(CLOCK_MONOTONIC);
+	arm_still_watch(c, request_id);
 	{
 		std::lock_guard<std::mutex> lk(c->pair_mu);
 		c->still = why.empty() ? still_state::READY : still_state::FAILED;
@@ -3753,7 +3987,9 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 			           fed > 0 ? (double)c->trk_busy_ns.load() / fed / 1e6 : 0.0);
 			c->stats_ns = now;
 			c->stats_pairs = p;
+			report_pairing(c);
 		}
+		check_still_watch(c);
 		return true;
 	}
 	if (c->down_since_ns == 0) {
@@ -3986,7 +4222,14 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	c->cap_cb.context = c;
 	c->cap_cb.onLogicalCameraCaptureCompleted = on_capture_completed;
 	c->cap_cb.onLogicalCameraCaptureFailed = on_capture_failed;
+	c->still_cb = c->cap_cb;
+	c->still_cb.onLogicalCameraCaptureCompleted = on_still_capture_completed;
 #endif
+	{
+		const std::string t = prop_str("debug.dxr.leia.scam_pair_tol_ms", "");
+		const double v = t.empty() ? -1.0 : atof(t.c_str());
+		c->pair_tol_cfg_ns = v > 0.0 && v < 100.0 ? (int64_t)(v * 1e6) : kPairTolDefaultNs;
+	}
 	c->track = c->desc.front && prop_bool("debug.dxr.leia.scam_track", true);
 
 	if (c->track) {
@@ -4358,16 +4601,18 @@ leia_stereo_camera_android_get_capture_result(struct xrt_plugin_stereo_camera *c
 	if (c == nullptr || out == nullptr) {
 		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 	}
-	int64_t ts = 0;
+	int64_t ts = 0, img_ts[2] = {0, 0};
 	{
 		std::lock_guard<std::mutex> lk(c->pair_mu);
 		if (c->held < 0) {
 			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 		}
 		ts = c->bufs[c->held].ts_boot;
+		img_ts[0] = c->bufs[c->held].eye_ts_boot[0];
+		img_ts[1] = c->bufs[c->held].eye_ts_boot[1];
 	}
 	leia_scam_capture_state s;
-	capture_state_of(c, ts, &s); // camera thread: c->ctl is stable here
+	capture_state_of(c, ts, img_ts, false, &s); // camera thread: c->ctl is stable here
 	put_capture_result(s, out);
 	return XRT_SUCCESS;
 }

@@ -490,6 +490,51 @@ leia_scam_eye_times_observe(struct leia_scam_eye_times_tracker *t, int64_t left_
 bool
 leia_scam_eye_times_independent(const struct leia_scam_eye_times_tracker *t);
 
+/*
+ *
+ * Pairing and its diagnostics.
+ *
+ */
+
+/*!
+ * The pairing tolerance: the configured one (debug.dxr.leia.scam_pair_tol_ms,
+ * default 8 ms), never more than 0.3 of the frame period @p frame_period_ns
+ * when it is known (> 0), so two images of DIFFERENT frames (one period
+ * apart) can never pair, while a constant lens offset of a few ms (a real
+ * sensor phase) still does. At 29.80 fps the cap is 10.1 ms.
+ */
+int64_t
+leia_scam_pair_tolerance_ns(int64_t configured_ns, int64_t frame_period_ns);
+
+/*!
+ * The candidate in @p ts (n other-lens timestamps) closest to @p t within
+ * @p tol_ns, or -1. Closest, not first: with a tolerance under half a period
+ * only one can qualify, but the rule stays right if it is ever raised.
+ */
+int
+leia_scam_pair_pick(const int64_t *ts, size_t n, int64_t t, int64_t tol_ns);
+
+//! Samples one skew window keeps (the last ones win).
+#define LEIA_SCAM_SKEW_WINDOW 512u
+
+//! A window of signed nanosecond samples (right - left, image - physical, ...).
+struct leia_scam_skew_window
+{
+	int64_t v[LEIA_SCAM_SKEW_WINDOW];
+	uint32_t n;    //!< samples held (<= LEIA_SCAM_SKEW_WINDOW)
+	uint32_t next; //!< ring write index
+};
+
+void
+leia_scam_skew_reset(struct leia_scam_skew_window *w);
+
+void
+leia_scam_skew_push(struct leia_scam_skew_window *w, int64_t v);
+
+//! min / median / max of what @p w holds; false when it is empty.
+bool
+leia_scam_skew_summary(const struct leia_scam_skew_window *w, int64_t *out_min, int64_t *out_median, int64_t *out_max);
+
 #ifdef __cplusplus
 }
 #endif
