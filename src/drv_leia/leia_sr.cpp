@@ -655,9 +655,10 @@ create_v2(double max_time,
 		sr.lens_bound = sr.lens_v2 != nullptr;
 	}
 	// The lens leiasr_request_display_mode will drive: the v2 handle for a
-	// screen-bound DP, the lens hint otherwise. None = nothing will ever ask
-	// this weaver for 3D, so it must not wait at OFF for it.
-	if (!(sr.screen_bound ? sr.lens_v2 != nullptr : sr.lens_hint != nullptr)) {
+	// screen-bound DP; for an unbound DP the lens hint, or on the v2 path
+	// (no v1 SRContext, so no hint) the active-display v2 handle (#589). None =
+	// nothing will ever ask this weaver for 3D, so it must not wait at OFF for it.
+	if (!(sr.screen_bound ? sr.lens_v2 != nullptr : (sr.lens_hint != nullptr || sr.lens_v2 != nullptr))) {
 		leia_sr_v2_weaver_tracking_no_lens(weaver, &sr.tracking_held_off, "VK");
 	}
 	if (non_active && segment_tracked) {
@@ -2011,6 +2012,22 @@ leiasr_request_display_mode(struct leiasr *leiasr, bool enable_3d)
 			        (unsigned long long)leiasr->bind_display_id,
 			        leiasr->lens_bound ? "(bound)" : "(active panel)", enable_3d ? "3D" : "2D",
 			        leia_sr_v2_result_str(r));
+		}
+		return SR_SUCCEEDED(r);
+	}
+	/*
+	 * #589: an unbound DP on the v2 path has no lens hint (the hint comes from
+	 * the v1 SRContext, which is null there) but holds the active-display v2
+	 * lens created with its weaver. Drive that, as the D3D11, D3D12 and GL DPs
+	 * do; otherwise every 2D/3D request is a no-op on the panel.
+	 */
+	if (leiasr != nullptr && !leiasr->screen_bound && leiasr->instance_v2 != nullptr &&
+	    leiasr->lens_hint == nullptr && leiasr->lens_v2 != nullptr) {
+		const SrResult r = enable_3d ? srLensEnable(leiasr->lens_v2) : srLensDisable(leiasr->lens_v2);
+		if (SR_SUCCEEDED(r)) {
+			U_LOG_W("SR Vulkan display mode switched to %s", enable_3d ? "3D" : "2D");
+		} else {
+			U_LOG_E("SR Vulkan: lens %s failed (%s)", enable_3d ? "3D" : "2D", leia_sr_v2_result_str(r));
 		}
 		return SR_SUCCEEDED(r);
 	}
