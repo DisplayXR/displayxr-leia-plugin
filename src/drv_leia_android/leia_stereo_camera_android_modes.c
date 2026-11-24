@@ -802,3 +802,17 @@ leia_scam_phase_partner_ts(int64_t t, bool left, int shift, int64_t period_ns)
 	const int64_t d = (int64_t)shift * period_ns;
 	return left ? t + d : t - d;
 }
+
+bool
+leia_scam_phase_stamps_identical(const struct leia_scam_phase_lock *l)
+{
+	if (l->n == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < l->n; i++) {
+		if (l->g[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}

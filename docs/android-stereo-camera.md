@@ -560,6 +560,20 @@ session measured the same on a phone's front pair (0 ms in about half the
 opens, else up to 40 ms; visible as depth error when the device rotates).
 It is a real exposure-time offset between the eyes.
 
+The gap is **bimodal** on the tablet's rear pair: exactly 0.000 ms, or about
+−35 to −42 ms (once −6.5 ms). An exact 0.000 is either a hardware frame sync
+that locked (one shared start of frame) or the HAL reporting one stamp for
+both lenses in that state; timestamps cannot tell which. Behaviour does not
+change for it; the log says `identical stamps on all N samples: hardware sync
+or a shared stamp, not distinguishable`.
+
+Measured with the lock (d3f76be, rear 1920x1440, 7 opens): session restart
+−38.965 → 0.000 after 1 (420 ms), 0.000 without one, −36.480 → 0.000 after 1
+(417 ms); device restart −38.168 → −42.085 → −40.525 → 0.000 after 3 (236 /
+294 / 278 ms), −34.791 → 0.000 after 1 (257 ms), −38.024 → 0.000 after 1
+(246 ms). Both levels re-roll the phase. First frame at the client: 706 ms
+without a restart, ~1.6–1.7 s with one, 3.3 s with three.
+
 **Lock** (`leia_scam_phase_*`, after every start):
 
 1. Measure the gap G = R − L of the two lenses' physical `SENSOR_TIMESTAMP`
@@ -587,11 +601,20 @@ After a mode reconfigure (a new session, so a new phase) the lock re-measures
 and re-pairs but neither restarts nor holds frames, to keep the switch inside
 its 500 ms budget. A HAL with no per-lens stamps: no lock (after 36 pairs).
 
-**Restart level** (`debug.dxr.leia.scam_phase_restart`): `session`
-(default) recreates only the capture session on the open device; the HAL
-reconfigures and restarts both sensors' streaming, which should re-roll the
-phase (the next device run decides). `device` closes and re-opens the
-logical camera (sensors powered down and up: a sure re-roll, ~2× the cost).
+**Restart level** (`debug.dxr.leia.scam_phase_restart`): `device` (rear
+default) closes and re-opens the logical camera; `session` (front default)
+recreates only the capture session on the open device. Both re-roll the
+phase; on the rear pair the device restart measured faster (236–294 ms vs
+417–420 ms). The front keeps `session` because a device restart there also
+waits for the tracking lens to be released.
+
+**Every wait is bounded and logged.** A start holds frames at most 2.5 s per
+session for the lock; past it the lock gives up with a WARN naming why (no
+pair arrived / pairs but no capture results / results without both lenses'
+stamps) and frames flow unshifted. Every open attempt logs one WARN (first
+open, watchdog re-open, retry after a policy refusal, lens-phase restart),
+and so does every `openCamera` refusal (a process in the background or with
+the screen off is refused with −10012); the watchdog gives up after 15 s.
 
 **Front pair**: re-pairing only by default. A restart there stops the
 tracking feed for its duration (a session restart ~200–250 ms, a device
@@ -672,7 +695,7 @@ On either, the source:
 | `debug.dxr.leia.scam_phase_samples=<n>` | pairs measured per session (default 12) |
 | `debug.dxr.leia.scam_phase_max_ms=<ms>` | accepted lens-phase gap (default 3) |
 | `debug.dxr.leia.scam_phase_restarts=<n>` | restarts at most (default 4) |
-| `debug.dxr.leia.scam_phase_restart=session\|device` | restart level (default session) |
+| `debug.dxr.leia.scam_phase_restart=session\|device` | restart level (default device on the rear pair, session on the front) |
 | `debug.dxr.leia.scam_phase_repair=0` | no nearest-frame re-pairing |
 | `debug.dxr.leia.scam_phase_restart_rear=0` / `_front=1` | restarts on the rear (default on) / front (default off) pair |
 | `debug.dxr.leia.scam_pair_tol_ms=<ms>` | pairing tolerance between the two lenses' image stamps (default 8; always capped at 0.3 frame period) |

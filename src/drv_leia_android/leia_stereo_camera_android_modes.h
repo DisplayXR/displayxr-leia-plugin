@@ -617,6 +617,15 @@ leia_scam_phase_feed(struct leia_scam_phase_lock *l, int64_t gap_ns, int64_t per
 enum leia_scam_phase_action
 leia_scam_phase_pair_without_sample(struct leia_scam_phase_lock *l);
 
+/*!
+ * True when every gap sample of this session is exactly 0: the two lenses'
+ * stamps are identical. That is either a hardware frame sync that locked (one
+ * shared start of frame) or the HAL reporting one stamp for both lenses;
+ * timestamps cannot tell which. Logged, behaviour unchanged.
+ */
+bool
+leia_scam_phase_stamps_identical(const struct leia_scam_phase_lock *l);
+
 //! True while frames are held back (MEASURING or REOPEN pending).
 bool
 leia_scam_phase_holding(const struct leia_scam_phase_lock *l);

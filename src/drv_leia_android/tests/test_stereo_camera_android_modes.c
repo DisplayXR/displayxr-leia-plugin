@@ -746,6 +746,7 @@ test_phase_lock(void)
 	CHECK(a == LEIA_SCAM_PHASE_MEASURING && leia_scam_phase_holding(&l));
 	feed_n(&l, 0, P, 1, &a);
 	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.shift == 0 && l.residual_ns == 0 && !leia_scam_phase_holding(&l));
+	CHECK(leia_scam_phase_stamps_identical(&l));
 	// -6.5: re-pairing cannot help (n = 0), over 3 ms -> reopen.
 	leia_scam_phase_init(&l, &rear);
 	feed_n(&l, -6495000, P, 12, &a);
@@ -792,6 +793,7 @@ test_phase_lock(void)
 	feed_n(&l, 0, P, 11, &a);
 	feed_n(&l, -16000000, P, 1, &a);
 	CHECK(a == LEIA_SCAM_PHASE_LOCKED && l.gap_ns == 0);
+	CHECK(!leia_scam_phase_stamps_identical(&l)); // one sample differed: not "identical"
 	// Re-pairing off: the raw gap decides.
 	{
 		struct leia_scam_phase_cfg c = rear;
