@@ -136,7 +136,9 @@ main(void)
 	CHECK(s.left_is_sub);
 	NEAR(s.k[0][0], 1724.2 * sc, 1e-9);                       // left = sub
 	NEAR(s.k[1][0], 1726.8 * sc, 1e-9);                       // right = main
-	NEAR(s.k[1][3], (1204.5 - 1224.0) * sc + 360.0, 1e-9);    // cy with the row crop
+	// cy with the row crop, pixel-centre aware (v8): c' = (c + 1/2) s - 1/2.
+	NEAR(s.k[1][3], (1204.5 + 0.5 - 1224.0) * sc + 360.0 - 0.5, 1e-9);
+	NEAR(s.k[1][2], (1624.2 + 0.5) * sc - 0.5, 1e-9);
 	NEAR(s.d[0][1], -1.481, 1e-12);
 	// Right camera at +x of left: c = -R_rl^T T_rl must have x = +|T|.
 	double cx = 0.0;
@@ -168,8 +170,8 @@ main(void)
 		struct leia_scam_stream_calib two;
 		CHECK(leia_scam_stream_calib_from_factory(&f, 4576, 3168, 1280, 960, 1280, 720, 0, &two));
 		const double s43 = 960.0 / 3168.0;
-		const double main_cx = (1624.2 - 4576.0 / 2.0) * s43 + 640.0; // column crop in step 1
-		const double main_cy = 1204.5 * s43 - 120.0;                  // row crop in step 2
+		const double main_cx = (1624.2 + 0.5 - 4576.0 / 2.0) * s43 + 640.0 - 0.5; // column crop in step 1
+		const double main_cy = (1204.5 + 0.5) * s43 - 0.5 - 120.0;              // row crop in step 2
 		NEAR(two.k[two.left_is_sub ? 1 : 0][0], 1726.8 * s43, 1e-9);
 		NEAR(two.k[two.left_is_sub ? 1 : 0][2], main_cx, 1e-9);
 		NEAR(two.k[two.left_is_sub ? 1 : 0][3], main_cy, 1e-9);

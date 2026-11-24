@@ -137,6 +137,46 @@ leia_scam_lens_for_stream(const struct leia_scam_lens *l,
 	}
 }
 
+/*!
+ * Step 1 of the published calibration: the array -> stream step, PIXEL-CENTRE
+ * aware (pixel centres at integer coordinates, as OpenCV's calibration and the
+ * runtime's own rescale rules use): c' = (c - offset + 1/2) s - 1/2. Same
+ * region as leia_scam_lens_for_stream, which stays edge-origin (c' = c s) for
+ * the tracker's intrinsics it was tuned with. The two differ by (s - 1) / 2 px
+ * (about -0.35 px at 1280 of a 4208-column array). This one composes exactly
+ * with the runtime's per-mode rule (XR_DXR_stereo_camera v8 §5.5,
+ * cx' = (cx + 1/2) s - 1/2), so a mode's numbers derived from the default's
+ * equal the numbers computed for the mode directly from the block.
+ */
+static void
+lens_for_stream_pc(const struct leia_scam_lens *l,
+                   uint32_t array_w,
+                   uint32_t array_h,
+                   uint32_t width,
+                   uint32_t height,
+                   struct leia_scam_lens *out)
+{
+	*out = *l;
+	if (array_w == 0 || array_h == 0 || width == 0 || height == 0) {
+		return;
+	}
+	const double aw = (double)array_w, ah = (double)array_h, w = (double)width, h = (double)height;
+	double s, x0, y0;
+	if (w * ah >= h * aw) {
+		s = w / aw;
+		x0 = 0.0;
+		y0 = (ah - h / s) / 2.0;
+	} else {
+		s = h / ah;
+		x0 = (aw - w / s) / 2.0;
+		y0 = 0.0;
+	}
+	out->fx = l->fx * s;
+	out->fy = l->fy * s;
+	out->cx = (l->cx - x0 + 0.5) * s - 0.5;
+	out->cy = (l->cy - y0 + 0.5) * s - 0.5;
+}
+
 //! Step 2: the plug-in's centre crop of a cap_w x cap_h image to width x height.
 static void
 lens_crop(struct leia_scam_lens *l, uint32_t cap_w, uint32_t cap_h, uint32_t width, uint32_t height)
@@ -217,8 +257,8 @@ leia_scam_stream_calib_from_factory(const struct leia_scam_factory_calib *f,
 		cap_h = height;
 	}
 	struct leia_scam_lens main_s, sub_s;
-	leia_scam_lens_for_stream(&f->main, array_w, array_h, cap_w, cap_h, &main_s);
-	leia_scam_lens_for_stream(&f->sub, array_w, array_h, cap_w, cap_h, &sub_s);
+	lens_for_stream_pc(&f->main, array_w, array_h, cap_w, cap_h, &main_s);
+	lens_for_stream_pc(&f->sub, array_w, array_h, cap_w, cap_h, &sub_s);
 	lens_crop(&main_s, cap_w, cap_h, width, height);
 	lens_crop(&sub_s, cap_w, cap_h, width, height);
 

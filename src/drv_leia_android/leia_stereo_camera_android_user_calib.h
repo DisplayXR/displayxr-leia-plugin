@@ -28,6 +28,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "leia_stereo_camera_android_calib.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -153,6 +155,93 @@ leia_scam_user_calib_choose(enum leia_scam_user_calib_provider provider,
                             const uint8_t block_sha256[32],
                             const double R_factory[3][3],
                             struct leia_scam_user_calib_choice *out);
+
+/*
+ *
+ * The SERVED record: the display config's "stereoCalibrations" entry of a
+ * pair, as CNSDK (>= 0.10.91) parses it out of the config the display-config
+ * service (com.leialoft.display.config) serves. This is the primary source;
+ * the calibration app's provider above is only the fallback (an OEM
+ * auto-launch policy blocks a cold start of that provider, so it answers only
+ * while the calibration app is alive).
+ *
+ * Two writers put entries there (leia-calibration-suite StereoConfigSection):
+ * - the MIRROR routine (source "mirror"): both lenses FITTED at the pair
+ *   streams' size (imageSize, 1280x960 on the tablet), R and a metric T
+ *   solved with them, "factory": null (no block SHA-256);
+ * - the "Stereo cameras" tool (source "user"): R only re-estimated against
+ *   the factory intrinsics, keyed to the factory block's SHA-256.
+ * CNSDK serves neither "source" nor "method", so the block SHA-256 tells them
+ * apart: none = a mirror record (full lens model), present = a user record
+ * (rotation only, gated on the block exactly like the provider's).
+ *
+ */
+
+//! One served entry (a copy of CNSDK's leia_stereo_calibration, in doubles).
+struct leia_scam_served_stereo
+{
+	char logical_id[16];
+	char lens_ids[2][16]; //!< "" when the config does not name them
+	int32_t width, height; //!< imageSize: the size lens[] is stated at
+	struct
+	{
+		double fx, fy, cx, cy;
+		double dist[8]; //!< k1 k2 p1 p2 k3 k4 k5 k6, zero-padded
+	} lens[2];             //!< [0] = lens0, [1] = lens1 (pair.lensIds order)
+	double R[3][3];        //!< x1 = R x0 + T, OpenCV frame, native sensor orientation
+	double T_mm[3];        //!< the usable vector (any sign flag already applied)
+	char block_sha256[65]; //!< "" = none (a mirror record)
+	char timestamp[32];
+};
+
+enum leia_scam_served_verdict
+{
+	LEIA_SCAM_SERVED_FULL = 0,      //!< mirror record: the whole lens model replaces the block
+	LEIA_SCAM_SERVED_ROTATION,      //!< user record: its R replaces the block's R
+	LEIA_SCAM_SERVED_OTHER_LENSES,  //!< pair.lensIds are not this pair's two lenses
+	LEIA_SCAM_SERVED_BAD_SIZE,      //!< imageSize missing (or no array size)
+	LEIA_SCAM_SERVED_BAD_LENS,      //!< a focal length, principal point or distortion term is not plausible
+	LEIA_SCAM_SERVED_NOT_ROTATION,  //!< R_1_from_0 is not a rotation
+	LEIA_SCAM_SERVED_BAD_BASELINE,  //!< |T| outside 1..200 mm
+	LEIA_SCAM_SERVED_BLOCK_CHANGED, //!< user record of another factory block (or the device has none)
+	LEIA_SCAM_SERVED_TOO_FAR,       //!< R more than LEIA_SCAM_USER_CALIB_MAX_DELTA_DEG from the block's
+};
+
+const char *
+leia_scam_served_verdict_str(enum leia_scam_served_verdict v);
+
+/*!
+ * Turn the served entry @p s of the pair (@p main_id, @p sub_id: the factory
+ * block's main and sub lens) into the plug-in's own model at the active array
+ * @p array_w x @p array_h, @p out (main = the block's main lens, x_sub =
+ * R x_main + T), and say how to use it.
+ *
+ * - Lens order: lensIds [main, sub] is taken as is; [sub, main] swaps the two
+ *   lenses and inverts the extrinsics (R <- R^T, T <- -R^T T); empty ids are
+ *   taken as [main, sub] (CNSDK and the writer put the main lens first); any
+ *   other ids = OTHER_LENSES.
+ * - FULL (no block SHA-256): each lens's intrinsics go from imageSize to the
+ *   array through the HAL's array -> stream step inverted PER AXIS (the
+ *   stream is the centred region of its aspect; s_x = width / region.w,
+ *   s_y = height / region.h, equal for an exact 4:3 size, a little different
+ *   for a listed size that is not exactly the region's aspect), pixel-centre
+ *   aware like the record (OpenCV): c_array = x0 + (c + 1/2) / s - 1/2.
+ *   Distortion is normalised and carries over. @p block (optional, the factory
+ *   block at the array) only bounds R: more than 5 deg from it = TOO_FAR.
+ * - ROTATION (a block SHA-256): it must equal @p block_sha256 (none on the
+ *   device = BLOCK_CHANGED), and @p out is @p block with R replaced.
+ * @p out_delta_deg (optional): the angle between the record's R and the block's.
+ */
+enum leia_scam_served_verdict
+leia_scam_served_to_factory(const struct leia_scam_served_stereo *s,
+                            const char *main_id,
+                            const char *sub_id,
+                            uint32_t array_w,
+                            uint32_t array_h,
+                            const struct leia_scam_factory_calib *block,
+                            const uint8_t *block_sha256,
+                            struct leia_scam_factory_calib *out,
+                            double *out_delta_deg);
 
 //! SHA-256 of @p len bytes.
 void

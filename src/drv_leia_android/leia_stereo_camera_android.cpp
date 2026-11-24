@@ -784,6 +784,15 @@ struct pair_desc
 	bool user_calib_disabled{false};
 	//! The record last written to the cache file (skip rewriting it).
 	std::string user_calib_cached;
+	//! The factory block at the array, as stored (factory returns to it before
+	//! any user / served calibration is applied).
+	leia_scam_factory_calib block_factory{};
+	//! factory holds a served FULL record: its convention is explicit
+	//! (x_sub = R x_main + T, the writer's), so the lens-pose swap
+	//! (pose_orient) never applies to it.
+	bool factory_explicit{false};
+	//! Why the factory block is absent (for the source log line).
+	std::string block_why;
 };
 
 std::mutex g_mu;
@@ -815,16 +824,136 @@ oriented_factory(const pair_desc &p);
  *
  * One WARN whenever the outcome changes.
  */
+/*!
+ * The served record (display config "stereoCalibrations", read by CNSDK) for
+ * @p p, when it applies. Returns true and fills p.factory when it does; else
+ * false with @p why (why it was skipped, for the log line).
+ */
+bool
+apply_served_locked(pair_desc &p, std::string &why, std::string &state)
+{
+	if (!prop_bool("debug.dxr.leia.scam_served_calib", true)) {
+		why = "disabled by debug.dxr.leia.scam_served_calib=0";
+		return false;
+	}
+	leia_scam_served_stereo srv;
+	memset(&srv, 0, sizeof(srv));
+	const int r = leia_cnsdk_find_stereo_calibration(p.logical_id, &srv);
+	if (r == LEIA_CNSDK_SERVED_UNKNOWN) {
+		why = "no CNSDK core of this process has read its display config yet (checked again on enumerate)";
+		return false;
+	}
+	if (r == LEIA_CNSDK_SERVED_UNSUPPORTED) {
+		why = "the CNSDK on the device predates 0.10.91 (no stereoCalibrations accessor)";
+		return false;
+	}
+	if (r == LEIA_CNSDK_SERVED_NONE) {
+		why = std::string("the served display config has no stereoCalibrations entry for logical ") + p.logical_id;
+		return false;
+	}
+	leia_scam_factory_calib conv{};
+	double delta = 0.0;
+	const leia_scam_served_verdict v =
+	    leia_scam_served_to_factory(&srv, p.main_id, p.sub_id, p.array_w, p.array_h,
+	                                p.have_block ? &p.block_factory : nullptr, p.have_block ? p.block_sha256 : nullptr,
+	                                &conv, &delta);
+	char buf[300];
+	if (v == LEIA_SCAM_SERVED_FULL) {
+		if (!p.have_block && leia_scam_factory_is_vertical(&conv)) {
+			why = "a vertical (turned) pair without a factory block is not supported";
+			return false;
+		}
+		// The record's eye order must agree with the HAL's lens poses (when
+		// they decide): a record that puts the sub lens on the other side is
+		// refused, never silently mirrored.
+		if (p.have_pose && p.have_sensor_orientation && prop_bool("debug.dxr.leia.scam_pose", true)) {
+			leia_scam_factory_calib probe = conv;
+			if (leia_scam_factory_orient_by_pose(&probe, p.pose_main, p.pose_sub, p.front, p.sensor_orientation,
+			                                     p.rot) == 1) {
+				why = "its eye order contradicts the HAL's lens poses";
+				return false;
+			}
+		}
+		p.factory = conv;
+		p.factory_explicit = true;
+		snprintf(buf, sizeof(buf),
+		         "source=served display config record (mirror: full lens model at %dx%d, lensIds [%s, %s], saved "
+		         "%s, R %.3f deg from the factory R)",
+		         srv.width, srv.height, srv.lens_ids[0], srv.lens_ids[1], srv.timestamp[0] ? srv.timestamp : "?",
+		         delta);
+		state = buf;
+		return true;
+	}
+	if (v == LEIA_SCAM_SERVED_ROTATION) {
+		memcpy(p.factory.R, conv.R, sizeof(p.factory.R));
+		snprintf(buf, sizeof(buf),
+		         "source=served display config record (user: R only on this factory block, saved %s, R %.3f deg "
+		         "from the factory R)",
+		         srv.timestamp[0] ? srv.timestamp : "?", delta);
+		state = buf;
+		return true;
+	}
+	why = std::string("the served record of logical ") + p.logical_id + " was refused: " +
+	      leia_scam_served_verdict_str(v);
+	return false;
+}
+
+/*!
+ * Pick the calibration of @p p, in order (one WARN whenever the outcome
+ * changes, naming the source that won and why the ones above it were skipped):
+ *  1. the served display config record (leia_cnsdk_find_stereo_calibration):
+ *     a mirror record replaces the whole lens model, a user record R only;
+ *  2. the calibration app's provider (content://com.leiainc.calibrationapp.stereo,
+ *     or its cached copy): R only, as before. Only a fallback: an OEM
+ *     auto-launch policy blocks a cold start of that provider;
+ *  3. the factory block.
+ */
 void
 apply_user_calib_locked(pair_desc &p)
 {
+	const leia_scam_factory_calib prev = p.factory;
+	p.factory_explicit = false;
+	if (p.have_block) {
+		p.factory = p.block_factory;
+	}
+	std::string served_why, served_state;
+	if (apply_served_locked(p, served_why, served_state)) {
+		const leia_scam_factory_calib of = oriented_factory(p);
+		p.calibrated = leia_scam_stream_calib_from_factory(&of, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w,
+		                                                   p.crop_h, p.rot, &p.stream);
+		const std::string state = served_state + "; calibration app provider and factory block skipped (the served "
+		                                         "record wins)";
+		if (state != p.user_calib_state) {
+			p.user_calib_state = state;
+			SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) calibration %s", p.front ? "front" : "rear",
+			           p.logical_id, state.c_str());
+		}
+		return;
+	}
 	if (!p.have_block || p.ref_w == 0) {
-		return; // no factory block: nothing a rotation could complete
+		// No factory block: only a served mirror record could calibrate it.
+		if (p.calibrated) {
+			p.calibrated = false;
+		}
+		const std::string state = "source=none (raw only, ideal parallel pair downstream): served display config "
+		                          "record skipped (" +
+		                          served_why +
+		                          "); calibration app provider skipped (it refines the factory block's R); factory "
+		                          "block skipped (" +
+		                          p.block_why + ")";
+		if (state != p.user_calib_state) {
+			p.user_calib_state = state;
+			SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) calibration %s", p.front ? "front" : "rear",
+			           p.logical_id, state.c_str());
+		}
+		return;
 	}
 	const bool disabled = !prop_bool("debug.dxr.leia.scam_user_calib", true);
 	const int64_t now = clock_ns(CLOCK_MONOTONIC);
-	if (!disabled && !p.user_calib_disabled && now < p.user_calib_next_query_ns) {
-		return; // backing off an unreachable provider: keep the current source
+	if (!disabled && !p.user_calib_disabled && now < p.user_calib_next_query_ns && !p.user_calib_state.empty() &&
+	    p.user_calib_state.rfind("source=served", 0) != 0) {
+		p.factory = prev; // backing off an unreachable provider: keep the current source
+		return;
 	}
 	p.user_calib_disabled = disabled;
 	memcpy(p.factory.R, p.factory_R, sizeof(p.factory.R));
@@ -919,9 +1048,10 @@ apply_user_calib_locked(pair_desc &p)
 	const leia_scam_factory_calib p_oriented_tmp = oriented_factory(p);
 	p.calibrated = leia_scam_stream_calib_from_factory(&p_oriented_tmp, p.array_w, p.array_h, p.cap_w, p.cap_h, p.crop_w,
 	                                                   p.crop_h, p.rot, &p.stream);
+	state = "rotation " + state + "; served display config record skipped (" + served_why + ")";
 	if (state != p.user_calib_state) {
 		p.user_calib_state = state;
-		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) rotation %s%s", p.front ? "front" : "rear",
+		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) calibration %s%s", p.front ? "front" : "rear",
 		           p.logical_id, state.c_str(), age.c_str());
 	}
 }
@@ -1085,7 +1215,7 @@ leia_scam_factory_calib
 oriented_factory(const pair_desc &p)
 {
 	leia_scam_factory_calib f = p.factory;
-	if (p.pose_orient == 1) {
+	if (p.pose_orient == 1 && !p.factory_explicit) {
 		leia_scam_factory_swap_convention(&f);
 	}
 	return f;
@@ -1283,6 +1413,7 @@ describe_pair_locked(ACameraManager *m, pair_desc &p)
 		p.have_block = true;
 		leia_scam_sha256(blk.data(), blk.size(), p.block_sha256);
 		memcpy(p.factory_R, p.factory.R, sizeof(p.factory_R));
+		p.block_factory = p.factory;
 	}
 	if (swap == "0" || swap == "1") {
 		p.swap_override = true;
@@ -1305,17 +1436,11 @@ describe_pair_locked(ACameraManager *m, pair_desc &p)
 	    p.calibrated ? "CALIBRATED" : "raw only",
 	    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
 	    eff_sub ? "sub" : "main", eff_sub ? p.sub_id : p.main_id, order_src);
-	if (have) {
-		// The calibration app's user rotation, when it saved one for this pair
-		// (logs the source that won: user calibration, its cached copy, or the
-		// factory block's own R, and why the higher ones were skipped).
-		apply_user_calib_locked(p);
-	} else {
-		SCAM_LOG_W("leia stereo camera (android): %s pair (logical %s) calibration source=none (raw only, ideal "
-		           "parallel pair downstream): user calibration skipped (it refines the factory block's R and is "
-		           "keyed to the block's SHA-256, so it needs the block); factory block skipped (%s)",
-		           p.front ? "front" : "rear", p.logical_id, why.c_str());
-	}
+	p.block_why = have ? std::string() : why;
+	// The served display config record, the calibration app's user rotation,
+	// or the factory block (logs the source that won and why the higher ones
+	// were skipped). Without a block only a served mirror record can calibrate.
+	apply_user_calib_locked(p);
 }
 
 //! Is any pair still waiting for its factory block (#505)?

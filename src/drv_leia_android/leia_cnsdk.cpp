@@ -11,6 +11,7 @@
 #include "leia_cnsdk.h"
 #include "leia_stereo_camera_android.h"
 #include "leia_stereo_camera_android_calib.h"
+#include "leia_stereo_camera_android_user_calib.h"
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -136,7 +137,10 @@ static const uint64_t kDropVerboseRuns = 32;
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <memory>
 #include <cmath>
 #include <cstdio>
@@ -838,6 +842,128 @@ apply_eye_tracking_mode(struct leia_cnsdk *cnsdk)
  *
  */
 
+/*
+ *
+ * The served stereo calibrations (display config "stereoCalibrations"),
+ * snapshotted by the first core that reads its device config. CNSDK >= 0.10.91
+ * parses them; the plug-in's pinned CNSDK floor predates the accessor, so its
+ * struct is mirrored here (layout = CNSDK's abiVerification.h) and the
+ * functions are looked up at run time, as for the tracking camera.
+ *
+ */
+
+struct cnsdk_stereo_lens
+{
+	float fx, fy, cx, cy;
+	int32_t distCount;
+	float dist[8];
+};
+
+struct cnsdk_stereo_calibration
+{
+	char logicalCameraId[16];
+	char lensIds[2][16];
+	int32_t facing;
+	int32_t width;
+	int32_t height;
+	cnsdk_stereo_lens lens[2];
+	float R[9];
+	float T_mm[3];
+	char factoryBlockSha256[65];
+	char timestamp[32];
+	char reserved[64];
+};
+static_assert(offsetof(cnsdk_stereo_calibration, lensIds) == 16, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, facing) == 48, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, width) == 52, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, lens) == 60, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, R) == 164, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, T_mm) == 200, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, factoryBlockSha256) == 212, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, timestamp) == 277, "CNSDK leia_stereo_calibration layout");
+static_assert(offsetof(cnsdk_stereo_calibration, reserved) == 309, "CNSDK leia_stereo_calibration layout");
+static_assert(sizeof(cnsdk_stereo_calibration) == 376, "CNSDK leia_stereo_calibration layout");
+
+std::mutex g_served_mu;
+int g_served_state = LEIA_CNSDK_SERVED_UNKNOWN; //!< UNKNOWN until a core read its config
+std::vector<leia_scam_served_stereo> g_served;
+
+//! @p name from the loader shim this plug-in links (already mapped), else the global scope.
+void *
+cnsdk_sym(const char *name)
+{
+	void *h = dlopen("libleiaCore-loader.so", RTLD_NOW | RTLD_NOLOAD);
+	void *fn = h != nullptr ? dlsym(h, name) : nullptr;
+	if (h != nullptr) {
+		dlclose(h); // drops the NOLOAD reference only; our DT_NEEDED keeps it mapped
+	}
+	return fn != nullptr ? fn : dlsym(RTLD_DEFAULT, name);
+}
+
+//! Worker, config in hand: snapshot its stereo calibrations once per process.
+void
+snapshot_stereo_calibrations(struct leia_device_config *cfg)
+{
+	{
+		std::lock_guard<std::mutex> lk(g_served_mu);
+		if (g_served_state != LEIA_CNSDK_SERVED_UNKNOWN) {
+			return;
+		}
+	}
+	using count_fn = int32_t (*)(struct leia_device_config const *);
+	using get_fn = leia_bool (*)(struct leia_device_config const *, int32_t, cnsdk_stereo_calibration *);
+	static const auto get_count = reinterpret_cast<count_fn>(cnsdk_sym("leia_device_config_get_stereo_calibration_count"));
+	static const auto get_one = reinterpret_cast<get_fn>(cnsdk_sym("leia_device_config_get_stereo_calibration"));
+	std::vector<leia_scam_served_stereo> all;
+	int state = LEIA_CNSDK_SERVED_UNSUPPORTED;
+	if (get_count != nullptr && get_one != nullptr) {
+		state = LEIA_CNSDK_SERVED_NONE;
+		const int32_t n = get_count(cfg);
+		for (int32_t i = 0; i < n && i < 16; i++) {
+			cnsdk_stereo_calibration c;
+			memset(&c, 0, sizeof(c));
+			if (!get_one(cfg, i, &c)) {
+				continue;
+			}
+			leia_scam_served_stereo s;
+			memset(&s, 0, sizeof(s));
+			snprintf(s.logical_id, sizeof(s.logical_id), "%.15s", c.logicalCameraId);
+			for (int k = 0; k < 2; k++) {
+				snprintf(s.lens_ids[k], sizeof(s.lens_ids[k]), "%.15s", c.lensIds[k]);
+				s.lens[k].fx = c.lens[k].fx;
+				s.lens[k].fy = c.lens[k].fy;
+				s.lens[k].cx = c.lens[k].cx;
+				s.lens[k].cy = c.lens[k].cy;
+				for (int j = 0; j < 8; j++) {
+					s.lens[k].dist[j] = j < c.lens[k].distCount ? c.lens[k].dist[j] : 0.0;
+				}
+			}
+			s.width = c.width;
+			s.height = c.height;
+			for (int j = 0; j < 9; j++) {
+				s.R[j / 3][j % 3] = c.R[j];
+			}
+			for (int j = 0; j < 3; j++) {
+				s.T_mm[j] = c.T_mm[j];
+			}
+			snprintf(s.block_sha256, sizeof(s.block_sha256), "%.64s", c.factoryBlockSha256);
+			snprintf(s.timestamp, sizeof(s.timestamp), "%.31s", c.timestamp);
+			all.push_back(s);
+		}
+	}
+	std::string ids;
+	for (const leia_scam_served_stereo &s : all) {
+		ids += std::string(ids.empty() ? "" : ", ") + s.logical_id + (s.block_sha256[0] != '\0' ? " (user)" : " (mirror)");
+	}
+	U_LOG_W("CNSDK display config stereoCalibrations: %s",
+	        state == LEIA_CNSDK_SERVED_UNSUPPORTED ? "no accessor (CNSDK on the device predates 0.10.91)"
+	        : all.empty()                         ? "none"
+	                                              : ids.c_str());
+	std::lock_guard<std::mutex> lk(g_served_mu);
+	g_served = all;
+	g_served_state = state;
+}
+
 std::mutex g_ext_mu;                       // guards the three below
 std::vector<struct leia_cnsdk *> g_ext_cores;
 int g_ext_depth = 0;
@@ -1172,6 +1298,7 @@ face_tracking_worker(struct leia_cnsdk *cnsdk)
 			U_LOG_W("leia_device_config_get_camera_data(0) failed; frame-listener "
 			        "face fallback keeps a zero camera offset (axis flip still applied)");
 		}
+		snapshot_stereo_calibrations(cfg);
 		leia_device_config_release(cfg);
 		cnsdk->display_metrics_cached.store(true, std::memory_order_release);
 		DXR_HW_DBG("worker: natural_orientation=%d", natural_ori);
@@ -2470,6 +2597,25 @@ leia_cnsdk_get_tracking_camera_id(char *out, size_t cap)
 		}
 	}
 	return false;
+}
+
+extern "C" int
+leia_cnsdk_find_stereo_calibration(const char *logical_id, struct leia_scam_served_stereo *out)
+{
+	std::lock_guard<std::mutex> lk(g_served_mu);
+	if (g_served_state != LEIA_CNSDK_SERVED_NONE) {
+		return g_served_state; // UNKNOWN or UNSUPPORTED
+	}
+	// The last entry of an id wins (CNSDK applies the same rule).
+	for (auto it = g_served.rbegin(); it != g_served.rend(); ++it) {
+		if (logical_id != nullptr && strcmp(it->logical_id, logical_id) == 0) {
+			if (out != nullptr) {
+				*out = *it;
+			}
+			return LEIA_CNSDK_SERVED_FOUND;
+		}
+	}
+	return LEIA_CNSDK_SERVED_NONE;
 }
 
 extern "C" bool

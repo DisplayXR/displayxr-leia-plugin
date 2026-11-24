@@ -392,7 +392,8 @@ add_test(NAME test_stereo_camera_android_calib COMMAND test_stereo_camera_androi
 # that decide whether its rotation replaces the block's R.
 add_executable(test_stereo_camera_android_user_calib
     ../drv_leia_android/tests/test_stereo_camera_android_user_calib.c
-    ../drv_leia_android/leia_stereo_camera_android_user_calib.c)
+    ../drv_leia_android/leia_stereo_camera_android_user_calib.c
+    ../drv_leia_android/leia_stereo_camera_android_calib.c)
 target_include_directories(test_stereo_camera_android_user_calib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_android)
 target_link_libraries(test_stereo_camera_android_user_calib PRIVATE m)
 add_test(NAME test_stereo_camera_android_user_calib COMMAND test_stereo_camera_android_user_calib)

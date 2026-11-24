@@ -12,6 +12,7 @@
 
 #include "leia_stereo_camera_android_user_calib.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -233,9 +234,214 @@ test_choose(void)
 	CHECK(c.source == LEIA_SCAM_USER_CALIB_SRC_FACTORY && !c.considered && !c.cache_drop);
 }
 
+/*
+ * The served record (display config "stereoCalibrations"): the real-shaped
+ * tablet entry from leia-calibration-suite
+ * android/app/src/test/resources/configs/k68-tablet-saved-old-layout.json
+ * (mirror Save: logical 5, lensIds ["1","3"], imageSize 1280x960, factory null).
+ */
+static struct leia_scam_served_stereo
+tablet_served(void)
+{
+	struct leia_scam_served_stereo s;
+	memset(&s, 0, sizeof(s));
+	snprintf(s.logical_id, sizeof(s.logical_id), "5");
+	snprintf(s.lens_ids[0], sizeof(s.lens_ids[0]), "1");
+	snprintf(s.lens_ids[1], sizeof(s.lens_ids[1]), "3");
+	s.width = 1280;
+	s.height = 960;
+	s.lens[0].fx = 693.3099546541497;
+	s.lens[0].fy = 692.2241582736079;
+	s.lens[0].cx = 641.2852896328532;
+	s.lens[0].cy = 481.7170643688129;
+	s.lens[0].dist[0] = 0.03416474974987201;
+	s.lens[0].dist[1] = -0.05696495902361015;
+	s.lens[1].fx = 692.9834930279095;
+	s.lens[1].fy = 692.1524860734401;
+	s.lens[1].cx = 638.3147356512378;
+	s.lens[1].cy = 479.4969527726019;
+	s.lens[1].dist[0] = 0.02981495872017688;
+	s.lens[1].dist[1] = -0.05159669312255205;
+	const double R[9] = {0.9999969921006638,    -0.0011835956661088538, -0.0021482297186240446,
+	                     0.0011858200711528134, 0.9999987618387237,     0.0010344814055983885,
+	                     0.002147002651060855,  -0.0010370257079002423, 0.9999971574746088};
+	memcpy(s.R, R, sizeof(s.R));
+	s.T_mm[0] = -25.015269088222244;
+	s.T_mm[1] = 0.013857612014705938;
+	s.T_mm[2] = -0.002862206078678098;
+	snprintf(s.timestamp, sizeof(s.timestamp), "2026-11-20T15:02:11+09:00");
+	return s;
+}
+
+static void
+test_served(void)
+{
+	const struct leia_scam_served_stereo s = tablet_served();
+	struct leia_scam_factory_calib f;
+	double d = -1.0;
+
+	// Tablet front: main = 1, sub = 3 (lensIds order) -> full model, as is.
+	// Front array 3264x2448 (4:3): the 1280x960 stream is the whole array.
+	CHECK(leia_scam_served_to_factory(&s, "1", "3", 3264, 2448, NULL, NULL, &f, &d) == LEIA_SCAM_SERVED_FULL);
+	const double sc = 3264.0 / 1280.0;
+	NEAR(f.main.fx, 693.3099546541497 * sc, 1e-9);
+	NEAR(f.main.cx, (641.2852896328532 + 0.5) * sc - 0.5, 1e-9);
+	NEAR(f.sub.cy, (479.4969527726019 + 0.5) * (2448.0 / 960.0) - 0.5, 1e-9);
+	NEAR(f.T[0], -25.015269088222244, 0.0);
+	NEAR(f.main.d[1], -0.05696495902361015, 0.0);
+	// Round trip through the stream pipeline: at the 1280x960 capture the eyes
+	// carry exactly the record's numbers (T.x < 0: lens1 = sub sits at +x, so
+	// main = the SBS left eye).
+	struct leia_scam_stream_calib sc960;
+	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 1280, 960, 1280, 960, 0, &sc960));
+	CHECK(!sc960.left_is_sub);
+	NEAR(sc960.k[0][0], 693.3099546541497, 1e-9);
+	NEAR(sc960.k[0][2], 641.2852896328532, 1e-9);
+	NEAR(sc960.k[0][3], 481.7170643688129, 1e-9);
+	NEAR(sc960.k[1][1], 692.1524860734401, 1e-9);
+	NEAR(sc960.k[1][2], 638.3147356512378, 1e-9);
+	NEAR(sc960.T_rl_mm[0], -25.015269088222244, 0.0);
+	// The default 1280x720 eye: the centre rows, cy - 120.
+	CHECK(leia_scam_stream_calib_from_factory(&f, 3264, 2448, 1280, 960, 1280, 720, 0, &sc960));
+	NEAR(sc960.k[0][3], 481.7170643688129 - 120.0, 1e-9);
+
+	// Per axis against the REGION (rear-like 4208x3120 array, not 4:3): the
+	// 1280x960 stream is the 4160x3120 centred region, so both ratios are 3.25
+	// and cx gains the region's 24-column offset; never 4208/1280 on x.
+	CHECK(leia_scam_served_to_factory(&s, "1", "3", 4208, 3120, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+	NEAR(f.main.fx, 693.3099546541497 * 3.25, 1e-9);
+	NEAR(f.main.fy, 692.2241582736079 * 3.25, 1e-9);
+	NEAR(f.main.cx, 24.0 + (641.2852896328532 + 0.5) * 3.25 - 0.5, 1e-9);
+	NEAR(f.main.cy, (481.7170643688129 + 0.5) * 3.25 - 0.5, 1e-9);
+	// A stated size a hair off the region's aspect: each axis by its own ratio.
+	{
+		struct leia_scam_served_stereo s2 = s;
+		s2.width = 1276; // 1276/960 vs the 4:3 region
+		CHECK(leia_scam_served_to_factory(&s2, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+		const double rw = 2448.0 * 1276.0 / 960.0, x0 = (3264.0 - rw) / 2.0;
+		NEAR(f.main.fx, 693.3099546541497 * rw / 1276.0, 1e-9);
+		NEAR(f.main.fy, 692.2241582736079 * 2448.0 / 960.0, 1e-9);
+		NEAR(f.main.cx, x0 + (641.2852896328532 + 0.5) * rw / 1276.0 - 0.5, 1e-9);
+	}
+
+	// Lens order reversed relative to the block (lensIds = [sub, main]): the
+	// lenses swap and the extrinsics invert (x_main = R^T x_sub - R^T T).
+	CHECK(leia_scam_served_to_factory(&s, "3", "1", 3264, 2448, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+	NEAR(f.main.fx, 692.9834930279095 * sc, 1e-9); // lens1 ("3") is the main lens now
+	NEAR(f.sub.fx, 693.3099546541497 * sc, 1e-9);
+	NEAR(f.R[0][1], s.R[1][0], 0.0);
+	{
+		double t = 0.0;
+		for (int j = 0; j < 3; j++) {
+			t -= s.R[j][0] * s.T_mm[j];
+		}
+		NEAR(f.T[0], t, 1e-12); // ~ +25.0
+	}
+	// Either order describes the same pair: the SBS left eye is the same lens.
+	{
+		struct leia_scam_factory_calib a, b;
+		struct leia_scam_stream_calib ca, cb;
+		leia_scam_served_to_factory(&s, "1", "3", 3264, 2448, NULL, NULL, &a, NULL);
+		leia_scam_served_to_factory(&s, "3", "1", 3264, 2448, NULL, NULL, &b, NULL);
+		leia_scam_stream_calib_from_factory(&a, 3264, 2448, 1280, 960, 1280, 720, 0, &ca);
+		leia_scam_stream_calib_from_factory(&b, 3264, 2448, 1280, 960, 1280, 720, 0, &cb);
+		for (int e = 0; e < 2; e++) {
+			for (int k = 0; k < 4; k++) {
+				NEAR(ca.k[e][k], cb.k[e][k], 1e-9);
+			}
+		}
+		NEAR(ca.T_rl_mm[0], cb.T_rl_mm[0], 1e-9);
+	}
+
+	// Phone order ["1","0"] (suite MirrorStereoSaveTest: T = (-0.31, -14.92, 0.44),
+	// a vertical pair): main = 1, sub = 0 -> as is; the pipeline turns it.
+	{
+		struct leia_scam_served_stereo p = s;
+		snprintf(p.lens_ids[0], sizeof(p.lens_ids[0]), "1");
+		snprintf(p.lens_ids[1], sizeof(p.lens_ids[1]), "0");
+		p.T_mm[0] = -0.31;
+		p.T_mm[1] = -14.92;
+		p.T_mm[2] = 0.44;
+		CHECK(leia_scam_served_to_factory(&p, "1", "0", 4576, 3168, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+		CHECK(leia_scam_factory_is_vertical(&f));
+		NEAR(f.main.fx, 693.3099546541497 / (960.0 / 3168.0), 1e-9); // the 4224x3168 region
+		CHECK(leia_scam_served_to_factory(&p, "0", "1", 4576, 3168, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+		NEAR(f.main.fx, 692.9834930279095 / (960.0 / 3168.0), 1e-9);
+	}
+
+	// Ids that name other lenses; ids not named = [main, sub].
+	CHECK(leia_scam_served_to_factory(&s, "0", "2", 3264, 2448, NULL, NULL, &f, NULL) ==
+	      LEIA_SCAM_SERVED_OTHER_LENSES);
+	{
+		struct leia_scam_served_stereo n = s;
+		n.lens_ids[0][0] = n.lens_ids[1][0] = '\0';
+		CHECK(leia_scam_served_to_factory(&n, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_FULL);
+		NEAR(f.main.fx, 693.3099546541497 * sc, 1e-9);
+	}
+	// Implausible values.
+	{
+		struct leia_scam_served_stereo b = s;
+		b.R[0][0] = 2.0;
+		CHECK(leia_scam_served_to_factory(&b, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) ==
+		      LEIA_SCAM_SERVED_NOT_ROTATION);
+		b = s;
+		b.T_mm[0] = 0.2;
+		b.T_mm[1] = b.T_mm[2] = 0.0;
+		CHECK(leia_scam_served_to_factory(&b, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) ==
+		      LEIA_SCAM_SERVED_BAD_BASELINE);
+		b = s;
+		b.lens[1].cx = 1400.0; // outside the 1280 stated width
+		CHECK(leia_scam_served_to_factory(&b, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_BAD_LENS);
+		b = s;
+		b.width = 0;
+		CHECK(leia_scam_served_to_factory(&b, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) == LEIA_SCAM_SERVED_BAD_SIZE);
+	}
+	// Against a factory block: R within 5 deg passes, further is refused.
+	{
+		struct leia_scam_factory_calib blk;
+		memset(&blk, 0, sizeof(blk));
+		blk.R[0][0] = blk.R[1][1] = blk.R[2][2] = 1.0;
+		CHECK(leia_scam_served_to_factory(&s, "1", "3", 3264, 2448, &blk, NULL, &f, &d) == LEIA_SCAM_SERVED_FULL);
+		CHECK(d > 0.0 && d < 0.2);
+		const double a = 8.0 * 3.14159265358979323846 / 180.0;
+		blk.R[0][0] = cos(a);
+		blk.R[0][1] = -sin(a);
+		blk.R[1][0] = sin(a);
+		blk.R[1][1] = cos(a);
+		CHECK(leia_scam_served_to_factory(&s, "1", "3", 3264, 2448, &blk, NULL, &f, &d) == LEIA_SCAM_SERVED_TOO_FAR);
+	}
+	// A user record (it names a factory block): R only, on that block only.
+	{
+		struct leia_scam_factory_calib blk;
+		memset(&blk, 0, sizeof(blk));
+		blk.R[0][0] = blk.R[1][1] = blk.R[2][2] = 1.0;
+		blk.main.fx = 1726.8;
+		blk.T[0] = 14.989;
+		uint8_t sha[32];
+		const char *bytes = "factory block bytes";
+		leia_scam_sha256((const uint8_t *)bytes, strlen(bytes), sha);
+		struct leia_scam_served_stereo u = s;
+		leia_scam_sha256_hex(sha, u.block_sha256);
+		u.block_sha256[3] = (char)toupper((unsigned char)u.block_sha256[3]); // compared case-insensitively
+		CHECK(leia_scam_served_to_factory(&u, "1", "3", 3264, 2448, &blk, sha, &f, NULL) == LEIA_SCAM_SERVED_ROTATION);
+		NEAR(f.main.fx, 1726.8, 0.0); // the block's intrinsics and T stay
+		NEAR(f.T[0], 14.989, 0.0);
+		NEAR(f.R[0][1], s.R[0][1], 0.0);
+		uint8_t other[32];
+		memcpy(other, sha, sizeof(other));
+		other[0] ^= 1;
+		CHECK(leia_scam_served_to_factory(&u, "1", "3", 3264, 2448, &blk, other, &f, NULL) ==
+		      LEIA_SCAM_SERVED_BLOCK_CHANGED);
+		CHECK(leia_scam_served_to_factory(&u, "1", "3", 3264, 2448, NULL, NULL, &f, NULL) ==
+		      LEIA_SCAM_SERVED_BLOCK_CHANGED);
+	}
+	CHECK(strcmp(leia_scam_served_verdict_str(LEIA_SCAM_SERVED_FULL), "?") != 0);
+}
+
 int
 main(void)
 {
+	test_served();
 	test_sha256();
 	test_parse();
 	test_check();
