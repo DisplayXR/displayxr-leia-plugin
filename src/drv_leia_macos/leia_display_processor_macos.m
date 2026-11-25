@@ -147,6 +147,9 @@ struct leia_dp_mac
 	struct leia_lens_owner lens_owner;
 
 	_Atomic int64_t last_pair_ns; //!< monotonic time of the last raw eye sample (tracking freshness)
+	//! Views in the last process_atlas grid (0 until the first frame). 1 = the
+	//! 2D mode, which is untracked (ADR-066): the eye getter reports no eyes.
+	_Atomic uint32_t view_count;
 
 	//! Eye-tracking mode (MANAGED / MANUAL, XR_DXR_display_info) — the SR
 	//! weaver tracking-loss mode, ST-5961. The runtime's set_eye_tracking_mode
@@ -931,6 +934,7 @@ leia_dp_mac_process_atlas(struct xrt_display_processor_metal *xdp,
 		return;
 	}
 	ldp->frames++;
+	atomic_store(&ldp->view_count, tile_columns * tile_rows > 1 ? tile_columns * tile_rows : 1u);
 
 	// Canvas (ADR-010): 0 = the whole target.
 	const bool use_canvas = canvas_width > 0 && canvas_height > 0;
@@ -1221,6 +1225,21 @@ leia_dp_mac_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
 {
 	struct leia_dp_mac *ldp = leia_dp_mac(xdp);
 	leia_dp_mac_sync_loss_mode(ldp);
+	// ADR-066: the 2D mode (a 1x1 atlas) is UNTRACKED (mode 0 carries no
+	// HAS_TRACKING, drv_leia/leia_device.c). Report "no tracker answer": the
+	// runtime frames 2D for the nominal viewer, so the flat image does not
+	// follow the head and isTracking stays false through 2D. 3D unchanged.
+	if (atomic_load(&ldp->view_count) == 1u) {
+		memset(out, 0, sizeof(*out));
+		out->timestamp_ns = (int64_t)os_monotonic_get_ns();
+		static bool logged_2d = false;
+		if (!logged_2d) {
+			logged_2d = true;
+			U_LOG_W("leia_mac_dp: 2D mode is untracked (ADR-066) - no eyes reported; the runtime frames 2D "
+			        "for the nominal viewer. Logged once.");
+		}
+		return true;
+	}
 	SrPoint3f l = {0}, r = {0};
 	const SrResult res =
 	    ldp->weaver != NULL ? srWeaverGetPredictedEyePositions(ldp->weaver, &l, &r) : SR_ERROR_HANDLE_INVALID;

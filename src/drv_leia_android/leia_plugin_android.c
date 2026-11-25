@@ -163,9 +163,9 @@ leia_android_hmd_create(void)
 
 	hmd->base.rendering_mode_count = 2;
 
-	// Mode 0: 2D (mono, full resolution, 1x1 tile). Tracked, like 3D: the 2D view
-	// still follows the live eye position, so isTracking must not be forced FALSE
-	// here (see drv_leia/leia_device.c). Rotatable.
+	// Mode 0: 2D (mono, full resolution, 1x1 tile). UNTRACKED (runtime ADR-066),
+	// and the DP reports no eyes for a 1x1 atlas so the view does not follow
+	// the head either (see drv_leia/leia_device.c). Rotatable.
 	hmd->base.rendering_modes[0].mode_index = 0;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
@@ -174,8 +174,7 @@ leia_android_hmd_create(void)
 	hmd->base.rendering_modes[0].hardware_display_3d = false;
 	hmd->base.rendering_modes[0].tile_columns = 1;
 	hmd->base.rendering_modes[0].tile_rows = 1;
-	hmd->base.rendering_modes[0].mode_flags =
-	    XRT_RENDERING_MODE_FLAG_HAS_TRACKING | XRT_RENDERING_MODE_FLAG_CAN_ROTATE;
+	hmd->base.rendering_modes[0].mode_flags = XRT_RENDERING_MODE_FLAG_CAN_ROTATE;
 
 	// Mode 1: Leia 3D (two views, 2x1 SBS atlas, scale from device config). Tracked.
 	hmd->base.rendering_modes[1].mode_index = 1;

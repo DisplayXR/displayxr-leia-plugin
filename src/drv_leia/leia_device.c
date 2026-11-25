@@ -482,11 +482,14 @@ leia_hmd_create(void)
 	// at device creation and applied by the SR v2 weavers.
 	hmd->base.rendering_mode_count = 2;
 
-	// Mode 0: 2D (mono, full resolution, 1×1 tile). TRACKED: the runtime still
-	// builds this mode's view from the live SR eye position (head-tracked
-	// look-around on the flat image), so it consumes eye tracking and must say
-	// so. Left at 0, the runtime forced isTracking = FALSE in 2D while the view
-	// kept following the face, and apps reported "face lost" to a tracked viewer.
+	// Mode 0: 2D (mono, full resolution, 1×1 tile). UNTRACKED (runtime ADR-066:
+	// mode 0 is scale 1x1 with no tracking; sim_display's 2D entry is the same).
+	// The flag and the eyes agree: every DP reports "no tracker answer" for a
+	// 1x1 atlas (the get_predicted_eye_positions of each DP), so the runtime
+	// frames 2D for the nominal viewer and the flat image does not follow the
+	// head. (The flag used to be set because the 2D view DID follow the live
+	// eye while isTracking was forced false, and apps showed "face lost" to a
+	// tracked viewer; now neither follows the head.)
 	hmd->base.rendering_modes[0].mode_index = LEIA_MODE_2D;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
@@ -495,7 +498,7 @@ leia_hmd_create(void)
 	hmd->base.rendering_modes[0].hardware_display_3d = false;
 	hmd->base.rendering_modes[0].tile_columns = 1;
 	hmd->base.rendering_modes[0].tile_rows = 1;
-	hmd->base.rendering_modes[0].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+	hmd->base.rendering_modes[0].mode_flags = 0;
 
 	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from the ONE derivation in
 	// leia_view_scale_get() — the same pair leia_plugin_get_display_info() reports
