@@ -2182,6 +2182,22 @@ leia_lnx_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struc
 	out_eye_pos->timestamp_ns = ts_ns;
 	out_eye_pos->valid = true;
 	out_eye_pos->is_tracking = is_tracking; // explicit state (R-T3), no collapse heuristic
+
+	// ADR-066: the 2D mode (a 1x1 atlas) is UNTRACKED (mode 0 carries no
+	// HAS_TRACKING, leia_device.c). Report "no tracker answer": the runtime
+	// frames 2D for the screen's nominal viewer, so the flat image does not
+	// follow the head and isTracking stays false through 2D. 3D unchanged.
+	if (ldp->view_count == 1) {
+		out_eye_pos->valid = false;
+		out_eye_pos->is_tracking = false;
+		out_eye_pos->count = 0;
+		static bool logged_2d = false;
+		if (!logged_2d) {
+			logged_2d = true;
+			U_LOG_W("leia_lnx_dp: 2D mode is untracked (ADR-066) - no eyes reported; the runtime frames 2D "
+			        "for the nominal viewer. Logged once.");
+		}
+	}
 	return true;
 }
 

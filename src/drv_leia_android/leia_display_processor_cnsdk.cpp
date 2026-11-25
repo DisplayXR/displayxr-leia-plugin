@@ -94,6 +94,9 @@ struct leia_dp_cnsdk
 	struct leia_cnsdk *cnsdk;          //!< Owned.
 	struct vk_bundle *vk;              //!< Borrowed from compositor.
 	VkCommandPool cmd_pool;            //!< Borrowed from compositor; used by mono passthrough.
+	//! Views in the last process_atlas grid (0 until the first frame, calloc).
+	//! 1 = the 2D mode, which is untracked (ADR-066): the eye getter reports no eyes.
+	uint32_t view_count;
 
 	// CNSDK's self-submitting Vulkan weave (leia_interlacer_vulkan_do_post_process)
 	// needs a *caller-supplied* destination framebuffer (color + depth)
@@ -2809,6 +2812,8 @@ process_atlas_weave(struct xrt_display_processor *xdp,
 	                             canvas_width != target_width || canvas_height != target_height);
 
 	leia_dp_cnsdk *impl = as_impl(xdp);
+	// ADR-066: the eye getter reports no eyes for a 1x1 grid (the untracked 2D mode).
+	impl->view_count = (tile_columns * tile_rows > 1) ? tile_columns * tile_rows : 1u;
 
 	// runtime#1394: clear the per-frame verdict BEFORE any early return. Every
 	// path out of this function below either leaves it false (the frame is as
@@ -3307,6 +3312,23 @@ get_predicted_eye_positions_ipd(struct xrt_display_processor *xdp,
 	out_eye_pos->count = 2;
 	out_eye_pos->valid = true;
 	out_eye_pos->is_tracking = tracked;
+
+	// ADR-066: the 2D mode (a 1x1 atlas) is UNTRACKED (mode 0 carries no
+	// HAS_TRACKING, leia_plugin_android.c). Report "no tracker answer": the
+	// runtime frames 2D for the nominal viewer, so the flat image does not
+	// follow the head and isTracking stays false through 2D. Face tracking
+	// above still ran (its own power policy decides when it rests). 3D unchanged.
+	if (impl->view_count == 1u) {
+		out_eye_pos->valid = false;
+		out_eye_pos->is_tracking = false;
+		out_eye_pos->count = 0;
+		static bool logged_2d = false;
+		if (!logged_2d) {
+			logged_2d = true;
+			U_LOG_W("Leia Android DP: 2D mode is untracked (ADR-066) - no eyes reported; the runtime frames "
+			        "2D for the nominal viewer. Logged once.");
+		}
+	}
 	return true;
 }
 

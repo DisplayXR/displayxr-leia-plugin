@@ -1542,12 +1542,22 @@ leia_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
 	if (ldp->backend_state.load(std::memory_order_relaxed) == LEIA_SR_BACKEND_STALE) {
 		out_eye_pos->is_tracking = false;
 	}
-	// In 2D mode, average L/R to a single midpoint eye.
-	if (ldp->view_count == 1 && out_eye_pos->count >= 2) {
-		out_eye_pos->eyes[0].x = (out_eye_pos->eyes[0].x + out_eye_pos->eyes[1].x) * 0.5f;
-		out_eye_pos->eyes[0].y = (out_eye_pos->eyes[0].y + out_eye_pos->eyes[1].y) * 0.5f;
-		out_eye_pos->eyes[0].z = (out_eye_pos->eyes[0].z + out_eye_pos->eyes[1].z) * 0.5f;
-		out_eye_pos->count = 1;
+	// ADR-066: the 2D mode (a 1x1 atlas) is UNTRACKED, like mode 0 in every
+	// DisplayXR mode table. Report "no tracker answer" (valid = false): the
+	// runtime then frames 2D for each screen's NOMINAL viewer, so the flat
+	// image no longer follows the head, and isTracking stays false for the
+	// whole of 2D (no loss/recovery edges). The SR query above still ran, so
+	// the weaver's own state is unchanged; 3D (more than one view) is as before.
+	if (ldp->view_count == 1) {
+		out_eye_pos->valid = false;
+		out_eye_pos->is_tracking = false;
+		out_eye_pos->count = 0;
+		static bool logged_2d = false;
+		if (!logged_2d) {
+			logged_2d = true;
+			U_LOG_W("Leia GL DP: 2D mode is untracked (ADR-066) - no eyes reported; the runtime frames "
+			        "2D for the nominal viewer. Logged once.");
+		}
 	}
 	return true;
 }
