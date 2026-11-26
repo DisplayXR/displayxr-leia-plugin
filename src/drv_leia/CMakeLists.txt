@@ -52,8 +52,9 @@ set(LEIA_SOURCES
     # run by the Linux CI job).
     leia_sr_version.h
     leia_sr_version.c
-    # The MULTI_VIEWER setting's parse / resolve rules (#446). Plain C,
-    # host-tested (tests/test_multi_viewer.c, run by the Linux CI job).
+    # The MULTI_VIEWER setting's parse / resolve rules and the rules of the
+    # "LeiaSR multi-viewer" 3D entry (#446). Plain C, host-tested
+    # (tests/test_multi_viewer.c, run by the Linux CI job).
     leia_multi_viewer.h
     leia_multi_viewer.c
 
@@ -275,10 +276,11 @@ endif()
 # the display-enumeration probe instance for its capability query (hence the
 # DISPLAY_ENUM prerequisite) and the M6 weaver fields for "is this weaver
 # pinned to a simulated viewer" (hence MULTI_WIN). Absent => the MULTI_VIEWER
-# setting (leia_multi_viewer.h) is ignored with one WARN. Present => it is
-# honoured when the installed SR runtime reports multiViewerWeave at run time.
-# (Multi-viewer was rendering mode 2 until the runtime's two-mode contract,
-# displayxr-runtime#2766; the device now always declares two modes.)
+# setting (leia_multi_viewer.h) is ignored with one WARN and the device
+# declares 2D + LeiaSR. Present => when the installed SR runtime reports
+# multiViewerWeave at run time, the setting is honoured and, against runtime
+# headers with the declared-list contract (runtime ADR-066 C1, v2.70.7+), the
+# device declares a third entry, the "LeiaSR multi-viewer" 3D mode.
 set(LEIA_SR_MULTI_VIEWER_AVAILABLE FALSE)
 if(LEIA_SR_MULTI_WIN_AVAILABLE
    AND EXISTS "${LEIASR_V2_SDKROOT}/include/sr/sr_viewer_tracker.h"
@@ -294,7 +296,7 @@ if(LEIA_SR_MULTI_WIN_AVAILABLE
     unset(_leia_sr_h)
 endif()
 if(LEIA_SR_MULTI_VIEWER_AVAILABLE)
-    message(STATUS "SR multi-viewer weave (#446): ENABLED - the MULTI_VIEWER setting applies when the SR runtime reports multiViewerWeave")
+    message(STATUS "SR multi-viewer weave (#446): ENABLED - the LeiaSR multi-viewer 3D mode and the MULTI_VIEWER setting apply when the SR runtime reports multiViewerWeave")
 else()
     message(STATUS "SR multi-viewer weave (#446): DISABLED (SDK predates srWeaverSetMultiViewerMode) - the MULTI_VIEWER setting is ignored")
 endif()

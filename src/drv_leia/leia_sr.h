@@ -98,6 +98,18 @@ leiasr_snap_window_rect(struct leiasr *leiasr,
                         int32_t *out_y);
 
 /*!
+ * Which declared rendering-mode entry this weaver's display processor draws
+ * (the DP's `set_output_entry` slot, runtime ADR-047 Amendment 10). A 3D entry
+ * selects the multi-viewer value applied before the next weave: "LeiaSR
+ * multi-viewer" forces it on, "LeiaSR" follows the MULTI_VIEWER setting
+ * (leia_multi_viewer.h). The 2D entry and an index outside the list change
+ * nothing. A weaver never told follows the head device's entry. No SR call
+ * here; safe while the weaver is still being created.
+ */
+void
+leiasr_set_output_entry(struct leiasr *leiasr, uint32_t mode_index);
+
+/*!
  * Was this instance created for one screen (@ref leiasr_create_for_screen)?
  * Such a weaver confines its output to the canvas it is given.
  */

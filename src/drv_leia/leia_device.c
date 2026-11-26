@@ -24,6 +24,18 @@
 
 #include "xrt/xrt_device.h"
 
+/*
+ * The "LeiaSR multi-viewer" 3D entry (leia_multi_viewer.h): Windows only, and
+ * only against runtime headers with the declared-list contract (runtime
+ * ADR-066 C1, v2.70.7+; XRT_RENDERING_MODE_FLAG_START_UP_ONLY landed with the
+ * CONFIGURED_3D_MODE property used below). Everywhere else the device is the
+ * two modes it always was, with no property interface.
+ */
+#include "leia_multi_viewer.h" /* the entry names (macros only here: the Linux / macOS arms do not link its .c) */
+#if defined(_WIN32) && defined(XRT_RENDERING_MODE_FLAG_START_UP_ONLY)
+#define LEIA_HMD_HAS_3D_ENTRIES 1
+#endif
+
 #include "os/os_time.h"
 
 #include "math/m_api.h"
@@ -69,6 +81,11 @@ struct leia_hmd
 
 	//! Nominal viewer distance in meters.
 	float nominal_z_m;
+
+	//! How many rendering-mode entries this device DECLARED (2 or 3). The
+	//! runtime presents two of them and keeps the rest behind
+	//! rendering_mode_count, so this is the count to walk the table with.
+	uint32_t entry_count;
 
 	enum u_logging_level log_level;
 };
@@ -359,7 +376,7 @@ leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *g
 	const float sx = g_view_scale_x;
 	const float sy = g_view_scale_y;
 
-	/* Every 3D mode carries the same per-view scale (today: mode 1 only). */
+	/* Every 3D mode carries the same per-view scale. */
 	struct xrt_rendering_mode *m3d = &hmd->base.rendering_modes[LEIA_MODE_3D];
 	const bool same_geom = hmd->base.hmd->screens[0].w_pixels == g.pixel_w &&
 	                       hmd->base.hmd->screens[0].h_pixels == g.pixel_h &&
@@ -375,12 +392,113 @@ leia_hmd_apply_geometry(struct xrt_device *xdev, const struct leiasr_geometry *g
 		U_LOG_E("Failed to re-apply Leia display geometry to the live device");
 		return false;
 	}
-	for (uint32_t i = LEIA_MODE_3D; i < hmd->base.rendering_mode_count; i++) {
+	/* Over the DECLARED entries: the runtime presents two and keeps the other
+	 * 3D entry behind rendering_mode_count (it may also have swapped the two
+	 * 3D entries; both carry the same scale, so the order does not matter). */
+	const uint32_t n = hmd->entry_count > hmd->base.rendering_mode_count ? hmd->entry_count
+	                                                                       : hmd->base.rendering_mode_count;
+	for (uint32_t i = LEIA_MODE_3D; i < n && i < XRT_MAX_RENDERING_MODES; i++) {
 		hmd->base.rendering_modes[i].view_scale_x = sx;
 		hmd->base.rendering_modes[i].view_scale_y = sy;
 	}
 	return true;
 }
+
+void
+leia_hmd_fill_rendering_modes(struct xrt_rendering_mode *out_modes, uint32_t entry_count)
+{
+	if (out_modes == NULL) {
+		return;
+	}
+	const uint32_t n = entry_count >= 3 ? 3u : 2u;
+	memset(out_modes, 0, n * sizeof(out_modes[0]));
+
+	// Entry 0: 2D (mono, full resolution, 1×1 tile). UNTRACKED (runtime ADR-066:
+	// mode 0 is scale 1x1 with no tracking; sim_display's 2D entry is the same).
+	// The flag and the eyes agree: every DP reports "no tracker answer" for a
+	// 1x1 atlas (the get_predicted_eye_positions of each DP), so the runtime
+	// frames 2D for the nominal viewer and the flat image does not follow the
+	// head. (The flag used to be set because the 2D view DID follow the live
+	// eye while isTracking was forced false, and apps showed "face lost" to a
+	// tracked viewer; now neither follows the head.)
+	out_modes[0].mode_index = LEIA_MODE_2D;
+	snprintf(out_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "%s", LEIA_MV_NAME_2D);
+	out_modes[0].view_count = 1;
+	out_modes[0].view_scale_x = 1.0f;
+	out_modes[0].view_scale_y = 1.0f;
+	out_modes[0].hardware_display_3d = false;
+	out_modes[0].tile_columns = 1;
+	out_modes[0].tile_rows = 1;
+	out_modes[0].mode_flags = 0;
+
+	// Entry 1: LeiaSR (two views, 2×1 tile atlas, scale from the ONE derivation in
+	// leia_view_scale_get() — the same pair leia_plugin_get_display_info() reports
+	// as recommended_view_scale_x/y, never a second hardcoded number).
+	// Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
+	// Entry 2 (Windows, when offered): LeiaSR multi-viewer. The same atlas —
+	// views, scale, tiles, lens and tracking — woven for every tracked viewer,
+	// so the runtime switches between the two live (no START_UP_ONLY flag).
+	for (uint32_t i = LEIA_MODE_3D; i < n; i++) {
+		out_modes[i].mode_index = i;
+		snprintf(out_modes[i].mode_name, XRT_DEVICE_NAME_LEN, "%s",
+		         i == LEIA_MODE_3D ? LEIA_MV_NAME_3D : LEIA_MV_NAME_MULTI_VIEWER);
+		out_modes[i].view_count = 2;
+		leia_view_scale_get(&out_modes[i].view_scale_x, &out_modes[i].view_scale_y);
+		out_modes[i].hardware_display_3d = true;
+		out_modes[i].tile_columns = 2;
+		out_modes[i].tile_rows = 1;
+		out_modes[i].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
+	}
+}
+
+#ifdef LEIA_HMD_HAS_3D_ENTRIES
+/*
+ *
+ * Generic property interface. Installed only on a device that declares the
+ * "LeiaSR multi-viewer" entry: the runtime then names, in this table's own
+ * numbering, the entry its 3D slot is mapped to (runtime ADR-066 C1).
+ *
+ */
+
+static xrt_result_t
+leia_hmd_set_property(struct xrt_device *xdev, enum xrt_device_property_id property, int32_t value)
+{
+	struct leia_hmd *hmd = leia_hmd(xdev);
+	if (property != XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (value < 0 || (uint32_t)value >= hmd->entry_count) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	// The active mode index stays the runtime's to write, as it always was
+	// for this device. Which 3D ENTRY is drawn is what the weavers need: the
+	// 2D entry keeps the last one (the lens is off there).
+	leia_multi_viewer_set_head_entry((uint32_t)value);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+leia_hmd_get_property(struct xrt_device *xdev, enum xrt_device_property_id property, int32_t *out_value)
+{
+	if (out_value == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+		// The entry in effect, in this table's numbering.
+		*out_value = xdev->hmd->active_rendering_mode_index == 0 ? (int32_t)LEIA_MODE_2D
+		                                                         : (int32_t)leia_multi_viewer_head_entry();
+		return XRT_SUCCESS;
+	}
+	if (property == XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE) {
+		// The plug-in's own default 3D entry NOW (MULTI_VIEWER, read again on
+		// every call): the runtime polls this and remaps its 3D slot live. A
+		// stored per-screen choice wins over it, in the runtime.
+		*out_value = (int32_t)leia_multi_viewer_configured_entry();
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+#endif // LEIA_HMD_HAS_3D_ENTRIES
 
 struct xrt_device *
 leia_hmd_create(void)
@@ -475,48 +593,35 @@ leia_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Leia 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "leia_display_0");
 
-	// Rendering modes: exactly two on every platform -- mode 0 = 2D, mode 1 =
-	// 3D (the runtime's two-mode contract, displayxr-runtime#2766). Multi-viewer
-	// weaving, once mode 2 "LeiaSR multi-viewer" on Windows (#446), is the
-	// MULTI_VIEWER setting (leia_multi_viewer.h), resolved by leia_plugin.c
-	// at device creation and applied by the SR v2 weavers.
-	hmd->base.rendering_mode_count = 2;
+	// Rendering modes: mode 0 = 2D and mode 1 = "LeiaSR" on every platform. On
+	// Windows a third entry, "LeiaSR multi-viewer" (#446), follows when the
+	// installed LeiaSR runtime weaves for several viewers (decided by
+	// leia_plugin.c right before this call) and the runtime headers carry the
+	// declared-list contract (runtime ADR-066 C1): apps still see two modes,
+	// and the runtime maps its 3D slot to the entry the screen's "3D mode"
+	// names. Otherwise multi-viewer weaving is only the MULTI_VIEWER setting
+	// (leia_multi_viewer.h), as it has been since the two-mode contract
+	// (displayxr-runtime#2766).
+	uint32_t entry_count = 2;
+	uint32_t default_3d = LEIA_MODE_3D;
+#ifdef LEIA_HMD_HAS_3D_ENTRIES
+	if (leia_multi_viewer_declared_entries() > LEIA_MV_ENTRY_MULTI_VIEWER) {
+		entry_count = 3;
+		default_3d = leia_multi_viewer_head_entry(); // what MULTI_VIEWER names
+		if (default_3d < LEIA_MODE_3D || default_3d >= entry_count) {
+			default_3d = LEIA_MODE_3D;
+		}
+		// The runtime tells the device which entry its 3D slot is
+		// (OUTPUT_MODE) and asks for the default (CONFIGURED_3D_MODE).
+		hmd->base.set_property = leia_hmd_set_property;
+		hmd->base.get_property = leia_hmd_get_property;
+	}
+#endif
+	hmd->entry_count = entry_count;
+	hmd->base.rendering_mode_count = entry_count;
+	leia_hmd_fill_rendering_modes(hmd->base.rendering_modes, entry_count);
 
-	// Mode 0: 2D (mono, full resolution, 1×1 tile). UNTRACKED (runtime ADR-066:
-	// mode 0 is scale 1x1 with no tracking; sim_display's 2D entry is the same).
-	// The flag and the eyes agree: every DP reports "no tracker answer" for a
-	// 1x1 atlas (the get_predicted_eye_positions of each DP), so the runtime
-	// frames 2D for the nominal viewer and the flat image does not follow the
-	// head. (The flag used to be set because the 2D view DID follow the live
-	// eye while isTracking was forced false, and apps showed "face lost" to a
-	// tracked viewer; now neither follows the head.)
-	hmd->base.rendering_modes[0].mode_index = LEIA_MODE_2D;
-	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
-	hmd->base.rendering_modes[0].view_count = 1;
-	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
-	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
-	hmd->base.rendering_modes[0].hardware_display_3d = false;
-	hmd->base.rendering_modes[0].tile_columns = 1;
-	hmd->base.rendering_modes[0].tile_rows = 1;
-	hmd->base.rendering_modes[0].mode_flags = 0;
-
-	// Mode 1: LeiaSR (two views, 2×1 tile atlas, scale from the ONE derivation in
-	// leia_view_scale_get() — the same pair leia_plugin_get_display_info() reports
-	// as recommended_view_scale_x/y, never a second hardcoded number).
-	// Consumes live SR eye tracking → HAS_TRACKING (#441 ABI v3).
-	// reserved[] stays zeroed via the calloc'd U_DEVICE_ALLOCATE block.
-	// Multi-viewer weaving follows the MULTI_VIEWER setting (Windows SR v2).
-	hmd->base.rendering_modes[1].mode_index = LEIA_MODE_3D;
-	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
-	hmd->base.rendering_modes[1].view_count = 2;
-	leia_view_scale_get(&hmd->base.rendering_modes[1].view_scale_x,
-	                    &hmd->base.rendering_modes[1].view_scale_y);
-	hmd->base.rendering_modes[1].hardware_display_3d = true;
-	hmd->base.rendering_modes[1].tile_columns = 2;
-	hmd->base.rendering_modes[1].tile_rows = 1;
-	hmd->base.rendering_modes[1].mode_flags = XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
-
-	hmd->base.hmd->active_rendering_mode_index = LEIA_MODE_3D; // Default to LeiaSR (3D)
+	hmd->base.hmd->active_rendering_mode_index = default_3d; // Default to 3D
 
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;

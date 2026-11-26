@@ -119,6 +119,18 @@ leiasr_d3d12_snap_window_rect(struct leiasr_d3d12 *leiasr,
                               int32_t *out_y);
 
 /*!
+ * Which declared rendering-mode entry this weaver's display processor draws
+ * (the DP's `set_output_entry` slot, runtime ADR-047 Amendment 10). A 3D entry
+ * selects the multi-viewer value applied before the next weave: "LeiaSR
+ * multi-viewer" forces it on, "LeiaSR" follows the MULTI_VIEWER setting
+ * (leia_multi_viewer.h). The 2D entry and an index outside the list change
+ * nothing. A weaver never told follows the head device's entry. No SR call
+ * here; safe while the weaver is still being created.
+ */
+void
+leiasr_d3d12_set_output_entry(struct leiasr_d3d12 *leiasr, uint32_t mode_index);
+
+/*!
  * Destroy a D3D12 SR weaver instance.
  *
  * @param leiasr_ptr Pointer to the instance pointer (set to NULL on return).

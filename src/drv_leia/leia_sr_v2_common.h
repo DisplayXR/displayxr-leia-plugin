@@ -416,13 +416,17 @@ leia_sr_v2_log_target_accepted(const char *arm,
 /* ------------------------------------------------------------------ *
  * Multi-viewer weaving (#446) -- ONE body for every backend.
  *
- * The MULTI_VIEWER setting is the switch (leia_multi_viewer.h; it was
- * rendering mode 2 until the runtime's two-mode contract): `on` sets the
- * weaver's override to SR_MULTI_VIEWER_MODE_ON, `off` to
- * SR_MULTI_VIEWER_MODE_OFF, `system` leaves the SDK default
- * (SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG) and costs no call. The value is
- * resolved once per device creation; the override is sticky per weaver, so it
- * is applied on a weaver's first weave (and on CHANGE only after that).
+ * What a weaver applies is the value of the 3D entry it draws
+ * (leia_multi_viewer.h, leia_multi_viewer_wanted()): "LeiaSR multi-viewer"
+ * sets the weaver's override to SR_MULTI_VIEWER_MODE_ON; "LeiaSR" follows the
+ * MULTI_VIEWER setting, `off` = SR_MULTI_VIEWER_MODE_OFF and `system` = the
+ * SDK default (SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG, which costs no call on a
+ * fresh weaver). Where the list has no multi-viewer entry the setting alone
+ * decides (`on` = ON). The override is sticky per weaver, so it is applied on
+ * a weaver's first weave and on CHANGE only after that. A change is a live
+ * switch of the screen's 3D mode: srWeaverSetMultiViewerMode only stores the
+ * override, and FOLLOW_CONFIG removes it, so going back from "LeiaSR
+ * multi-viewer" to "LeiaSR" needs no weaver recreate.
  *
  * The SR runtime decides what a backend can do: the D3D11 and Vulkan weavers
  * weave several viewers; D3D12 and GL refuse ON (SR_ERROR_FEATURE_NOT_SUPPORTED)
@@ -447,13 +451,14 @@ struct leia_sr_v2_mv_state
 };
 
 /*!
- * Apply the MULTI_VIEWER override to @p w if it is not in effect yet. Call
- * right before the weave, on the weave thread, with leia_multi_viewer_active().
+ * Apply the multi-viewer override to @p w if it is not in effect yet. Call
+ * right before the weave, on the weave thread, with leia_multi_viewer_wanted()
+ * of the weaver's entry.
  * Never throws; never logs per frame (one WARN per actual change, one per
  * refusal).
  *
  * @param w        The v2 weaver about to weave; NULL = no-op.
- * @param setting  The effective MULTI_VIEWER value.
+ * @param setting  The value wanted now (leia_multi_viewer_wanted()).
  * @param st       This weaver's state.
  * @param backend  "D3D11" / "D3D12" / "GL" / "Vulkan", for the log.
  */

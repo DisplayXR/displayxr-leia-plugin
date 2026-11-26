@@ -29,7 +29,7 @@ The first release without the provider is **v2.24.0**.
 | State at install time | What the installer does |
 |---|---|
 | DisplayXR runtime not installed | Installs and registers anyway, logs *"DisplayXR runtime not installed yet: the plug-in will be used once the DisplayXR runtime is installed."* The registration key may exist before the runtime does; the runtime finds it when it starts. |
-| Runtime installed, `Version` **below** the plug-in's runtime floor | Refuses (exit **5**; message box only when not silent). The floor is `MIN_RUNTIME_VERSION` in `installer/CMakeLists.txt`: the higher of the ABI pin (`DXR_RUNTIME_GIT_TAG`) and the behaviour floor `DXR_LEIA_BEHAVIOUR_MIN_RUNTIME` (2.70.5 from plug-in v2.24.0: an older runtime still sends 2D-to-3D conversion to the display driver, which no longer serves it). A runtime with no recorded `Version` is not gated. |
+| Runtime installed, `Version` **below** the plug-in's runtime floor | Refuses (exit **5**; message box only when not silent). The floor is `MIN_RUNTIME_VERSION` in `installer/CMakeLists.txt`: the higher of the ABI pin (`DXR_RUNTIME_GIT_TAG`) and the behaviour floor `DXR_LEIA_BEHAVIOUR_MIN_RUNTIME` (2.70.5 from plug-in v2.24.0: an older runtime still sends 2D-to-3D conversion to the display driver, which no longer serves it). The ABI pin is 2.70.9 (the "LeiaSR multi-viewer" 3D mode needs the runtime's declared-list slots), so the floor is 2.70.9. A runtime with no recorded `Version` is not gated. |
 | Runtime installed, new enough | Installs. |
 | LeiaSR platform absent | Installs. There is **deliberately no SR check**: the plug-in loads without SR and reports the platform as absent at run time, so SR can be installed before or after. |
 | Not 64-bit Windows | Refuses (exit **3**). |

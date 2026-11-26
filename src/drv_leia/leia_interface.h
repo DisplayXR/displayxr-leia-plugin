@@ -327,16 +327,32 @@ leia_hmd_set_pose_source(struct xrt_device *leia_dev, struct xrt_device *source)
 /*!
  * @name Rendering-mode indices of the Leia head device
  *
- * The mode table leia_hmd_create() fills: exactly two modes on every platform,
- * per the runtime's two-mode contract (displayxr-runtime#2766: mode 0 = 2D,
- * mode 1 = 3D, anything else a per-driver setting). Multi-viewer weaving, once
- * a third mode on Windows (#446), is the MULTI_VIEWER setting
- * (leia_multi_viewer.h).
+ * The mode table leia_hmd_create() fills: mode 0 = 2D and mode 1 = "LeiaSR" on
+ * every platform. On Windows, when the installed LeiaSR runtime weaves for
+ * several viewers and the runtime headers carry the declared-list contract
+ * (runtime ADR-066 C1, v2.70.7+), a third entry follows: "LeiaSR
+ * multi-viewer", identical to mode 1 except for the weaver option
+ * (leia_multi_viewer.h). Apps always see two modes (0 = 2D, 1 = 3D); which 3D
+ * entry mode 1 shows is the screen's "3D mode", chosen in the runtime.
  * @{
  */
 #define LEIA_MODE_2D 0u //!< Flat, one view, lens off.
-#define LEIA_MODE_3D 1u //!< LeiaSR, two views; multi-viewer weaving per the MULTI_VIEWER setting.
+#define LEIA_MODE_3D 1u //!< LeiaSR, two views.
 /*! @} */
+
+struct xrt_rendering_mode;
+
+/*!
+ * Fill the Leia rendering-mode list: entry 0 "2D", entry 1 "LeiaSR" and, when
+ * @p entry_count is 3, entry 2 "LeiaSR multi-viewer" (same views, scale, tiles
+ * and flags as entry 1). ONE writer for the head device's table and the
+ * plug-in's per-monitor list, so the two cannot disagree.
+ *
+ * @param out_modes    At least @p entry_count entries; each is zeroed first.
+ * @param entry_count  2 or 3 (clamped).
+ */
+void
+leia_hmd_fill_rendering_modes(struct xrt_rendering_mode *out_modes, uint32_t entry_count);
 
 #ifdef __cplusplus
 }

@@ -200,9 +200,18 @@ endif()
 # plug-in ABI still v5. This plug-in no longer fills them (they stay NULL; 2D->3D
 # conversion is the separate conversion provider, docs/conversion-moved.md), so
 # no pin is ever moved for lift or for the conversion-provider ABI again.
+# v2.70.9 (from v2.66.8): the declared rendering-mode list (runtime ADR-066 C1,
+# ADR-047 Amendment 10), first released in v2.70.7: the per-monitor list slot
+# (XRT_PLUGIN_IFACE_HAS_RENDERING_MODES_FOR_MONITOR), the DP set_output_entry
+# slots (XRT_DP_{D3D11,D3D12,GL,VK}_HAS_OUTPUT_ENTRY) and the device's
+# CONFIGURED_3D_MODE property. The "LeiaSR multi-viewer" 3D mode
+# (src/drv_leia/leia_multi_viewer.h) needs them; an older pin compiles it OUT
+# and the plug-in declares 2D + LeiaSR only. The installer's minimum runtime
+# follows the pin: 2.70.9 (it was the 2.70.5 behaviour floor of
+# installer/CMakeLists.txt). Plug-in ABI still v5.
 # The rule-5 CI self-check below asserts this value equals the workflow's
 # runtime checkout ref so the two can't drift.
-set(DXR_RUNTIME_GIT_TAG "v2.66.8" CACHE STRING
+set(DXR_RUNTIME_GIT_TAG "v2.70.9" CACHE STRING
     "Runtime git ref to fetch. Must equal the workflow's runtime checkout ref (rule-5 CI check enforces).")
 # Linux carries its own pin so it can move independently of the Windows
 # installer's derived MIN_RUNTIME_VERSION (same reason as _ANDROID below).
