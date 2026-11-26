@@ -90,6 +90,11 @@ struct leia_bg_capture
 	UINT monitor_h;
 	RECT monitor_rect; // virtual-screen coords
 
+	// Re-bind after the monitor handle changes (see rebind_monitor()).
+	HMONITOR rebind_tried_monitor;   //!< handle of the last re-bind attempt.
+	ULONGLONG rebind_tried_ms;       //!< GetTickCount64() of that attempt.
+	HMONITOR rebind_refused_monitor; //!< handle already logged as not re-bindable.
+
 	// Producer-side D3D11 (internal — separate from any DP).
 	ComPtr<ID3D11Device> d3d11_device;
 	ComPtr<ID3D11DeviceContext> d3d11_context;
@@ -703,6 +708,129 @@ leia_bg_capture_get_preview(struct leia_bg_capture *c, struct xrt_dp_background_
 static void
 cpu_produce(struct leia_bg_capture *c, UINT64 gen); // #539, defined below
 
+/*!
+ * Create the WGC capture item, frame pool and session for @p monitor on
+ * @p wg_device and apply the session options (no cursor, no border, delivery
+ * cap). Does NOT start the capture. On failure @p out_stage names the call
+ * that failed.
+ */
+static HRESULT
+open_capture_session(WGD3D::IDirect3DDevice *wg_device,
+                     HMONITOR monitor,
+                     ComPtr<WGC::IGraphicsCaptureItem> &out_item,
+                     ComPtr<WGC::IDirect3D11CaptureFramePool> &out_pool,
+                     ComPtr<WGC::IGraphicsCaptureSession> &out_session,
+                     const char **out_stage)
+{
+	HRESULT hr = S_OK;
+
+	ComPtr<IGraphicsCaptureItemInterop> interop;
+	{
+		HStringReference cls(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem);
+		ComPtr<IActivationFactory> factory;
+		hr = RoGetActivationFactory(cls.Get(), IID_PPV_ARGS(&factory));
+		if (FAILED(hr)) {
+			*out_stage = "WGC item activation factory";
+			return hr;
+		}
+		hr = factory.As(&interop);
+		if (FAILED(hr)) {
+			*out_stage = "IGraphicsCaptureItemInterop QI";
+			return hr;
+		}
+	}
+
+	ComPtr<WGC::IGraphicsCaptureItem> capture_item;
+	hr = interop->CreateForMonitor(monitor, IID_PPV_ARGS(capture_item.GetAddressOf()));
+	if (FAILED(hr)) {
+		*out_stage = "CreateForMonitor";
+		return hr;
+	}
+
+	WG::SizeInt32 item_size = {};
+	capture_item->get_Size(&item_size);
+
+	ComPtr<WGC::IDirect3D11CaptureFramePoolStatics2> pool_statics;
+	{
+		HStringReference cls(RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool);
+		hr = RoGetActivationFactory(cls.Get(), IID_PPV_ARGS(&pool_statics));
+		if (FAILED(hr)) {
+			*out_stage = "FramePool statics";
+			return hr;
+		}
+	}
+
+	ComPtr<WGC::IDirect3D11CaptureFramePool> frame_pool;
+	hr = pool_statics->CreateFreeThreaded(wg_device,
+	                                      WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+	                                      2,
+	                                      item_size,
+	                                      frame_pool.GetAddressOf());
+	if (FAILED(hr)) {
+		*out_stage = "FramePool::CreateFreeThreaded";
+		return hr;
+	}
+
+	ComPtr<WGC::IGraphicsCaptureSession> capture_session;
+	hr = frame_pool->CreateCaptureSession(capture_item.Get(), capture_session.GetAddressOf());
+	if (FAILED(hr)) {
+		*out_stage = "CreateCaptureSession";
+		return hr;
+	}
+
+	// Don't capture the cursor — we draw our own UI; the desktop cursor under us
+	// would be doubled.
+	ComPtr<WGC::IGraphicsCaptureSession2> session2;
+	if (SUCCEEDED(capture_session.As(&session2))) {
+		session2->put_IsCursorCaptureEnabled(false);
+	}
+	// Suppress the yellow "this screen is being captured" border DWM draws
+	// around the captured region. Requires Windows 11 22H2+; on older Windows
+	// the QI fails or the put silently no-ops — fine, we just keep the border.
+	ComPtr<WGC::IGraphicsCaptureSession3> session3;
+	if (SUCCEEDED(capture_session.As(&session3))) {
+		session3->put_IsBorderRequired(false);
+	}
+	// Capture delivery throttle (Suki's measurement, avatar iGPU study
+	// 2026-08-10): WGC delivers a frame per DESKTOP CHANGE — monitor capture
+	// is served by DWM, so every delivery is dwm-column GPU work, and a
+	// moving cursor alone drives it (~13 system GPU points). Capping delivery
+	// is FREE when the desktop is quiet (the still-cost is flat across every
+	// cap) and only bites when something changes; the trade is band
+	// freshness, bounded by the cap. The compose consumer only reads the
+	// latest frame, so dropped intermediates cost nothing. 66 ms measured as
+	// the knee (~9 points saved under motion). LEIA_DP_CAPTURE_MIN_INTERVAL_MS:
+	// unset = 66, 0 = uncapped, N = cap at N ms. Requires
+	// IGraphicsCaptureSession5 (Win11 24H2); QI failure = uncapped, as today.
+	{
+		long interval_ms = 66;
+		const char *e = getenv("LEIA_DP_CAPTURE_MIN_INTERVAL_MS");
+		if (e != nullptr && e[0] != '\0') {
+			interval_ms = atol(e);
+			if (interval_ms < 0 || interval_ms > 1000) {
+				interval_ms = 66;
+			}
+		}
+		if (interval_ms > 0) {
+			ComPtr<WGC::IGraphicsCaptureSession5> session5;
+			if (SUCCEEDED(capture_session.As(&session5))) {
+				ABI::Windows::Foundation::TimeSpan ts;
+				ts.Duration = (INT64)interval_ms * 10000; // 100 ns units
+				if (SUCCEEDED(session5->put_MinUpdateInterval(ts))) {
+					U_LOG_W("leia_bg_capture: delivery capped at %ld ms "
+					        "(LEIA_DP_CAPTURE_MIN_INTERVAL_MS)",
+					        interval_ms);
+				}
+			}
+		}
+	}
+
+	out_item = capture_item;
+	out_pool = frame_pool;
+	out_session = capture_session;
+	return S_OK;
+}
+
 extern "C" struct leia_bg_capture *
 leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 {
@@ -787,111 +915,16 @@ leia_bg_capture_create(HWND hwnd, uint64_t adapter_luid)
 		return nullptr;
 	}
 
-	ComPtr<IGraphicsCaptureItemInterop> interop;
-	{
-		HStringReference cls(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureItem);
-		ComPtr<IActivationFactory> factory;
-		hr = RoGetActivationFactory(cls.Get(), IID_PPV_ARGS(&factory));
-		if (FAILED(hr)) {
-			U_LOG_W("leia_bg_capture: WGC item activation factory unavailable: 0x%08x — falling back to chroma-key",
-			        (unsigned)hr);
-			reset_affinity();
-			return nullptr;
-		}
-		hr = factory.As(&interop);
-		if (FAILED(hr)) {
-			U_LOG_W("leia_bg_capture: IGraphicsCaptureItemInterop QI failed: 0x%08x", (unsigned)hr);
-			reset_affinity();
-			return nullptr;
-		}
-	}
-
 	ComPtr<WGC::IGraphicsCaptureItem> capture_item;
-	hr = interop->CreateForMonitor(monitor, IID_PPV_ARGS(capture_item.GetAddressOf()));
-	if (FAILED(hr)) {
-		U_LOG_W("leia_bg_capture: CreateForMonitor failed: 0x%08x", (unsigned)hr);
-		reset_affinity();
-		return nullptr;
-	}
-
-	WG::SizeInt32 item_size = {};
-	capture_item->get_Size(&item_size);
-
-	ComPtr<WGC::IDirect3D11CaptureFramePoolStatics2> pool_statics;
+	ComPtr<WGC::IDirect3D11CaptureFramePool> frame_pool;
+	ComPtr<WGC::IGraphicsCaptureSession> capture_session;
 	{
-		HStringReference cls(RuntimeClass_Windows_Graphics_Capture_Direct3D11CaptureFramePool);
-		hr = RoGetActivationFactory(cls.Get(), IID_PPV_ARGS(&pool_statics));
+		const char *stage = "";
+		hr = open_capture_session(wg_device.Get(), monitor, capture_item, frame_pool, capture_session, &stage);
 		if (FAILED(hr)) {
-			U_LOG_W("leia_bg_capture: FramePool statics unavailable: 0x%08x", (unsigned)hr);
+			U_LOG_W("leia_bg_capture: %s failed: 0x%08x — falling back to chroma-key", stage, (unsigned)hr);
 			reset_affinity();
 			return nullptr;
-		}
-	}
-
-	ComPtr<WGC::IDirect3D11CaptureFramePool> frame_pool;
-	hr = pool_statics->CreateFreeThreaded(wg_device.Get(),
-	                                      WGDX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
-	                                      2,
-	                                      item_size,
-	                                      frame_pool.GetAddressOf());
-	if (FAILED(hr)) {
-		U_LOG_W("leia_bg_capture: FramePool::CreateFreeThreaded failed: 0x%08x", (unsigned)hr);
-		reset_affinity();
-		return nullptr;
-	}
-
-	ComPtr<WGC::IGraphicsCaptureSession> capture_session;
-	hr = frame_pool->CreateCaptureSession(capture_item.Get(), capture_session.GetAddressOf());
-	if (FAILED(hr)) {
-		U_LOG_W("leia_bg_capture: CreateCaptureSession failed: 0x%08x", (unsigned)hr);
-		reset_affinity();
-		return nullptr;
-	}
-
-	// Don't capture the cursor — we draw our own UI; the desktop cursor under us
-	// would be doubled.
-	ComPtr<WGC::IGraphicsCaptureSession2> session2;
-	if (SUCCEEDED(capture_session.As(&session2))) {
-		session2->put_IsCursorCaptureEnabled(false);
-	}
-	// Suppress the yellow "this screen is being captured" border DWM draws
-	// around the captured region. Requires Windows 11 22H2+; on older Windows
-	// the QI fails or the put silently no-ops — fine, we just keep the border.
-	ComPtr<WGC::IGraphicsCaptureSession3> session3;
-	if (SUCCEEDED(capture_session.As(&session3))) {
-		session3->put_IsBorderRequired(false);
-	}
-	// Capture delivery throttle (Suki's measurement, avatar iGPU study
-	// 2026-08-10): WGC delivers a frame per DESKTOP CHANGE — monitor capture
-	// is served by DWM, so every delivery is dwm-column GPU work, and a
-	// moving cursor alone drives it (~13 system GPU points). Capping delivery
-	// is FREE when the desktop is quiet (the still-cost is flat across every
-	// cap) and only bites when something changes; the trade is band
-	// freshness, bounded by the cap. The compose consumer only reads the
-	// latest frame, so dropped intermediates cost nothing. 66 ms measured as
-	// the knee (~9 points saved under motion). LEIA_DP_CAPTURE_MIN_INTERVAL_MS:
-	// unset = 66, 0 = uncapped, N = cap at N ms. Requires
-	// IGraphicsCaptureSession5 (Win11 24H2); QI failure = uncapped, as today.
-	{
-		long interval_ms = 66;
-		const char *e = getenv("LEIA_DP_CAPTURE_MIN_INTERVAL_MS");
-		if (e != nullptr && e[0] != '\0') {
-			interval_ms = atol(e);
-			if (interval_ms < 0 || interval_ms > 1000) {
-				interval_ms = 66;
-			}
-		}
-		if (interval_ms > 0) {
-			ComPtr<WGC::IGraphicsCaptureSession5> session5;
-			if (SUCCEEDED(capture_session.As(&session5))) {
-				ABI::Windows::Foundation::TimeSpan ts;
-				ts.Duration = (INT64)interval_ms * 10000; // 100 ns units
-				if (SUCCEEDED(session5->put_MinUpdateInterval(ts))) {
-					U_LOG_W("leia_bg_capture: delivery capped at %ld ms "
-					        "(LEIA_DP_CAPTURE_MIN_INTERVAL_MS)",
-					        interval_ms);
-				}
-			}
 		}
 	}
 
@@ -1173,6 +1206,110 @@ leia_bg_capture_get_size(struct leia_bg_capture *c, uint32_t *out_w, uint32_t *o
 	if (out_h) *out_h = c->monitor_h;
 }
 
+/*!
+ * The window's monitor handle is no longer the one the capture session was
+ * created for. Two different things look like that:
+ *
+ *  - the panel went away and came back (deep sleep, cable, a display-topology
+ *    change): Windows hands out a NEW HMONITOR for the same panel and the old
+ *    capture item is dead. The runtime keeps the display processor in place
+ *    across a short drop, so nothing else re-creates this capture; without a
+ *    re-bind the poll below returned false for the rest of the session — a
+ *    transparent app then showed black where the desktop belongs.
+ *  - the window really moved to another monitor.
+ *
+ * Re-create the WGC item/pool/session on the new handle when the new monitor
+ * has the SAME pixel size: the staging texture, its shared handle, the fence
+ * and every consumer's import of them stay valid, so only the WGC objects are
+ * swapped. A different size needs a new staging texture that consumers would
+ * have to re-import; that case keeps the old behaviour (no compose).
+ *
+ * Tried at most once a second per handle. Render thread only, like the poll.
+ *
+ * @return true when the session now captures @p cur.
+ */
+static bool
+rebind_monitor(struct leia_bg_capture *c, HMONITOR cur)
+{
+	const ULONGLONG now_ms = GetTickCount64();
+	if (cur == c->rebind_tried_monitor && now_ms - c->rebind_tried_ms < 1000) {
+		return false;
+	}
+	c->rebind_tried_monitor = cur;
+	c->rebind_tried_ms = now_ms;
+
+	MONITORINFO mi = {};
+	mi.cbSize = sizeof(mi);
+	if (cur == nullptr || !GetMonitorInfoW(cur, &mi)) {
+		return false;
+	}
+	const UINT w = (UINT)(mi.rcMonitor.right - mi.rcMonitor.left);
+	const UINT h = (UINT)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+	if (w != c->monitor_w || h != c->monitor_h) {
+		if (c->rebind_refused_monitor != cur) {
+			c->rebind_refused_monitor = cur;
+			U_LOG_W("leia_bg_capture: the window is on a %ux%u monitor but the capture was created for "
+			        "%ux%u — not re-bound (needs a new staging texture); compose-under stays off while "
+			        "the window is there",
+			        w, h, c->monitor_w, c->monitor_h);
+		}
+		return false;
+	}
+
+	ComPtr<WGC::IGraphicsCaptureItem> item;
+	ComPtr<WGC::IDirect3D11CaptureFramePool> pool;
+	ComPtr<WGC::IGraphicsCaptureSession> session;
+	const char *stage = "";
+	HRESULT hr = open_capture_session(c->wg_device.Get(), cur, item, pool, session, &stage);
+	if (SUCCEEDED(hr)) {
+		stage = "StartCapture";
+		hr = session->StartCapture();
+	}
+	if (FAILED(hr)) {
+		ComPtr<WF::IClosable> closable;
+		if (pool != nullptr && SUCCEEDED(pool.As(&closable))) {
+			closable->Close();
+		}
+		if (session != nullptr && SUCCEEDED(session.As(&closable))) {
+			closable->Close();
+		}
+		if (c->rebind_refused_monitor != cur) {
+			c->rebind_refused_monitor = cur;
+			U_LOG_W("leia_bg_capture: re-bind to the new monitor handle failed at %s: 0x%08x — retrying "
+			        "once a second (logged once)",
+			        stage, (unsigned)hr);
+		}
+		return false;
+	}
+
+	// Swap: close the session bound to the dead handle, adopt the new one.
+	{
+		ComPtr<WF::IClosable> closable;
+		if (c->frame_pool != nullptr && SUCCEEDED(c->frame_pool.As(&closable))) {
+			closable->Close();
+		}
+	}
+	{
+		ComPtr<WF::IClosable> closable;
+		if (c->capture_session != nullptr && SUCCEEDED(c->capture_session.As(&closable))) {
+			closable->Close();
+		}
+	}
+	U_LOG_W("leia_bg_capture: monitor handle changed (0x%p -> 0x%p, same %ux%u size) — capture session "
+	        "re-created on the new handle",
+	        (void *)c->monitor, (void *)cur, w, h);
+	c->capture_item = item;
+	c->frame_pool = pool;
+	c->capture_session = session;
+	c->monitor = cur;
+	c->monitor_rect = mi.rcMonitor;
+	c->rebind_refused_monitor = nullptr;
+	// The staging texture still holds the last frame of the old session; do
+	// not present it as current. The new session delivers a first frame at once.
+	c->has_frame.store(false, std::memory_order_release);
+	return true;
+}
+
 extern "C" bool
 leia_bg_capture_poll(struct leia_bg_capture *c,
                      float out_bg_uv_origin[2],
@@ -1301,11 +1438,10 @@ leia_bg_capture_poll(struct leia_bg_capture *c,
 
 	// Window-on-monitor rect → normalized UVs.
 	HMONITOR cur = MonitorFromWindow(c->hwnd, MONITOR_DEFAULTTONEAREST);
-	if (cur != c->monitor) {
-		// Cross-monitor move: capture session is still bound to the old monitor.
-		// Recreating the session mid-stream is non-trivial; for now skip compose
-		// (caller can fall through to opaque-only weave).
-		// TODO follow-up: tear-down + re-create on monitor change.
+	if (cur != c->monitor && !rebind_monitor(c, cur)) {
+		// The window is on a monitor this session does not capture and could
+		// not be re-bound to (different size, or the re-bind failed): skip
+		// compose (caller can fall through to opaque-only weave).
 		out_bg_uv_origin[0] = 0;
 		out_bg_uv_origin[1] = 0;
 		out_bg_uv_extent[0] = 0;
