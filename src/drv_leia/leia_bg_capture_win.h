@@ -137,9 +137,14 @@ void leia_bg_capture_get_size(struct leia_bg_capture *c,
  * window-on-monitor region as normalized UVs and the fence value the caller
  * must Wait on before sampling.
  *
+ * If the window's monitor handle changed and the new monitor has the same
+ * pixel size (the panel went away and came back), the capture session is
+ * re-created on the new handle here; consumers' imports stay valid.
+ *
  * @return  true if a captured frame is available; false if no frame yet
- *          or the window has crossed monitors (caller should skip compose
- *          for this frame and either fall back or pass-through).
+ *          or the window is on a monitor of a different size than the one
+ *          the capture was created for (caller should skip compose for
+ *          this frame and either fall back or pass-through).
  */
 bool leia_bg_capture_poll(struct leia_bg_capture *c,
                           float out_bg_uv_origin[2],
