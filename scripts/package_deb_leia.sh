@@ -38,7 +38,10 @@
 # one. No Depends / Recommends on it: it is in no Ubuntu archive (DebInstall
 # checks every relation resolves), and the plug-in works without conversion.
 #
-# NO postinst/postrm: the plug-in .deb just drops files into the shared
+# postinst/postrm do ONE thing: ask the runtime's helper to try-restart a
+# RUNNING displayxr.service, because a running service keeps the old plug-in
+# mapped until it restarts (runtime #2812). Nothing else is registered: the
+# plug-in .deb just drops files into the shared
 # DisplayProcessors discovery root (`/usr/lib/displayxr/plugins`, which the
 # runtime searches by default — runtime #781 Phase 1). The runtime .deb owns
 # the OpenXR ActiveRuntime registration; the SR runtime package owns
@@ -394,6 +397,30 @@ Description: DisplayXR Leia SR display processor (Linux plug-in)
  enabled for the user; without it transparency falls back to silhouette
  intersection.
 EOF
+# A running displayxr.service has the previous plug-in mapped: it must restart to
+# load this one (or to drop it on removal). The runtime ships the helper
+# (runtime #2812): it try-restarts only a service that is running, in every
+# user manager, never starts one, and always exits 0. A runtime too old to
+# ship it is left alone, as before.
+write_restart_script() {
+    cat > "$1" <<'EOS'
+#!/bin/sh
+set -e
+case "$1" in
+    __WHEN__)
+        if [ -x /usr/lib/displayxr/bin/displayxr-restart-service ]; then
+            /usr/lib/displayxr/bin/displayxr-restart-service || true
+        fi
+        ;;
+esac
+exit 0
+EOS
+    sed -i.bak "s/__WHEN__/$2/" "$1" && rm -f "$1.bak"
+    chmod 0755 "$1"
+}
+write_restart_script "$STAGE/DEBIAN/postinst" "configure"
+write_restart_script "$STAGE/DEBIAN/postrm" "remove|purge"
+
 # The split's guard (see header): neither provider file may ride in this package.
 if find "$STAGE" \( -name 'DisplayXR-LeiaConversion*' -o -name '*conversion-provider*.json' \) | grep -q .; then
     echo "error: the staged tree contains Leia conversion provider files; they belong to" >&2
