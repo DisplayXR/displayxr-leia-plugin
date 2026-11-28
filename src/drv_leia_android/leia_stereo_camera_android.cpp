@@ -939,6 +939,10 @@ struct pair_desc
 	bool factory_explicit{false};
 	//! Why the factory block is absent (for the source log line).
 	std::string block_why;
+	//! The size the intrinsics in use are stated at (a served mirror record's
+	//! imageSize, else the block's reference size), for the open log.
+	uint32_t calib_ref_w{0}, calib_ref_h{0};
+	const char *calib_ref_what{"factory block reference"};
 };
 
 std::mutex g_mu;
@@ -1022,6 +1026,9 @@ apply_served_locked(pair_desc &p, std::string &why, std::string &state)
 		}
 		p.factory = conv;
 		p.factory_explicit = true;
+		p.calib_ref_w = (uint32_t)srv.width;
+		p.calib_ref_h = (uint32_t)srv.height;
+		p.calib_ref_what = "served record imageSize";
 		snprintf(buf, sizeof(buf),
 		         "source=served display config record (mirror: full lens model at %dx%d, lensIds [%s, %s], saved "
 		         "%s, R %.3f deg from the factory R)",
@@ -1059,6 +1066,9 @@ apply_user_calib_locked(pair_desc &p)
 {
 	const leia_scam_factory_calib prev = p.factory;
 	p.factory_explicit = false;
+	p.calib_ref_w = p.ref_w;
+	p.calib_ref_h = p.ref_h;
+	p.calib_ref_what = "factory block reference";
 	if (p.have_block) {
 		p.factory = p.block_factory;
 	}
@@ -2021,6 +2031,48 @@ left_is_sub(const pair_desc &p)
 		return p.swap_value;
 	}
 	return p.calibrated ? p.stream.left_is_sub : true;
+}
+
+/*!
+ * One WARN per open with the calibration in use, for checking against the
+ * served record: its source ("rotation source=..."), the lens ids in the
+ * factory block's order (lens0 = main, lens1 = sub), R and T (x_lens1 =
+ * R x_lens0 + T, T in mm, after any pose-based convention swap), the
+ * baseline, the size the intrinsics are stated at, the published eye size,
+ * and which lens is the SBS left eye.
+ */
+void
+log_calibration_in_use(const pair_desc &p, bool lsub)
+{
+	std::string src = p.user_calib_state;
+	for (const char *pre : {"rotation ", "source="}) {
+		if (src.rfind(pre, 0) == 0) {
+			src.erase(0, strlen(pre));
+		}
+	}
+	if (!p.calibrated) {
+		SCAM_LOG_W("leia stereo camera (android): %s pair calibration at open: rotation source=%s; lensIds [%s, %s] "
+		           "(lens0 = camera %s, lens1 = camera %s); RAW only, no R / T in use",
+		           p.front ? "front" : "rear", src.empty() ? "none" : src.c_str(), p.main_id, p.sub_id, p.main_id,
+		           p.sub_id);
+		return;
+	}
+	const leia_scam_factory_calib f = oriented_factory(p);
+	// Both lenses' intrinsics at the size they are stated at (the pipeline at a
+	// capture of that size, no crop, no turn: a served record's own numbers).
+	const uint32_t rw = p.calib_ref_w != 0 ? p.calib_ref_w : p.array_w, rh = p.calib_ref_h != 0 ? p.calib_ref_h : p.array_h;
+	leia_scam_stream_calib at{};
+	leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, rw, rh, rw, rh, 0, &at);
+	const double *k0 = at.k[at.left_is_sub ? 1 : 0], *k1 = at.k[at.left_is_sub ? 0 : 1];
+	SCAM_LOG_W("leia stereo camera (android): %s pair calibration at open: rotation source=%s; lensIds [%s, %s] "
+	           "(lens0 = camera %s, lens1 = camera %s); R_1_from_0 [[%.6f, %.6f, %.6f], [%.6f, %.6f, %.6f], [%.6f, "
+	           "%.6f, %.6f]]; T_mm_1_from_0 [%.3f, %.3f, %.3f]; baseline %.3f mm; intrinsics at %ux%u (%s): lens0 "
+	           "fx %.2f fy %.2f cx %.2f cy %.2f, lens1 fx %.2f fy %.2f cx %.2f cy %.2f; published %ux%u per eye; "
+	           "SBS left = camera %s",
+	           p.front ? "front" : "rear", src.c_str(), p.main_id, p.sub_id, p.main_id, p.sub_id, f.R[0][0], f.R[0][1],
+	           f.R[0][2], f.R[1][0], f.R[1][1], f.R[1][2], f.R[2][0], f.R[2][1], f.R[2][2], f.T[0], f.T[1], f.T[2],
+	           leia_scam_factory_baseline_mm(&f), rw, rh, p.calib_ref_what, k0[0], k0[1], k0[2], k0[3], k1[0], k1[1],
+	           k1[2], k1[3], p.eye_w, p.eye_h, lsub ? p.sub_id : p.main_id);
 }
 
 } // namespace
@@ -4627,6 +4679,7 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		c->desc = g_pairs[index];
 	}
 	c->lsub = left_is_sub(c->desc);
+	log_calibration_in_use(c->desc, c->lsub);
 	c->w = c->desc.eye_w;
 	c->h = c->desc.eye_h;
 	c->crop_w = c->desc.crop_w;
