@@ -696,12 +696,39 @@ query_display_impl(SrInstance instance,
 	int32_t rec_w = 0;
 	int32_t rec_h = 0;
 	const SrResult rr = srDisplayGetRecommendedTextureSize(display, &rec_w, &rec_h);
-	if (SR_SUCCEEDED(rr) && rec_w > 0 && rec_h > 0) {
-		out_info->recommended_view_width = (uint32_t)rec_w;
+	bool have_view = false;
+#ifdef SR_HAS_DISPLAY_RECOMMENDED_VIEW_SCALE
+	{
+		// LeiaSR q4 (2026-11-28): the per-view scale, from the same display config value.
+		float sx = 0.0f;
+		float sy = 0.0f;
+		if (SR_SUCCEEDED(srDisplayGetRecommendedViewScale(display, &sx, &sy)) && sx > 0.0f && sy > 0.0f &&
+		    out_info->pixel_width > 0 && out_info->pixel_height > 0) {
+			out_info->recommended_view_width = (uint32_t)(sx * (float)out_info->pixel_width + 0.5f);
+			out_info->recommended_view_height = (uint32_t)(sy * (float)out_info->pixel_height + 0.5f);
+			out_info->recommended_valid = true;
+			have_view = true;
+			U_LOG_W("SR recommended view: %ux%u per view (scale %.4f x %.4f)", out_info->recommended_view_width,
+			        out_info->recommended_view_height, (double)sx, (double)sy);
+		}
+	}
+#endif
+	if (!have_view && SR_SUCCEEDED(rr) && rec_w > 0 && rec_h > 0) {
+		// Both views side by side since LeiaSR #429 (SR 1.38+); one view before it. A one-view answer
+		// has the panel's aspect rather than twice it (the macOS arm's rule).
+		bool per_view_already = false;
+		if (out_info->pixel_width > 0 && out_info->pixel_height > 0) {
+			const double rec_aspect = (double)rec_w / (double)rec_h;
+			const double px_aspect = (double)out_info->pixel_width / (double)out_info->pixel_height;
+			per_view_already = rec_aspect < 1.5 * px_aspect;
+		}
+		out_info->recommended_view_width = (uint32_t)(per_view_already ? rec_w : rec_w / 2);
 		out_info->recommended_view_height = (uint32_t)rec_h;
 		out_info->recommended_valid = true;
-		U_LOG_W("SR recommended view texture: %dx%d per eye", rec_w, rec_h);
-	} else {
+		U_LOG_W("SR recommended texture %dx%d (%s) -> %ux%u per view", rec_w, rec_h,
+		        per_view_already ? "one view" : "side by side", out_info->recommended_view_width,
+		        out_info->recommended_view_height);
+	} else if (!have_view) {
 		// Leave invalid rather than substituting a guess; the caller has its own
 		// fallback and a wrong view size is worse than a missing one.
 		U_LOG_W("SR v2 recommended texture unavailable (%s) - caller will fall back",

@@ -721,11 +721,39 @@ sr_ctx_refresh_display_info_locked(void)
 	info.pixel_height = (uint32_t)px_h;
 	info.screen_left = (int32_t)rect.left;
 	info.screen_top = (int32_t)rect.top;
-	/* Per-view: srDisplayGetRecommendedTextureSize wraps the same legacy
-	 * getRecommendedViewsTextureWidth/Height getter the Windows arm already
-	 * consumes and logs as "per eye" (leia_sr_d3d11.cpp) — settled. */
-	info.recommended_view_width = (uint32_t)rec_w;
-	info.recommended_view_height = (uint32_t)rec_h;
+	/* Per view. srDisplayGetRecommendedViewScale (LeiaSR q4, 2026-11-28) when the
+	 * SDK declares it and the runtime answers: the display config's recommended
+	 * view size over the panel, about 0.5 x 0.5. Else srDisplayGetRecommendedTextureSize,
+	 * which is BOTH views side by side since LeiaSR #429 (ST-5814, SR 1.38+): reading
+	 * it as one view gave the DS1 3840x1080 views (a 1.0 x 0.5 scale). A pre-#429
+	 * runtime answered one view; that answer has the panel's aspect, not twice it,
+	 * so it is kept as is (the macOS arm's rule). */
+	const char *rec_src = "srDisplayGetRecommendedTextureSize";
+	bool have_view = false;
+#ifdef SR_HAS_DISPLAY_RECOMMENDED_VIEW_SCALE
+	{
+		float sx = 0.0f, sy = 0.0f;
+		if (SR_SUCCEEDED(srDisplayGetRecommendedViewScale(g_ctx.display, &sx, &sy)) && sx > 0.0f && sy > 0.0f &&
+		    px_w > 0 && px_h > 0) {
+			info.recommended_view_width = (uint32_t)(sx * (float)px_w + 0.5f);
+			info.recommended_view_height = (uint32_t)(sy * (float)px_h + 0.5f);
+			rec_src = "srDisplayGetRecommendedViewScale";
+			have_view = true;
+		}
+	}
+#endif
+	if (!have_view) {
+		bool per_view_already = false;
+		if (rec_w > 0 && rec_h > 0 && px_w > 0 && px_h > 0) {
+			const double rec_aspect = (double)rec_w / (double)rec_h;
+			const double px_aspect = (double)px_w / (double)px_h;
+			per_view_already = rec_aspect < 1.5 * px_aspect;
+		}
+		info.recommended_view_width = (uint32_t)(per_view_already ? rec_w : rec_w / 2);
+		info.recommended_view_height = (uint32_t)rec_h;
+	}
+	U_LOG_I("leia_lnx: recommended view %ux%u per view (from %s; texture size %dx%d, panel %dx%d)",
+	        info.recommended_view_width, info.recommended_view_height, rec_src, rec_w, rec_h, px_w, px_h);
 	/* Refresh (leia-plugin #184): srDisplayGetRefreshRate (slot 98) when the
 	 * SDK has it and the installed runtime answers; else the 60 Hz constant
 	 * (SR 1.38 has no getter — contract §8 R-D1). */

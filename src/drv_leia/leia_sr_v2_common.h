@@ -59,11 +59,12 @@ struct leia_sr_v2_display_info
 	uint64_t display_id;
 
 	/*!
-	 * Recommended render size, **per eye** — confirmed with the SDK team, who
-	 * pointed out that `srDisplayGetRecommendedTextureSize` forwards directly to
-	 * the same `getRecommendedViewsTextureWidth/Height()` the v1 path calls. For
-	 * this value the two APIs are not merely equivalent, they are one
-	 * implementation, so v1 and v2 cannot disagree.
+	 * Recommended render size, **per view**: srDisplayGetRecommendedViewScale x the
+	 * panel when the SDK and runtime have it (LeiaSR q4, 2026-11-28); else
+	 * srDisplayGetRecommendedTextureSize, which since LeiaSR #429 (SR 1.38) is BOTH
+	 * views side by side and is halved here (a pre-#429 one-view answer, with the
+	 * panel's aspect, is kept). Either way the value is the display config's
+	 * `getRecommendedViewsTextureWidth/Height()`, the one the v1 path reads.
 	 *
 	 * Two properties that are easy to get wrong:
 	 *

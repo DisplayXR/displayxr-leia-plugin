@@ -497,6 +497,17 @@ read_active_geometry_locked(uint64_t display_id, struct leia_mac_display_info *i
 		info->rec_view_width =
 		    rec_w > 0 ? (uint32_t)(pre429_per_view ? rec_w : rec_w / 2) : (uint32_t)px_w / 2;
 		info->rec_view_height = rec_h > 0 ? (uint32_t)rec_h : (uint32_t)px_h / 2;
+#ifdef SR_HAS_DISPLAY_RECOMMENDED_VIEW_SCALE
+		{
+			/* LeiaSR q4 (2026-11-28): the per-view scale itself, when the runtime has it. */
+			float sx = 0.0f, sy = 0.0f;
+			if (SR_SUCCEEDED(srDisplayGetRecommendedViewScale(display, &sx, &sy)) && sx > 0.0f && sy > 0.0f) {
+				info->rec_view_width = (uint32_t)(sx * (float)px_w + 0.5f);
+				info->rec_view_height = (uint32_t)(sy * (float)px_h + 0.5f);
+				pre429_per_view = false; // not used: nothing to guess
+			}
+		}
+#endif
 		static bool guard_logged = false;
 		if (pre429_per_view && !guard_logged) {
 			guard_logged = true;
