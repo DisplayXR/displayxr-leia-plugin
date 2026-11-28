@@ -37,16 +37,67 @@ is shaped as a *request* (returning `XR_SUCCESS` on acceptance, not on physical 
 On Android, `leia_core_set_backlight` is direct: enabling the backlight engages the lightfield
 optics, disabling it returns the panel to conventional 2D.
 
-## Two rendering modes; multi-viewer weaving is a setting (Windows)
+## Rendering modes; "LeiaSR multi-viewer" is a second 3D mode (Windows)
 
-The device declares exactly two rendering modes on every platform: **mode 0 = 2D** (one view,
-1×1, lens off) and **mode 1 = LeiaSR** (two views, 2×1). That is the runtime's two-mode
-contract (displayxr-runtime#2766: a display driver exposes 2D and 3D at run time; any other
-choice is a per-driver setting).
+Apps always see two rendering modes: **mode 0 = 2D** (one view, 1×1, lens off) and **mode 1 =
+3D** (two views, 2×1). That is the runtime's two-slot contract (runtime ADR-065). Behind it, a
+display driver declares a *list* of entries, and the runtime maps the 3D slot to the entry the
+screen's **3D mode** names (runtime ADR-066 C1).
 
-On Windows, multi-viewer weaving (#446) used to be a third mode, "LeiaSR multi-viewer": the
-same atlas as mode 1, with the SR v2 weaver told `srWeaverSetMultiViewerMode(ON)`. It is now the
-`MULTI_VIEWER` setting of the `leia-sr` display processor:
+The Leia plug-in declares:
+
+| Entry | Name | Views | Weaver multi-viewer override | Declared |
+|---|---|---|---|---|
+| 0 | `2D` | 1 | (lens off) | always |
+| 1 | `LeiaSR` | 2 | none (follows the LeiaSR system setting), or `OFF` with `MULTI_VIEWER=off` | always |
+| 2 | `LeiaSR multi-viewer` | 2 | `SR_MULTI_VIEWER_MODE_ON` | Windows, when the LeiaSR runtime can weave for several viewers |
+
+Entry 2 is the same atlas as entry 1 (views, scale, tiles, lens, tracking). Only the SR v2
+weaver's option differs, so the runtime switches between the two **live**, under running apps,
+with no swapchain change.
+
+- **When entry 2 is declared.** At each Leia device creation, when all three hold: the plug-in
+  was built against an SR SDK with `srWeaverSetMultiViewerMode` (`DXR_LEIA_HAS_SR_MULTI_VIEWER`),
+  the installed LeiaSR runtime reports `multiViewerWeave`, and the plug-in was built against
+  runtime headers with the declared-list contract (v2.70.7 or later). Otherwise the list is
+  entries 0 and 1, exactly as before. Linux, macOS and Android declare entries 0 and 1.
+- **Choosing it.** The DisplayXR Dashboard shows a "3D mode" picker on the screen's card (only
+  when the list has more than one 3D entry), or:
+
+  ```bat
+  displayxr-cli dp mode list                                       REM each screen's choices
+  displayxr-cli dp mode set leiasr_multi_viewer --screen <key>     REM applies now
+  displayxr-cli dp mode set leiasr --screen <key>
+  displayxr-cli dp mode reset --screen <key>                       REM back to the default
+  ```
+
+  The choice names are the runtime's slugs of the entry names: `leiasr`, `leiasr_multi_viewer`.
+  The choice is stored by the runtime, per screen.
+- **Which graphics APIs.** The SR **D3D11** and **Vulkan** weavers weave for several viewers.
+  The SR **D3D12** and **OpenGL** weavers weave for one: they refuse the override
+  (`SR_ERROR_FEATURE_NOT_SUPPORTED`), log one WARN per weaver, and keep weaving the primary
+  viewer. So the mode takes effect for D3D11 and Vulkan apps (and for apps the runtime weaves
+  through its D3D11 path, such as service clients); D3D12 and OpenGL apps on their own weaver
+  stay single-viewer for now. The SR capability is runtime-wide, so the entry is offered
+  whatever API an app uses.
+- **What it does.** With one person in front the picture is the same as `LeiaSR`; the weaver's
+  multi-viewer path engages with two or more tracked viewers. The app still renders one stereo
+  pair. The `ON` override weaves every tracked viewer, up to four, and does not apply the
+  viewer cap of the LeiaSR system setting; `LeiaSR` (no override) honours the system setting.
+  The override is per weaver, so it does not change the system setting or other apps.
+- **How it reaches the weavers.** For the head device's screen, the runtime names the entry
+  through the device's `OUTPUT_MODE` property (`leia_hmd_set_property`, `leia_device.c`), kept
+  process-wide. A display processor made for one screen (`create_dp_*_for_screen`) is told its
+  own entry through its `set_output_entry` slot (D3D11, D3D12, GL, Vulkan) and uses that
+  instead. Right before each weave the weaver applies the value of its entry
+  (`leia_multi_viewer_wanted` → `leia_sr_v2_apply_multiviewer`), on change only. Going back to
+  `LeiaSR` sets `SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG`, which removes the override; no weaver is
+  recreated. The 2D entry changes nothing (the lens is off). Weavers pinned to a simulated
+  viewer (untracked secondary screens) are left alone, so the mode has no effect there.
+
+### The `MULTI_VIEWER` setting (an alias)
+
+The `leia-sr` display processor keeps its setting from before the mode existed:
 
 ```bat
 displayxr-cli dp options leia-sr               REM lists MULTI_VIEWER, its value and where it came from
@@ -54,32 +105,35 @@ displayxr-cli dp set leia-sr MULTI_VIEWER on   REM per user; --machine for every
 displayxr-cli dp unset leia-sr MULTI_VIEWER    REM back to the default
 ```
 
-| Value | Weaver override | Was |
+| Value | Where entry 2 is declared | Where it is not (two entries) |
 |---|---|---|
-| `system` (default) | none: the weaver follows the LeiaSR system setting (SDK default `FOLLOW_CONFIG`) | mode 1 |
-| `on` | `SR_MULTI_VIEWER_MODE_ON` | mode 2 |
-| `off` | `SR_MULTI_VIEWER_MODE_OFF` | (new) |
+| `system` (default) | `LeiaSR` is the default 3D mode; it follows the LeiaSR system setting (SDK default `FOLLOW_CONFIG`) | the weaver follows the LeiaSR system setting |
+| `on` | `LeiaSR multi-viewer` is the **default** 3D mode | `SR_MULTI_VIEWER_MODE_ON` on every weaver, when the SR runtime supports it; ignored otherwise |
+| `off` | `LeiaSR` is the default 3D mode and forces `SR_MULTI_VIEWER_MODE_OFF` | `SR_MULTI_VIEWER_MODE_OFF`, when the SR runtime supports it; ignored otherwise |
 
+- **A stored per-screen 3D mode wins over the setting.** The setting only names the default
+  for a screen with no choice. With `on` and `LeiaSR` chosen for a screen, that screen follows
+  the system setting.
 - **How it is read.** Only through the runtime's `host->get_setting("leia-sr", "MULTI_VIEWER")`
   (ADR-054 decision 7), so the runtime's precedence applies: `DXR_DP_LEIA_SR_MULTI_VIEWER` in the
   **hosting** process's environment, then the per-user store, then the machine store. Words are
   case-insensitive; anything else logs one WARN and means `system`.
-- **When.** Once per Leia device creation (`leia_plugin_resolve_multi_viewer`, `leia_plugin.c`),
-  so a change takes effect at the next app start, or, for IPC apps, the next start of
-  `displayxr-service` (it hosts the device, and reads its own environment, not the client's).
-  There is no live re-read.
-- **Where it applies.** Every SR v2 weaver (D3D11, D3D12, GL, Vulkan) gets the override on its
-  first weave, right before the weave (`leia_sr_v2_apply_multiviewer`); a recreated weaver gets it
-  again. `system` costs no SR call. The override is a weaver option, independent of the 2D/3D
-  mode; in 2D the lens is off, so it has no visible effect there. Weavers pinned to a simulated
-  viewer (untracked secondary screens) are left alone, as before.
+- **When.** At each Leia device creation (`leia_plugin_resolve_multi_viewer`, `leia_plugin.c`).
+  Where entry 2 is declared, the runtime also polls the plug-in's default
+  (`XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE`), and the setting is read again on each poll, so a
+  change applies to running apps. Where it is not, a change takes effect at the next app start,
+  or, for IPC apps, the next start of `displayxr-service` (it hosts the device, and reads its
+  own environment, not the client's).
 - **When it cannot apply.** If the plug-in was built against an SR SDK without
   `srWeaverSetMultiViewerMode`, or the installed LeiaSR runtime does not report
-  `multiViewerWeave`, a non-default value is ignored with one WARN at device creation. The D3D12
-  and GL weavers refuse `on` (`SR_ERROR_FEATURE_NOT_SUPPORTED`) and weave the primary viewer, with
-  one WARN per weaver, as mode 2 did.
-- **Log lines.** `leia_plugin: multi-viewer weave: <effective> (MULTI_VIEWER <value>[, default])`
-  at device creation, and `Leia <backend>: multi-viewer weave ON|OFF` when a weaver takes it.
+  `multiViewerWeave`, a non-default value is ignored with one WARN at device creation, and
+  `displayxr-cli dp options` reports the setting as not supported here.
+- **Log lines.** At device creation:
+  `leia_plugin: multi-viewer weave: <value> (MULTI_VIEWER <value>[, default]); <n> rendering modes[ ('LeiaSR multi-viewer' offered)], default 3D mode '<name>'`.
+  On a switch: `leia_plugin: 3D mode '<name>' (entry <n>; was '<name>')` for the head device,
+  `Leia <backend> DP: 3D mode '<name>' for this screen (entry <n>)` for a per-screen display
+  processor, and `Leia <backend>: multi-viewer weave ON|OFF|FOLLOW_CONFIG` when a weaver takes
+  the value.
 
 ## Hardware vs processing (runtime ADR-028, runtime#542)
 

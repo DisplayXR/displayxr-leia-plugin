@@ -10,7 +10,7 @@
 #include "leia_sr_gl.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
-#include "leia_multi_viewer.h" // leia_multi_viewer_active (#446)
+#include "leia_multi_viewer.h" // leia_multi_viewer_wanted (#446)
 #include "leia_sr_liveness.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
@@ -152,6 +152,9 @@ struct leiasr_gl
 	//! #446: the MULTI_VIEWER setting's override as applied to this weaver
 	//! (leia_sr_v2_apply_multiviewer). Re-arms on a new weaver handle.
 	struct leia_sr_v2_mv_state mv = {};
+	//! The declared 3D entry this weaver's DP was told to draw
+	//! (set_output_entry); 0 = never told: the head device's entry.
+	std::atomic<uint32_t> mv_entry{0};
 #endif
 	//! lens_v2 is bound to bind_display_id (SR D3): disabled before destroy.
 	bool lens_bound = false;
@@ -786,13 +789,15 @@ w_weave(leiasr_gl *sr)
 		}
 #endif
 #ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
-		// #446: the MULTI_VIEWER setting's override (on = ON, off = OFF, system
-		// = the SDK default), applied on this weaver's first weave and on change
-		// only, right before the weave that uses it. A weaver pinned to a
+		// #446: the multi-viewer override of the 3D entry this weaver draws
+		// ("LeiaSR multi-viewer" = ON; "LeiaSR" = the MULTI_VIEWER setting: off
+		// = OFF, system = the SDK default), applied on this weaver's first weave
+		// and on change only, right before the weave that uses it. A weaver pinned to a
 		// simulated viewer (an untracked secondary screen) has no tracked
 		// viewers to add and is left alone.
 		if (!sr->viewer_pinned) {
-			leia_sr_v2_apply_multiviewer(sr->weaver_v2, leia_multi_viewer_active(), &sr->mv, "GL");
+			const uint32_t mv_entry = sr->mv_entry.load(std::memory_order_relaxed);
+			leia_sr_v2_apply_multiviewer(sr->weaver_v2, leia_multi_viewer_wanted(mv_entry), &sr->mv, "GL");
 		}
 #endif
 		srWeaverWeave(sr->weaver_v2);
@@ -1004,6 +1009,20 @@ leiasr_gl_phases_from_present_origin(struct leiasr_gl *leiasr)
 {
 	// Written once, by the synchronous create, before the holder is handed out.
 	return leiasr != nullptr && leiasr->needs_present_origin;
+}
+
+void
+leiasr_gl_set_output_entry(struct leiasr_gl *leiasr, uint32_t mode_index)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+	const uint32_t cur = leiasr->mv_entry.load(std::memory_order_relaxed);
+	leiasr->mv_entry.store(leia_multi_viewer_dp_entry(cur, mode_index, "GL"), std::memory_order_relaxed);
+#else
+	(void)mode_index;
+#endif
 }
 
 bool

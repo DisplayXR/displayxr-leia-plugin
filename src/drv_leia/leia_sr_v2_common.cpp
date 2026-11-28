@@ -373,7 +373,7 @@ leia_sr_v2_apply_multiviewer(SrWeaver w,
 	}
 	if (st->weaver != w) {
 		// A weaver we have not touched (first weave, or a recreated weaver):
-		// it starts at the SDK default, so MULTI_VIEWER=system costs no call.
+		// it starts at the SDK default, so "follow the system" costs no call.
 		st->weaver = w;
 		st->applied = SR_MULTI_VIEWER_MODE_FOLLOW_CONFIG;
 		st->failed = -1;

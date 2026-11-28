@@ -28,6 +28,7 @@
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_device.h" /* struct xrt_rendering_mode, XRT_RENDERING_MODE_FLAG_* */
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -73,7 +74,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h> /* InterlockedExchange (the MULTI_VIEWER value) */
+#include <windows.h> /* InterlockedExchange (the multi-viewer state) */
 #endif
 
 #ifndef XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
@@ -109,30 +110,94 @@ static bool g_leia_probe_timing_logged = false;
 static xrt_component_get_setting_fn_t g_leia_get_setting = NULL;
 #endif
 
-/*!
- * The effective MULTI_VIEWER value (enum leia_multi_viewer) the weave paths
- * apply, published by leia_plugin_resolve_multi_viewer() at each device
- * creation. A LONG for the Interlocked functions; SYSTEM until then.
+/*
+ * Built against runtime headers that carry the declared rendering-mode list
+ * (ADR-066 C1, runtime v2.70.7): the per-monitor list slot here, and in
+ * xrt_device.h the CONFIGURED_3D_MODE property leia_device.c answers (announced
+ * by XRT_RENDERING_MODE_FLAG_START_UP_ONLY, which landed with it). Without
+ * them the mode list stays two entries and MULTI_VIEWER is the only switch.
  */
-static volatile LONG g_leia_multi_viewer_active = (LONG)LEIA_MULTI_VIEWER_SYSTEM;
+#if defined(XRT_PLUGIN_IFACE_HAS_RENDERING_MODES_FOR_MONITOR) && defined(XRT_RENDERING_MODE_FLAG_START_UP_ONLY)
+#define LEIA_HAS_ENTRY_CONTRACT 1
+#else
+#define LEIA_HAS_ENTRY_CONTRACT 0
+#endif
+
+/*!
+ * The effective MULTI_VIEWER setting (enum leia_multi_viewer), published by
+ * leia_plugin_resolve_multi_viewer() at each device creation and refreshed by
+ * leia_multi_viewer_configured_entry(). A LONG for the Interlocked functions;
+ * SYSTEM until then.
+ */
+static volatile LONG g_leia_multi_viewer_setting = (LONG)LEIA_MULTI_VIEWER_SYSTEM;
+//! How many rendering-mode entries the head device declares (2 or 3); 0 = no device yet.
+static volatile LONG g_leia_mv_entry_count = 0;
+//! The 3D entry the head device draws (leia_multi_viewer_set_head_entry()).
+static volatile LONG g_leia_mv_head_entry = (LONG)LEIA_MV_ENTRY_3D;
+//! Whether the SR runtime weaves for several viewers, as asked at the last device creation.
+static volatile LONG g_leia_mv_weave_supported = 0;
+
+static LONG
+leia_long_get(volatile LONG *p)
+{
+	return InterlockedCompareExchange(p, 0, 0);
+}
+
+uint32_t
+leia_multi_viewer_declared_entries(void)
+{
+	return (uint32_t)leia_long_get(&g_leia_mv_entry_count);
+}
+
+uint32_t
+leia_multi_viewer_head_entry(void)
+{
+	return (uint32_t)leia_long_get(&g_leia_mv_head_entry);
+}
+
+void
+leia_multi_viewer_set_head_entry(uint32_t entry)
+{
+	const uint32_t cur = leia_multi_viewer_head_entry();
+	const uint32_t next = leia_multi_viewer_latch_entry(cur, entry, leia_multi_viewer_declared_entries());
+	if (next != cur) {
+		InterlockedExchange(&g_leia_mv_head_entry, (LONG)next);
+		U_LOG_W("leia_plugin: 3D mode '%s' (entry %u; was '%s')", leia_multi_viewer_entry_name(next), next,
+		        leia_multi_viewer_entry_name(cur));
+	}
+}
+
+uint32_t
+leia_multi_viewer_dp_entry(uint32_t current, uint32_t incoming, const char *backend)
+{
+	const uint32_t next = leia_multi_viewer_latch_entry(current, incoming, leia_multi_viewer_declared_entries());
+	if (next != current) {
+		U_LOG_W("Leia %s DP: 3D mode '%s' for this screen (entry %u)", backend,
+		        leia_multi_viewer_entry_name(next), next);
+	}
+	return next;
+}
+
+enum leia_multi_viewer
+leia_multi_viewer_wanted(uint32_t dp_entry)
+{
+	const uint32_t entry = dp_entry >= LEIA_MV_ENTRY_3D ? dp_entry : leia_multi_viewer_head_entry();
+	return leia_multi_viewer_for_entry(entry, leia_multi_viewer_declared_entries(),
+	                                   (enum leia_multi_viewer)leia_long_get(&g_leia_multi_viewer_setting));
+}
 
 enum leia_multi_viewer
 leia_multi_viewer_active(void)
 {
-	return (enum leia_multi_viewer)InterlockedCompareExchange(&g_leia_multi_viewer_active, 0, 0);
+	return leia_multi_viewer_wanted(0);
 }
 
 /*!
- * Read MULTI_VIEWER once (#446: multi-viewer weaving is a setting, not a third
- * rendering mode, under the runtime's two-mode contract), decide whether this
- * build and the installed SR runtime can honour it, and publish the effective
- * value for the weavers. Called at device creation, after the SR client DLLs
- * are bound (the capability query reaches SR). Start-up only by contract: a
- * change takes effect at the next device creation (the next app start, or the
- * next service start for IPC apps).
+ * Read MULTI_VIEWER through the host. @p out_set says whether a value is
+ * stored; an unknown word logs one WARN when @p warn and reads as system.
  */
-static void
-leia_plugin_resolve_multi_viewer(void)
+static enum leia_multi_viewer
+leia_plugin_read_multi_viewer(bool *out_set, bool warn)
 {
 	char buf[64];
 	buf[0] = '\0';
@@ -145,32 +210,128 @@ leia_plugin_resolve_multi_viewer(void)
 #endif
 
 	enum leia_multi_viewer setting = LEIA_MULTI_VIEWER_SYSTEM;
-	if (set && !leia_multi_viewer_parse(buf, &setting) && buf[0] != '\0') {
+	if (set && !leia_multi_viewer_parse(buf, &setting) && buf[0] != '\0' && warn) {
 		U_LOG_W("leia_plugin: MULTI_VIEWER='%s' is not one of system|on|off -- using system", buf);
 	}
+	if (out_set != NULL) {
+		*out_set = set;
+	}
+	return setting;
+}
 
-	enum leia_multi_viewer effective = LEIA_MULTI_VIEWER_SYSTEM;
-	if (setting != LEIA_MULTI_VIEWER_SYSTEM) {
-		/* Asked only when it matters: the query may spin up the SR probe
-		 * instance. False when this build's SR SDK predates the feature
-		 * (compiled out), or the SR runtime does not report it. */
-		const bool supported = leia_win_sr_multi_viewer_weave_supported();
-		effective = leia_multi_viewer_effective(setting, supported);
-		if (effective != setting) {
+/*!
+ * Decide the rendering-mode list and read MULTI_VIEWER (#446), at device
+ * creation, BEFORE the device is made (it declares the list) and so before
+ * any display processor or weaver exists for it. Called after the SR client
+ * DLLs are bound (the capability query reaches SR).
+ *
+ * The list has the "LeiaSR multi-viewer" entry when this build and the
+ * installed SR runtime can weave for several viewers and the runtime headers
+ * carry the declared-list contract; MULTI_VIEWER=on then names the default 3D
+ * entry. Otherwise the list is 2D + LeiaSR and the setting is the only switch,
+ * as before.
+ */
+static void
+leia_plugin_resolve_multi_viewer(void)
+{
+	bool set = false;
+	const enum leia_multi_viewer setting = leia_plugin_read_multi_viewer(&set, true);
+
+	/* The query may spin up the SR probe instance, so it is asked only when
+	 * the answer is used: for the list (the contract is compiled in), or for
+	 * a non-default setting. False when this build's SR SDK predates the
+	 * feature (compiled out), or the SR runtime does not report it. */
+	bool supported = false;
 #ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
-			const char *why = "the installed LeiaSR runtime does not report multi-viewer weaving";
+#if LEIA_HAS_ENTRY_CONTRACT
+	supported = leia_win_sr_multi_viewer_weave_supported();
 #else
-			const char *why = "this plug-in was built against an SR SDK without multi-viewer weaving";
+	if (setting != LEIA_MULTI_VIEWER_SYSTEM) {
+		supported = leia_win_sr_multi_viewer_weave_supported();
+	}
 #endif
-			U_LOG_W("leia_plugin: MULTI_VIEWER=%s ignored -- %s; following the LeiaSR system setting",
-			        leia_multi_viewer_name(setting), why);
-		}
+#endif
+	const enum leia_multi_viewer effective = leia_multi_viewer_effective(setting, supported);
+	if (effective != setting) {
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+		const char *why = "the installed LeiaSR runtime does not report multi-viewer weaving";
+#else
+		const char *why = "this plug-in was built against an SR SDK without multi-viewer weaving";
+#endif
+		U_LOG_W("leia_plugin: MULTI_VIEWER=%s ignored -- %s; following the LeiaSR system setting",
+		        leia_multi_viewer_name(setting), why);
 	}
 
-	U_LOG_W("leia_plugin: multi-viewer weave: %s (MULTI_VIEWER %s%s)", leia_multi_viewer_name(effective),
-	        leia_multi_viewer_name(setting), set ? "" : ", default");
-	InterlockedExchange(&g_leia_multi_viewer_active, (LONG)effective);
+	const uint32_t count = leia_multi_viewer_entry_count(supported, LEIA_HAS_ENTRY_CONTRACT != 0);
+	const uint32_t entry = leia_multi_viewer_default_entry(effective, count);
+	InterlockedExchange(&g_leia_mv_weave_supported, supported ? 1 : 0);
+	InterlockedExchange(&g_leia_multi_viewer_setting, (LONG)effective);
+	InterlockedExchange(&g_leia_mv_entry_count, (LONG)count);
+	InterlockedExchange(&g_leia_mv_head_entry, (LONG)entry);
+
+	U_LOG_W("leia_plugin: multi-viewer weave: %s (MULTI_VIEWER %s%s); %u rendering modes%s, default 3D mode '%s'",
+	        leia_multi_viewer_name(leia_multi_viewer_active()), leia_multi_viewer_name(setting),
+	        set ? "" : ", default", count,
+	        count > LEIA_MV_ENTRY_MULTI_VIEWER ? " ('" LEIA_MV_NAME_MULTI_VIEWER "' offered)" : "",
+	        leia_multi_viewer_entry_name(entry));
 }
+
+uint32_t
+leia_multi_viewer_configured_entry(void)
+{
+	const uint32_t count = leia_multi_viewer_declared_entries();
+	if (count == 0) {
+		return LEIA_MV_ENTRY_3D;
+	}
+	/* Read again, not the value from device creation: the runtime polls this
+	 * (XRT_DEVICE_PROPERTY_CONFIGURED_3D_MODE) to apply a change of the
+	 * setting to running apps. The capability answer is the one the list was
+	 * declared with. */
+	const enum leia_multi_viewer setting = leia_plugin_read_multi_viewer(NULL, false);
+	const enum leia_multi_viewer effective =
+	    leia_multi_viewer_effective(setting, leia_long_get(&g_leia_mv_weave_supported) != 0);
+	const LONG was = InterlockedExchange(&g_leia_multi_viewer_setting, (LONG)effective);
+	if (was != (LONG)effective) {
+		U_LOG_W("leia_plugin: MULTI_VIEWER is now %s (was %s)", leia_multi_viewer_name(effective),
+		        leia_multi_viewer_name((enum leia_multi_viewer)was));
+	}
+	return leia_multi_viewer_default_entry(effective, count);
+}
+
+#if LEIA_HAS_ENTRY_CONTRACT
+/*
+ * The declared rendering-mode list of ONE monitor this plug-in claimed
+ * (runtime ADR-047 Amendment 10): the head device's own list, so every Leia
+ * screen offers the same 3D modes, each with its own per-screen choice, and
+ * the display processor made for it is told which one to draw through its
+ * set_output_entry slot. The default 3D entry is the one MULTI_VIEWER names
+ * now. False where the list is the two entries it always was (the runtime
+ * then reads the head device's, as before), and before the first device.
+ */
+static bool
+leia_plugin_get_rendering_modes_for_monitor(struct xrt_plugin_instance *inst,
+                                            const struct xrt_display_descriptor *display,
+                                            const struct xrt_display_physical *physical,
+                                            struct xrt_rendering_mode *out_modes,
+                                            uint32_t capacity,
+                                            uint32_t *out_count,
+                                            uint32_t *out_default_3d)
+{
+	(void)inst;
+	(void)display;
+	(void)physical;
+	const uint32_t count = leia_multi_viewer_declared_entries();
+	if (out_modes == NULL || out_count == NULL || count <= LEIA_MV_ENTRY_MULTI_VIEWER || capacity < count) {
+		return false;
+	}
+	leia_hmd_fill_rendering_modes(out_modes, count);
+	*out_count = count;
+	if (out_default_3d != NULL) {
+		*out_default_3d = leia_multi_viewer_configured_entry();
+	}
+	return true;
+}
+#endif
 
 /*
  * Setting status (displayxr-runtime #2773): tells `displayxr-cli dp options`
@@ -337,12 +498,13 @@ leia_plugin_create_device(struct xrt_plugin_instance *inst, struct xrt_device **
 	if (leia_sr_client_bind() != LEIA_SR_BIND_OK) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+	/* Before the device (it declares the list this decides), and so before
+	 * any display processor or weaver exists for it. */
+	leia_plugin_resolve_multi_viewer();
 	struct xrt_device *xdev = leia_hmd_create();
 	if (xdev == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
-	/* Before any display processor (and so any weaver) exists for it. */
-	leia_plugin_resolve_multi_viewer();
 	*out_dev = xdev;
 	return XRT_SUCCESS;
 }
@@ -1158,6 +1320,10 @@ static struct xrt_plugin_iface g_leia_iface = {
 #endif
 #ifdef XRT_PLUGIN_IFACE_HAS_SETTING_STATUS
     .get_setting_status = leia_plugin_get_setting_status,
+#endif
+#if LEIA_HAS_ENTRY_CONTRACT
+    /* ADR-066 C1 / ADR-047 Amendment 10: the per-monitor 3D-mode list ("LeiaSR multi-viewer"). */
+    .get_rendering_modes_for_monitor = leia_plugin_get_rendering_modes_for_monitor,
 #endif
 };
 

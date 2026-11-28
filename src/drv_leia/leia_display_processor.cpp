@@ -2750,6 +2750,22 @@ leia_dp_vk_set_present_origin(struct xrt_display_processor_vk *xdp, int32_t pane
 }
 #endif
 
+#ifdef XRT_DP_VK_HAS_OUTPUT_ENTRY
+/*!
+ * Appended slot set_output_entry (runtime ADR-047 Amendment 10, ADR-066 C1):
+ * which entry of the plug-in's declared list (leia_multi_viewer.h: 0 = 2D,
+ * 1 = "LeiaSR", 2 = "LeiaSR multi-viewer") this DP's screen shows. The two 3D
+ * entries are the same atlas; they differ in the weaver's multi-viewer
+ * override, applied before the next weave. The 2D entry changes nothing here:
+ * weave vs flat blit follows the atlas grid, as before.
+ */
+static void
+leia_dp_vk_set_output_entry(struct xrt_display_processor_vk *xdp, uint32_t mode_index)
+{
+	leiasr_set_output_entry(((struct leia_display_processor *)xdp)->leiasr, mode_index);
+}
+#endif
+
 #ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
 /*!
  * runtime#2405 / runtime#2726: phase-snap the window (or windowless texture
@@ -2938,6 +2954,9 @@ leia_dp_create_vk(void *vk_bundle_ptr,
 #ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
 	ldp->base.snap_window_rect = leia_dp_vk_snap_window_rect; // runtime#2726 drag phase-snap (appended VK-variant slot)
 #endif
+#ifdef XRT_DP_VK_HAS_OUTPUT_ENTRY
+	ldp->base.set_output_entry = leia_dp_vk_set_output_entry; // the screen's 3D mode (appended VK-variant slot)
+#endif
 #ifdef XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY
 	ldp->base.accepts_atlas_encoding = leia_dp_vk_accepts_atlas_encoding; // #2340: explicit "no" for PQ
 #endif
@@ -3111,6 +3130,9 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 #endif
 #ifdef XRT_DP_VK_HAS_SNAP_WINDOW_RECT
 	ldp->base.snap_window_rect = leia_dp_vk_snap_window_rect; // runtime#2726 (vtable parity with the factory)
+#endif
+#ifdef XRT_DP_VK_HAS_OUTPUT_ENTRY
+	ldp->base.set_output_entry = leia_dp_vk_set_output_entry; // the screen's 3D mode (vtable parity with the factory)
 #endif
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
 	// For now just assign the full destroy; callers will be migrated to factory.

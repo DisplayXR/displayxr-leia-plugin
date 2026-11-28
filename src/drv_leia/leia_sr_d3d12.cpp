@@ -10,7 +10,7 @@
 #include "leia_sr_d3d12.h"
 #include "leia_sr_api_select.h"
 #include "leia_sr_v2_common.h"
-#include "leia_multi_viewer.h" // leia_multi_viewer_active (#446)
+#include "leia_multi_viewer.h" // leia_multi_viewer_wanted (#446)
 #include "leia_sr_liveness.h"
 #include "leia_sr_multi_win.h" // multi-screen M6 per-screen weaver plan (plain C)
 #include "leia_sr_presence_win.h" // per-display user presence (SR event 20)
@@ -203,6 +203,9 @@ struct leiasr_d3d12
 	//! #446: the MULTI_VIEWER setting's override as applied to this weaver
 	//! (leia_sr_v2_apply_multiviewer). Re-arms on a new weaver handle.
 	struct leia_sr_v2_mv_state mv = {};
+	//! The declared 3D entry this weaver's DP was told to draw
+	//! (set_output_entry); 0 = never told: the head device's entry.
+	std::atomic<uint32_t> mv_entry{0};
 #endif
 	//! lens_v2 is bound to bind_display_id (SR D3): disabled before destroy.
 	bool lens_bound = false;
@@ -1039,13 +1042,15 @@ w_weave(leiasr_d3d12 *sr)
 		}
 #endif
 #ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
-		// #446: the MULTI_VIEWER setting's override (on = ON, off = OFF, system
-		// = the SDK default), applied on this weaver's first weave and on change
-		// only, right before the weave that uses it. A weaver pinned to a
+		// #446: the multi-viewer override of the 3D entry this weaver draws
+		// ("LeiaSR multi-viewer" = ON; "LeiaSR" = the MULTI_VIEWER setting: off
+		// = OFF, system = the SDK default), applied on this weaver's first weave
+		// and on change only, right before the weave that uses it. A weaver pinned to a
 		// simulated viewer (an untracked secondary screen) has no tracked
 		// viewers to add and is left alone.
 		if (!sr->viewer_pinned) {
-			leia_sr_v2_apply_multiviewer(sr->weaver_v2, leia_multi_viewer_active(), &sr->mv, "D3D12");
+			const uint32_t mv_entry = sr->mv_entry.load(std::memory_order_relaxed);
+			leia_sr_v2_apply_multiviewer(sr->weaver_v2, leia_multi_viewer_wanted(mv_entry), &sr->mv, "D3D12");
 		}
 #endif
 		srWeaverWeave(sr->weaver_v2);
@@ -1341,6 +1346,20 @@ leiasr_d3d12_set_present_origin(struct leiasr_d3d12 *leiasr, int32_t panel_x, in
 	}
 	leiasr->present_origin_x.store(panel_x, std::memory_order_relaxed);
 	leiasr->present_origin_y.store(panel_y, std::memory_order_relaxed);
+}
+
+void
+leiasr_d3d12_set_output_entry(struct leiasr_d3d12 *leiasr, uint32_t mode_index)
+{
+	if (leiasr == nullptr) {
+		return;
+	}
+#ifdef DXR_LEIA_HAS_SR_MULTI_VIEWER
+	const uint32_t cur = leiasr->mv_entry.load(std::memory_order_relaxed);
+	leiasr->mv_entry.store(leia_multi_viewer_dp_entry(cur, mode_index, "D3D12"), std::memory_order_relaxed);
+#else
+	(void)mode_index;
+#endif
 }
 
 bool

@@ -2216,6 +2216,24 @@ leia_dp_gl_get_scanout_caps(struct xrt_display_processor_gl *xdp, struct xrt_dp_
 }
 #endif
 
+#ifdef XRT_DP_GL_HAS_OUTPUT_ENTRY
+/*!
+ * Appended slot set_output_entry (runtime ADR-047 Amendment 10, ADR-066 C1):
+ * which entry of the plug-in's declared list (leia_multi_viewer.h: 0 = 2D,
+ * 1 = "LeiaSR", 2 = "LeiaSR multi-viewer") this DP's screen shows. The two 3D
+ * entries are the same atlas; they differ in the weaver's multi-viewer
+ * override, applied before the next weave. The 2D entry changes nothing here:
+ * weave vs flat blit follows the atlas grid, as before. The
+ * SR OpenGL weaver weaves one viewer: it refuses the multi-viewer override
+ * (one WARN per weaver) and keeps weaving the primary viewer.
+ */
+static void
+leia_dp_gl_set_output_entry(struct xrt_display_processor_gl *xdp, uint32_t mode_index)
+{
+	leiasr_gl_set_output_entry(leia_dp_gl(xdp)->leiasr, mode_index);
+}
+#endif
+
 #ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
 /*!
  * runtime#2405: phase-snap the runtime-owned window the user is dragging —
@@ -2271,6 +2289,9 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 #endif
 #ifdef XRT_DP_GL_HAS_SNAP_WINDOW_RECT
 	ldp->base.snap_window_rect = leia_dp_gl_snap_window_rect; // runtime#2405 drag phase-snap (slot 24)
+#endif
+#ifdef XRT_DP_GL_HAS_OUTPUT_ENTRY
+	ldp->base.set_output_entry = leia_dp_gl_set_output_entry; // the screen's 3D mode (slot 25)
 #endif
 }
 
