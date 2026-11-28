@@ -61,6 +61,7 @@
 
 #include "leia_stereo_camera_android_calib.h"
 #include "leia_stereo_camera_android_modes.h"
+#include "leia_stereo_camera_android_still.h"
 #include "leia_stereo_camera_android_user_calib.h"
 #include "leia_tracking_feed_stats.h"
 #include "leia_cnsdk.h"
@@ -4080,10 +4081,13 @@ jpeg_decoder()
 
 /*!
  * One eye's JPEG (@p cap_w x @p cap_h, unturned: JPEG_ORIENTATION 0) into
- * the SBS NV12 still at column @p x0 (stride 2 * @p ew): decode to RGBA, keep
- * the centred @p ew x @p eh, convert to full-range BT.601 YCbCr (what the
- * camera's own YUV_420_888 is), chroma from each 2x2 block. @p rgba is
- * scratch, reused across eyes. False (with @p why) on any failure.
+ * the SBS NV12 still at column @p x0 (stride 2 * @p ew): decode to RGBA
+ * (AImageDecoder decodes to nothing closer to YCbCr), keep the centred
+ * @p ew x @p eh, convert to full-range BT.601 NV12
+ * (leia_scam_rgba_to_nv12: NEON, always built -O2, also in a Debug plug-in).
+ * Each eye has its own decoder and scratch, so the two eyes run on two
+ * threads. @p out_decode_ms / @p out_convert_ms: the split, for the log.
+ * False (with @p why) on any failure.
  */
 bool
 jpeg_eye_to_nv12(const std::vector<uint8_t> &jpeg,
@@ -4093,19 +4097,23 @@ jpeg_eye_to_nv12(const std::vector<uint8_t> &jpeg,
                  uint32_t eh,
                  uint8_t *dst,
                  uint32_t x0,
-                 std::vector<uint8_t> &rgba,
-                 std::string &why)
+                 std::string &why,
+                 double *out_decode_ms,
+                 double *out_convert_ms)
 {
+	*out_decode_ms = *out_convert_ms = 0.0;
 	const jpeg_decoder_api &api = jpeg_decoder();
 	if (!api.ok) {
 		why = "no AImageDecoder (libjnigraphics, API 30+)";
 		return false;
 	}
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
 	AImageDecoder *d = nullptr;
 	if (api.create(jpeg.data(), jpeg.size(), &d) != ANDROID_IMAGE_DECODER_SUCCESS || d == nullptr) {
 		why = "AImageDecoder_createFromBuffer failed";
 		return false;
 	}
+	std::vector<uint8_t> rgba;
 	bool ok = false;
 	do {
 		if (api.set_format(d, ANDROID_BITMAP_FORMAT_RGBA_8888) != ANDROID_IMAGE_DECODER_SUCCESS) {
@@ -4126,32 +4134,13 @@ jpeg_eye_to_nv12(const std::vector<uint8_t> &jpeg,
 			why = "AImageDecoder_decodeImage failed";
 			break;
 		}
+		const int64_t t1 = clock_ns(CLOCK_MONOTONIC);
 		const uint32_t ox = ((cap_w - ew) / 2u) & ~1u, oy = ((cap_h - eh) / 2u) & ~1u;
 		const size_t ds = (size_t)2 * ew;
-		uint8_t *uv = dst + ds * eh;
-		for (uint32_t y = 0; y < eh; y += 2) {
-			const uint8_t *r0 = rgba.data() + (size_t)(y + oy) * stride + (size_t)ox * 4;
-			const uint8_t *r1 = r0 + stride;
-			uint8_t *y0 = dst + (size_t)y * ds + x0, *y1 = y0 + ds;
-			uint8_t *c = uv + (size_t)(y / 2) * ds + x0;
-			for (uint32_t x = 0; x < ew; x += 2) {
-				int sr = 0, sg = 0, sb = 0;
-				const uint8_t *px[4] = {r0 + 4 * x, r0 + 4 * x + 4, r1 + 4 * x, r1 + 4 * x + 4};
-				uint8_t *py[4] = {y0 + x, y0 + x + 1, y1 + x, y1 + x + 1};
-				for (int k = 0; k < 4; k++) {
-					const int R = px[k][0], G = px[k][1], B = px[k][2];
-					*py[k] = (uint8_t)((77 * R + 150 * G + 29 * B + 128) >> 8);
-					sr += R;
-					sg += G;
-					sb += B;
-				}
-				// Averages, then Cb / Cr with a +128 offset folded in (no negative shifts).
-				const int cb = (-43 * sr - 85 * sg + 128 * sb + 4 * 32768 + 512) >> 10;
-				const int cr = (128 * sr - 107 * sg - 21 * sb + 4 * 32768 + 512) >> 10;
-				c[x] = (uint8_t)std::min(255, std::max(0, cb));
-				c[x + 1] = (uint8_t)std::min(255, std::max(0, cr));
-			}
-		}
+		leia_scam_rgba_to_nv12(rgba.data(), stride, ox, oy, ew, eh, dst + x0, dst + ds * eh + x0, ds);
+		const int64_t t2 = clock_ns(CLOCK_MONOTONIC);
+		*out_decode_ms = (double)(t1 - t0) / 1e6;
+		*out_convert_ms = (double)(t2 - t1) / 1e6;
 		ok = true;
 	} while (false);
 	api.destroy(d);
@@ -4166,10 +4155,10 @@ jpeg_eye_to_nv12(const std::vector<uint8_t> &jpeg,
  *   change, no frame lost, ~1 frame.
  * - A still from the JPEG outputs (rear): ONE still request (ZSL / preview
  *   template, targeting the stream outputs too) on the RUNNING session; stage
- *   0 measured both JPEGs ~320 ms later with no stream frame lost. Each eye is
- *   then decoded and converted to NV12 here, one after the other (peak memory:
- *   one RGBA eye, ~50 MB at 4096x3072, beside the 38 MB NV12 pair and the two
- *   JPEGs).
+ *   0 measured both JPEGs ~320 ms later with no stream frame lost. The two
+ *   eyes are then decoded and converted to NV12 here on two threads (peak
+ *   memory: two RGBA eyes, ~50 MB each at 4096x3072, beside the 38 MB NV12
+ *   pair and the two JPEGs).
  */
 void
 still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
@@ -4199,6 +4188,7 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 		}
 	}
 	int64_t t_pair = t0;
+	double dec_ms[2] = {0.0, 0.0}, cvt_ms[2] = {0.0, 0.0};
 	if (why.empty()) {
 		std::unique_lock<std::mutex> lk(c->pair_mu);
 		const int64_t deadline = t0 + (jpeg ? kStillJpegWaitNs : kStillSameCaptureNs);
@@ -4233,10 +4223,32 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 		uint32_t ew, eh;
 		leia_scam_eye_size(&m.geom, &ew, &eh);
 		// still_buf is the worker's alone in CAPTURED (nothing packs into it).
-		c->still_buf.assign((size_t)2 * ew * eh * 3 / 2, 128);
-		std::vector<uint8_t> rgba;
-		if (!jpeg_eye_to_nv12(jl, m.geom.cap_w, m.geom.cap_h, ew, eh, c->still_buf.data(), 0, rgba, why) ||
-		    !jpeg_eye_to_nv12(jr, m.geom.cap_w, m.geom.cap_h, ew, eh, c->still_buf.data(), ew, rgba, why)) {
+		c->still_buf.resize((size_t)2 * ew * eh * 3 / 2); // every byte is written below
+		// Both eyes at once: each has its own decoder and RGBA scratch, and they
+		// write disjoint columns of still_buf.
+		std::string why_r;
+		bool ok_r = false;
+		uint8_t *buf = c->still_buf.data();
+		const uint32_t cw = m.geom.cap_w, chh = m.geom.cap_h;
+		auto do_right = [&] { ok_r = jpeg_eye_to_nv12(jr, cw, chh, ew, eh, buf, ew, why_r, &dec_ms[1], &cvt_ms[1]); };
+		std::thread right;
+		try {
+			right = std::thread(do_right);
+		} catch (...) {
+			// No thread (resources): the right eye after the left, as before.
+		}
+		const bool ok_l = jpeg_eye_to_nv12(jl, cw, chh, ew, eh, buf, 0, why, &dec_ms[0], &cvt_ms[0]);
+		if (right.joinable()) {
+			right.join();
+		} else {
+			do_right();
+		}
+		if (ok_l && !ok_r) {
+			why = "right eye: " + why_r;
+		} else if (!ok_l) {
+			why = "left eye: " + why;
+		}
+		if (!ok_l || !ok_r) {
 			c->still_buf.clear();
 			c->still_buf.shrink_to_fit();
 		} else {
@@ -4259,11 +4271,16 @@ still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
 		c->still = why.empty() ? still_state::READY : still_state::FAILED;
 	}
 	if (why.empty()) {
+		char split[160] = "";
+		if (jpeg) {
+			snprintf(split, sizeof(split), ": L decode %.0f + NV12 %.0f ms, R decode %.0f + NV12 %.0f ms, in parallel",
+			         dec_ms[0], cvt_ms[0], dec_ms[1], cvt_ms[1]);
+		}
 		SCAM_LOG_W("leia stereo camera (android): still %llu: %ux%u per eye from %s in %.0f ms (pair after %.0f ms, "
-		           "decode + NV12 %.0f ms); the stream lost no frame for it",
+		           "decode + NV12 %.0f ms%s); the stream lost no frame for it",
 		           (unsigned long long)request_id, c->still_w, c->still_h,
 		           jpeg ? "the JPEG outputs" : "the next stream pair", (double)(t_end - t0) / 1e6,
-		           (double)(t_pair - t0) / 1e6, (double)(t_end - t_pair) / 1e6);
+		           (double)(t_pair - t0) / 1e6, (double)(t_end - t_pair) / 1e6, split);
 	} else {
 		SCAM_LOG_W("leia stereo camera (android): still %llu (%ux%u per eye) FAILED after %.0f ms: %s",
 		           (unsigned long long)request_id, m.eye_w, m.eye_h, (double)(t_end - t0) / 1e6, why.c_str());

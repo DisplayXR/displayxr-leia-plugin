@@ -648,10 +648,20 @@ and accepted gap.
   like the camera's own YUV. The JPEG round trip is lossy (quality 95), so the
   still carries `XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE` (runtime
   `XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR`); stills from stream pairs do not.
+- **Speed.** The two eyes are decoded and converted on two threads, and the
+  RGBA → NV12 step (`leia_stereo_camera_android_still.c`, NEON, bit-identical
+  to its scalar reference) is always built `-O2`, also in a Debug plug-in.
+  Host (Apple M1, the two 4096x3072 halves of a tablet still): the conversion
+  went from ~100 ms per eye (the old C++ loop at -O0) to 2.5 ms; decode +
+  conversion of both eyes from 350–380 ms to 117–122 ms. AImageDecoder
+  decodes to RGBA at best (no YCbCr output) and the NDK has no public
+  libjpeg, so a direct-to-YCbCr decode would mean shipping libjpeg-turbo: not
+  done. The still log splits the time per eye (`L decode .. + NV12 .., R
+  decode .. + NV12 .., in parallel`).
 - **Memory.** The 4096x3072 NV12 pair is 37.7 MB, freed at `release_still`.
-  While a still is decoded: the two JPEGs (~5–10 MB each), one RGBA eye
-  (50 MB, the eyes are decoded one after the other) and the NV12 pair. The
-  rear session also carries two JPEG readers of 2 images each.
+  While a still is decoded: the two JPEGs (~5–10 MB each), two RGBA eyes
+  (50 MB each, decoded at the same time) and the NV12 pair. The rear session
+  also carries two JPEG readers of 2 images each.
 - `debug.dxr.leia.scam_still=0` drops the JPEG outputs (stream-pair stills only).
 - A still of the default capture asked while the rear stream runs its
   1920x1440 capture is refused (BUSY): it is a cut of a capture that is not
