@@ -603,14 +603,9 @@ leia_hmd_create(void)
 	// (leia_multi_viewer.h), as it has been since the two-mode contract
 	// (displayxr-runtime#2766).
 	uint32_t entry_count = 2;
-	uint32_t default_3d = LEIA_MODE_3D;
 #ifdef LEIA_HMD_HAS_3D_ENTRIES
 	if (leia_multi_viewer_declared_entries() > LEIA_MV_ENTRY_MULTI_VIEWER) {
 		entry_count = 3;
-		default_3d = leia_multi_viewer_head_entry(); // what MULTI_VIEWER names
-		if (default_3d < LEIA_MODE_3D || default_3d >= entry_count) {
-			default_3d = LEIA_MODE_3D;
-		}
 		// The runtime tells the device which entry its 3D slot is
 		// (OUTPUT_MODE) and asks for the default (CONFIGURED_3D_MODE).
 		hmd->base.set_property = leia_hmd_set_property;
@@ -621,7 +616,12 @@ leia_hmd_create(void)
 	hmd->base.rendering_mode_count = entry_count;
 	leia_hmd_fill_rendering_modes(hmd->base.rendering_modes, entry_count);
 
-	hmd->base.hmd->active_rendering_mode_index = default_3d; // Default to 3D
+	// Start in the 3D slot. The runtime, not this device, decides the mode an
+	// app starts in (runtime ADR-065 Amendment 1, runtime #2857): it starts every
+	// app in slot 1 and maps slot 1 to the screen's chosen 3D entry from
+	// CONFIGURED_3D_MODE / the stored choice, so the index written here never
+	// picks between "LeiaSR" and "LeiaSR multi-viewer".
+	hmd->base.hmd->active_rendering_mode_index = LEIA_MODE_3D;
 
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
