@@ -387,6 +387,26 @@ target_include_directories(test_stereo_camera_android_calib PRIVATE ${CMAKE_CURR
 target_link_libraries(test_stereo_camera_android_calib PRIVATE m)
 add_test(NAME test_stereo_camera_android_calib COMMAND test_stereo_camera_android_calib)
 
+# --- Host unit test: Android stereo camera spec v8 (modes, controls, stills) ---
+# The mode list on the tablets' numbers (stage 0's rear size list), the
+# calibration of every listed mode against the runtime's derivation rule
+# (XR_DXR_stereo_camera v8 §5.5), metering mapping, control plans, results.
+add_executable(test_stereo_camera_android_modes
+    ../drv_leia_android/tests/test_stereo_camera_android_modes.c
+    ../drv_leia_android/leia_stereo_camera_android_modes.c
+    ../drv_leia_android/leia_stereo_camera_android_calib.c)
+target_include_directories(test_stereo_camera_android_modes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_android)
+target_link_libraries(test_stereo_camera_android_modes PRIVATE m)
+add_test(NAME test_stereo_camera_android_modes COMMAND test_stereo_camera_android_modes)
+
+# --- Host unit test: Android stereo camera still RGBA -> NV12 (NEON = scalar) ---
+add_executable(test_stereo_camera_android_still
+    ../drv_leia_android/tests/test_stereo_camera_android_still.c
+    ../drv_leia_android/leia_stereo_camera_android_still.c)
+target_include_directories(test_stereo_camera_android_still PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drv_leia_android)
+set_source_files_properties(../drv_leia_android/leia_stereo_camera_android_still.c PROPERTIES COMPILE_OPTIONS "-O2")
+add_test(NAME test_stereo_camera_android_still COMMAND test_stereo_camera_android_still)
+
 # --- Host unit test: Android stereo camera user calibration (calibration app) ---
 # The schema-1 record's parse, SHA-256 of the factory block, and the checks
 # that decide whether its rotation replaces the block's R.

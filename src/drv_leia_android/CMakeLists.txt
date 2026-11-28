@@ -98,6 +98,15 @@ set(DRV_LEIA_ANDROID_SOURCES
     leia_stereo_camera_android.h
     leia_stereo_camera_android_calib.c
     leia_stereo_camera_android_calib.h
+    # Spec v8 (modes, controls, stills): mode list, metering mapping, control
+    # caps / request plan, capture results. Pure C, host-tested
+    # (tests/test_stereo_camera_android_modes.c, Linux CI).
+    leia_stereo_camera_android_modes.c
+    leia_stereo_camera_android_modes.h
+    # The JPEG still's RGBA -> NV12 (NEON). Pure C, host-tested
+    # (tests/test_stereo_camera_android_still.c, Linux CI); always -O2 (below).
+    leia_stereo_camera_android_still.c
+    leia_stereo_camera_android_still.h
     # The calibration app's user rotation (schema-1 record): parse, SHA-256 of
     # the factory block, checks. Pure C, host-tested
     # (tests/test_stereo_camera_android_user_calib.c, Linux CI).
@@ -123,6 +132,11 @@ spirv_shaders(
         shaders/compose_under_bg.frag
 )
 list(APPEND DRV_LEIA_ANDROID_SOURCES ${LEIA_ANDROID_SHADER_HEADERS})
+
+# The still conversion runs over two 12.6 MP eyes: at -O0 (a Debug plug-in,
+# paired with a Debug runtime) it took seconds. Optimise this one file in every
+# build type; it holds no struct the runtime's ABI checks see.
+set_source_files_properties(leia_stereo_camera_android_still.c PROPERTIES COMPILE_OPTIONS "-O2")
 
 add_library(dxrp050_leia_cnsdk SHARED ${DRV_LEIA_ANDROID_SOURCES})
 
@@ -157,6 +171,8 @@ target_link_libraries(dxrp050_leia_cnsdk
         vulkan
         camera2ndk
         mediandk
+        # dlopen of libjnigraphics.so (AImageDecoder, API 30+) for the JPEG stills.
+        dl
 )
 
 # Debug-log + ATrace gating: when XRT_DEBUG_ANDROID_VERBOSE is defined,

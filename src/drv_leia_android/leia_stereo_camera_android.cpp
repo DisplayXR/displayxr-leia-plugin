@@ -22,6 +22,13 @@
  * service itself feeds its detector, with the same intrinsics. A GPU path
  * (PRIVATE eyes, AHardwareBuffer transport) is the A4 performance phase.
  *
+ * Spec v8 (runtime #2803) adds, on the rear pair only: one further YUV
+ * stream capture (1920x1440 by default; a mode switch to it is a session
+ * reconfigure) and one JPEG still output per lens in every session (a still is
+ * one request on the running session, decoded here). Still ONE YUV output per
+ * lens. The front pair keeps exactly the shape above. Design and the stage 0
+ * numbers: docs/android-stereo-camera.md, "Capture modes, controls and stills".
+ *
  * - The two eyes arrive on the image readers' own threads with identical
  *   sensor timestamps; the second of a pair packs both into one SBS NV12
  *   buffer (one copy), publishes it latest-wins, and wakes wait_frame.
@@ -53,6 +60,8 @@
 #ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA
 
 #include "leia_stereo_camera_android_calib.h"
+#include "leia_stereo_camera_android_modes.h"
+#include "leia_stereo_camera_android_still.h"
 #include "leia_stereo_camera_android_user_calib.h"
 #include "leia_tracking_feed_stats.h"
 #include "leia_cnsdk.h"
@@ -62,6 +71,8 @@
 #include <camera/NdkCameraManager.h>
 #include <camera/NdkCameraMetadata.h>
 #include <camera/NdkCaptureRequest.h>
+#include <android/imagedecoder.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <media/NdkImage.h>
 #include <media/NdkImageReader.h>
@@ -82,6 +93,17 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+/*
+ * Spec v8 (capture modes, controls, stills): each slot group is compiled only
+ * when the runtime headers announce it, like every earlier appended field, so
+ * the plug-in still builds against the pinned (pre-v8) runtime and behaves
+ * exactly as before there. LEIA_SCAM_V8 = any of them.
+ */
+#if defined(XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES) || defined(XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS) ||   \
+    defined(XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL)
+#define LEIA_SCAM_V8 1
+#endif
 
 #ifdef LEIA_SCAM_HARNESS
 #include <android/log.h>
@@ -105,10 +127,47 @@ constexpr int64_t kGiveUpNs = 15000 * kNsPerMs;     //!< device gone this long -
 constexpr int64_t kEarlyFailNs = 3000 * kNsPerMs;   //!< a loss this soon after open counts as an open failure
 constexpr int kEarlyFailMax = 2;                    //!< consecutive open failures -> ERROR, no more reopens
 constexpr int64_t kLensFreeNs = 3000 * kNsPerMs;    //!< how long the tracking service gets to release its lens
-constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;  //!< measured skew is 0; be lenient
+//! Capture-result lookup: a result belongs to a pair when its logical stamp is
+//! this close to the pair's (the logical stamp is the primary lens's).
+constexpr int64_t kPairToleranceNs = 1 * kNsPerMs;
+//! Pairing tolerance between the two lenses' IMAGE stamps (default; capped at 0.3
+//! of the frame period, leia_scam_pair_tolerance_ns): a constant lens offset of a
+//! few ms still pairs, two different frames never do.
+//! debug.dxr.leia.scam_pair_tol_ms overrides it.
+constexpr int64_t kPairTolDefaultNs = 8 * kNsPerMs;
 constexpr uint32_t kTrackW = 640, kTrackH = 480;    //!< the in-app detector accepts only this
 constexpr int kEyeMaxImages = 4;
+//! Readers of a large capture (kStreamMaxDefault raised by the knob): kPendingPerEye + 1.
+constexpr int kEyeMaxImagesLarge = 3;
+constexpr uint64_t kLargeCapturePixels = 4000000;
 constexpr size_t kPendingPerEye = 2;
+//! JPEG still readers: one still at a time, plus one spare.
+constexpr int kJpegMaxImages = 2;
+//! Spec v8 §5.7: a still that has not arrived within this fails (the stream never
+//! pauses for it: the JPEG outputs share the running session, stage 0 §4b).
+[[maybe_unused]] constexpr int64_t kStillJpegWaitNs = 3000 * kNsPerMs;
+//! A still on the running capture is just the next pair: give it a second.
+[[maybe_unused]] constexpr int64_t kStillSameCaptureNs = 1000 * kNsPerMs;
+//! The longest frame a STREAM mode on its own capture may need (1/30 s + slack).
+constexpr int64_t kStreamFrameNs = 33400000;
+//! Default stream cap on a pair that may reconfigure (stage 0: lowest latency,
+//! full 29.80 fps): debug.dxr.leia.scam_max_stream overrides it.
+constexpr uint32_t kStreamMaxDefaultW = 1920, kStreamMaxDefaultH = 1440;
+//! Default still width cap per eye (the lead's call: 4096x3072 on the rear pair).
+constexpr uint32_t kStillMaxDefaultW = 4096;
+//! Without the HAL's AF, the distance a cleared focus bit means: 0.5 D = 2 m.
+//! Stage 0's rear lens bottoms out at 0.30-0.33 D (~hyperfocal, ~3.2 m), so at
+//! 2 m the depth of field reaches ~1.2 m to ~5.3 m (H x d / (H +- d)): the
+//! distances people and tabletop scenes are shot at, at the cost of sharpness
+//! at infinity (0.31 D would cover ~1.6 m to infinity instead).
+//! debug.dxr.leia.scam_default_focus_d overrides it.
+constexpr float kDefaultFocusD = 0.5f;
+//! A start holds frames while its lens phase locks; never longer than this per
+//! session (12 pairs take ~400 ms): past it the lock gives up, WARNs why
+//! (no pairs / no results / no per-lens stamps) and frames flow unshifted.
+constexpr int64_t kPhaseHoldMaxNs = 2500 * kNsPerMs;
+//! Metering rectangle: this fraction of the logical array's shorter side.
+constexpr double kMeteringFrac = 0.05;
 constexpr int kRateWindow = 60;
 //! Where this OEM publishes the factory stereo block (a vendor characteristics
 //! key on the logical camera and its main lens). debug.dxr.leia.scam_calib_key_prefix overrides it.
@@ -230,6 +289,71 @@ has_camera_permission(jni_env &j)
 	env->DeleteLocalRef(perm);
 	env->DeleteLocalRef(ctx_cls);
 	return !ok || r == 0; // PackageManager.PERMISSION_GRANTED
+}
+
+/*!
+ * This process's state as the platform sees it, for the refusal log:
+ * ActivityManager.getMyMemoryState() importance (100 FOREGROUND, 125
+ * FOREGROUND_SERVICE, 200 VISIBLE, 230 PERCEPTIBLE, 300 SERVICE, 400 CACHED),
+ * PowerManager.isInteractive() and KeyguardManager.isKeyguardLocked().
+ * "?" for what could not be read. No permission needed.
+ */
+std::string
+process_state_str()
+{
+	int importance = -1, interactive = -1, keyguard = -1;
+	jni_env j;
+	if (j.acquire()) {
+		JNIEnv *env = j.env;
+		env->PushLocalFrame(16);
+		jclass am = env->FindClass("android/app/ActivityManager");
+		jclass info = env->FindClass("android/app/ActivityManager$RunningAppProcessInfo");
+		if (j.ok() && am != nullptr && info != nullptr) {
+			jmethodID ctor = env->GetMethodID(info, "<init>", "()V");
+			jmethodID get = env->GetStaticMethodID(am, "getMyMemoryState",
+			                                       "(Landroid/app/ActivityManager$RunningAppProcessInfo;)V");
+			jfieldID imp = env->GetFieldID(info, "importance", "I");
+			if (j.ok() && ctor != nullptr && get != nullptr && imp != nullptr) {
+				jobject o = env->NewObject(info, ctor);
+				if (j.ok() && o != nullptr) {
+					env->CallStaticVoidMethod(am, get, o);
+					if (j.ok()) {
+						importance = env->GetIntField(o, imp);
+					}
+				}
+			}
+		}
+		j.ok();
+		jclass ctx_cls = env->FindClass("android/content/Context");
+		jmethodID gs = j.ok() && ctx_cls != nullptr
+		                   ? env->GetMethodID(ctx_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;")
+		                   : nullptr;
+		if (gs != nullptr && j.ok()) {
+			jobject pm = env->CallObjectMethod(j.ctx, gs, env->NewStringUTF("power"));
+			jclass pm_cls = j.ok() ? env->FindClass("android/os/PowerManager") : nullptr;
+			jmethodID ii = pm_cls != nullptr && j.ok() ? env->GetMethodID(pm_cls, "isInteractive", "()Z") : nullptr;
+			if (pm != nullptr && ii != nullptr && j.ok()) {
+				const jboolean b = env->CallBooleanMethod(pm, ii);
+				if (j.ok()) {
+					interactive = b ? 1 : 0;
+				}
+			}
+			jobject km = j.ok() ? env->CallObjectMethod(j.ctx, gs, env->NewStringUTF("keyguard")) : nullptr;
+			jclass km_cls = j.ok() ? env->FindClass("android/app/KeyguardManager") : nullptr;
+			jmethodID kl = km_cls != nullptr && j.ok() ? env->GetMethodID(km_cls, "isKeyguardLocked", "()Z") : nullptr;
+			if (km != nullptr && kl != nullptr && j.ok()) {
+				const jboolean b = env->CallBooleanMethod(km, kl);
+				if (j.ok()) {
+					keyguard = b ? 1 : 0;
+				}
+			}
+		}
+		j.ok();
+		env->PopLocalFrame(nullptr);
+	}
+	char buf[96];
+	snprintf(buf, sizeof(buf), "importance %d, interactive %d, keyguard %d", importance, interactive, keyguard);
+	return buf;
 }
 
 /*!
@@ -770,6 +894,28 @@ struct pair_desc
 	double pose_main[3]{}, pose_sub[3]{}; //!< ACAMERA_LENS_POSE_TRANSLATION, metres
 	bool have_pose{false};
 	float measured_rate{0.0f};
+	//! Spec v8 §5.5: the listed modes (mode 0 = the default eye), built once
+	//! the pair is described (describe_v8_locked). Every one keeps the
+	//! default's horizontal field of view (leia_scam_build_modes).
+	leia_scam_mode modes[LEIA_SCAM_MODES_MAX]{};
+	uint32_t n_modes{0};
+	//! Spec v8 §5.6: the logical camera's control characteristics. hal.af_modes
+	//! is NOT stored (a pair_desc is copied); hal_caps_of() points it at af_modes.
+	uint8_t af_modes[8]{};
+	size_t n_af_modes{0};
+	leia_scam_hal_caps hal{};
+	leia_scam_control_caps ctl_caps{};
+	//! The lens cannot focus (the HAL lists a minimum focus distance of 0).
+	bool fixed_focus{false};
+	//! The HAL's AF may be used (debug.dxr.leia.scam_hal_af=1); else AF off + one distance.
+	bool hal_af{false};
+	float default_focus_d{0.5f};
+	//! Index of the mode taken from the JPEG still output, -1 = none (no JPEG outputs).
+	int still_out{-1};
+	//! Measured pair rate of the own stream capture (the default's is measured_rate).
+	float measured_own_rate{0.0f};
+	//! The logical camera's active array: metering regions are relative to it.
+	uint32_t log_aw{0}, log_ah{0};
 	//! The user calibration (calibration app) is checked against these: the
 	//! SHA-256 of the exact block bytes read, and the block's own R, which
 	//! factory.R returns to whenever no valid record applies.
@@ -793,6 +939,10 @@ struct pair_desc
 	bool factory_explicit{false};
 	//! Why the factory block is absent (for the source log line).
 	std::string block_why;
+	//! The size the intrinsics in use are stated at (a served mirror record's
+	//! imageSize, else the block's reference size), for the open log.
+	uint32_t calib_ref_w{0}, calib_ref_h{0};
+	const char *calib_ref_what{"factory block reference"};
 };
 
 std::mutex g_mu;
@@ -876,6 +1026,9 @@ apply_served_locked(pair_desc &p, std::string &why, std::string &state)
 		}
 		p.factory = conv;
 		p.factory_explicit = true;
+		p.calib_ref_w = (uint32_t)srv.width;
+		p.calib_ref_h = (uint32_t)srv.height;
+		p.calib_ref_what = "served record imageSize";
 		snprintf(buf, sizeof(buf),
 		         "source=served display config record (mirror: full lens model at %dx%d, lensIds [%s, %s], saved "
 		         "%s, R %.3f deg from the factory R)",
@@ -913,6 +1066,9 @@ apply_user_calib_locked(pair_desc &p)
 {
 	const leia_scam_factory_calib prev = p.factory;
 	p.factory_explicit = false;
+	p.calib_ref_w = p.ref_w;
+	p.calib_ref_h = p.ref_h;
+	p.calib_ref_what = "factory block reference";
 	if (p.have_block) {
 		p.factory = p.block_factory;
 	}
@@ -1089,6 +1245,42 @@ avail_off(void *, const char *id)
 
 ACameraManager_AvailabilityCallbacks g_avail_cb{nullptr, avail_on, avail_off};
 
+/*
+ * Retry triggers after a policy refusal (ACAMERA_ERROR_CAMERA_DISABLED): the
+ * camera service calls onCameraAccessPrioritiesChanged when the access
+ * priorities of camera clients change (AOSP: on process-state changes of
+ * monitored uids; stated from knowledge, not verified on this OEM build), and
+ * the availability callbacks fire when a camera is opened or closed. Each
+ * bumps a generation; a refused open retries at once when one moved, and the
+ * 250 ms poll stays as the fallback.
+ */
+std::atomic<uint64_t> g_access_gen{0};
+std::atomic<uint64_t> g_avail_gen{0};
+
+void
+access_changed(void *)
+{
+	g_access_gen++;
+}
+
+void
+avail_on_ext(void *ctx, const char *id)
+{
+	avail_on(ctx, id);
+	g_avail_gen++;
+}
+
+void
+avail_off_ext(void *ctx, const char *id)
+{
+	avail_off(ctx, id);
+	g_avail_gen++;
+}
+
+//! Zero-initialised storage, filled field by field in mgr(): the
+//! physical-camera members are API 30 and are never named (they stay NULL).
+ACameraManager_ExtendedAvailabilityCallbacks g_ext_cb;
+
 ACameraManager *
 mgr()
 {
@@ -1096,7 +1288,14 @@ mgr()
 		g_mgr = ACameraManager_create();
 		// Registered once, long before any open (enumerate scans first), so the
 		// initial status of every camera has arrived by the time it is needed.
-		if (g_mgr != nullptr && ACameraManager_registerAvailabilityCallback(g_mgr, &g_avail_cb) != ACAMERA_OK) {
+		// Extended (API 29): availability + access-priority changes (retry
+		// triggers after a refusal). The plain callbacks if it is refused.
+		g_ext_cb.availabilityCallbacks.context = nullptr;
+		g_ext_cb.availabilityCallbacks.onCameraAvailable = avail_on_ext;
+		g_ext_cb.availabilityCallbacks.onCameraUnavailable = avail_off_ext;
+		g_ext_cb.onCameraAccessPrioritiesChanged = access_changed;
+		if (g_mgr != nullptr && ACameraManager_registerExtendedAvailabilityCallback(g_mgr, &g_ext_cb) != ACAMERA_OK &&
+		    ACameraManager_registerAvailabilityCallback(g_mgr, &g_avail_cb) != ACAMERA_OK) {
 			SCAM_LOG_W("leia stereo camera (android): no camera availability callback; lenses are not checked "
 			           "before an open");
 		}
@@ -1205,6 +1404,251 @@ parse_size(const std::string &s, uint32_t *w, uint32_t *h)
 		*w = a & ~1u;
 		*h = b & ~1u;
 	}
+}
+
+//! p.hal with its AF-mode list pointing into @p p itself.
+leia_scam_hal_caps
+hal_caps_of(const pair_desc &p)
+{
+	leia_scam_hal_caps h = p.hal;
+	h.af_modes = p.af_modes;
+	h.n_af_modes = p.n_af_modes;
+	return h;
+}
+
+//! The default eye of @p p as the capture + crop + turn the source runs for it.
+leia_scam_eye_geom
+default_geom(const pair_desc &p)
+{
+	leia_scam_eye_geom g{};
+	g.cap_w = p.cap_w;
+	g.cap_h = p.cap_h;
+	g.crop_w = p.crop_w;
+	g.crop_h = p.crop_h;
+	g.rot = p.rot;
+	return g;
+}
+
+//! @p format output sizes of @p m with their minimum frame durations (0 = not listed).
+[[maybe_unused]] std::vector<leia_scam_size>
+output_sizes(const ACameraMetadata *m, int32_t format)
+{
+	std::vector<leia_scam_size> out;
+	std::vector<int32_t> c;
+	if (!get_i32(m, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, c)) {
+		return out;
+	}
+	for (size_t i = 0; i + 3 < c.size(); i += 4) {
+		if (c[i] == format && c[i + 3] == ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT &&
+		    c[i + 1] > 0 && c[i + 2] > 0) {
+			out.push_back({(uint32_t)c[i + 1], (uint32_t)c[i + 2], 0});
+		}
+	}
+	ACameraMetadata_const_entry e{};
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_SCALER_AVAILABLE_MIN_FRAME_DURATIONS, &e) == ACAMERA_OK) {
+		for (uint32_t i = 0; i + 3 < e.count; i += 4) {
+			if (e.data.i64[i] != format) {
+				continue;
+			}
+			for (leia_scam_size &s : out) {
+				if ((int64_t)s.w == e.data.i64[i + 1] && (int64_t)s.h == e.data.i64[i + 2]) {
+					s.min_frame_duration_ns = e.data.i64[i + 3];
+				}
+			}
+		}
+	}
+	return out;
+}
+
+/*!
+ * Spec v8: the mode list and the control caps of @p p, from the lenses' and
+ * the logical camera's characteristics (once the pair is described). One
+ * WARN with the result. Knobs:
+ *   debug.dxr.leia.scam_modes=0          list the default mode only (v7 behaviour)
+ *   debug.dxr.leia.scam_max_stream=WxH   largest own-capture STREAM mode (rear default
+ *                                        1920x1440; the front never reconfigures)
+ *   debug.dxr.leia.scam_max_still=WxH    largest still from the JPEG output (default 4096 wide)
+ *   debug.dxr.leia.scam_still=0          no JPEG still output in the session (rear)
+ *   debug.dxr.leia.scam_front_controls=1 metering + exposure compensation on the front pair
+ *   debug.dxr.leia.scam_hal_af=1         use the HAL's AF (CONTINUOUS / AUTO_ONCE) on a pair
+ */
+[[maybe_unused]] void
+describe_v8_locked(ACameraManager *m, pair_desc &p)
+{
+	// Sizes both lenses list, with the larger of the two minimum frame durations.
+	std::vector<leia_scam_size> sizes, jpegs;
+	ACameraMetadata *mm = nullptr, *sm = nullptr;
+	if (ACameraManager_getCameraCharacteristics(m, p.main_id, &mm) == ACAMERA_OK && mm != nullptr &&
+	    ACameraManager_getCameraCharacteristics(m, p.sub_id, &sm) == ACAMERA_OK && sm != nullptr) {
+		for (int32_t fmt : {(int32_t)AIMAGE_FORMAT_YUV_420_888, (int32_t)AIMAGE_FORMAT_JPEG}) {
+			std::vector<leia_scam_size> &dst = fmt == AIMAGE_FORMAT_JPEG ? jpegs : sizes;
+			const std::vector<leia_scam_size> a = output_sizes(mm, fmt), b = output_sizes(sm, fmt);
+			for (const leia_scam_size &x : a) {
+				for (const leia_scam_size &y : b) {
+					if (x.w == y.w && x.h == y.h) {
+						leia_scam_size s = x;
+						s.min_frame_duration_ns =
+						    (x.min_frame_duration_ns == 0 || y.min_frame_duration_ns == 0)
+						        ? 0
+						        : std::max(x.min_frame_duration_ns, y.min_frame_duration_ns);
+						dst.push_back(s);
+					}
+				}
+			}
+		}
+	}
+	if (mm != nullptr) {
+		ACameraMetadata_free(mm);
+	}
+	if (sm != nullptr) {
+		ACameraMetadata_free(sm);
+	}
+
+	// The front pair is the head tracker's lens: no session change under it (no
+	// reconfigure, no JPEG output on the tracking lens): its modes are cuts of
+	// the default capture only, and a still there is the next stream pair.
+	leia_scam_mode_policy pol{};
+	pol.max_stream_w = kStreamMaxDefaultW;
+	pol.max_stream_h = kStreamMaxDefaultH;
+	parse_size(prop_str("debug.dxr.leia.scam_max_stream", ""), &pol.max_stream_w, &pol.max_stream_h);
+	pol.max_still_w = kStillMaxDefaultW;
+	pol.max_still_h = 0;
+	parse_size(prop_str("debug.dxr.leia.scam_max_still", ""), &pol.max_still_w, &pol.max_still_h);
+	pol.reconfigure_stream = !p.front;
+	pol.still_output = !p.front && prop_bool("debug.dxr.leia.scam_still", true);
+	pol.default_rate = 0.0f; // filled at enumerate time from the measured rates
+	pol.own_rate = 0.0f;
+	pol.max_stream_frame_ns = kStreamFrameNs;
+	const leia_scam_eye_geom def = default_geom(p);
+	if (prop_bool("debug.dxr.leia.scam_modes", true)) {
+		p.n_modes = (uint32_t)leia_scam_build_modes(p.array_w, p.array_h, &def, sizes.data(), sizes.size(),
+		                                            jpegs.data(), jpegs.size(), &pol, p.modes, LEIA_SCAM_MODES_MAX);
+	} else {
+		p.n_modes = (uint32_t)leia_scam_build_modes(p.array_w, p.array_h, &def, nullptr, 0, nullptr, 0, &pol,
+		                                            p.modes, 1);
+	}
+	p.still_out = -1;
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
+	// The session carries the JPEG outputs only when a still can be asked for.
+	for (uint32_t i = 0; i < p.n_modes; i++) {
+		if (p.modes[i].source == LEIA_SCAM_SRC_STILL_OUTPUT) {
+			p.still_out = (int)i;
+		}
+	}
+#endif
+
+	// Controls: the logical camera's characteristics (AF, AE and the lens are
+	// controlled through it); the main lens stands in for a missing lens key.
+	leia_scam_hal_caps h{};
+	p.n_af_modes = 0;
+	ACameraMetadata *lm = nullptr;
+	if (ACameraManager_getCameraCharacteristics(m, p.logical_id, &lm) == ACAMERA_OK && lm != nullptr) {
+		ACameraMetadata_const_entry e{};
+		if (ACameraMetadata_getConstEntry(lm, ACAMERA_CONTROL_AF_AVAILABLE_MODES, &e) == ACAMERA_OK) {
+			for (uint32_t i = 0; i < e.count && p.n_af_modes < sizeof(p.af_modes); i++) {
+				p.af_modes[p.n_af_modes++] = e.data.u8[i];
+			}
+		}
+		const char *lens_ids[2] = {p.logical_id, p.main_id};
+		for (const char *id : lens_ids) {
+			ACameraMetadata *x = nullptr;
+			if (id == p.logical_id) {
+				x = lm;
+			} else if (ACameraManager_getCameraCharacteristics(m, id, &x) != ACAMERA_OK) {
+				x = nullptr;
+			}
+			if (x == nullptr) {
+				continue;
+			}
+			if (!h.have_min_focus_distance &&
+			    ACameraMetadata_getConstEntry(x, ACAMERA_LENS_INFO_MINIMUM_FOCUS_DISTANCE, &e) == ACAMERA_OK &&
+			    e.count > 0) {
+				h.min_focus_distance = e.data.f[0];
+				h.have_min_focus_distance = true;
+				uint8_t cal = 0;
+				if (get_u8(x, ACAMERA_LENS_INFO_FOCUS_DISTANCE_CALIBRATION, &cal)) {
+					h.focus_distance_calibration = cal;
+				}
+			}
+			if (x != lm) {
+				ACameraMetadata_free(x);
+			}
+		}
+		std::vector<int32_t> v;
+		if (get_i32(lm, ACAMERA_REQUEST_AVAILABLE_CAPABILITIES, v)) {
+			h.manual_sensor = std::find(v.begin(), v.end(), (int32_t)ACAMERA_REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) !=
+			                  v.end();
+		}
+		if (get_i32(lm, ACAMERA_CONTROL_MAX_REGIONS, v) && v.size() >= 3) {
+			h.max_regions_ae = v[0];
+			h.max_regions_af = v[2];
+		}
+		if (get_i32(lm, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, v) && v.size() >= 2) {
+			h.ae_comp_min = v[0];
+			h.ae_comp_max = v[1];
+		}
+		if (ACameraMetadata_getConstEntry(lm, ACAMERA_CONTROL_AE_COMPENSATION_STEP, &e) == ACAMERA_OK && e.count > 0) {
+			h.ae_comp_step_num = e.data.r[0].numerator;
+			h.ae_comp_step_den = e.data.r[0].denominator;
+		}
+		if (get_i32(lm, ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE, v) && v.size() >= 4) {
+			p.log_aw = (uint32_t)v[2];
+			p.log_ah = (uint32_t)v[3];
+		}
+		ACameraMetadata_free(lm);
+	}
+	if (p.log_aw == 0) {
+		p.log_aw = p.array_w; // a logical camera without its own array uses its main lens's
+		p.log_ah = p.array_h;
+	}
+	p.hal = h;
+	p.hal.af_modes = nullptr;
+	const leia_scam_hal_caps hc = hal_caps_of(p);
+	p.hal_af = prop_bool("debug.dxr.leia.scam_hal_af", false);
+	leia_scam_control_caps_from_hal(&hc, p.hal_af, p.front, prop_bool("debug.dxr.leia.scam_front_controls", false),
+	                                &p.ctl_caps);
+	p.default_focus_d = kDefaultFocusD;
+	{
+		const std::string d = prop_str("debug.dxr.leia.scam_default_focus_d", "");
+		const double v = d.empty() ? -1.0 : atof(d.c_str());
+		if (v >= 0.0 && v <= 50.0) {
+			p.default_focus_d = (float)v;
+		}
+	}
+	p.fixed_focus = h.have_min_focus_distance && h.min_focus_distance <= 0.0f;
+
+	std::string ml;
+	for (uint32_t i = 0; i < p.n_modes; i++) {
+		const leia_scam_mode &md = p.modes[i];
+		const bool same = md.geom.cap_w == p.cap_w && md.geom.cap_h == p.cap_h;
+		char buf[160];
+		(void)same;
+		snprintf(buf, sizeof(buf), "%s%ux%u %s%s (%s %ux%u%s)", i == 0 ? "" : ", ", md.eye_w, md.eye_h,
+		         (md.flags & LEIA_SCAM_MODE_STREAM) ? "stream" : "",
+		         (md.flags & LEIA_SCAM_MODE_STILL) ? ((md.flags & LEIA_SCAM_MODE_STREAM) ? "+still" : "still") : "",
+		         md.source == LEIA_SCAM_SRC_DEFAULT_CAPTURE ? "default capture"
+		         : md.source == LEIA_SCAM_SRC_OWN_CAPTURE   ? "own capture"
+		                                                    : "JPEG output",
+		         md.geom.cap_w, md.geom.cap_h, md.geom.crop_w != md.geom.cap_w ? ", columns cropped" : "");
+		ml += buf;
+	}
+	const leia_scam_control_caps &cc = p.ctl_caps;
+	SCAM_LOG_W("leia stereo camera (android): %s pair v8: %u mode(s): %s; %zu YUV / %zu JPEG size(s) on both "
+	           "lenses; controls 0x%x (focus modes 0x%x, %s, default %.2f D, min focus %.2f D %s%s, EV %.2f..%.2f "
+	           "step %.3f)%s",
+	           p.front ? "front" : "rear", p.n_modes, ml.c_str(), sizes.size(), jpegs.size(), cc.supported_controls,
+	           cc.supported_focus_modes,
+	           p.hal_af ? "HAL AF (debug.dxr.leia.scam_hal_af=1)"
+	                    : "AF off, one logical distance drives both lenses",
+	           p.default_focus_d, h.min_focus_distance,
+	           h.focus_distance_calibration == 2   ? "calibrated"
+	           : h.focus_distance_calibration == 1 ? "approximate"
+	                                               : "uncalibrated",
+	           p.fixed_focus ? ", fixed focus" : "", cc.exposure_compensation_min_ev, cc.exposure_compensation_max_ev,
+	           cc.exposure_compensation_step_ev,
+	           p.front ? "; tracking-shared: only cuts of the default capture (no reconfigure, no JPEG output on "
+	                     "the tracking lens), exposure controls only with debug.dxr.leia.scam_front_controls=1"
+	                   : "");
 }
 
 bool
@@ -1436,6 +1880,9 @@ describe_pair_locked(ACameraManager *m, pair_desc &p)
 	    p.calibrated ? "CALIBRATED" : "raw only",
 	    p.calibrated ? leia_scam_factory_baseline_mm(&p.factory) : 0.0,
 	    eff_sub ? "sub" : "main", eff_sub ? p.sub_id : p.main_id, order_src);
+#ifdef LEIA_SCAM_V8
+	describe_v8_locked(m, p); // built against pre-v8 headers: one mode, no controls, as before
+#endif
 	p.block_why = have ? std::string() : why;
 	// The served display config record, the calibration app's user rotation,
 	// or the factory block (logs the source that won and why the higher ones
@@ -1586,6 +2033,48 @@ left_is_sub(const pair_desc &p)
 	return p.calibrated ? p.stream.left_is_sub : true;
 }
 
+/*!
+ * One WARN per open with the calibration in use, for checking against the
+ * served record: its source ("rotation source=..."), the lens ids in the
+ * factory block's order (lens0 = main, lens1 = sub), R and T (x_lens1 =
+ * R x_lens0 + T, T in mm, after any pose-based convention swap), the
+ * baseline, the size the intrinsics are stated at, the published eye size,
+ * and which lens is the SBS left eye.
+ */
+void
+log_calibration_in_use(const pair_desc &p, bool lsub)
+{
+	std::string src = p.user_calib_state;
+	for (const char *pre : {"rotation ", "source="}) {
+		if (src.rfind(pre, 0) == 0) {
+			src.erase(0, strlen(pre));
+		}
+	}
+	if (!p.calibrated) {
+		SCAM_LOG_W("leia stereo camera (android): %s pair calibration at open: rotation source=%s; lensIds [%s, %s] "
+		           "(lens0 = camera %s, lens1 = camera %s); RAW only, no R / T in use",
+		           p.front ? "front" : "rear", src.empty() ? "none" : src.c_str(), p.main_id, p.sub_id, p.main_id,
+		           p.sub_id);
+		return;
+	}
+	const leia_scam_factory_calib f = oriented_factory(p);
+	// Both lenses' intrinsics at the size they are stated at (the pipeline at a
+	// capture of that size, no crop, no turn: a served record's own numbers).
+	const uint32_t rw = p.calib_ref_w != 0 ? p.calib_ref_w : p.array_w, rh = p.calib_ref_h != 0 ? p.calib_ref_h : p.array_h;
+	leia_scam_stream_calib at{};
+	leia_scam_stream_calib_from_factory(&f, p.array_w, p.array_h, rw, rh, rw, rh, 0, &at);
+	const double *k0 = at.k[at.left_is_sub ? 1 : 0], *k1 = at.k[at.left_is_sub ? 0 : 1];
+	SCAM_LOG_W("leia stereo camera (android): %s pair calibration at open: rotation source=%s; lensIds [%s, %s] "
+	           "(lens0 = camera %s, lens1 = camera %s); R_1_from_0 [[%.6f, %.6f, %.6f], [%.6f, %.6f, %.6f], [%.6f, "
+	           "%.6f, %.6f]]; T_mm_1_from_0 [%.3f, %.3f, %.3f]; baseline %.3f mm; intrinsics at %ux%u (%s): lens0 "
+	           "fx %.2f fy %.2f cx %.2f cy %.2f, lens1 fx %.2f fy %.2f cx %.2f cy %.2f; published %ux%u per eye; "
+	           "SBS left = camera %s",
+	           p.front ? "front" : "rear", src.c_str(), p.main_id, p.sub_id, p.main_id, p.sub_id, f.R[0][0], f.R[0][1],
+	           f.R[0][2], f.R[1][0], f.R[1][1], f.R[1][2], f.R[2][0], f.R[2][1], f.R[2][2], f.T[0], f.T[1], f.T[2],
+	           leia_scam_factory_baseline_mm(&f), rw, rh, p.calib_ref_what, k0[0], k0[1], k0[2], k0[3], k1[0], k1[1],
+	           k1[2], k1[3], p.eye_w, p.eye_h, lsub ? p.sub_id : p.main_id);
+}
+
 } // namespace
 
 /*
@@ -1599,12 +2088,61 @@ struct sbs_buf
 	std::vector<uint8_t> data;
 	uint64_t seq{0};
 	int64_t time_mono_ns{0};
+	//! Per-eye size of THIS buffer (a mode switch changes it while the runtime
+	//! may still hold an older buffer).
+	uint32_t eye_w{0}, eye_h{0};
+	//! The pair's sensor timestamp (BOOTTIME, the capture-result key) and each
+	//! eye's own start of exposure on CLOCK_MONOTONIC.
+	int64_t ts_boot{0};
+	int64_t eye_mono_ns[2]{};
+	int64_t eye_ts_boot[2]{}; //!< each eye's own IMAGE stamp (BOOTTIME)
 };
 
 struct pending_img
 {
 	AImage *img{nullptr};
 	int64_t ts{0};
+};
+
+//! One capture's metadata (spec v8 capture result), keyed by sensor timestamp.
+struct hal_rec
+{
+	int64_t ts{0}; //!< logical result's SENSOR_TIMESTAMP (BOOTTIME), 0 = empty slot
+	bool have_logical{false}, have_left{false}, have_right{false};
+	//! The result of a still request (excluded from the stream's lookups and
+	//! from the per-eye-time and skew statistics).
+	bool from_still{false};
+	leia_scam_hal_result logical{}, left{}, right{};
+};
+constexpr size_t kResultRing = 16;
+
+/*!
+ * The Camera2 request template's own values for every tag the controls touch,
+ * so a cleared control bit puts back exactly the source's default (spec v8
+ * §9b: "a field whose bit is clear means the source's own default").
+ */
+struct req_defaults
+{
+	bool have_af_mode{false};
+	uint8_t af_mode{0};
+	bool have_ae_comp{false};
+	int32_t ae_comp{0};
+	bool have_focus_distance{false};
+	float focus_distance{0.0f};
+	std::vector<int32_t> af_regions, ae_regions; //!< empty = the template had none
+};
+
+//! Still state machine (spec v8 §5.7). Written under pair_mu.
+enum class still_state
+{
+	IDLE,      //!< nothing requested (or released)
+	BUSY,      //!< the worker is getting it
+	GRAB,      //!< armed: the next stream pair is packed as the still (default capture)
+	WAIT_JPEG, //!< a still request went out; collecting both lenses' JPEGs
+	CAPTURED,  //!< the pair is here; the worker finishes it
+	READY,     //!< poll_still hands it over
+	FAILED,    //!< poll_still reports FAILED once
+	DELIVERED, //!< handed over, until release_still
 };
 
 struct xrt_plugin_stereo_camera
@@ -1628,10 +2166,58 @@ struct xrt_plugin_stereo_camera
 	bool trk_lens_guessed{false};
 	char trk_lens[16]{};
 	struct leia_cnsdk_ext_intrinsics trk_intr{};
+	// The RUNNING stream mode's geometry (spec v8: set_mode changes it; the
+	// readers read it under pair_mu, so it is written under pair_mu too).
 	uint32_t w{0}, h{0};           //!< per-eye output (after the turn)
 	uint32_t crop_w{0}, crop_h{0}; //!< per-eye crop of the capture (before the turn)
 	uint32_t rot{0};               //!< clockwise turn of each eye
-	uint32_t cap_w{0}, cap_h{0};   //!< per-lens capture
+	uint32_t cap_w{0}, cap_h{0};   //!< per-lens capture of the stream mode
+	uint32_t mode_index{0};
+	//! What the capture session streams right now (= cap_w x cap_h except while
+	//! a still runs on its own session). Under pair_mu.
+	uint32_t sess_cap_w{0}, sess_cap_h{0};
+	//! The capture session is configured lazily (spec v8 §9b): on the first
+	//! wait_frame or set_mode, so a set_mode right after open costs nothing.
+	bool started{false};
+
+	// Spec v8 controls (camera thread; applied under cam_mu).
+	leia_scam_controls ctl{};
+	uint32_t trigger_seen{0};
+	//! Without HAL AF: the distance the request carries now (LOCKED keeps it).
+	float cmd_focus_d{0.0f};
+	leia_scam_eye_times_tracker eye_times{};
+	// The JPEG still outputs (rear) and the still request, beside the stream's.
+	AImageReader *rd_jl{nullptr}, *rd_jr{nullptr};
+	ACaptureSessionOutput *out_jl{nullptr}, *out_jr{nullptr};
+	ACameraOutputTarget *stgt_l{nullptr}, *stgt_r{nullptr}, *stgt_jl{nullptr}, *stgt_jr{nullptr};
+	ACaptureRequest *still_req{nullptr};
+	req_defaults still_tmpl;
+	req_defaults tmpl;
+	//! The metering rectangle last applied (valid when ctl asks for a point).
+	bool region_ok{false};
+	int32_t region[5]{};
+	ACameraCaptureSession_logicalCamera_captureCallbacks cap_cb{};
+	ACameraCaptureSession_logicalCamera_captureCallbacks still_cb{}; //!< the still request's (from_still)
+	std::mutex res_mu;
+	hal_rec res_ring[kResultRing];
+	size_t res_next{0};
+	char left_id[16]{}; //!< physical id of the SBS left eye's lens
+
+	// Spec v8 still (state under pair_mu).
+	still_state still{still_state::IDLE};
+	std::thread still_thread;
+	std::condition_variable still_cv;
+	leia_scam_eye_geom still_geom{};
+	std::vector<uint8_t> jpeg[2]; //!< the still's JPEG per eye (WAIT_JPEG -> CAPTURED)
+	int64_t jpeg_ts[2]{};
+	std::vector<uint8_t> still_buf;
+	uint32_t still_w{0}, still_h{0}; //!< per eye
+	int64_t still_ts_boot{0};
+	int64_t still_eye_mono[2]{};
+	uint64_t still_request{0};
+	bool still_lossy{false}; //!< the still came through the JPEG outputs
+	leia_scam_capture_state still_res{};
+	bool still_have_res{false};
 
 	// Camera objects (camera thread = whoever runs (re)open; the HAL calls back
 	// on its own threads).
@@ -1657,6 +2243,50 @@ struct xrt_plugin_stereo_camera
 	std::condition_variable cv;
 	std::atomic<int64_t> last_pair_ns{0};
 	std::atomic<uint64_t> pairs{0}, drops{0}, singles{0};
+	// Pairing diagnostics (pair_mu): tolerance, frame period, rejected
+	// candidates and images dropped unpaired per lens (0 = left, 1 = right),
+	// and right - left IMAGE stamp of every pair.
+	int64_t pair_tol_cfg_ns{0};
+	int64_t frame_period_ns{0};
+	int64_t last_img_ts[2]{};
+	uint64_t rejected{0}, unpaired[2]{};
+	leia_scam_skew_window img_dt{};
+	// Capture-result diagnostics (res_mu): right - left PHYSICAL result stamp,
+	// and per lens IMAGE stamp - PHYSICAL stamp of the same pair.
+	leia_scam_skew_window phys_dt{};
+	leia_scam_skew_window img_vs_phys[2]{};
+	// Lens phase lock (leia_scam_phase_*; state under res_mu).
+	leia_scam_phase_cfg phase_cfg{};
+	leia_scam_phase_lock phase{};
+	bool phase_enabled{true};
+	bool phase_device_level{false}; //!< restart = re-open the device (else only the capture session)
+	int64_t phase_t0{0};
+	std::atomic<int> phase_shift{0};          //!< right eye taken this many frames after the left
+	std::atomic<bool> phase_hold{false};      //!< hold pairs back (WAITING) while locking a start
+	std::atomic<bool> phase_reopen_due{false};
+	std::atomic<int64_t> period_atomic{0};
+	bool phase_restarting{false}; //!< start_locked runs for a lens-phase restart
+	std::atomic<uint32_t> phase_pairs_held{0}; //!< pairs held back this session
+	uint32_t phase_results{0};                 //!< stream results seen this session (res_mu)
+	int open_attempts{0};
+	// Start timeline (spec v8 diagnostics): when the stream asked for frames
+	// (ensure_started), the first open attempt, the first refusal, the open
+	// that got through, the first published pair.
+	int64_t stream_start_ns{0};
+	int64_t first_attempt_ns{0};
+	int64_t first_refusal_ns{0};
+	int64_t opened_ok_ns{0};
+	int refusals{0};
+	uint64_t access_gen_seen{0}, avail_gen_seen{0};
+	const char *retry_trigger{"first open"};
+	const char *retry_trigger_used{"first open"}; //!< the trigger of the attempt in progress
+	std::atomic<bool> first_pair_logged{false};
+	// Still watch: medians before a still, and the window after it.
+	std::atomic<bool> still_watch{false};
+	uint64_t still_watch_id{0};
+	bool pre_img_have{false}, pre_phys_have{false};
+	int64_t pre_img_med{0}, pre_phys_med{0};
+	leia_scam_skew_window post_img_dt{}, post_phys_dt{};
 	int64_t rate_t0{0};
 	int rate_n{0};
 	//! Per eye: each reader thread uses only its own, so a lens re-pick that
@@ -1875,10 +2505,73 @@ push_tracking(xrt_plugin_stereo_camera *c, const uint8_t *y, int32_t stride, int
 	c->trk_cv.notify_one();
 }
 
+//! One eye of @p g's geometry (crop, then turn) into an SBS NV12 buffer of eye width @p ew at column @p x0.
+void
+pack_eye_geom(const yuv_view &v, uint8_t *dst, const leia_scam_eye_geom &g, uint32_t ew, uint32_t eh, uint32_t x0)
+{
+	if (g.rot == 0) {
+		pack_eye(v, dst, ew, eh, x0);
+	} else {
+		pack_eye_turned(v, dst, g.crop_w, g.crop_h, g.rot, ew, eh, x0);
+	}
+}
+
+/*!
+ * Under pair_mu: the armed still (spec v8 §5.7) from this pair, when the pair
+ * is of the still's capture (a still of the default capture is the next
+ * stream pair, cropped as the still asks): pack it into still_buf and wake
+ * the worker.
+ */
+void
+grab_still_locked(xrt_plugin_stereo_camera *c, const yuv_view &vl, const yuv_view &vr, int64_t ts_l, int64_t ts_r)
+{
+	if (c->still != still_state::GRAB || (uint32_t)vl.w != c->still_geom.cap_w ||
+	    (uint32_t)vl.h != c->still_geom.cap_h || (uint32_t)vr.w != c->still_geom.cap_w ||
+	    (uint32_t)vr.h != c->still_geom.cap_h) {
+		return;
+	}
+	uint32_t ew, eh;
+	leia_scam_eye_size(&c->still_geom, &ew, &eh);
+	const size_t need = (size_t)2 * ew * eh * 3 / 2;
+	if (c->still_buf.size() != need) {
+		c->still_buf.assign(need, 128);
+	}
+	pack_eye_geom(vl, c->still_buf.data(), c->still_geom, ew, eh, 0);
+	pack_eye_geom(vr, c->still_buf.data(), c->still_geom, ew, eh, ew);
+	const int64_t off = boot_minus_mono_ns();
+	c->still_w = ew;
+	c->still_h = eh;
+	c->still_ts_boot = ts_l;
+	c->still_eye_mono[0] = ts_l - off;
+	c->still_eye_mono[1] = ts_r - off;
+	c->still = still_state::CAPTURED;
+	c->still_cv.notify_all();
+}
+
 //! Under pair_mu: pack the matched pair (left, right) and publish it.
 void
-pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_boot)
+pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_l, int64_t ts_r)
 {
+	const int64_t ts_boot = ts_l;
+	yuv_view vl, vr;
+	if (!yuv_view_of(l, &vl) || !yuv_view_of(r, &vr)) {
+		c->drops++;
+		return;
+	}
+	grab_still_locked(c, vl, vr, ts_l, ts_r);
+	if (c->phase_hold.load(std::memory_order_relaxed)) {
+		// Locking the lens phase of a start: nothing is published, so the
+		// camera stays WAITING and consumers see one clean start.
+		c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
+		c->phase_pairs_held++;
+		return;
+	}
+	if ((uint32_t)vl.w != c->cap_w || (uint32_t)vl.h != c->cap_h || (uint32_t)vr.w != c->cap_w ||
+	    (uint32_t)vr.h != c->cap_h) {
+		// The tail of a session switch (an image of the previous capture size):
+		// not a frame of the running stream mode.
+		return;
+	}
 	int slot = -1;
 	for (int i = 0; i < 3; i++) {
 		if (i != c->held && i != c->ready) {
@@ -1897,25 +2590,37 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_b
 		b.data.assign(need, 0);
 		memset(b.data.data() + (size_t)2 * c->w * c->h, 128, need - (size_t)2 * c->w * c->h);
 	}
-	yuv_view vl, vr;
-	if (!yuv_view_of(l, &vl) || !yuv_view_of(r, &vr)) {
-		c->drops++;
-		return;
-	}
-	if (c->rot == 0) {
-		pack_eye(vl, b.data.data(), c->w, c->h, 0);
-		pack_eye(vr, b.data.data(), c->w, c->h, c->w);
-	} else {
-		pack_eye_turned(vl, b.data.data(), c->crop_w, c->crop_h, c->rot, c->w, c->h, 0);
-		pack_eye_turned(vr, b.data.data(), c->crop_w, c->crop_h, c->rot, c->w, c->h, c->w);
-	}
+	leia_scam_eye_geom g{c->cap_w, c->cap_h, c->crop_w, c->crop_h, c->rot};
+	pack_eye_geom(vl, b.data.data(), g, c->w, c->h, 0);
+	pack_eye_geom(vr, b.data.data(), g, c->w, c->h, c->w);
 	b.seq = ++c->seq;
-	b.time_mono_ns = ts_boot - boot_minus_mono_ns();
+	const int64_t off = boot_minus_mono_ns();
+	b.time_mono_ns = ts_boot - off;
+	b.eye_w = c->w;
+	b.eye_h = c->h;
+	b.ts_boot = ts_boot;
+	b.eye_mono_ns[0] = ts_l - off;
+	b.eye_mono_ns[1] = ts_r - off;
+	b.eye_ts_boot[0] = ts_l;
+	b.eye_ts_boot[1] = ts_r;
+	leia_scam_skew_push(&c->img_dt, ts_r - ts_l);
+	if (c->still_watch) {
+		leia_scam_skew_push(&c->post_img_dt, ts_r - ts_l);
+	}
 	if (c->ready >= 0) {
 		c->drops++; // previous never fetched: latest wins
 	}
 	c->ready = slot;
 	c->pairs++;
+	if (!c->first_pair_logged.exchange(true)) {
+		const int64_t t = clock_ns(CLOCK_MONOTONIC);
+		auto ms = [](int64_t a, int64_t b) { return a != 0 && b != 0 ? (double)(b - a) / 1e6 : -1.0; };
+		SCAM_LOG_W("leia stereo camera (android): first pair published %.0f ms after the stream start (first open "
+		           "attempt at %.0f ms, open through at %.0f ms, %d open attempt(s); lens-phase lock %.0f ms of the "
+		           "last session)",
+		           ms(c->stream_start_ns, t), ms(c->stream_start_ns, c->first_attempt_ns),
+		           ms(c->stream_start_ns, c->opened_ok_ns), c->open_attempts, ms(c->phase_t0, t));
+	}
 	const int64_t now = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(now);
 	if (c->rate_n == 0) {
@@ -1923,16 +2628,20 @@ pack_pair_locked(xrt_plugin_stereo_camera *c, AImage *l, AImage *r, int64_t ts_b
 	}
 	if (++c->rate_n == kRateWindow + 1) {
 		const float rate = (float)kRateWindow * 1e9f / (float)(now - c->rate_t0);
-		if (c->desc.measured_rate <= 0.0f) {
-			SCAM_LOG_W("leia stereo camera (android): measured pair rate %.2f Hz over %d pairs", rate,
-			           kRateWindow);
+		// Per capture (spec v8 modes report the rate of THEIR capture): the
+		// default's, or the one further stream capture's.
+		const bool def_cap = c->cap_w == c->desc.cap_w && c->cap_h == c->desc.cap_h;
+		float &mine = def_cap ? c->desc.measured_rate : c->desc.measured_own_rate;
+		if (mine <= 0.0f) {
+			SCAM_LOG_W("leia stereo camera (android): measured pair rate %.2f Hz over %d pairs (%ux%u per lens)",
+			           rate, kRateWindow, c->cap_w, c->cap_h);
 		}
-		c->desc.measured_rate = rate;
+		mine = rate;
 		{
 			std::lock_guard<std::mutex> g(g_mu);
 			for (auto &p : g_pairs) {
 				if (strcmp(p.logical_id, c->desc.logical_id) == 0) {
-					p.measured_rate = rate;
+					(def_cap ? p.measured_rate : p.measured_own_rate) = rate;
 				}
 			}
 		}
@@ -1955,9 +2664,12 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 		// independent of pairing: CNSDK resets its predictor on a >70 ms gap,
 		// so one lost pair must never become a lost tracking frame. Only this
 		// reader's thread touches trk_scratch[eye].
+		// The tracker's intrinsics are those of the default capture's 4:3 cut;
+		// a capture of another aspect (never on the front pair today, which
+		// only runs its default capture) would feed it a different field.
 		if (c->track && eye == c->trk_eye.load(std::memory_order_relaxed) && !c->closing.load()) {
 			yuv_view vm;
-			if (yuv_view_of(img, &vm)) {
+			if (yuv_view_of(img, &vm) && (uint64_t)vm.w * c->desc.cap_h == (uint64_t)vm.h * c->desc.cap_w) {
 				std::vector<uint8_t> &scratch = c->trk_scratch[eye];
 				scratch.resize((size_t)kTrackW * kTrackH);
 				crop_track_from_eye(vm, scratch.data());
@@ -1965,34 +2677,71 @@ on_eye(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
 			}
 		}
 		std::lock_guard<std::mutex> lk(c->pair_mu);
-		if (c->closing.load()) {
+		// A reader of a session that was just replaced (spec v8 mode switch or
+		// still): its images are no longer this source's.
+		if (c->closing.load() || reader != (eye == 0 ? c->rd_l : c->rd_r)) {
 			AImage_delete(img);
 			continue;
 		}
 		auto &mine = c->pend[eye];
 		auto &other = c->pend[1 - eye];
-		auto it = std::find_if(other.begin(), other.end(),
-		                       [ts](const pending_img &p) { return std::llabs(p.ts - ts) <= kPairToleranceNs; });
-		if (it != other.end()) {
+		// The frame period from this lens's own consecutive stamps, so the
+		// tolerance can never span two frames (leia_scam_pair_tolerance_ns).
+		if (c->last_img_ts[eye] != 0 && ts > c->last_img_ts[eye] && ts - c->last_img_ts[eye] < 200 * kNsPerMs) {
+			c->frame_period_ns = ts - c->last_img_ts[eye];
+		}
+		c->last_img_ts[eye] = ts;
+		c->period_atomic.store(c->frame_period_ns, std::memory_order_relaxed);
+		const int64_t tol = leia_scam_pair_tolerance_ns(c->pair_tol_cfg_ns, c->frame_period_ns);
+		// Lens phase (leia_scam_phase_*): with a shift of n frames the left
+		// image at t pairs with the right image at t + n P, the frame nearest
+		// in real exposure time. The image stamps are synthesized and periodic.
+		const int shift = c->phase_shift.load(std::memory_order_relaxed);
+		const int64_t target = leia_scam_phase_partner_ts(ts, eye == 0, shift, c->frame_period_ns);
+		int64_t cand[kPendingPerEye + 1];
+		size_t nc = 0;
+		for (const pending_img &q : other) {
+			if (nc < sizeof(cand) / sizeof(cand[0])) {
+				cand[nc++] = q.ts;
+			}
+		}
+		const int pick = leia_scam_pair_pick(cand, nc, target, tol);
+		if (pick >= 0) {
+			auto it = other.begin() + pick;
+			const int64_t pts = it->ts;
 			AImage *l = eye == 0 ? img : it->img;
 			AImage *r = eye == 0 ? it->img : img;
-			pack_pair_locked(c, l, r, ts);
+			const int64_t lt = eye == 0 ? ts : pts, rt = eye == 0 ? pts : ts;
+			pack_pair_locked(c, l, r, lt, rt);
 			AImage_delete(img);
-			// Drop the partner and everything older on both sides.
-			const int64_t cut = ts;
-			for (auto *q : {&mine, &other}) {
-				while (!q->empty() && q->front().ts <= cut + kPairToleranceNs) {
-					AImage_delete(q->front().img);
-					q->pop_front();
+			// Drop the partner and everything older on its own side (each side
+			// against its own image of the pair: with a shift they differ); an
+			// older image that never paired counts as dropped unpaired.
+			const int64_t cut[2] = {lt, rt};
+			for (int side = 0; side < 2; side++) {
+				auto &q = c->pend[side];
+				while (!q.empty() && q.front().ts <= cut[side]) {
+					if (!(side == 1 - eye && q.front().ts == pts)) {
+						c->unpaired[side]++;
+					}
+					AImage_delete(q.front().img);
+					q.pop_front();
 				}
 			}
 			continue;
+		}
+		// Rejected = the partner can no longer come: the other lens already
+		// delivered images past it (with a shift of +1 the left image simply
+		// waits for the next right one, which is not a rejection).
+		if (!other.empty() && other.back().ts > target + tol) {
+			c->rejected++;
 		}
 		mine.push_back({img, ts});
 		while (mine.size() > kPendingPerEye) {
 			AImage_delete(mine.front().img);
 			mine.pop_front();
 			c->singles++;
+			c->unpaired[eye]++;
 		}
 	}
 }
@@ -2045,15 +2794,15 @@ pick_tracking_lens(xrt_plugin_stereo_camera *c)
 	                           : "factory main lens; no core knows the tracking camera yet");
 	leia_scam_lens tl{};
 	leia_scam_lens_for_stream(use_sub ? &c->desc.factory.sub : &c->desc.factory.main, c->desc.array_w,
-	                          c->desc.array_h, c->cap_w, c->cap_h, &tl);
+	                          c->desc.array_h, c->desc.cap_w, c->desc.cap_h, &tl);
 	{
-		const double cw = std::min<double>(c->cap_w, c->cap_h * 4.0 / 3.0);
-		const double ch = std::min<double>(c->cap_h, cw * 0.75);
+		const double cw = std::min<double>(c->desc.cap_w, c->desc.cap_h * 4.0 / 3.0);
+		const double ch = std::min<double>(c->desc.cap_h, cw * 0.75);
 		const double s = (double)kTrackW / cw;
 		tl.fx *= s;
 		tl.fy *= s;
-		tl.cx = (tl.cx - (c->cap_w - cw) / 2.0) * s;
-		tl.cy = (tl.cy - (c->cap_h - ch) / 2.0) * s;
+		tl.cx = (tl.cx - (c->desc.cap_w - cw) / 2.0) * s;
+		tl.cy = (tl.cy - (c->desc.cap_h - ch) / 2.0) * s;
 	}
 	struct leia_cnsdk_ext_intrinsics ei;
 	memset(&ei, 0, sizeof(ei));
@@ -2083,11 +2832,11 @@ pick_tracking_lens(xrt_plugin_stereo_camera *c)
 		if (read_vendor_i32(c->trk_lens, "org.quic.camera2.sensormode.info.SensorModeTable", tbl)) {
 			nm = leia_scam_parse_sensor_modes(tbl.data(), tbl.size(), modes, 8);
 		}
-		double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->cap_w, c->cap_h,
+		double r = leia_scam_track_fov_ratio(c->desc.array_w, c->desc.array_h, modes, nm, c->desc.cap_w, c->desc.cap_h,
 		                                     30, kTrackW, kTrackH, trk_fps);
 		const char *src = "sensor-mode table";
-		if (r > 0.0 && c->cap_w * 3 > c->cap_h * 4) {
-			r *= (double)c->cap_h * 4.0 / (3.0 * (double)c->cap_w); // our 4:3 cut of a wider capture
+		if (r > 0.0 && c->desc.cap_w * 3 > c->desc.cap_h * 4) {
+			r *= (double)c->desc.cap_h * 4.0 / (3.0 * (double)c->desc.cap_w); // our 4:3 cut of a wider capture
 		}
 		if (!(r > 0.0)) {
 			r = 1.0;
@@ -2103,7 +2852,7 @@ pick_tracking_lens(xrt_plugin_stereo_camera *c)
 		snprintf(ei.lens, sizeof(ei.lens), "%s", c->trk_lens);
 		SCAM_LOG_W("leia stereo camera (android): tracking frame field = %.4f x the tracker's own %ux%u@%u "
 		           "capture (%s; %zu sensor mode(s); our %ux%u@30 cut to 640x480); block-derived fx %.1f",
-		           r, kTrackW, kTrackH, trk_fps, src, nm, c->cap_w, c->cap_h, tl.fx);
+		           r, kTrackW, kTrackH, trk_fps, src, nm, c->desc.cap_w, c->desc.cap_h, tl.fx);
 	}
 	c->trk_intr = ei; // handed over by start_locked, around the actual open
 	c->trk_lens_guessed = forced.empty() && !have_cfg;
@@ -2252,64 +3001,621 @@ void
 ses_noop(void *, ACameraCaptureSession *)
 {}
 
-//! Under cam_mu. Idempotent.
-void
-teardown_locked(xrt_plugin_stereo_camera *c)
+/*
+ *
+ * Capture results (spec v8 §5.6): the logical camera's per-frame metadata and
+ * the SBS left lens's physical result, kept in a small ring keyed by the
+ * sensor timestamp; get_capture_result and the still look a pair up by it.
+ *
+ */
+
+//! What @p m reports; @p ts gets its SENSOR_TIMESTAMP when non-NULL.
+[[maybe_unused]] void
+read_hal_result(const ACameraMetadata *m, leia_scam_hal_result *r, int64_t *ts)
 {
-	if (c->session != nullptr) {
-		ACameraCaptureSession_stopRepeating(c->session);
-		ACameraCaptureSession_close(c->session);
-		c->session = nullptr;
+	ACameraMetadata_const_entry e{};
+	if (ts != nullptr && ACameraMetadata_getConstEntry(m, ACAMERA_SENSOR_TIMESTAMP, &e) == ACAMERA_OK && e.count > 0) {
+		*ts = e.data.i64[0];
 	}
-	if (c->req != nullptr) {
-		ACaptureRequest_free(c->req);
-		c->req = nullptr;
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_CONTROL_AF_STATE, &e) == ACAMERA_OK && e.count > 0) {
+		r->have_af_state = true;
+		r->af_state = e.data.u8[0];
 	}
-	for (ACameraOutputTarget **t : {&c->tgt_l, &c->tgt_r}) {
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_LENS_FOCUS_DISTANCE, &e) == ACAMERA_OK && e.count > 0) {
+		r->have_focus_distance = true;
+		r->focus_distance = e.data.f[0];
+	}
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_SENSOR_EXPOSURE_TIME, &e) == ACAMERA_OK && e.count > 0) {
+		r->have_exposure = true;
+		r->exposure_ns = e.data.i64[0];
+	}
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_SENSOR_SENSITIVITY, &e) == ACAMERA_OK && e.count > 0) {
+		r->have_iso = true;
+		r->iso = e.data.i32[0];
+	}
+	if (ACameraMetadata_getConstEntry(m, ACAMERA_LENS_STATE, &e) == ACAMERA_OK && e.count > 0) {
+		r->have_lens_state = true;
+		r->lens_state = e.data.u8[0];
+	}
+	if (ts != nullptr && *ts != 0) {
+		r->have_timestamp = true;
+		r->timestamp = *ts;
+	}
+}
+
+#ifdef LEIA_SCAM_V8
+/*!
+ * ACaptureSessionLogicalCamera completion (HAL thread): the logical result
+ * (focus distance; AF state with HAL AF) and both lenses' physical results
+ * (exposure, ISO, LENS_STATE, SENSOR_TIMESTAMP). Also counts whether the two
+ * lenses' stamps are ever different (leia_scam_eye_times_tracker).
+ */
+/*!
+ * Under res_mu, HAL thread: one stream request's result into the lens-phase
+ * lock (leia_scam_phase_*). On a decision: the pairing shift takes effect,
+ * frames are released (or a restart is due), and one WARN says what happened.
+ */
+void
+phase_feed_locked(xrt_plugin_stereo_camera *c, const hal_rec &rec)
+{
+	const leia_scam_phase_action before = c->phase.state;
+	if (before != LEIA_SCAM_PHASE_MEASURING) {
+		return;
+	}
+	c->phase_results++;
+	const int64_t period = c->period_atomic.load(std::memory_order_relaxed);
+	leia_scam_phase_action after;
+	if (rec.have_left && rec.have_right && rec.left.have_timestamp && rec.right.have_timestamp) {
+		after = leia_scam_phase_feed(&c->phase, rec.right.timestamp - rec.left.timestamp, period);
+	} else {
+		after = leia_scam_phase_pair_without_sample(&c->phase);
+	}
+	if (after == LEIA_SCAM_PHASE_MEASURING) {
+		return;
+	}
+	const leia_scam_phase_lock &l = c->phase;
+	const double ms = (double)(clock_ns(CLOCK_MONOTONIC) - c->phase_t0) / 1e6;
+	if (leia_scam_phase_stamps_identical(&l)) {
+		SCAM_LOG_W("leia stereo camera (android): lens phase: identical stamps on all %u samples: hardware sync or "
+		           "a shared stamp, not distinguishable",
+		           l.n);
+	}
+	switch (after) {
+	case LEIA_SCAM_PHASE_REOPEN:
+		SCAM_LOG_W("leia stereo camera (android): lens phase: R-L gap %.3f ms over %u pairs (re-paired %+d frame -> "
+		           "%.3f ms) exceeds %.2f ms; restart %u of %u (%s) to re-roll it",
+		           (double)l.gap_ns / 1e6, l.n, l.shift, (double)l.residual_ns / 1e6,
+		           (double)l.cfg.threshold_ns / 1e6, l.reopens, l.cfg.max_reopens,
+		           c->phase_device_level ? "device" : "session");
+		c->phase_reopen_due.store(true);
+		break;
+	case LEIA_SCAM_PHASE_UNKNOWN:
+		SCAM_LOG_W("leia stereo camera (android): lens phase: the HAL publishes no per-lens stamps; pairs as "
+		           "delivered, no lock (%.0f ms)",
+		           ms);
+		break;
+	default:
+		SCAM_LOG_W("leia stereo camera (android): lens phase %s: R-L gap %.3f ms, right eye %+d frame -> accepted "
+		           "%.3f ms after %u restart(s) (threshold %.2f ms, best seen %.3f ms, %.0f ms this session)",
+		           after == LEIA_SCAM_PHASE_LOCKED ? "LOCKED" : "ACCEPTED over the threshold",
+		           (double)l.gap_ns / 1e6, l.shift, (double)l.residual_ns / 1e6, l.reopens,
+		           (double)l.cfg.threshold_ns / 1e6, (double)l.best_abs_ns / 1e6, ms);
+		break;
+	}
+	c->phase_shift.store(after == LEIA_SCAM_PHASE_REOPEN ? 0 : l.shift);
+	if (after != LEIA_SCAM_PHASE_REOPEN) {
+		c->phase_hold.store(false);
+	}
+}
+
+void
+capture_completed(xrt_plugin_stereo_camera *c,
+                  bool from_still,
+                  const ACameraMetadata *result,
+                  size_t n,
+                  const char **ids,
+                  const ACameraMetadata **phys)
+{
+	hal_rec rec;
+	rec.from_still = from_still;
+	int64_t ts = 0;
+	if (result != nullptr) {
+		rec.have_logical = true;
+		read_hal_result(result, &rec.logical, &ts);
+	}
+	for (size_t i = 0; i < n && ids != nullptr && phys != nullptr; i++) {
+		if (ids[i] == nullptr || phys[i] == nullptr) {
+			continue;
+		}
+		const bool is_left = strcmp(ids[i], c->left_id) == 0;
+		const bool is_right = !is_left && (strcmp(ids[i], c->desc.main_id) == 0 || strcmp(ids[i], c->desc.sub_id) == 0);
+		if (!is_left && !is_right) {
+			continue;
+		}
+		int64_t pts = 0;
+		read_hal_result(phys[i], is_left ? &rec.left : &rec.right, &pts);
+		(is_left ? rec.have_left : rec.have_right) = true;
+		if (ts == 0) {
+			ts = pts;
+		}
+	}
+	if (ts == 0) {
+		return;
+	}
+	rec.ts = ts;
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	if (!from_still) {
+		phase_feed_locked(c, rec);
+	}
+	if (!from_still && rec.have_left && rec.have_right && rec.left.have_timestamp && rec.right.have_timestamp) {
+		leia_scam_eye_times_observe(&c->eye_times, rec.left.timestamp, rec.right.timestamp);
+		leia_scam_skew_push(&c->phys_dt, rec.right.timestamp - rec.left.timestamp);
+		if (c->still_watch) {
+			leia_scam_skew_push(&c->post_phys_dt, rec.right.timestamp - rec.left.timestamp);
+		}
+	}
+	c->res_ring[c->res_next] = rec;
+	c->res_next = (c->res_next + 1) % kResultRing;
+}
+
+//! Stream requests' results.
+void
+on_capture_completed(void *ctx,
+                     ACameraCaptureSession *,
+                     ACaptureRequest *,
+                     const ACameraMetadata *result,
+                     size_t n,
+                     const char **ids,
+                     const ACameraMetadata **phys)
+{
+	capture_completed((xrt_plugin_stereo_camera *)ctx, false, result, n, ids, phys);
+}
+
+//! The still request's results (its own callbacks: a ZSL still can carry the
+//! stamp of a stream frame, and must never stand in for that frame's result).
+void
+on_still_capture_completed(void *ctx,
+                           ACameraCaptureSession *,
+                           ACaptureRequest *,
+                           const ACameraMetadata *result,
+                           size_t n,
+                           const char **ids,
+                           const ACameraMetadata **phys)
+{
+	capture_completed((xrt_plugin_stereo_camera *)ctx, true, result, n, ids, phys);
+}
+
+void
+on_capture_failed(void *, ACameraCaptureSession *, ACaptureRequest *, ALogicalCameraCaptureFailure *)
+{}
+#endif
+
+//! The result of the pair at @p ts: a still's own result when @p still, else a stream request's.
+[[maybe_unused]] bool
+lookup_result(xrt_plugin_stereo_camera *c, int64_t ts, hal_rec *out, bool still = false)
+{
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	for (const hal_rec &r : c->res_ring) {
+		if (r.ts != 0 && r.from_still == still && std::llabs(r.ts - ts) <= kPairToleranceNs) {
+			*out = r;
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The source holds the lens itself (MANUAL / LOCKED in force).
+[[maybe_unused]] bool
+holding_focus(const xrt_plugin_stereo_camera *c)
+{
+	return (c->ctl.valid_controls & c->desc.ctl_caps.supported_controls & LEIA_SCAM_CTL_FOCUS_MODE) != 0 &&
+	       (c->ctl.focus_mode == LEIA_SCAM_FOCUS_MANUAL || c->ctl.focus_mode == LEIA_SCAM_FOCUS_LOCKED);
+}
+
+/*!
+ * The capture state of the pair at @p ts_boot (only what the HAL reported).
+ * Per-eye times come from the two physical results, and only once they have
+ * proved independent (stage 0: this HAL stamps both lenses with one
+ * synthesized time, so they never do there).
+ */
+[[maybe_unused]] void
+capture_state_of(xrt_plugin_stereo_camera *c,
+                 int64_t ts_boot,
+                 const int64_t *img_ts,
+                 bool still,
+                 leia_scam_capture_state *out)
+{
+	// Each eye from the result of ITS OWN request: with a lens-phase shift the
+	// right eye's image is of another request than the left's (its image stamp
+	// is that request's); the logical fields (focus) follow the left eye.
+	hal_rec rl, rr;
+	const bool have_l = lookup_result(c, img_ts != nullptr ? img_ts[0] : ts_boot, &rl, still);
+	const bool have_r = img_ts != nullptr && img_ts[1] != img_ts[0] ? lookup_result(c, img_ts[1], &rr, still)
+	                                                                : (rr = rl, have_l);
+	bool indep;
+	{
+		std::lock_guard<std::mutex> lk(c->res_mu);
+		indep = leia_scam_eye_times_independent(&c->eye_times);
+		// Diagnostics: each lens's IMAGE stamp against its own PHYSICAL result
+		// stamp. Equal image stamps beside different physical ones = the HAL
+		// synthesizes the image stamps, and pairing by them cannot see a slip.
+		if (img_ts != nullptr && !still) {
+			if (have_l && rl.have_left && rl.left.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[0], img_ts[0] - rl.left.timestamp);
+			}
+			if (have_r && rr.have_right && rr.right.have_timestamp) {
+				leia_scam_skew_push(&c->img_vs_phys[1], img_ts[1] - rr.right.timestamp);
+			}
+		}
+	}
+	leia_scam_capture_state_from_hal(have_l && rl.have_left ? &rl.left : nullptr,
+	                                 have_r && rr.have_right ? &rr.right : nullptr,
+	                                 have_l && rl.have_logical ? &rl.logical : nullptr, c->desc.fixed_focus,
+	                                 c->desc.hal_af, holding_focus(c), indep, boot_minus_mono_ns(), out);
+}
+
+/*
+ *
+ * Requests and controls (spec v8 §5.6).
+ *
+ */
+
+void
+read_defaults(const ACaptureRequest *req, req_defaults *d)
+{
+	*d = req_defaults{};
+	ACameraMetadata_const_entry e{};
+	if (ACaptureRequest_getConstEntry(req, ACAMERA_CONTROL_AF_MODE, &e) == ACAMERA_OK && e.count > 0) {
+		d->have_af_mode = true;
+		d->af_mode = e.data.u8[0];
+	}
+	if (ACaptureRequest_getConstEntry(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, &e) == ACAMERA_OK && e.count > 0) {
+		d->have_ae_comp = true;
+		d->ae_comp = e.data.i32[0];
+	}
+	if (ACaptureRequest_getConstEntry(req, ACAMERA_LENS_FOCUS_DISTANCE, &e) == ACAMERA_OK && e.count > 0) {
+		d->have_focus_distance = true;
+		d->focus_distance = e.data.f[0];
+	}
+	if (ACaptureRequest_getConstEntry(req, ACAMERA_CONTROL_AF_REGIONS, &e) == ACAMERA_OK && e.count > 0) {
+		d->af_regions.assign(e.data.i32, e.data.i32 + e.count);
+	}
+	if (ACaptureRequest_getConstEntry(req, ACAMERA_CONTROL_AE_REGIONS, &e) == ACAMERA_OK && e.count > 0) {
+		d->ae_regions.assign(e.data.i32, e.data.i32 + e.count);
+	}
+}
+
+//! Under cam_mu: the metering rectangle of c->ctl's point, in the running mode's frame.
+[[maybe_unused]] void
+update_region_locked(xrt_plugin_stereo_camera *c)
+{
+	c->region_ok = false;
+	if ((c->ctl.valid_controls & LEIA_SCAM_CTL_METERING_POINT) == 0) {
+		return;
+	}
+	const leia_scam_eye_geom g{c->cap_w, c->cap_h, c->crop_w, c->crop_h, c->rot};
+	double nx = 0.0, ny = 0.0;
+	if (leia_scam_metering_to_array(c->ctl.metering_x, c->ctl.metering_y, c->desc.array_w, c->desc.array_h, &g, &nx,
+	                                &ny)) {
+		leia_scam_metering_region(nx, ny, c->desc.log_aw, c->desc.log_ah, kMeteringFrac, c->region);
+		c->region_ok = true;
+	}
+}
+
+//! Write @p p into @p req (a default = @p d's value back, or the tag removed).
+[[maybe_unused]] void
+write_plan(ACaptureRequest *req, const req_defaults &d, const leia_scam_request_plan &p)
+{
+	auto put_u8 = [req](uint32_t tag, bool have, uint8_t v) {
+		ACaptureRequest_setEntry_u8(req, tag, have ? 1 : 0, have ? &v : nullptr);
+	};
+	auto put_regions = [req](uint32_t tag, const int32_t *v, uint32_t n) {
+		ACaptureRequest_setEntry_i32(req, tag, n, n > 0 ? v : nullptr);
+	};
+	if (p.af_mode_default) {
+		put_u8(ACAMERA_CONTROL_AF_MODE, d.have_af_mode, d.af_mode);
+	} else {
+		put_u8(ACAMERA_CONTROL_AF_MODE, true, p.af_mode);
+	}
+	if (p.set_focus_distance) {
+		ACaptureRequest_setEntry_float(req, ACAMERA_LENS_FOCUS_DISTANCE, 1, &p.focus_distance);
+	} else {
+		ACaptureRequest_setEntry_float(req, ACAMERA_LENS_FOCUS_DISTANCE, d.have_focus_distance ? 1 : 0,
+		                               d.have_focus_distance ? &d.focus_distance : nullptr);
+	}
+	if (!p.regions_default && p.set_af_regions) {
+		put_regions(ACAMERA_CONTROL_AF_REGIONS, p.region, 5);
+	} else {
+		put_regions(ACAMERA_CONTROL_AF_REGIONS, d.af_regions.data(), (uint32_t)d.af_regions.size());
+	}
+	if (!p.regions_default && p.set_ae_regions) {
+		put_regions(ACAMERA_CONTROL_AE_REGIONS, p.region, 5);
+	} else {
+		put_regions(ACAMERA_CONTROL_AE_REGIONS, d.ae_regions.data(), (uint32_t)d.ae_regions.size());
+	}
+	if (p.ae_comp_default) {
+		ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, d.have_ae_comp ? 1 : 0,
+		                             d.have_ae_comp ? &d.ae_comp : nullptr);
+	} else {
+		ACaptureRequest_setEntry_i32(req, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &p.ae_comp_index);
+	}
+	const uint8_t idle = ACAMERA_CONTROL_AF_TRIGGER_IDLE;
+	ACaptureRequest_setEntry_u8(req, ACAMERA_CONTROL_AF_TRIGGER, 1, &idle);
+}
+
+/*!
+ * Under cam_mu: write the plan for c->ctl into the stream request (and the
+ * still request, so a still carries the same focus and exposure). Without
+ * HAL AF (the default for a pair), a lens that focuses always runs AF OFF at
+ * one logical distance: the asked one, the current one (LOCKED), or
+ * desc.default_focus_d when no focus control is set. Returns whether one AF
+ * trigger is due (HAL AF only: AUTO_ONCE whose trigger moved, or after a
+ * re-open with @p force_trigger).
+ *
+ * Built against pre-v8 runtime headers nothing is written: the request stays
+ * the template, exactly as before v8.
+ */
+bool
+apply_controls_to_request_locked(xrt_plugin_stereo_camera *c, bool force_trigger)
+{
+#ifdef LEIA_SCAM_V8
+	if (c->req == nullptr) {
+		return false;
+	}
+	const leia_scam_hal_caps hal = hal_caps_of(c->desc);
+	leia_scam_focus_policy fp{};
+	fp.hal_af = c->desc.hal_af;
+	fp.default_d = c->desc.default_focus_d;
+	fp.current_d = c->cmd_focus_d;
+	leia_scam_request_plan p;
+	leia_scam_plan_controls(&c->ctl, &c->desc.ctl_caps, &hal, &fp, c->region_ok, c->region, &c->trigger_seen, &p);
+	if (p.set_focus_distance) {
+		c->cmd_focus_d = p.focus_distance;
+	}
+	write_plan(c->req, c->tmpl, p);
+	if (c->still_req != nullptr) {
+		leia_scam_request_plan ps = p;
+		ps.af_trigger_start = false;
+		write_plan(c->still_req, c->still_tmpl, ps);
+	}
+	const bool once = !p.af_mode_default && p.af_mode == LEIA_SCAM_AF_AUTO &&
+	                  c->ctl.focus_mode == LEIA_SCAM_FOCUS_AUTO_ONCE;
+	return p.af_trigger_start || (force_trigger && once);
+#else
+	(void)c;
+	(void)force_trigger;
+	return false;
+#endif
+}
+
+/*!
+ * Under cam_mu, session running: (re)issue the repeating request, with ONE
+ * AF_TRIGGER_START capture first when @p trigger (the trigger is a one-shot
+ * in Camera2: the repeating request carries IDLE).
+ */
+camera_status_t
+repeat_locked(xrt_plugin_stereo_camera *c, bool trigger)
+{
+#ifdef LEIA_SCAM_V8
+	if (trigger) {
+		const uint8_t start = ACAMERA_CONTROL_AF_TRIGGER_START;
+		ACaptureRequest_setEntry_u8(c->req, ACAMERA_CONTROL_AF_TRIGGER, 1, &start);
+		const camera_status_t st = ACameraCaptureSession_logicalCamera_capture(c->session, &c->cap_cb, 1, &c->req,
+		                                                                       nullptr);
+		const uint8_t idle = ACAMERA_CONTROL_AF_TRIGGER_IDLE;
+		ACaptureRequest_setEntry_u8(c->req, ACAMERA_CONTROL_AF_TRIGGER, 1, &idle);
+		if (st != ACAMERA_OK) {
+			SCAM_LOG_W("leia stereo camera (android): AF trigger capture failed (%d)", (int)st);
+		}
+	}
+	return ACameraCaptureSession_logicalCamera_setRepeatingRequest(c->session, &c->cap_cb, 1, &c->req, nullptr);
+#else
+	(void)trigger;
+	return ACameraCaptureSession_setRepeatingRequest(c->session, nullptr, 1, &c->req, nullptr);
+#endif
+}
+
+/*
+ *
+ * Stills from the JPEG outputs (spec v8 §5.7, rear pair).
+ *
+ */
+
+//! JPEG reader callback: keep this lens's JPEG of the still in flight.
+void
+on_jpeg(xrt_plugin_stereo_camera *c, AImageReader *reader, int eye)
+{
+	for (;;) {
+		AImage *img = nullptr;
+		if (AImageReader_acquireNextImage(reader, &img) != AMEDIA_OK || img == nullptr) {
+			return;
+		}
+		int64_t ts = 0;
+		AImage_getTimestamp(img, &ts);
+		uint8_t *data = nullptr;
+		int len = 0;
+		const bool ok = AImage_getPlaneData(img, 0, &data, &len) == AMEDIA_OK && data != nullptr && len > 0;
+		{
+			std::lock_guard<std::mutex> lk(c->pair_mu);
+			if (ok && !c->closing.load() && reader == (eye == 0 ? c->rd_jl : c->rd_jr) &&
+			    c->still == still_state::WAIT_JPEG && c->jpeg[eye].empty()) {
+				c->jpeg[eye].assign(data, data + len);
+				c->jpeg_ts[eye] = ts;
+				if (!c->jpeg[1 - eye].empty()) {
+					c->still = still_state::CAPTURED;
+					c->still_cv.notify_all();
+				}
+			}
+		}
+		AImage_delete(img);
+	}
+}
+
+void
+on_jpeg_l(void *ctx, AImageReader *r)
+{
+	on_jpeg((xrt_plugin_stereo_camera *)ctx, r, 0);
+}
+
+void
+on_jpeg_r(void *ctx, AImageReader *r)
+{
+	on_jpeg((xrt_plugin_stereo_camera *)ctx, r, 1);
+}
+
+/*
+ *
+ * Capture sessions.
+ *
+ */
+
+//! The objects of one capture session (and its two readers).
+struct session_objs
+{
+	ACameraCaptureSession *session{nullptr};
+	ACaptureRequest *req{nullptr};
+	ACaptureSessionOutputContainer *outputs{nullptr};
+	ACaptureSessionOutput *out_l{nullptr}, *out_r{nullptr};
+	ACameraOutputTarget *tgt_l{nullptr}, *tgt_r{nullptr};
+	AImageReader *rd_l{nullptr}, *rd_r{nullptr};
+	// The still outputs (rear): one JPEG reader per lens + the still request.
+	ACaptureRequest *still_req{nullptr};
+	ACaptureSessionOutput *out_jl{nullptr}, *out_jr{nullptr};
+	ACameraOutputTarget *stgt_l{nullptr}, *stgt_r{nullptr}, *stgt_jl{nullptr}, *stgt_jr{nullptr};
+	AImageReader *rd_jl{nullptr}, *rd_jr{nullptr};
+};
+
+//! Under cam_mu: move the session objects out of @p c (the readers stay
+//! installed until the caller swaps them under pair_mu).
+session_objs
+take_session_locked(xrt_plugin_stereo_camera *c)
+{
+	session_objs o;
+	o.session = c->session;
+	o.req = c->req;
+	o.outputs = c->outputs;
+	o.out_l = c->out_l;
+	o.out_r = c->out_r;
+	o.tgt_l = c->tgt_l;
+	o.tgt_r = c->tgt_r;
+	o.rd_l = c->rd_l;
+	o.rd_r = c->rd_r;
+	o.still_req = c->still_req;
+	o.out_jl = c->out_jl;
+	o.out_jr = c->out_jr;
+	o.stgt_l = c->stgt_l;
+	o.stgt_r = c->stgt_r;
+	o.stgt_jl = c->stgt_jl;
+	o.stgt_jr = c->stgt_jr;
+	o.rd_jl = c->rd_jl;
+	o.rd_jr = c->rd_jr;
+	c->session = nullptr;
+	c->req = nullptr;
+	c->still_req = nullptr;
+	c->outputs = nullptr;
+	c->out_l = c->out_r = c->out_jl = c->out_jr = nullptr;
+	c->tgt_l = c->tgt_r = nullptr;
+	c->stgt_l = c->stgt_r = c->stgt_jl = c->stgt_jr = nullptr;
+	return o;
+}
+
+//! Free @p o. Its session must be stopped (or replaced) and its readers no
+//! longer installed in the camera (on_eye drops what they still deliver).
+void
+free_session_objs(session_objs &o)
+{
+	if (o.session != nullptr) {
+		ACameraCaptureSession_close(o.session);
+		o.session = nullptr;
+	}
+	for (ACaptureRequest **q : {&o.req, &o.still_req}) {
+		if (*q != nullptr) {
+			ACaptureRequest_free(*q);
+			*q = nullptr;
+		}
+	}
+	for (ACameraOutputTarget **t : {&o.tgt_l, &o.tgt_r, &o.stgt_l, &o.stgt_r, &o.stgt_jl, &o.stgt_jr}) {
 		if (*t != nullptr) {
 			ACameraOutputTarget_free(*t);
 			*t = nullptr;
 		}
 	}
-	if (c->dev != nullptr) {
-		ACameraDevice_close(c->dev); // waits for in-flight callbacks
-		c->dev = nullptr;
-	}
-	if (c->outputs != nullptr) {
-		for (ACaptureSessionOutput **o : {&c->out_l, &c->out_r}) {
-			if (*o != nullptr) {
-				ACaptureSessionOutputContainer_remove(c->outputs, *o);
-				ACaptureSessionOutput_free(*o);
-				*o = nullptr;
+	if (o.outputs != nullptr) {
+		for (ACaptureSessionOutput **x : {&o.out_l, &o.out_r, &o.out_jl, &o.out_jr}) {
+			if (*x != nullptr) {
+				ACaptureSessionOutputContainer_remove(o.outputs, *x);
+				ACaptureSessionOutput_free(*x);
+				*x = nullptr;
 			}
 		}
-		ACaptureSessionOutputContainer_free(c->outputs);
-		c->outputs = nullptr;
+		ACaptureSessionOutputContainer_free(o.outputs);
+		o.outputs = nullptr;
 	}
-	{
-		std::lock_guard<std::mutex> lk(c->pair_mu);
-		for (auto &q : c->pend) {
-			for (auto &p : q) {
-				AImage_delete(p.img);
-			}
-			q.clear();
-		}
-	}
-	for (AImageReader **r : {&c->rd_l, &c->rd_r}) {
+	for (AImageReader **r : {&o.rd_l, &o.rd_r, &o.rd_jl, &o.rd_jr}) {
 		if (*r != nullptr) {
-			AImageReader_delete(*r);
+			AImageReader_delete(*r); // joins its callback thread
 			*r = nullptr;
 		}
 	}
 }
 
-bool
-make_reader(xrt_plugin_stereo_camera *c, uint32_t w, uint32_t h, int max_images, AImageReader_ImageCallback cb,
-            AImageReader **out)
+//! Under cam_mu, then pair_mu: drop the pending images and install the readers.
+void
+swap_readers_locked(xrt_plugin_stereo_camera *c,
+                    AImageReader *l,
+                    AImageReader *r,
+                    AImageReader *jl,
+                    AImageReader *jr,
+                    uint32_t cap_w,
+                    uint32_t cap_h)
 {
-	media_status_t s = AImageReader_new((int32_t)w, (int32_t)h, AIMAGE_FORMAT_YUV_420_888, max_images, out);
+	std::lock_guard<std::mutex> lk(c->pair_mu);
+	c->rd_jl = jl;
+	c->rd_jr = jr;
+	for (auto &q : c->pend) {
+		for (auto &p : q) {
+			AImage_delete(p.img);
+		}
+		q.clear();
+	}
+	c->rd_l = l;
+	c->rd_r = r;
+	c->sess_cap_w = cap_w;
+	c->sess_cap_h = cap_h;
+}
+
+//! Under cam_mu. Idempotent.
+void
+teardown_locked(xrt_plugin_stereo_camera *c)
+{
+	session_objs o = take_session_locked(c);
+	if (o.session != nullptr) {
+		ACameraCaptureSession_stopRepeating(o.session);
+		ACameraCaptureSession_close(o.session);
+		o.session = nullptr;
+	}
+	if (c->dev != nullptr) {
+		ACameraDevice_close(c->dev); // waits for in-flight callbacks
+		c->dev = nullptr;
+	}
+	swap_readers_locked(c, nullptr, nullptr, nullptr, nullptr, 0, 0);
+	free_session_objs(o);
+}
+
+bool
+make_reader(xrt_plugin_stereo_camera *c,
+            uint32_t w,
+            uint32_t h,
+            int max_images,
+            AImageReader_ImageCallback cb,
+            AImageReader **out,
+            int32_t format = AIMAGE_FORMAT_YUV_420_888)
+{
+	media_status_t s = AImageReader_new((int32_t)w, (int32_t)h, format, max_images, out);
 	if (s != AMEDIA_OK || *out == nullptr) {
-		SCAM_LOG_W("leia stereo camera (android): AImageReader %ux%u YUV failed (%d)", w, h, (int)s);
+		SCAM_LOG_W("leia stereo camera (android): AImageReader %ux%u format 0x%x failed (%d)", w, h, (unsigned)format,
+		           (int)s);
+		*out = nullptr;
 		return false;
 	}
 	AImageReader_ImageListener l{c, cb};
@@ -2317,9 +3623,21 @@ make_reader(xrt_plugin_stereo_camera *c, uint32_t w, uint32_t h, int max_images,
 	return true;
 }
 
+/*!
+ * One physical output for @p rd on lens @p phys, a target of it in @p req (the
+ * stream request for the stream outputs, NULL for the JPEG outputs, which only
+ * the still request targets) and, when @p still_tgt is non-NULL, a second
+ * target of it in the still request (the still request also targets the
+ * stream outputs, so the stream keeps every frame, stage 0 §4b).
+ */
 bool
-add_output(xrt_plugin_stereo_camera *c, AImageReader *rd, const char *phys, ACaptureSessionOutput **out,
-           ACameraOutputTarget **tgt)
+add_output(xrt_plugin_stereo_camera *c,
+           AImageReader *rd,
+           const char *phys,
+           ACaptureSessionOutput **out,
+           ACaptureRequest *req,
+           ACameraOutputTarget **tgt,
+           ACameraOutputTarget **still_tgt)
 {
 	ANativeWindow *win = nullptr;
 	if (AImageReader_getWindow(rd, &win) != AMEDIA_OK || win == nullptr) {
@@ -2331,10 +3649,136 @@ add_output(xrt_plugin_stereo_camera *c, AImageReader *rd, const char *phys, ACap
 	if (ACaptureSessionOutputContainer_add(c->outputs, *out) != ACAMERA_OK) {
 		return false;
 	}
-	if (ACameraOutputTarget_create(win, tgt) != ACAMERA_OK) {
+	if (req != nullptr && (ACameraOutputTarget_create(win, tgt) != ACAMERA_OK ||
+	                       ACaptureRequest_addTarget(req, *tgt) != ACAMERA_OK)) {
 		return false;
 	}
-	return ACaptureRequest_addTarget(c->req, *tgt) == ACAMERA_OK;
+	if (still_tgt != nullptr && c->still_req != nullptr &&
+	    (ACameraOutputTarget_create(win, still_tgt) != ACAMERA_OK ||
+	     ACaptureRequest_addTarget(c->still_req, *still_tgt) != ACAMERA_OK)) {
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Under cam_mu, device open: build a capture session of ONE YUV_420_888
+ * output per physical lens at @p cap_w x @p cap_h (the HAL aborts on a second
+ * YUV output on a lens, so a different size is always a new session, never an
+ * added stream), plus, when the camera lists a still from the JPEG output
+ * (desc.still_out, the rear pair), ONE JPEG output per lens at that still's
+ * size (stage 0 §4b: YUV stream + JPEG still per lens is accepted by the HAL
+ * and a still request on it loses no stream frame). The stream request
+ * targets the YUV outputs only; the still request (TEMPLATE_PREVIEW, or
+ * TEMPLATE_ZERO_SHUTTER_LAG with debug.dxr.leia.scam_still_template=zsl; never
+ * STILL_CAPTURE, which freezes the stream ~400 ms) targets all four. Then the
+ * repeating request starts with the controls in force.
+ *
+ * When a session already runs this is a RECONFIGURE (spec v8 set_mode): the
+ * device stays open, the old session's repeating request stops, the new
+ * readers are installed (the old ones' images are dropped from then on), and
+ * creating the new session makes the camera device close the old one and
+ * reconfigure its streams (stage 0: 86-124 ms); the old objects are freed
+ * after. @p force_trigger: see apply_controls_to_request_locked. False = no
+ * session runs now (everything freed); the caller decides what to rebuild.
+ */
+bool
+build_session_locked(xrt_plugin_stereo_camera *c, uint32_t cap_w, uint32_t cap_h, bool force_trigger)
+{
+	const char *left = c->lsub ? c->desc.sub_id : c->desc.main_id;
+	const char *right = c->lsub ? c->desc.main_id : c->desc.sub_id;
+	const int max_images = (uint64_t)cap_w * cap_h >= kLargeCapturePixels ? kEyeMaxImagesLarge : kEyeMaxImages;
+	const leia_scam_mode *sm = c->desc.still_out >= 0 ? &c->desc.modes[c->desc.still_out] : nullptr;
+	session_objs old = take_session_locked(c);
+	AImageReader *nl = nullptr, *nr = nullptr, *njl = nullptr, *njr = nullptr;
+	bool ok = c->dev != nullptr && make_reader(c, cap_w, cap_h, max_images, on_eye_l, &nl) &&
+	          make_reader(c, cap_w, cap_h, max_images, on_eye_r, &nr);
+	if (ok && sm != nullptr) {
+		ok = make_reader(c, sm->geom.cap_w, sm->geom.cap_h, kJpegMaxImages, on_jpeg_l, &njl, AIMAGE_FORMAT_JPEG) &&
+		     make_reader(c, sm->geom.cap_w, sm->geom.cap_h, kJpegMaxImages, on_jpeg_r, &njr, AIMAGE_FORMAT_JPEG);
+	}
+	ok = ok && ACaptureSessionOutputContainer_create(&c->outputs) == ACAMERA_OK &&
+	     ACameraDevice_createCaptureRequest(c->dev, TEMPLATE_PREVIEW, &c->req) == ACAMERA_OK;
+	if (ok && sm != nullptr) {
+		// PREVIEW by default: a device run saw the right lens's physical result
+		// stamp jump to one frame + 5.6 ms before the left's right after a ZSL
+		// still and stay there, while the image stamps (which pairing uses) stayed
+		// equal; ZSL picks each lens's buffer from its own queue. Stage 0 measured
+		// PREVIEW just as lossless for the stream (~320 ms to both JPEGs).
+		const bool zsl = prop_str("debug.dxr.leia.scam_still_template", "preview") == "zsl";
+		ok = ACameraDevice_createCaptureRequest(c->dev, zsl ? TEMPLATE_ZERO_SHUTTER_LAG : TEMPLATE_PREVIEW,
+		                                        &c->still_req) == ACAMERA_OK;
+	}
+	if (ok) {
+		read_defaults(c->req, &c->tmpl);
+		if (c->still_req != nullptr) {
+			read_defaults(c->still_req, &c->still_tmpl);
+		}
+		ok = add_output(c, nl, left, &c->out_l, c->req, &c->tgt_l, &c->stgt_l) &&
+		     add_output(c, nr, right, &c->out_r, c->req, &c->tgt_r, &c->stgt_r);
+		if (ok && sm != nullptr) {
+			ok = add_output(c, njl, left, &c->out_jl, nullptr, nullptr, &c->stgt_jl) &&
+			     add_output(c, njr, right, &c->out_jr, nullptr, nullptr, &c->stgt_jr);
+		}
+		if (!ok) {
+			SCAM_LOG_W("leia stereo camera (android): could not build the outputs");
+		}
+	}
+	if (ok) {
+		const int32_t fps[2] = {30, 30};
+		ACaptureRequest_setEntry_i32(c->req, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps);
+		if (c->still_req != nullptr) {
+			// The still request runs inside the stream: same rate, upright-agnostic
+			// JPEG (no EXIF turn: the eyes are published unturned), quality 95.
+			ACaptureRequest_setEntry_i32(c->still_req, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps);
+			const int32_t orient = 0;
+			ACaptureRequest_setEntry_i32(c->still_req, ACAMERA_JPEG_ORIENTATION, 1, &orient);
+			uint8_t q = 95;
+			const int qp = atoi(prop_str("debug.dxr.leia.scam_still_quality", "95").c_str());
+			if (qp >= 50 && qp <= 100) {
+				q = (uint8_t)qp;
+			}
+			ACaptureRequest_setEntry_u8(c->still_req, ACAMERA_JPEG_QUALITY, 1, &q);
+		}
+	}
+	const bool trigger = ok && apply_controls_to_request_locked(c, force_trigger);
+	if (old.session != nullptr) {
+		ACameraCaptureSession_stopRepeating(old.session);
+	}
+	swap_readers_locked(c, ok ? nl : nullptr, ok ? nr : nullptr, ok ? njl : nullptr, ok ? njr : nullptr,
+	                    ok ? cap_w : 0, ok ? cap_h : 0);
+	if (ok) {
+		c->ses_cb = {c, ses_noop, ses_noop, ses_noop};
+		const camera_status_t st = ACameraDevice_createCaptureSessionWithSessionParameters(
+		    c->dev, c->outputs, c->req, &c->ses_cb, &c->session);
+		if (st != ACAMERA_OK || c->session == nullptr) {
+			SCAM_LOG_W("leia stereo camera (android): createCaptureSession (%ux%u YUV per lens%s) failed (%d)",
+			           cap_w, cap_h, sm != nullptr ? " + JPEG still output" : "", (int)st);
+			c->session = nullptr;
+			ok = false;
+		}
+	}
+	if (ok) {
+		const camera_status_t st = repeat_locked(c, trigger);
+		if (st != ACAMERA_OK) {
+			SCAM_LOG_W("leia stereo camera (android): setRepeatingRequest failed (%d)", (int)st);
+			ok = false;
+		}
+	}
+	free_session_objs(old); // the device already closed the old session when the new one was created
+	if (!ok) {
+		session_objs mine = take_session_locked(c);
+		if (mine.session != nullptr) {
+			ACameraCaptureSession_stopRepeating(mine.session);
+		}
+		swap_readers_locked(c, nullptr, nullptr, nullptr, nullptr, 0, 0);
+		mine.rd_l = nl;
+		mine.rd_r = nr;
+		mine.rd_jl = njl;
+		mine.rd_jr = njr;
+		free_session_objs(mine);
+	}
+	return ok;
 }
 
 //! Under cam_mu. Hand head tracking to / back from this process's cores.
@@ -2356,7 +3800,42 @@ handover_locked(xrt_plugin_stereo_camera *c, bool on)
 	}
 }
 
-//! Under cam_mu: open the device and start the repeating request.
+//! How a capture session began, for the lens-phase lock.
+enum class phase_start
+{
+	START,   //!< a start (open, watchdog re-open): lock from scratch, frames held back
+	RESTART, //!< a restart the lock asked for: measure again, keep the restart count, frames held back
+	MODE,    //!< a mode reconfigure: re-pair only (no restart, no hold: the 500 ms switch budget)
+};
+
+//! A capture session just started: (re)arm the lens-phase lock.
+void
+phase_session_started(xrt_plugin_stereo_camera *c, phase_start kind)
+{
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	if (kind == phase_start::START) {
+		leia_scam_phase_init(&c->phase, &c->phase_cfg);
+	} else {
+		leia_scam_phase_restart(&c->phase);
+		c->phase.cfg = c->phase_cfg;
+		if (kind == phase_start::MODE) {
+			c->phase.cfg.reopen = false;
+		}
+	}
+	c->phase_t0 = clock_ns(CLOCK_MONOTONIC);
+	c->phase_results = 0;
+	c->phase_pairs_held.store(0);
+	c->phase_shift.store(0);
+	c->phase_reopen_due.store(false);
+	if (!c->phase_enabled) {
+		c->phase.state = LEIA_SCAM_PHASE_LOCKED;
+		c->phase_hold.store(false);
+		return;
+	}
+	c->phase_hold.store(kind != phase_start::MODE);
+}
+
+//! Under cam_mu: open the device and start the repeating request of the running mode.
 bool
 start_locked(xrt_plugin_stereo_camera *c)
 {
@@ -2365,12 +3844,24 @@ start_locked(xrt_plugin_stereo_camera *c)
 	c->device_error = 0;
 	const char *left = c->lsub ? c->desc.sub_id : c->desc.main_id;
 	const char *right = c->lsub ? c->desc.main_id : c->desc.sub_id;
-
-	if (!make_reader(c, c->cap_w, c->cap_h, kEyeMaxImages, on_eye_l, &c->rd_l) ||
-	    !make_reader(c, c->cap_w, c->cap_h, kEyeMaxImages, on_eye_r, &c->rd_r)) {
-		teardown_locked(c);
-		return false;
+	c->open_attempts++;
+	const int64_t t_att = clock_ns(CLOCK_MONOTONIC);
+	if (c->first_attempt_ns == 0) {
+		c->first_attempt_ns = t_att;
 	}
+	c->access_gen_seen = g_access_gen.load();
+	c->avail_gen_seen = g_avail_gen.load();
+	SCAM_LOG_W("leia stereo camera (android): %s pair open attempt %d (%s; trigger: %s), %.0f ms after the stream "
+	           "start, mode %u, %ux%u per lens",
+	           c->desc.front ? "front" : "rear", c->open_attempts,
+	           c->phase_restarting                ? "lens-phase restart"
+	           : c->open_attempts == 1            ? "first open"
+	           : c->open_refused                  ? "retry after a policy refusal"
+	                                              : "watchdog re-open",
+	           c->retry_trigger, c->stream_start_ns != 0 ? (double)(t_att - c->stream_start_ns) / 1e6 : 0.0,
+	           c->mode_index, c->cap_w, c->cap_h);
+	c->retry_trigger_used = c->retry_trigger;
+	c->retry_trigger = "poll";
 
 	// Into in-app tracking first, so the tracking service lets go of its lens;
 	// back out if the open does not get through. Not after a refused open while
@@ -2408,11 +3899,25 @@ start_locked(xrt_plugin_stereo_camera *c)
 	camera_status_t st = ACameraManager_openCamera(mgr(), c->desc.logical_id, &c->dev_cb, &c->dev);
 	if (st != ACAMERA_OK || c->dev == nullptr) {
 		const bool refused = st == ACAMERA_ERROR_CAMERA_DISABLED;
-		if (refused && !c->open_refused) {
-			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) refused by policy (%d); tracking stays with "
-			           "the tracking service until an open gets through",
-			           c->desc.logical_id, (int)st);
-		} else if (!refused) {
+		if (refused) {
+			// Every refusal (the camera service refuses a process in the
+			// background or with the screen off), so a run that never streams
+			// says why.
+			// -10012 = ACAMERA_ERROR_CAMERA_DISABLED. AOSP CameraService returns
+			// it for a device-policy camera disable, sensor privacy, or a caller
+			// it does not consider active ("can't open camera from background"):
+			// the process state is logged with it to tell them apart.
+			const int64_t t = clock_ns(CLOCK_MONOTONIC);
+			c->refusals++;
+			if (c->first_refusal_ns == 0) {
+				c->first_refusal_ns = t;
+			}
+			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) refused by policy (%d = CAMERA_DISABLED), "
+			           "attempt %d, refusal %d, %.0f ms after the first refusal; %s%s",
+			           c->desc.logical_id, (int)st, c->open_attempts, c->refusals,
+			           (double)(t - c->first_refusal_ns) / 1e6, process_state_str().c_str(),
+			           c->open_refused ? "" : "; tracking stays with the tracking service until an open gets through");
+		} else {
 			SCAM_LOG_W("leia stereo camera (android): openCamera(%s) failed (%d)", c->desc.logical_id, (int)st);
 		}
 		c->open_refused = refused;
@@ -2421,54 +3926,419 @@ start_locked(xrt_plugin_stereo_camera *c)
 		handover_locked(c, false);
 		return false;
 	}
+	c->opened_ok_ns = clock_ns(CLOCK_MONOTONIC);
 	if (c->open_refused) {
-		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) let through after refusals", c->desc.logical_id);
+		SCAM_LOG_W("leia stereo camera (android): openCamera(%s) let through after %d refusal(s) over %.0f ms "
+		           "(trigger: %s); %s",
+		           c->desc.logical_id, c->refusals, (double)(c->opened_ok_ns - c->first_refusal_ns) / 1e6,
+		           c->retry_trigger_used, process_state_str().c_str());
 		c->open_refused = false;
+		c->refusals = 0;
+		c->first_refusal_ns = 0;
 	}
 	if (!hand_first) {
 		handover_locked(c, true);
 	}
-	if (ACaptureSessionOutputContainer_create(&c->outputs) != ACAMERA_OK ||
-	    ACameraDevice_createCaptureRequest(c->dev, TEMPLATE_PREVIEW, &c->req) != ACAMERA_OK) {
+	// The device was (re)opened: its lens position is gone, so an AUTO_ONCE in
+	// force searches again (force_trigger).
+	if (!build_session_locked(c, c->cap_w, c->cap_h, true)) {
 		teardown_locked(c);
 		handover_locked(c, false);
 		return false;
 	}
-	const bool ok =
-	    add_output(c, c->rd_l, left, &c->out_l, &c->tgt_l) && add_output(c, c->rd_r, right, &c->out_r, &c->tgt_r);
-	if (!ok) {
-		SCAM_LOG_W("leia stereo camera (android): could not build the outputs");
-		teardown_locked(c);
-		handover_locked(c, false);
-		return false;
-	}
-	const int32_t fps[2] = {30, 30};
-	ACaptureRequest_setEntry_i32(c->req, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, fps);
-	c->ses_cb = {c, ses_noop, ses_noop, ses_noop};
-	st = ACameraDevice_createCaptureSessionWithSessionParameters(c->dev, c->outputs, c->req, &c->ses_cb,
-	                                                             &c->session);
-	if (st != ACAMERA_OK || c->session == nullptr) {
-		SCAM_LOG_W("leia stereo camera (android): createCaptureSession failed (%d)", (int)st);
-		c->session = nullptr;
-		teardown_locked(c);
-		handover_locked(c, false);
-		return false;
-	}
-	st = ACameraCaptureSession_setRepeatingRequest(c->session, nullptr, 1, &c->req, nullptr);
-	if (st != ACAMERA_OK) {
-		SCAM_LOG_W("leia stereo camera (android): setRepeatingRequest failed (%d)", (int)st);
-		teardown_locked(c);
-		handover_locked(c, false);
-		return false;
-	}
+	phase_session_started(c, c->phase_restarting ? phase_start::RESTART : phase_start::START);
 	c->opened_ns = clock_ns(CLOCK_MONOTONIC);
 	c->last_pair_ns.store(0);
 	SCAM_LOG_W("leia stereo camera (android): %s pair streaming: logical %s, L=%s R=%s, %ux%u YUV per lens -> %ux%u "
-	           "eyes (turned %u deg cw), tracking %s",
+	           "eyes (mode %u, turned %u deg cw), tracking %s; pairing by image stamp, tolerance %.2f ms "
+	           "(debug.dxr.leia.scam_pair_tol_ms; capped at 0.3 frame period, so never across frames)",
 	           c->desc.front ? "front" : "rear", c->desc.logical_id, left, right, c->cap_w, c->cap_h, c->w, c->h,
-	           c->rot, c->track ? "640x480 from the tracking lens (unturned)" : "not handed over");
+	           c->mode_index, c->rot, c->track ? "640x480 from the tracking lens (unturned)" : "not handed over",
+	           (double)c->pair_tol_cfg_ns / 1e6);
 	return true;
 }
+
+/*
+ *
+ * Pairing / skew diagnostics (every 10 s from the watchdog, and once after
+ * each still).
+ *
+ */
+
+//! "min/median/max ms" of @p w, or "none".
+std::string
+skew_str(const leia_scam_skew_window &w)
+{
+	int64_t lo = 0, med = 0, hi = 0;
+	if (!leia_scam_skew_summary(&w, &lo, &med, &hi)) {
+		return "none";
+	}
+	char b[80];
+	snprintf(b, sizeof(b), "%.3f/%.3f/%.3f ms (n %u)", (double)lo / 1e6, (double)med / 1e6, (double)hi / 1e6, w.n);
+	return b;
+}
+
+//! Camera thread, every 10 s: one WARN with the pairing and skew picture, then reset.
+void
+report_pairing(xrt_plugin_stereo_camera *c)
+{
+	std::string img, phys, ivp_l, ivp_r;
+	uint64_t rej, un_l, un_r;
+	int64_t tol, period;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		img = skew_str(c->img_dt);
+		rej = c->rejected;
+		un_l = c->unpaired[0];
+		un_r = c->unpaired[1];
+		tol = leia_scam_pair_tolerance_ns(c->pair_tol_cfg_ns, c->frame_period_ns);
+		period = c->frame_period_ns;
+		leia_scam_skew_reset(&c->img_dt);
+		c->rejected = c->unpaired[0] = c->unpaired[1] = 0;
+	}
+	bool indep;
+	char phase[160];
+	{
+		std::lock_guard<std::mutex> lk(c->res_mu);
+		const leia_scam_phase_lock &l = c->phase;
+		snprintf(phase, sizeof(phase), "lens phase %s, right eye %+d frame, accepted R-L %.3f ms (session gap %.3f ms, "
+		         "%u restart(s))",
+		         l.state == LEIA_SCAM_PHASE_MEASURING  ? "measuring"
+		         : l.state == LEIA_SCAM_PHASE_LOCKED    ? "locked"
+		         : l.state == LEIA_SCAM_PHASE_ACCEPTED  ? "accepted over threshold"
+		         : l.state == LEIA_SCAM_PHASE_UNKNOWN   ? "unknown (no per-lens stamps)"
+		                                                : "restarting",
+		         l.shift, (double)l.residual_ns / 1e6, (double)l.gap_ns / 1e6, l.reopens);
+		phys = skew_str(c->phys_dt);
+		ivp_l = skew_str(c->img_vs_phys[0]);
+		ivp_r = skew_str(c->img_vs_phys[1]);
+		indep = leia_scam_eye_times_independent(&c->eye_times);
+		leia_scam_skew_reset(&c->phys_dt);
+		leia_scam_skew_reset(&c->img_vs_phys[0]);
+		leia_scam_skew_reset(&c->img_vs_phys[1]);
+	}
+	SCAM_LOG_W("leia stereo camera (android): pairing (10 s): R-L image stamp min/med/max %s; R-L physical result "
+	           "stamp %s; image-physical L %s, R %s; tolerance %.2f ms (period %.3f ms); %llu rejected over "
+	           "tolerance; dropped unpaired L %llu R %llu; per-eye times %s; %s",
+	           img.c_str(), phys.c_str(), ivp_l.c_str(), ivp_r.c_str(), (double)tol / 1e6, (double)period / 1e6,
+	           (unsigned long long)rej, (unsigned long long)un_l, (unsigned long long)un_r,
+	           indep ? "REPORTED (independent stamps)" : "withheld (stamps not independent)", phase);
+}
+
+//! Before a still: the medians the still is compared against.
+[[maybe_unused]] void
+snapshot_pre_still(xrt_plugin_stereo_camera *c)
+{
+	int64_t lo, hi;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->pre_img_have = leia_scam_skew_summary(&c->img_dt, &lo, &c->pre_img_med, &hi);
+	}
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	c->pre_phys_have = leia_scam_skew_summary(&c->phys_dt, &lo, &c->pre_phys_med, &hi);
+}
+
+//! After a still: collect the next pairs' skews (check_still_watch compares).
+[[maybe_unused]] void
+arm_still_watch(xrt_plugin_stereo_camera *c, uint64_t request_id)
+{
+	std::lock_guard<std::mutex> l1(c->pair_mu);
+	std::lock_guard<std::mutex> l2(c->res_mu);
+	leia_scam_skew_reset(&c->post_img_dt);
+	leia_scam_skew_reset(&c->post_phys_dt);
+	c->still_watch_id = request_id;
+	c->still_watch = true;
+}
+
+/*!
+ * Camera thread: once 30 pairs followed a still, ONE WARN comparing the R-L
+ * image and physical skew medians before and after it ("CHANGED" when either
+ * moved by more than 1 ms; a device run saw the physical skew jump to
+ * -39.1 ms right after a still).
+ */
+void
+check_still_watch(xrt_plugin_stereo_camera *c)
+{
+	if (!c->still_watch.load()) {
+		return;
+	}
+	int64_t lo, hi, img_med = 0, phys_med = 0;
+	bool img_have, phys_have;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		if (c->post_img_dt.n < 30) {
+			return;
+		}
+		img_have = leia_scam_skew_summary(&c->post_img_dt, &lo, &img_med, &hi);
+	}
+	{
+		std::lock_guard<std::mutex> lk(c->res_mu);
+		phys_have = leia_scam_skew_summary(&c->post_phys_dt, &lo, &phys_med, &hi);
+	}
+	c->still_watch = false;
+	auto moved = [](bool a, int64_t x, bool b, int64_t y) { return a != b || (a && std::llabs(x - y) > kNsPerMs); };
+	const bool changed = moved(c->pre_img_have, c->pre_img_med, img_have, img_med) ||
+	                     moved(c->pre_phys_have, c->pre_phys_med, phys_have, phys_med);
+	SCAM_LOG_W("leia stereo camera (android): after still %llu: R-L median image stamp %.3f -> %.3f ms, physical "
+	           "result stamp %.3f -> %.3f ms%s",
+	           (unsigned long long)c->still_watch_id, c->pre_img_have ? (double)c->pre_img_med / 1e6 : 0.0,
+	           img_have ? (double)img_med / 1e6 : 0.0, c->pre_phys_have ? (double)c->pre_phys_med / 1e6 : 0.0,
+	           phys_have ? (double)phys_med / 1e6 : 0.0,
+	           changed ? " -- CHANGED by the still" : " (unchanged)");
+}
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
+/*
+ * AImageDecoder (NDK, API 30+) decodes the still's JPEGs. The plug-in is built
+ * for API 29 (the runtime's minSdk), so it is looked up at run time in
+ * libjnigraphics.so; on an API 29 system the JPEG still fails (FAILED) and
+ * the stills of the default capture still work.
+ */
+struct jpeg_decoder_api
+{
+	bool ok{false};
+	int (*create)(const void *, size_t, AImageDecoder **){nullptr};
+	int (*set_format)(AImageDecoder *, int32_t){nullptr};
+	const AImageDecoderHeaderInfo *(*header)(const AImageDecoder *){nullptr};
+	int32_t (*width)(const AImageDecoderHeaderInfo *){nullptr};
+	int32_t (*height)(const AImageDecoderHeaderInfo *){nullptr};
+	size_t (*stride)(AImageDecoder *){nullptr};
+	int (*decode)(AImageDecoder *, void *, size_t, size_t){nullptr};
+	void (*destroy)(AImageDecoder *){nullptr};
+};
+
+const jpeg_decoder_api &
+jpeg_decoder()
+{
+	static jpeg_decoder_api api;
+	static std::once_flag once;
+	std::call_once(once, [] {
+		void *h = dlopen("libjnigraphics.so", RTLD_NOW | RTLD_LOCAL);
+		if (h == nullptr) {
+			return;
+		}
+		api.create = (decltype(api.create))dlsym(h, "AImageDecoder_createFromBuffer");
+		api.set_format = (decltype(api.set_format))dlsym(h, "AImageDecoder_setAndroidBitmapFormat");
+		api.header = (decltype(api.header))dlsym(h, "AImageDecoder_getHeaderInfo");
+		api.width = (decltype(api.width))dlsym(h, "AImageDecoderHeaderInfo_getWidth");
+		api.height = (decltype(api.height))dlsym(h, "AImageDecoderHeaderInfo_getHeight");
+		api.stride = (decltype(api.stride))dlsym(h, "AImageDecoder_getMinimumStride");
+		api.decode = (decltype(api.decode))dlsym(h, "AImageDecoder_decodeImage");
+		api.destroy = (decltype(api.destroy))dlsym(h, "AImageDecoder_delete");
+		api.ok = api.create && api.set_format && api.header && api.width && api.height && api.stride &&
+		         api.decode && api.destroy;
+	});
+	return api;
+}
+
+/*!
+ * One eye's JPEG (@p cap_w x @p cap_h, unturned: JPEG_ORIENTATION 0) into
+ * the SBS NV12 still at column @p x0 (stride 2 * @p ew): decode to RGBA
+ * (AImageDecoder decodes to nothing closer to YCbCr), keep the centred
+ * @p ew x @p eh, convert to full-range BT.601 NV12
+ * (leia_scam_rgba_to_nv12: NEON, always built -O2, also in a Debug plug-in).
+ * Each eye has its own decoder and scratch, so the two eyes run on two
+ * threads. @p out_decode_ms / @p out_convert_ms: the split, for the log.
+ * False (with @p why) on any failure.
+ */
+bool
+jpeg_eye_to_nv12(const std::vector<uint8_t> &jpeg,
+                 uint32_t cap_w,
+                 uint32_t cap_h,
+                 uint32_t ew,
+                 uint32_t eh,
+                 uint8_t *dst,
+                 uint32_t x0,
+                 std::string &why,
+                 double *out_decode_ms,
+                 double *out_convert_ms)
+{
+	*out_decode_ms = *out_convert_ms = 0.0;
+	const jpeg_decoder_api &api = jpeg_decoder();
+	if (!api.ok) {
+		why = "no AImageDecoder (libjnigraphics, API 30+)";
+		return false;
+	}
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+	AImageDecoder *d = nullptr;
+	if (api.create(jpeg.data(), jpeg.size(), &d) != ANDROID_IMAGE_DECODER_SUCCESS || d == nullptr) {
+		why = "AImageDecoder_createFromBuffer failed";
+		return false;
+	}
+	std::vector<uint8_t> rgba;
+	bool ok = false;
+	do {
+		if (api.set_format(d, ANDROID_BITMAP_FORMAT_RGBA_8888) != ANDROID_IMAGE_DECODER_SUCCESS) {
+			why = "RGBA_8888 refused";
+			break;
+		}
+		const AImageDecoderHeaderInfo *hi = api.header(d);
+		const int32_t w = hi != nullptr ? api.width(hi) : 0, h = hi != nullptr ? api.height(hi) : 0;
+		if ((uint32_t)w != cap_w || (uint32_t)h != cap_h) {
+			char b[128];
+			snprintf(b, sizeof(b), "JPEG is %dx%d, the output is %ux%u (EXIF turn?)", w, h, cap_w, cap_h);
+			why = b;
+			break;
+		}
+		const size_t stride = api.stride(d);
+		rgba.resize(stride * (size_t)h);
+		if (api.decode(d, rgba.data(), stride, rgba.size()) != ANDROID_IMAGE_DECODER_SUCCESS) {
+			why = "AImageDecoder_decodeImage failed";
+			break;
+		}
+		const int64_t t1 = clock_ns(CLOCK_MONOTONIC);
+		const uint32_t ox = ((cap_w - ew) / 2u) & ~1u, oy = ((cap_h - eh) / 2u) & ~1u;
+		const size_t ds = (size_t)2 * ew;
+		leia_scam_rgba_to_nv12(rgba.data(), stride, ox, oy, ew, eh, dst + x0, dst + ds * eh + x0, ds);
+		const int64_t t2 = clock_ns(CLOCK_MONOTONIC);
+		*out_decode_ms = (double)(t1 - t0) / 1e6;
+		*out_convert_ms = (double)(t2 - t1) / 1e6;
+		ok = true;
+	} while (false);
+	api.destroy(d);
+	return ok;
+}
+
+/*!
+ * The still worker (one per request; the camera thread never waits for it).
+ *
+ * - A still of the default capture (LEIA_SCAM_SRC_DEFAULT_CAPTURE): the next
+ *   stream pair is packed at the still's crop (grab_still_locked). No session
+ *   change, no frame lost, ~1 frame.
+ * - A still from the JPEG outputs (rear): ONE still request (ZSL / preview
+ *   template, targeting the stream outputs too) on the RUNNING session; stage
+ *   0 measured both JPEGs ~320 ms later with no stream frame lost. The two
+ *   eyes are then decoded and converted to NV12 here on two threads (peak
+ *   memory: two RGBA eyes, ~50 MB each at 4096x3072, beside the 38 MB NV12
+ *   pair and the two JPEGs).
+ */
+void
+still_worker(xrt_plugin_stereo_camera *c, leia_scam_mode m, uint64_t request_id)
+{
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+	const bool jpeg = m.source == LEIA_SCAM_SRC_STILL_OUTPUT;
+	std::string why;
+	snapshot_pre_still(c);
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->still_geom = m.geom;
+		c->jpeg[0].clear();
+		c->jpeg[1].clear();
+		c->still = jpeg ? still_state::WAIT_JPEG : still_state::GRAB;
+		c->still_lossy = jpeg;
+	}
+	if (jpeg) {
+		std::lock_guard<std::mutex> lk(c->cam_mu);
+		if (c->session == nullptr || c->still_req == nullptr) {
+			why = "the source is not streaming";
+		} else {
+			const camera_status_t st =
+			    ACameraCaptureSession_logicalCamera_capture(c->session, &c->still_cb, 1, &c->still_req, nullptr);
+			if (st != ACAMERA_OK) {
+				why = "the still request was refused (" + std::to_string((int)st) + ")";
+			}
+		}
+	}
+	int64_t t_pair = t0;
+	double dec_ms[2] = {0.0, 0.0}, cvt_ms[2] = {0.0, 0.0};
+	if (why.empty()) {
+		std::unique_lock<std::mutex> lk(c->pair_mu);
+		const int64_t deadline = t0 + (jpeg ? kStillJpegWaitNs : kStillSameCaptureNs);
+		for (;;) {
+			const int64_t now = clock_ns(CLOCK_MONOTONIC);
+			if (c->still == still_state::CAPTURED || c->closing.load() || now >= deadline) {
+				break;
+			}
+			c->still_cv.wait_for(lk, std::chrono::nanoseconds(std::min<int64_t>(deadline - now, 100 * kNsPerMs)));
+		}
+		if (c->still != still_state::CAPTURED) {
+			why = c->closing.load() ? "the camera closed"
+			      : jpeg            ? "no JPEG pair from the HAL within 3 s"
+			                        : "no stream pair within 1 s";
+		}
+		t_pair = clock_ns(CLOCK_MONOTONIC);
+	}
+	if (why.empty() && jpeg) {
+		std::vector<uint8_t> jl, jr;
+		int64_t tl = 0, tr = 0;
+		{
+			std::lock_guard<std::mutex> lk(c->pair_mu);
+			jl.swap(c->jpeg[0]);
+			jr.swap(c->jpeg[1]);
+			tl = c->jpeg_ts[0];
+			tr = c->jpeg_ts[1];
+		}
+		if (std::llabs(tl - tr) > kPairToleranceNs) {
+			SCAM_LOG_W("leia stereo camera (android): still %llu: the two JPEGs' timestamps differ by %.1f ms",
+			           (unsigned long long)request_id, (double)(tl - tr) / 1e6);
+		}
+		uint32_t ew, eh;
+		leia_scam_eye_size(&m.geom, &ew, &eh);
+		// still_buf is the worker's alone in CAPTURED (nothing packs into it).
+		c->still_buf.resize((size_t)2 * ew * eh * 3 / 2); // every byte is written below
+		// Both eyes at once: each has its own decoder and RGBA scratch, and they
+		// write disjoint columns of still_buf.
+		std::string why_r;
+		bool ok_r = false;
+		uint8_t *buf = c->still_buf.data();
+		const uint32_t cw = m.geom.cap_w, chh = m.geom.cap_h;
+		auto do_right = [&] { ok_r = jpeg_eye_to_nv12(jr, cw, chh, ew, eh, buf, ew, why_r, &dec_ms[1], &cvt_ms[1]); };
+		std::thread right;
+		try {
+			right = std::thread(do_right);
+		} catch (...) {
+			// No thread (resources): the right eye after the left, as before.
+		}
+		const bool ok_l = jpeg_eye_to_nv12(jl, cw, chh, ew, eh, buf, 0, why, &dec_ms[0], &cvt_ms[0]);
+		if (right.joinable()) {
+			right.join();
+		} else {
+			do_right();
+		}
+		if (ok_l && !ok_r) {
+			why = "right eye: " + why_r;
+		} else if (!ok_l) {
+			why = "left eye: " + why;
+		}
+		if (!ok_l || !ok_r) {
+			c->still_buf.clear();
+			c->still_buf.shrink_to_fit();
+		} else {
+			const int64_t off = boot_minus_mono_ns();
+			c->still_w = ew;
+			c->still_h = eh;
+			c->still_ts_boot = tl;
+			c->still_eye_mono[0] = tl - off;
+			c->still_eye_mono[1] = tr - off;
+		}
+	}
+	if (why.empty()) {
+		std::lock_guard<std::mutex> lk(c->cam_mu); // c->ctl
+		capture_state_of(c, c->still_ts_boot, nullptr, jpeg, &c->still_res);
+	}
+	const int64_t t_end = clock_ns(CLOCK_MONOTONIC);
+	arm_still_watch(c, request_id);
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->still = why.empty() ? still_state::READY : still_state::FAILED;
+	}
+	if (why.empty()) {
+		char split[160] = "";
+		if (jpeg) {
+			snprintf(split, sizeof(split), ": L decode %.0f + NV12 %.0f ms, R decode %.0f + NV12 %.0f ms, in parallel",
+			         dec_ms[0], cvt_ms[0], dec_ms[1], cvt_ms[1]);
+		}
+		SCAM_LOG_W("leia stereo camera (android): still %llu: %ux%u per eye from %s in %.0f ms (pair after %.0f ms, "
+		           "decode + NV12 %.0f ms%s); the stream lost no frame for it",
+		           (unsigned long long)request_id, c->still_w, c->still_h,
+		           jpeg ? "the JPEG outputs" : "the next stream pair", (double)(t_end - t0) / 1e6,
+		           (double)(t_pair - t0) / 1e6, (double)(t_end - t_pair) / 1e6, split);
+	} else {
+		SCAM_LOG_W("leia stereo camera (android): still %llu (%ux%u per eye) FAILED after %.0f ms: %s",
+		           (unsigned long long)request_id, m.eye_w, m.eye_h, (double)(t_end - t0) / 1e6, why.c_str());
+	}
+}
+#endif // XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
 
 /*!
  * The watchdog, run from wait_frame (the runtime's camera thread for this
@@ -2502,7 +4372,9 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 			           fed > 0 ? (double)c->trk_busy_ns.load() / fed / 1e6 : 0.0);
 			c->stats_ns = now;
 			c->stats_pairs = p;
+			report_pairing(c);
 		}
+		check_still_watch(c);
 		return true;
 	}
 	if (c->down_since_ns == 0) {
@@ -2537,6 +4409,18 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 		*out_gave_up = true;
 		return false;
 	}
+	// After a policy refusal, an access-priority or availability change is a
+	// reason to try at once (the poll below stays as the fallback).
+	const bool access_moved = g_access_gen.load() != c->access_gen_seen;
+	const bool avail_moved = g_avail_gen.load() != c->avail_gen_seen;
+	if (c->open_refused && (access_moved || avail_moved) && now < c->next_reopen_ns) {
+		c->retry_trigger = access_moved ? "access-priorities callback" : "camera availability change";
+		c->next_reopen_ns = now;
+	} else if (now >= c->next_reopen_ns && c->open_refused) {
+		c->retry_trigger = "poll (250 ms)";
+	} else if (now >= c->next_reopen_ns) {
+		c->retry_trigger = "watchdog back-off";
+	}
 	if (now >= c->next_reopen_ns) {
 		std::lock_guard<std::mutex> lk(c->cam_mu);
 		c->reopens++;
@@ -2560,6 +4444,106 @@ supervise(xrt_plugin_stereo_camera *c, int64_t now, bool *out_gave_up)
 	return false;
 }
 
+
+/*!
+ * Camera thread: the restart the lens-phase lock asked for. Level (from
+ * debug.dxr.leia.scam_phase_restart): "session" closes and recreates only the
+ * capture session on the open device (the HAL reconfigures and restarts both
+ * sensors' streaming; whether that re-rolls their phase is what the next
+ * device run tests), "device" closes and re-opens the logical camera (the
+ * sensors are powered down and up: a sure re-roll, ~2x the cost). On the
+ * front pair a restart also stops the tracking feed for its duration (one
+ * CNSDK predictor reset each, > 70 ms gap; the hand-over itself is kept), so
+ * it is off there by default.
+ */
+void
+phase_restart(xrt_plugin_stereo_camera *c)
+{
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+	bool ok;
+	{
+		std::lock_guard<std::mutex> lk(c->cam_mu);
+		if (c->phase_device_level) {
+			c->phase_restarting = true;
+			ok = start_locked(c);
+			c->phase_restarting = false;
+		} else {
+			ok = c->dev != nullptr && build_session_locked(c, c->cap_w, c->cap_h, false);
+			if (ok) {
+				phase_session_started(c, phase_start::RESTART);
+			}
+		}
+	}
+	c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
+	if (!ok) {
+		c->device_failed = true; // the watchdog re-opens it (a fresh lock)
+	}
+	SCAM_LOG_W("leia stereo camera (android): lens phase: %s restart %s in %.1f ms", c->phase_device_level ? "device"
+	                                                                                                           : "session",
+	           ok ? "done" : "FAILED", (double)(clock_ns(CLOCK_MONOTONIC) - t0) / 1e6);
+}
+
+/*!
+ * Camera thread: a start never holds frames for its lens-phase lock longer
+ * than kPhaseHoldMaxNs. Past it the lock gives up (state UNKNOWN, no shift),
+ * frames flow, and one WARN names why: no pair arrived at all, pairs but no
+ * capture results (the logical-camera result callbacks never fired), or
+ * results without both lenses' stamps.
+ */
+void
+phase_check_hold(xrt_plugin_stereo_camera *c)
+{
+	if (!c->phase_hold.load(std::memory_order_relaxed) || c->phase_reopen_due.load()) {
+		return;
+	}
+	const int64_t now = clock_ns(CLOCK_MONOTONIC);
+	std::lock_guard<std::mutex> lk(c->res_mu);
+	if (c->phase.state != LEIA_SCAM_PHASE_MEASURING || now - c->phase_t0 < kPhaseHoldMaxNs) {
+		return;
+	}
+	const uint32_t held = c->phase_pairs_held.load();
+	const char *why = held == 0                                ? "no pair arrived (the session delivers no frames)"
+	                  : c->phase_results == 0                   ? "pairs but no capture results (no logical-camera "
+	                                                              "result callbacks)"
+	                  : c->phase.n < c->phase.cfg.samples        ? "results without both lenses' physical stamps"
+	                                                             : "?";
+	SCAM_LOG_W("leia stereo camera (android): lens phase: gave up after %.0f ms: %s (%u pair(s) held, %u result(s), "
+	           "%u gap sample(s)); frames flow unshifted",
+	           (double)(now - c->phase_t0) / 1e6, why, held, c->phase_results, c->phase.n);
+	c->phase.state = LEIA_SCAM_PHASE_UNKNOWN;
+	c->phase.shift = 0;
+	c->phase_shift.store(0);
+	c->phase_hold.store(false);
+}
+
+/*!
+ * Spec v8 §9b: the capture session starts on the first wait_frame or
+ * set_mode, not at open (a set_mode right after open then costs nothing).
+ * A failed start hands over to the watchdog, exactly as a failed open did.
+ */
+void
+ensure_started(xrt_plugin_stereo_camera *c)
+{
+	if (c->started) {
+		return;
+	}
+	c->started = true;
+	c->stream_start_ns = clock_ns(CLOCK_MONOTONIC);
+	bool ok;
+	{
+		std::lock_guard<std::mutex> lk(c->cam_mu);
+		ok = start_locked(c);
+	}
+	if (!ok) {
+		SCAM_LOG_W("leia stereo camera (android): open failed; the watchdog keeps retrying");
+		c->down_since_ns = clock_ns(CLOCK_MONOTONIC);
+		// A policy refusal is polled at the refusal cadence from the start (it
+		// was the 500 ms first back-off), and retried at once on a trigger.
+		c->backoff_ns = c->open_refused ? kReopenRefusedNs : kReopenFirstNs;
+		c->next_reopen_ns = c->down_since_ns + c->backoff_ns;
+	}
+	c->stats_ns = clock_ns(CLOCK_MONOTONIC);
+}
 } // namespace
 
 /*
@@ -2695,6 +4679,7 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		c->desc = g_pairs[index];
 	}
 	c->lsub = left_is_sub(c->desc);
+	log_calibration_in_use(c->desc, c->lsub);
 	c->w = c->desc.eye_w;
 	c->h = c->desc.eye_h;
 	c->crop_w = c->desc.crop_w;
@@ -2702,6 +4687,48 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 	c->rot = c->desc.rot;
 	c->cap_w = c->desc.cap_w;
 	c->cap_h = c->desc.cap_h;
+	c->mode_index = 0;
+	c->cmd_focus_d = c->desc.default_focus_d;
+	snprintf(c->left_id, sizeof(c->left_id), "%s", c->lsub ? c->desc.sub_id : c->desc.main_id);
+#ifdef LEIA_SCAM_V8
+	c->cap_cb.context = c;
+	c->cap_cb.onLogicalCameraCaptureCompleted = on_capture_completed;
+	c->cap_cb.onLogicalCameraCaptureFailed = on_capture_failed;
+	c->still_cb = c->cap_cb;
+	c->still_cb.onLogicalCameraCaptureCompleted = on_still_capture_completed;
+#endif
+	{
+		// Lens phase lock (docs/android-stereo-camera.md, "Lens phase").
+		auto num = [](const char *name, double dflt) {
+			const std::string v = prop_str(name, "");
+			return v.empty() ? dflt : atof(v.c_str());
+		};
+		leia_scam_phase_cfg pc{};
+		pc.samples = (uint32_t)std::max(1.0, std::min(32.0, num("debug.dxr.leia.scam_phase_samples", 12)));
+		pc.threshold_ns = (int64_t)(std::max(0.0, num("debug.dxr.leia.scam_phase_max_ms", 3.0)) * 1e6);
+		pc.max_reopens = (uint32_t)std::max(0.0, std::min(16.0, num("debug.dxr.leia.scam_phase_restarts", 4)));
+		pc.repair = prop_bool("debug.dxr.leia.scam_phase_repair", true);
+		pc.reopen = c->desc.front ? prop_bool("debug.dxr.leia.scam_phase_restart_front", false)
+		                          : prop_bool("debug.dxr.leia.scam_phase_restart_rear", true);
+		// The rear pair's JPEG stills take both eyes from one request: lock on the raw gap.
+		pc.judge_raw_gap = c->desc.still_out >= 0;
+		c->phase_cfg = pc;
+		// Rear default: device (measured 236-294 ms per restart vs 417-420 ms for a
+		// session restart; both re-roll the phase). Front: session (a device
+		// restart there also waits for the tracking lens to be free).
+		c->phase_device_level = prop_str("debug.dxr.leia.scam_phase_restart", c->desc.front ? "session" : "device") ==
+		                        "device";
+#ifdef LEIA_SCAM_V8
+		c->phase_enabled = prop_bool("debug.dxr.leia.scam_phase", true);
+#else
+		c->phase_enabled = false; // pre-v8 builds register no per-lens result callbacks
+#endif
+	}
+	{
+		const std::string t = prop_str("debug.dxr.leia.scam_pair_tol_ms", "");
+		const double v = t.empty() ? -1.0 : atof(t.c_str());
+		c->pair_tol_cfg_ns = v > 0.0 && v < 100.0 ? (int64_t)(v * 1e6) : kPairTolDefaultNs;
+	}
 	c->track = c->desc.front && prop_bool("debug.dxr.leia.scam_track", true);
 
 	if (c->track) {
@@ -2715,17 +4742,9 @@ leia_stereo_camera_android_open(struct xrt_plugin_instance *inst,
 		c->trk_thread = std::thread(tracking_feeder, c);
 	}
 
-	bool ok;
-	{
-		std::lock_guard<std::mutex> lk(c->cam_mu);
-		ok = start_locked(c);
-	}
-	if (!ok) {
-		SCAM_LOG_W("leia stereo camera (android): open failed; the watchdog keeps retrying");
-		c->down_since_ns = clock_ns(CLOCK_MONOTONIC);
-		c->next_reopen_ns = c->down_since_ns + kReopenFirstNs;
-		c->backoff_ns = kReopenFirstNs;
-	}
+	// Spec v8 §9b: the capture session is configured lazily, on the first
+	// wait_frame or set_mode (ensure_started), so a set_mode right after open
+	// opens straight into the wanted mode.
 	c->stats_ns = clock_ns(CLOCK_MONOTONIC);
 	*out_cam = c;
 	return XRT_SUCCESS;
@@ -2739,8 +4758,13 @@ leia_stereo_camera_android_wait_frame(struct xrt_plugin_stereo_camera *c,
 	if (c == nullptr || out == nullptr) {
 		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
 	}
+	ensure_started(c);
 	const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + std::max<int64_t>(timeout_ns, 0);
 	for (;;) {
+		if (c->phase_reopen_due.exchange(false)) {
+			phase_restart(c);
+		}
+		phase_check_hold(c);
 		const int64_t now = clock_ns(CLOCK_MONOTONIC);
 		bool gave_up = false;
 		const bool up = supervise(c, now, &gave_up);
@@ -2760,13 +4784,15 @@ leia_stereo_camera_android_wait_frame(struct xrt_plugin_stereo_camera *c,
 				out->sequence = b.seq;
 				out->time_ns = b.time_mono_ns;
 				out->time_is_exposure = true; // sensor start-of-exposure, BOOTTIME -> MONOTONIC
-				out->width = 2 * c->w;
-				out->height = c->h;
+				// The buffer's own size: after a mode switch the next buffer may
+				// still be of the previous mode (the runtime sizes from the frame).
+				out->width = 2 * b.eye_w;
+				out->height = b.eye_h;
 				out->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
 				out->planes[0] = b.data.data();
-				out->planes[1] = b.data.data() + (size_t)2 * c->w * c->h;
-				out->pitches[0] = 2 * c->w;
-				out->pitches[1] = 2 * c->w;
+				out->planes[1] = b.data.data() + (size_t)2 * b.eye_w * b.eye_h;
+				out->pitches[0] = 2 * b.eye_w;
+				out->pitches[1] = 2 * b.eye_w;
 				return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
 			}
 			if (now >= deadline) {
@@ -2795,6 +4821,13 @@ leia_stereo_camera_android_close(struct xrt_plugin_stereo_camera *c)
 		return;
 	}
 	c->closing = true;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->still_cv.notify_all();
+	}
+	if (c->still_thread.joinable()) {
+		c->still_thread.join(); // bounded: it sees closing within 100 ms (or finishes a decode)
+	}
 	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
 	{
 		std::lock_guard<std::mutex> lk(c->cam_mu);
@@ -2817,6 +4850,408 @@ leia_stereo_camera_android_close(struct xrt_plugin_stereo_camera *c)
 	           (double)(t2 - t1) / 1e6);
 	delete c;
 }
+
+/*
+ *
+ * Spec v8 slots (XR_DXR_stereo_camera §5.5-§5.7, §9b). Each group only when
+ * the runtime headers announce it.
+ *
+ */
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES
+static_assert(LEIA_SCAM_MODE_STREAM == XRT_PLUGIN_STEREO_CAMERA_MODE_STREAM, "mode bits");
+static_assert(LEIA_SCAM_MODE_STILL == XRT_PLUGIN_STEREO_CAMERA_MODE_STILL, "mode bits");
+
+namespace {
+
+//! The listed rate of @p m: the measured rate of its capture, else 0 (never the HAL's claimed 30).
+float
+mode_rate(const pair_desc &p, const leia_scam_mode &m)
+{
+	switch (m.source) {
+	case LEIA_SCAM_SRC_DEFAULT_CAPTURE: return p.measured_rate;
+	case LEIA_SCAM_SRC_OWN_CAPTURE: return p.measured_own_rate;
+	default: return 0.0f;
+	}
+}
+
+} // namespace
+
+extern "C" uint32_t
+leia_stereo_camera_android_enumerate_modes(struct xrt_plugin_instance *inst,
+                                           uint32_t index,
+                                           uint32_t capacity,
+                                           struct xrt_plugin_stereo_camera_mode *out)
+{
+	(void)inst;
+	std::lock_guard<std::mutex> lk(g_mu);
+	scan_locked();
+	if (any_pending_locked() || index >= g_pairs.size()) {
+		return 0;
+	}
+	const pair_desc &p = g_pairs[index];
+	for (uint32_t i = 0; out != nullptr && i < p.n_modes && i < capacity; i++) {
+		xrt_plugin_stereo_camera_mode m;
+		memset(&m, 0, sizeof(m));
+		m.struct_size = (uint32_t)sizeof(m);
+		m.eye_width = p.modes[i].eye_w;
+		m.eye_height = p.modes[i].eye_h;
+		m.max_frame_rate = mode_rate(p, p.modes[i]);
+		m.flags = p.modes[i].flags;
+		const uint32_t sz = out[i].struct_size;
+		memcpy(&out[i], &m, std::min<size_t>(sz, sizeof(m))); // never past struct_size
+		out[i].struct_size = sz;
+	}
+	return p.n_modes;
+}
+
+/*!
+ * Reconfigure the open camera to mode @p mode_index. A cut of the running
+ * capture (mode 0 <-> 1280x960, 1920x1080 <-> 1920x1440) only changes the crop:
+ * no frame and no tracking frame is lost. Another capture (rear only) is a
+ * session reconfigure on the open device: stage 0 measured 86-124 ms to
+ * configure plus ~85 ms to the first frame, inside the contract's 500 ms. The
+ * front pair lists no mode that needs one. A failure rebuilds the previous
+ * capture; if even that fails the watchdog re-opens it.
+ */
+extern "C" xrt_result_t
+leia_stereo_camera_android_set_mode(struct xrt_plugin_stereo_camera *c, uint32_t mode_index)
+{
+	if (c == nullptr || mode_index >= c->desc.n_modes ||
+	    (c->desc.modes[mode_index].flags & LEIA_SCAM_MODE_STREAM) == 0) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const leia_scam_mode &m = c->desc.modes[mode_index];
+	if (mode_index == c->mode_index) {
+		return XRT_SUCCESS;
+	}
+	auto set_geom = [c](const leia_scam_eye_geom &g, uint32_t idx) {
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		c->cap_w = g.cap_w;
+		c->cap_h = g.cap_h;
+		c->crop_w = g.crop_w;
+		c->crop_h = g.crop_h;
+		c->rot = g.rot;
+		leia_scam_eye_size(&g, &c->w, &c->h);
+		c->mode_index = idx;
+		c->rate_n = 0; // the rate window restarts with the capture
+	};
+	const leia_scam_eye_geom old{c->cap_w, c->cap_h, c->crop_w, c->crop_h, c->rot};
+	const uint32_t old_index = c->mode_index;
+	const bool same_capture = m.geom.cap_w == c->cap_w && m.geom.cap_h == c->cap_h;
+	std::lock_guard<std::mutex> lk(c->cam_mu);
+	if (same_capture || !c->started || c->session == nullptr) {
+		// A new crop of the running capture, or not streaming yet: the next
+		// start (lazy, or the watchdog's) builds the session in this mode.
+		set_geom(m.geom, mode_index);
+		SCAM_LOG_W("leia stereo camera (android): %s pair mode %u = %ux%u per eye (%s)",
+		           c->desc.front ? "front" : "rear", mode_index, m.eye_w, m.eye_h,
+		           same_capture ? "same capture, new crop: no frame lost" : "before the session starts");
+		return XRT_SUCCESS;
+	}
+	const int64_t t0 = clock_ns(CLOCK_MONOTONIC);
+	set_geom(m.geom, mode_index);
+	if (build_session_locked(c, m.geom.cap_w, m.geom.cap_h, false)) {
+		// A new session re-rolls the lens phase: measure and re-pair again,
+		// without a restart or a hold (the switch must stay within 500 ms).
+		phase_session_started(c, phase_start::MODE);
+		c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC)); // the watchdog counts from the switch
+		SCAM_LOG_W("leia stereo camera (android): %s pair mode %u = %ux%u per eye: session reconfigured to %ux%u "
+		           "YUV per lens in %.1f ms (frames resume after the HAL's first-frame latency)",
+		           c->desc.front ? "front" : "rear", mode_index, m.eye_w, m.eye_h, m.geom.cap_w, m.geom.cap_h,
+		           (double)(clock_ns(CLOCK_MONOTONIC) - t0) / 1e6);
+		return XRT_SUCCESS;
+	}
+	set_geom(old, old_index);
+	if (!build_session_locked(c, old.cap_w, old.cap_h, false)) {
+		c->device_failed = true; // the watchdog re-opens it in the old mode
+	} else {
+		phase_session_started(c, phase_start::MODE);
+	}
+	c->last_pair_ns.store(clock_ns(CLOCK_MONOTONIC));
+	SCAM_LOG_W("leia stereo camera (android): %s pair mode %u (%ux%u per lens) failed; staying in mode %u",
+	           c->desc.front ? "front" : "rear", mode_index, m.geom.cap_w, m.geom.cap_h, old_index);
+	return XRT_ERROR_STEREO_CAMERA_BUSY;
+}
+#endif // XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES
+
+#ifdef LEIA_SCAM_V8
+namespace {
+
+//! Our capture state as the runtime's struct, within @p out's struct_size.
+void
+put_capture_result(const leia_scam_capture_state &s, struct xrt_plugin_stereo_camera_capture_result *out)
+{
+	xrt_plugin_stereo_camera_capture_result r;
+	memset(&r, 0, sizeof(r));
+	r.struct_size = (uint32_t)sizeof(r);
+	r.valid_fields = s.valid_fields;
+	r.focus_distance_diopters = s.focus_distance_diopters;
+	r.focus_state = s.focus_state;
+	r.exposure_time_ns = s.exposure_time_ns;
+	r.sensitivity_iso = s.sensitivity_iso;
+	r.eye_time_ns[0] = s.eye_time_ns[0];
+	r.eye_time_ns[1] = s.eye_time_ns[1];
+	const uint32_t sz = out->struct_size;
+	memcpy(out, &r, std::min<size_t>(sz, sizeof(r)));
+	out->struct_size = sz;
+}
+
+} // namespace
+#endif
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS
+static_assert(LEIA_SCAM_CTL_FOCUS_MODE == XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_MODE, "control bits");
+static_assert(LEIA_SCAM_CTL_FOCUS_DISTANCE == XRT_PLUGIN_STEREO_CAMERA_CONTROL_FOCUS_DISTANCE, "control bits");
+static_assert(LEIA_SCAM_CTL_METERING_POINT == XRT_PLUGIN_STEREO_CAMERA_CONTROL_METERING_POINT, "control bits");
+static_assert(LEIA_SCAM_CTL_EXPOSURE_COMPENSATION == XRT_PLUGIN_STEREO_CAMERA_CONTROL_EXPOSURE_COMPENSATION,
+              "control bits");
+static_assert((int)LEIA_SCAM_FOCUS_CONTINUOUS_AUTO == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_CONTINUOUS_AUTO, "focus modes");
+static_assert((int)LEIA_SCAM_FOCUS_AUTO_ONCE == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_AUTO_ONCE, "focus modes");
+static_assert((int)LEIA_SCAM_FOCUS_MANUAL == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_MANUAL, "focus modes");
+static_assert((int)LEIA_SCAM_FOCUS_LOCKED == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_LOCKED, "focus modes");
+static_assert(LEIA_SCAM_RES_FOCUS_DISTANCE == XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_DISTANCE, "result bits");
+static_assert(LEIA_SCAM_RES_FOCUS_STATE == XRT_PLUGIN_STEREO_CAMERA_RESULT_FOCUS_STATE, "result bits");
+static_assert(LEIA_SCAM_RES_EXPOSURE_TIME == XRT_PLUGIN_STEREO_CAMERA_RESULT_EXPOSURE_TIME, "result bits");
+static_assert(LEIA_SCAM_RES_SENSITIVITY == XRT_PLUGIN_STEREO_CAMERA_RESULT_SENSITIVITY, "result bits");
+static_assert(LEIA_SCAM_RES_EYE_TIMES == XRT_PLUGIN_STEREO_CAMERA_RESULT_EYE_TIMES, "result bits");
+static_assert((int)LEIA_SCAM_FOCUS_STATE_FIXED == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FIXED, "focus states");
+static_assert((int)LEIA_SCAM_FOCUS_STATE_FAILED == (int)XRT_PLUGIN_STEREO_CAMERA_FOCUS_STATE_FAILED, "focus states");
+
+
+extern "C" xrt_result_t
+leia_stereo_camera_android_get_control_caps(struct xrt_plugin_instance *inst,
+                                            uint32_t index,
+                                            struct xrt_plugin_stereo_camera_control_caps *out)
+{
+	(void)inst;
+	std::lock_guard<std::mutex> lk(g_mu);
+	scan_locked();
+	if (out == nullptr || any_pending_locked() || index >= g_pairs.size()) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	const leia_scam_control_caps &cc = g_pairs[index].ctl_caps;
+	xrt_plugin_stereo_camera_control_caps c;
+	memset(&c, 0, sizeof(c));
+	c.struct_size = (uint32_t)sizeof(c);
+	c.supported_controls = cc.supported_controls;
+	c.supported_focus_modes = cc.supported_focus_modes;
+	c.min_focus_distance_diopters = cc.min_focus_distance_diopters;
+	c.focus_distance_calibration = cc.focus_distance_calibration;
+	c.exposure_compensation_min_ev = cc.exposure_compensation_min_ev;
+	c.exposure_compensation_max_ev = cc.exposure_compensation_max_ev;
+	c.exposure_compensation_step_ev = cc.exposure_compensation_step_ev;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_CONTROL_CAPS_HAS_DEFAULT_FOCUS
+	// What the source holds with no focus control set (written only within
+	// the runtime's struct_size, by the memcpy below). A pair whose lens
+	// focuses: AF off at desc.default_focus_d (FIXED), or the HAL's own AF with
+	// debug.dxr.leia.scam_hal_af=1 (AUTO). A fixed-focus lens (the front pair)
+	// has no focus control and min_focus_distance 0 already says so: UNKNOWN.
+	const pair_desc &pd = g_pairs[index];
+	if ((cc.supported_controls & LEIA_SCAM_CTL_FOCUS_MODE) != 0) {
+		c.default_focus = pd.hal_af ? XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_AUTO
+		                            : XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_FIXED;
+		c.default_focus_distance_diopters = pd.hal_af ? 0.0f : pd.default_focus_d;
+	} else {
+		c.default_focus = XRT_PLUGIN_STEREO_CAMERA_DEFAULT_FOCUS_UNKNOWN;
+	}
+#endif
+	const uint32_t sz = out->struct_size;
+	memcpy(out, &c, std::min<size_t>(sz, sizeof(c)));
+	out->struct_size = sz;
+	return XRT_SUCCESS;
+}
+
+/*!
+ * The WHOLE wanted control state (valid_controls == 0 = the defaults, at
+ * once). Applied to the running repeating request (and the still request)
+ * right away; kept for every session the camera builds after (a mode switch,
+ * the watchdog's re-open). The metering point is mapped through the running
+ * mode's crop and turn into the logical camera's active array now, so a later
+ * crop change keeps pointing at the same scene spot.
+ */
+extern "C" xrt_result_t
+leia_stereo_camera_android_set_controls(struct xrt_plugin_stereo_camera *c,
+                                        const struct xrt_plugin_stereo_camera_controls *controls)
+{
+	if (c == nullptr || controls == nullptr) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	xrt_plugin_stereo_camera_controls in;
+	memset(&in, 0, sizeof(in));
+	memcpy(&in, controls, std::min<size_t>(controls->struct_size, sizeof(in)));
+	leia_scam_controls k{};
+	k.valid_controls = in.valid_controls;
+	k.focus_mode = in.focus_mode;
+	k.focus_trigger = in.focus_trigger;
+	k.focus_distance_diopters = in.focus_distance_diopters;
+	k.metering_x = in.metering_x;
+	k.metering_y = in.metering_y;
+	k.exposure_compensation_ev = in.exposure_compensation_ev;
+	std::lock_guard<std::mutex> lk(c->cam_mu);
+	c->ctl = k;
+	update_region_locked(c);
+	const bool trigger = apply_controls_to_request_locked(c, false);
+	if (c->session != nullptr) {
+		const camera_status_t st = repeat_locked(c, trigger);
+		if (st != ACAMERA_OK) {
+			SCAM_LOG_W("leia stereo camera (android): controls not applied (setRepeatingRequest %d)", (int)st);
+			return XRT_ERROR_STEREO_CAMERA_BUSY;
+		}
+	}
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+leia_stereo_camera_android_get_capture_result(struct xrt_plugin_stereo_camera *c,
+                                              struct xrt_plugin_stereo_camera_capture_result *out)
+{
+	if (c == nullptr || out == nullptr) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	int64_t ts = 0, img_ts[2] = {0, 0};
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		if (c->held < 0) {
+			return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+		}
+		ts = c->bufs[c->held].ts_boot;
+		img_ts[0] = c->bufs[c->held].eye_ts_boot[0];
+		img_ts[1] = c->bufs[c->held].eye_ts_boot[1];
+	}
+	leia_scam_capture_state s;
+	capture_state_of(c, ts, img_ts, false, &s); // camera thread: c->ctl is stable here
+	put_capture_result(s, out);
+	return XRT_SUCCESS;
+}
+#endif // XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_CONTROLS
+
+#ifdef XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
+static_assert(XRT_PLUGIN_STEREO_CAMERA_STILL_READY == 1, "still poll");
+
+/*!
+ * Asynchronous: hands the request to a worker and returns. A still of the
+ * running capture (the default's cuts, or the stream's own crop) is the next
+ * pair; the rear pair's large still comes from its JPEG outputs on the
+ * running session (still_worker). Neither pauses the stream.
+ */
+extern "C" xrt_result_t
+leia_stereo_camera_android_request_still(struct xrt_plugin_stereo_camera *c,
+                                         const struct xrt_plugin_stereo_camera_still_request *req)
+{
+	if (c == nullptr || req == nullptr) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const int i = leia_scam_find_still_mode(c->desc.modes, c->desc.n_modes, req->eye_width, req->eye_height);
+	if (i < 0) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	leia_scam_mode m = c->desc.modes[i];
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		if (c->still != still_state::IDLE) {
+			return XRT_ERROR_STEREO_CAMERA_BUSY; // one at a time
+		}
+		if (m.source == LEIA_SCAM_SRC_DEFAULT_CAPTURE && (m.geom.cap_w != c->cap_w || m.geom.cap_h != c->cap_h)) {
+			// The stream runs its own (larger) capture right now: a cut of the
+			// default capture cannot be taken from it without scaling.
+			SCAM_LOG_W("leia stereo camera (android): still %llu at %ux%u refused: the stream runs %ux%u per lens, "
+			           "not the %ux%u capture that still is cut from",
+			           (unsigned long long)req->request_id, m.eye_w, m.eye_h, c->cap_w, c->cap_h, m.geom.cap_w,
+			           m.geom.cap_h);
+			return XRT_ERROR_STEREO_CAMERA_BUSY;
+		}
+		c->still = still_state::BUSY;
+		c->still_request = req->request_id;
+	}
+	if (c->still_thread.joinable()) {
+		c->still_thread.join(); // the previous one finished (the state was IDLE)
+	}
+	c->still_thread = std::thread(still_worker, c, m, req->request_id);
+	return XRT_SUCCESS;
+}
+
+extern "C" uint32_t
+leia_stereo_camera_android_poll_still(struct xrt_plugin_stereo_camera *c,
+                                      struct xrt_plugin_stereo_camera_still *out,
+                                      struct xrt_plugin_stereo_camera_capture_result *out_result)
+{
+	if (c == nullptr || out == nullptr) {
+		return XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED;
+	}
+	still_state st;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		st = c->still;
+		if (st == still_state::FAILED) {
+			c->still = still_state::IDLE;
+		} else if (st == still_state::READY) {
+			c->still = still_state::DELIVERED;
+		}
+	}
+	switch (st) {
+	case still_state::READY:
+	case still_state::DELIVERED: break;
+	case still_state::IDLE:
+	case still_state::FAILED:
+		if (c->still_thread.joinable()) {
+			c->still_thread.join();
+		}
+		return XRT_PLUGIN_STEREO_CAMERA_STILL_FAILED;
+	default: return XRT_PLUGIN_STEREO_CAMERA_STILL_NONE;
+	}
+	if (c->still_thread.joinable()) {
+		c->still_thread.join(); // it set READY as its last step
+	}
+	xrt_plugin_stereo_camera_still s;
+	memset(&s, 0, sizeof(s));
+	s.width = 2 * c->still_w;
+	s.height = c->still_h;
+	s.format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+	s.planes[0] = c->still_buf.data();
+	s.planes[1] = c->still_buf.data() + (size_t)2 * c->still_w * c->still_h;
+	s.pitches[0] = s.pitches[1] = 2 * c->still_w;
+	s.time_ns = c->still_eye_mono[0];
+	s.time_is_exposure = 1;
+#ifdef XRT_PLUGIN_STEREO_CAMERA_STILL_HAS_FLAGS
+	// The 4096x3072 still went through one JPEG per lens (quality 95); a still
+	// from stream pairs did not.
+	s.flags = c->still_lossy ? XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE : 0u;
+#endif
+	const uint32_t sz = out->struct_size;
+	memcpy(out, &s, std::min<size_t>(sz, sizeof(s)));
+	out->struct_size = sz;
+	if (out_result != nullptr) {
+		put_capture_result(c->still_res, out_result);
+	}
+	return XRT_PLUGIN_STEREO_CAMERA_STILL_READY;
+}
+
+extern "C" void
+leia_stereo_camera_android_release_still(struct xrt_plugin_stereo_camera *c)
+{
+	if (c == nullptr) {
+		return;
+	}
+	bool drop = false;
+	{
+		std::lock_guard<std::mutex> lk(c->pair_mu);
+		if (c->still == still_state::DELIVERED || c->still == still_state::READY ||
+		    c->still == still_state::FAILED) {
+			c->still = still_state::IDLE;
+			drop = true;
+		}
+	}
+	if (drop && c->still_buf.size() > ((size_t)8 << 20)) {
+		// A full-resolution pair is ~38 MB: give it back between stills.
+		c->still_buf.clear();
+		c->still_buf.shrink_to_fit();
+	}
+	if (drop && c->still_thread.joinable()) {
+		c->still_thread.join();
+	}
+}
+#endif // XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_STILL
 
 extern "C" bool
 leia_stereo_camera_android_tracking_lens(char *out, size_t cap)

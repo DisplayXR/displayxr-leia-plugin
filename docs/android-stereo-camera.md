@@ -358,6 +358,349 @@ in the same directory (Y8, 640×480, sensor-native: the engine rotates it).
 Y stride, non-zero rotation) are not on this path. Nothing here changes when
 the pin moves to CNSDK ≥ 0.10.88.
 
+## Capture modes, controls and stills (runtime `XR_DXR_stereo_camera` v8)
+
+The eight v8 slots (runtime PR #2803, spec §5.5–§5.7 and §9b) are compiled
+only against runtime headers that define `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA_MODES`,
+`_CONTROLS` and `_STILL`. Built against older headers (the pinned Android tag),
+the source behaves as before: one mode, no controls, the template's focus.
+The pure-C half (mode list, metering mapping, control plan, capture result)
+is `leia_stereo_camera_android_modes.{h,c}`, host-tested by
+`tests/test_stereo_camera_android_modes.c`.
+
+The numbers below come from the stage 0 measurements on an NP02J rear pair
+(DisplayXR Camera, `docs/STAGE0.md`): 29.80 fps in every mode that keeps up
+(never 30.0), YUV at full rate up to 3264x2448 per lens, 4000x3000 and
+4208x3120 YUV at ~27.4 fps with ~220 ms latency.
+
+### Modes
+
+Every mode has the default eye's **horizontal** field of view about the same
+optical axis, with square pixels; only the vertical extent differs. That is
+what lets the runtime derive each mode's calibration from the default's
+(§5.5: `s = w / w_default`, `f' = f s`, `cx' = (cx + ½) s − ½`,
+`cy' = (cy + ½ − h_default/2) s + h/2 − ½`). For a listed size the HAL serves
+the centred region of its aspect; the eye keeps exactly the default's columns
+of it (a whole, even number, centred at an even offset) and either every row
+or the default's 16:9 cut. 16:9 capture sizes see the whole array width
+(4208 columns on the rear pair) while the 4:3 default sees 4160, so they never
+become modes of their own.
+
+| Pair | Mode | Capture per lens | Flags | Switching to it |
+|---|---|---|---|---|
+| both | **1280x720** (default) | 1280x960 YUV | stream, still | — |
+| both | 1280x960 | 1280x960 YUV | stream, still | new crop of the running capture: no frame lost |
+| rear | 1920x1080 | 1920x1440 YUV | stream | session reconfigure |
+| rear | 1920x1440 | 1920x1440 YUV | stream | session reconfigure (free between 1920x1080 and 1920x1440) |
+| rear | 4096x3072 | JPEG output, 4096x3072 | still | none: the JPEG outputs are in every rear session |
+
+- **One further stream capture only**: the largest listed YUV size within the
+  stream cap (default 1920x1440, `debug.dxr.leia.scam_max_stream`) whose
+  listed minimum frame duration is at most 1/30 s. The runtime serves any size
+  in between by downscaling, so more captures would only add reconfigures.
+- **Reconfigure** (rear, `set_mode` to the other capture): the device stays
+  open, the new session replaces the old one (stage 0: 86–124 ms to
+  configure, ~85 ms to the first frame at 1920x1440), the sequence keeps
+  counting. One WARN per switch gives the time. A failed switch rebuilds the
+  previous capture and returns BUSY; if that also fails the watchdog re-opens.
+- **Lazy session**: `open` no longer starts the capture; the first `wait_frame`
+  or `set_mode` does, so a `set_mode` right after open opens straight into the
+  wanted mode.
+- `maxFrameRate` is the **measured** rate of the mode's capture (the default
+  capture's or the further capture's, once it has run), else 0. The HAL lists
+  33.33 ms for every size, including the ones that deliver 27.4 fps, so its
+  table is never reported.
+- A turned pair (phone held upright) lists the default only: its published
+  horizontal is the sensor's vertical.
+
+**The calibration is pixel-centre aware** (changed with v8, also for older
+runtimes): the array → stream step is `c' = (c − offset + ½)·s − ½` (pixel
+centres at integer coordinates, as the block's OpenCV numbers and the
+runtime's rule use) instead of `c' = c·s`. The two differ by `(s − 1)/2`
+pixels, about −0.35 px for 1280 of a 4208-column array; with the old rule the
+runtime's derivation would put a 4096x3072 still's principal point ~1.1 px off.
+The host test checks, for every listed mode on the tablets' numbers, that the
+runtime's rule applied to the default calibration equals the calibration
+computed for the mode directly from the factory block. The tracker's 640x480
+intrinsics keep the old rule (unchanged).
+
+### Front pair (shared with head tracking)
+
+The front pair lists only the default and 1280x960: both are cuts of the same
+1280x960 capture, so a mode switch changes nothing for the camera session and
+nothing for the **tracking feed** (the 640x480 frame is cut from every
+tracking-lens image of that capture, before pairing, whatever the mode). No
+larger stream mode (a reconfigure stops the feed for well over CNSDK's 70 ms
+predictor window) and no JPEG output (an extra output on the tracking lens
+changes its session; not measured). A still on the front pair is the next
+stream pair, at 1280x720 or 1280x960: no session change, no tracking gap.
+
+### Controls
+
+`get_control_caps` advertises what the source can apply:
+
+- **Focus.** On a pair whose lens focuses, the source runs the AF state
+  machine **OFF** and drives both lenses with one logical
+  `LENS_FOCUS_DISTANCE`. Stage 0: one logical distance moves both lenses
+  (they agree within ~0.03 D, settled ~260 ms after the request), while
+  continuous AF and an AF trigger move lens 0 only, and the HAL lists no
+  per-lens request keys. So only **MANUAL** and **LOCKED** are advertised;
+  the app focuses from the stereo pair itself. With no focus control set
+  (`valid_controls == 0`, or the focus bits clear) the source's default is a
+  fixed **0.5 D (2 m)**: the lens's ~0.31 D floor is about its hyperfocal
+  distance (~3.2 m), so at 2 m the depth of field spans ~1.2–5.3 m, the range
+  people and tabletop scenes are shot at, at the cost of sharpness at
+  infinity (0.31 D would cover ~1.6 m–∞). LOCKED, and MANUAL without a
+  distance, keep the distance in force. The caps say so:
+  `default_focus = FIXED`, `default_focus_distance_diopters = 0.5` (AUTO with
+  HAL AF; UNKNOWN on the fixed-focus front pair, whose minimum focus distance
+  0 already tells). There is no HAL signal that tells
+  whether its AF drives both lenses of a logical pair, so this is the default
+  for every pair; `debug.dxr.leia.scam_hal_af=1` opts a device back into the
+  HAL's AF (CONTINUOUS_AUTO, AUTO_ONCE with one `AF_TRIGGER_START` per
+  `focus_trigger` change, LOCKED = AUTO without a trigger).
+- **Metering point**: one `AE_REGIONS` rectangle (and `AF_REGIONS` with HAL
+  AF), 5 % of the logical array's shorter side, centred on the point. The
+  point arrives normalised in the raw left eye of the delivered frame; it is
+  mapped through the turn (if any) and the centred crop into the capture, then
+  through the HAL's array → stream step into the lens's active array, and
+  proportionally into the logical camera's array (regions are relative to it).
+  No mirror: the published frames are sensor images. Mapped once when the
+  controls arrive, so a later crop change keeps pointing at the same spot.
+- **Exposure compensation**: the HAL's range and step (rounded, clamped).
+- **Front pair**: fixed-focus lenses, and metering / compensation would move
+  the exposure the tracker sees, so it advertises **no controls** unless
+  `debug.dxr.leia.scam_front_controls=1` (metering + compensation).
+
+A cleared bit puts back the request template's own value (or removes the
+tag). The state is applied to the repeating request at once and to every
+session built later (mode switch, watchdog re-open; with HAL AF and
+AUTO_ONCE a re-open searches again).
+
+**Capture result** (`get_capture_result`, only what the HAL reported), from
+`ACaptureSessionLogicalCamera` callbacks:
+
+| Field | Source |
+|---|---|
+| focus distance | the logical result (it commands both lenses). With APPROXIMATE calibration it may be the commanded value, not a sensed one |
+| focus state | AF off: the two lenses' `LENS_STATE`, MOVING on either = SEARCHING, both STATIONARY = LOCKED. HAL AF: the logical `AF_STATE`. Fixed focus: FIXED |
+| exposure, ISO | the left eye lens's physical result, else the logical one |
+| per-eye exposure start | the two physical `SENSOR_TIMESTAMP`s, **only once they have proved independent** |
+
+Per-eye times: stage 0 found this HAL stamps both lenses with one synthesized
+time on 99.7 % of frames, although lens 2's buffers arrive 12–16 ms after
+lens 0's. Equal stamps are therefore not evidence of sync. The source sets
+the per-eye bit only after 60 frames with both stamps of which at least one in
+ten differed (`leia_scam_eye_times_tracker`); on the NP02J that never
+happens, so the bit stays clear and `captureTime` is the only time.
+
+### Pairing and per-eye times
+
+Two different clocks are in play, and they disagree on this HAL:
+
+- **Image stamps** (`AImage_getTimestamp`, one per lens): what **pairing** uses.
+  On the NP02J they are equal for both lenses (stage 0: one synthesized stamp,
+  interval std 0.000 ms), although lens 2's buffers arrive 12–16 ms later.
+- **Physical result stamps** (`SENSOR_TIMESTAMP` in each lens's physical
+  result of an `ACaptureSessionLogicalCamera` callback): what the per-eye
+  capture times report, and only once they have proved independent.
+
+A pair is the left image with the right image whose stamp is the closest
+within the tolerance (default 8 ms, `debug.dxr.leia.scam_pair_tol_ms`,
+always capped at 0.3 of the frame period measured from each lens's own
+consecutive stamps), so a constant lens offset of a few ms still pairs and two
+different frames (one period, 33.56 ms, apart) never do. Before v8 the rule
+was the first image within 1 ms.
+
+**What stamps cannot show.** Because the image stamps are synthesized, a
+pair whose lenses delivered DIFFERENT sensor frames under one request would
+still carry equal image stamps and pair. The physical stamps are the only
+witness. Device runs of this branch saw them at a constant −6.5 ms (R − L)
+in one stream (a plausible sensor phase: reported, and harmless to pairing)
+and, in another, jump to −39.1 ms (one period + 5.6 ms) right after a
+ZSL still and stay there: that would be a one-frame temporal mismatch in
+every later pair if the physical stamps are right. The still request
+therefore uses `TEMPLATE_PREVIEW` by default; whether ZSL really slips a
+lens, and whether the pixels follow the physical stamps, needs the
+diagnostics below and an optical check (a moving object or a stopwatch on a
+screen in both eyes of one pair).
+
+The still request's results come through their own callbacks and never
+stand in for a stream frame's result, nor count towards the per-eye-time
+decision. Per-eye times stay withheld until 60 frames had both physical
+stamps and at least one in ten differed; the first ~60 frames of a stream
+therefore always report no per-eye times, even when the offset is constant.
+
+**Diagnostics** (WARN):
+
+- at each stream start: the pairing tolerance;
+- every 10 s: min/median/max of R − L image stamp over the paired frames, of
+  R − L physical result stamp, and of image − physical stamp per lens; the
+  candidates rejected for exceeding the tolerance; images dropped unpaired
+  per lens; whether per-eye times are reported;
+- once 30 pairs followed a still: `after still <id>: R-L median image stamp
+  a -> b ms, physical result stamp c -> d ms`, flagged `CHANGED` when either
+  median moved by more than 1 ms.
+
+Image − physical per lens is the decisive number: equal image stamps beside
+a physical skew mean the HAL synthesizes the image stamps.
+
+### Lens phase
+
+**Measured** (dev runtime, rear pair at 1920x1440, the 10 s pairing WARN):
+`R-L image stamp 0.000/0.000/0.000 ms; R-L physical result stamp
+-40.615/-40.615/-40.615 ms; image-physical L -40.615, R 0.000`. Over four
+opens of the tablet's rear pair the R − L gap between the two lenses'
+start of exposure was **0, −6.5, −39.1 and −40.6 ms**: fixed within a
+session, re-rolled at each open, unchanged by a still. The two sensors
+free-run (sync type APPROXIMATE) and the HAL stamps both images with one
+time (here the right lens's), so pairing by image stamp pairs the two
+buffers of one REQUEST, whatever their real exposure times. The calibration
+session measured the same on a phone's front pair (0 ms in about half the
+opens, else up to 40 ms; visible as depth error when the device rotates).
+It is a real exposure-time offset between the eyes.
+
+The gap is **bimodal** on the tablet's rear pair: exactly 0.000 ms, or about
+−35 to −42 ms (once −6.5 ms). An exact 0.000 is either a hardware frame sync
+that locked (one shared start of frame) or the HAL reporting one stamp for
+both lenses in that state; timestamps cannot tell which. Behaviour does not
+change for it; the log says `identical stamps on all N samples: hardware sync
+or a shared stamp, not distinguishable`.
+
+Measured with the lock (d3f76be, rear 1920x1440, 7 opens): session restart
+−38.965 → 0.000 after 1 (420 ms), 0.000 without one, −36.480 → 0.000 after 1
+(417 ms); device restart −38.168 → −42.085 → −40.525 → 0.000 after 3 (236 /
+294 / 278 ms), −34.791 → 0.000 after 1 (257 ms), −38.024 → 0.000 after 1
+(246 ms). Both levels re-roll the phase. First frame at the client: 706 ms
+without a restart, ~1.6–1.7 s with one, 3.3 s with three.
+
+**Lock** (`leia_scam_phase_*`, after every start):
+
+1. Measure the gap G = R − L of the two lenses' physical `SENSOR_TIMESTAMP`
+   of one request over the first 12 pairs (median).
+2. **Re-pair to the nearest frame**: both lenses run at the same period P, so
+   the right frame `k + n`, `n = round(−G/P)` (±1 at most), is nearer in time
+   to left frame `k`. No per-lens buffer matching is needed: the image stamps
+   are one per request and periodic, so the right image of request `k + n`
+   carries stamp `t + n·P`. The residual is `G + n·P`, at most P/2
+   (−40.6 ms → right eye one frame later → −7.06 ms). Costs `n = +1` one frame
+   of latency. Each eye's capture result (exposure, ISO, per-eye time) then
+   comes from its own request.
+3. If the judged gap still exceeds 3 ms, **restart** to re-roll the phase,
+   at most 4 times, then accept the last session as it is (a restart re-rolls
+   the phase, so an earlier better session cannot be restored; the log gives
+   the best seen). One WARN per restart (gap, re-paired residual, attempt) and
+   a final `lens phase LOCKED | ACCEPTED ...` line.
+4. **Judged on**: the rear pair, whose JPEG stills take both eyes from one
+   request (no re-pairing possible for them), is judged on the raw gap G; a
+   pair without same-request stills (the front) on the re-paired residual.
+
+While a start locks, no pair is published: the camera stays WAITING and
+consumers see one clean start (~12 frames, 400 ms, plus any restart).
+After a mode reconfigure (a new session, so a new phase) the lock re-measures
+and re-pairs but neither restarts nor holds frames, to keep the switch inside
+its 500 ms budget. A HAL with no per-lens stamps: no lock (after 36 pairs).
+
+**Restart level** (`debug.dxr.leia.scam_phase_restart`): `device` (rear
+default) closes and re-opens the logical camera; `session` (front default)
+recreates only the capture session on the open device. Both re-roll the
+phase; on the rear pair the device restart measured faster (236–294 ms vs
+417–420 ms). The front keeps `session` because a device restart there also
+waits for the tracking lens to be released.
+
+**Every wait is bounded and logged.** A start holds frames at most 2.5 s per
+session for the lock; past it the lock gives up with a WARN naming why (no
+pair arrived / pairs but no capture results / results without both lenses'
+stamps) and frames flow unshifted. Every open attempt logs one WARN (first
+open, watchdog re-open, retry after a policy refusal, lens-phase restart),
+and so does every `openCamera` refusal (a process in the background or with
+the screen off is refused with −10012); the watchdog gives up after 15 s.
+
+**Front pair**: re-pairing only by default. A restart there stops the
+tracking feed for its duration (a session restart ~200–250 ms, a device
+restart more, plus the lens-free wait): each one is a CNSDK predictor reset
+(gap > 70 ms); the in-app hand-over itself is kept, since a restart never
+hands tracking back. `debug.dxr.leia.scam_phase_restart_front=1` enables it.
+
+The accepted gap reaches the runtime as the per-eye capture times (once the
+stamps proved independent); the 10 s WARN ends with the lock's state, shift
+and accepted gap.
+
+### Stills
+
+| Still | How | Stream | Expected latency |
+|---|---|---|---|
+| 1280x720 / 1280x960 (both pairs) | the next stream pair, packed at the still's crop | no frame lost | ~1 frame |
+| 4096x3072 (rear) | one request on the running session targeting the stream outputs **and** one JPEG output per lens (`TEMPLATE_PREVIEW`; `debug.dxr.leia.scam_still_template=zsl` for `TEMPLATE_ZERO_SHUTTER_LAG`, see *Pairing* below), then each JPEG decoded (`AImageDecoder`) and converted to NV12 | no frame lost | ~320 ms to both JPEGs (stage 0) + decode/convert, ~0.6–0.8 s to READY (estimate, not measured) |
+
+- **Never a reconfigure** for a still (stage 0: 1.35 s without frames) and
+  never `TEMPLATE_STILL_CAPTURE` on the live stream (a ~400 ms freeze).
+- **Why JPEG.** The HAL takes exactly one YUV output per lens (a second one
+  aborts it), and the runtime wants a RAW pair in GRAY8 / NV12 / BGRA8. With
+  YUV stream outputs the still output per lens has to be JPEG, decoded here.
+  Moving the stream outputs to PRIVATE (the AHardwareBuffer transport step)
+  would allow a YUV still output instead; not this change.
+- **Decode.** `AImageDecoder` is API 30; the plug-in targets API 29, so it is
+  looked up in `libjnigraphics.so` at run time (an API 29 system: the JPEG
+  still fails, the stream-pair stills work). The JPEGs are requested with
+  `JPEG_ORIENTATION` 0 (pixels as captured, no EXIF turn) and quality 95
+  (`debug.dxr.leia.scam_still_quality`); RGBA → NV12 is full-range BT.601,
+  like the camera's own YUV. The JPEG round trip is lossy (quality 95), so the
+  still carries `XRT_PLUGIN_STEREO_CAMERA_STILL_LOSSY_SOURCE` (runtime
+  `XR_STEREO_CAMERA_STILL_SOURCE_LOSSY_BIT_DXR`); stills from stream pairs do not.
+- **Speed.** The two eyes are decoded and converted on two threads, and the
+  RGBA → NV12 step (`leia_stereo_camera_android_still.c`, NEON, bit-identical
+  to its scalar reference) is always built `-O2`, also in a Debug plug-in.
+  Host (Apple M1, the two 4096x3072 halves of a tablet still): the conversion
+  went from ~100 ms per eye (the old C++ loop at -O0) to 2.5 ms; decode +
+  conversion of both eyes from 350–380 ms to 117–122 ms. AImageDecoder
+  decodes to RGBA at best (no YCbCr output) and the NDK has no public
+  libjpeg, so a direct-to-YCbCr decode would mean shipping libjpeg-turbo: not
+  done. The still log splits the time per eye (`L decode .. + NV12 .., R
+  decode .. + NV12 .., in parallel`).
+- **Memory.** The 4096x3072 NV12 pair is 37.7 MB, freed at `release_still`.
+  While a still is decoded: the two JPEGs (~5–10 MB each), two RGBA eyes
+  (50 MB each, decoded at the same time) and the NV12 pair. The rear session
+  also carries two JPEG readers of 2 images each.
+- `debug.dxr.leia.scam_still=0` drops the JPEG outputs (stream-pair stills only).
+- A still of the default capture asked while the rear stream runs its
+  1920x1440 capture is refused (BUSY): it is a cut of a capture that is not
+  running.
+
+## Opening after a policy refusal
+
+`openCamera` returning **−10012** is `ACAMERA_ERROR_CAMERA_DISABLED`. From
+AOSP CameraService (knowledge, not verified on this OEM build) that comes
+from one of three checks: a device-policy camera disable, sensor privacy, or
+the caller not counting as active ("can't open camera from background"). The
+runtime satellite has no foreground-service type: it may use the camera
+because the binding app's while-in-use capability reaches it through
+`BIND_INCLUDE_CAPABILITIES` (runtime `Client.bindService`), and right after
+the app comes to the front that state lags. Device runs: the camera app's
+rear open was refused for 3.7–4.9 s; the probe app mostly went straight
+through.
+
+The front pair's first `openCamera` comes later in its own start (after
+the tracking hand-over and the wait for the tracking service to release its
+lens), so it reaches the camera service after part of that lag has passed;
+that explains a shift of up to about a second, not a 3–4 s difference. The
+logs below are there to settle it.
+
+Retry: the first retry after a refusal comes 250 ms later (was 500 ms), then
+every 250 ms for 10 s, and **at once** when the camera service reports an
+access-priority change (`onCameraAccessPrioritiesChanged`) or a camera
+opens or closes (extended availability callbacks).
+
+Logged for every start (WARN): each open attempt (reason, trigger, ms after
+the stream start); each refusal (attempt, ms since the first refusal, and the
+process state: `ActivityManager.getMyMemoryState()` importance,
+`PowerManager.isInteractive()`, `KeyguardManager.isKeyguardLocked()`); the
+open that got through (refusals, duration, trigger, process state); the first
+published pair (ms after the stream start, first attempt, open through,
+lens-phase lock time). A refusal while importance stays at 100–125 and the
+screen is interactive points at the camera service's own uid state rather than
+the process state.
+
 ## Watchdog
 
 The pair counts as stalled when no frame pair has arrived for 1.5 s. A stall
@@ -387,3 +730,20 @@ On either, the source:
 | `debug.dxr.leia.scam_rotate=auto\|0\|90\|180\|270` | clockwise turn of each eye (auto: the sensor orientation when the lenses are stacked along the sensor's y axis, else 0) |
 | `debug.dxr.leia.scam_calib_ref=auto\|array\|WxH` | the size the factory block's intrinsics are expressed at (auto: see *Reference size*) |
 | `debug.dxr.leia.scam_served_calib=0` | ignore the served display config record (provider / factory only) |
+| `debug.dxr.leia.scam_modes=0` | v8: list the default mode only |
+| `debug.dxr.leia.scam_max_stream=WxH` | v8: largest mode on a further stream capture (rear; default 1920x1440). The front pair never reconfigures |
+| `debug.dxr.leia.scam_max_still=WxH` | v8: largest still from the JPEG output (default 4096 wide) |
+| `debug.dxr.leia.scam_still=0` | v8: no JPEG still outputs (stills from stream pairs only) |
+| `debug.dxr.leia.scam_still_template=preview\|zsl` | v8: template of the still request (default preview) |
+| `debug.dxr.leia.scam_phase=0` | no lens-phase lock (pairs as delivered) |
+| `debug.dxr.leia.scam_phase_samples=<n>` | pairs measured per session (default 12) |
+| `debug.dxr.leia.scam_phase_max_ms=<ms>` | accepted lens-phase gap (default 3) |
+| `debug.dxr.leia.scam_phase_restarts=<n>` | restarts at most (default 4) |
+| `debug.dxr.leia.scam_phase_restart=session\|device` | restart level (default device on the rear pair, session on the front) |
+| `debug.dxr.leia.scam_phase_repair=0` | no nearest-frame re-pairing |
+| `debug.dxr.leia.scam_phase_restart_rear=0` / `_front=1` | restarts on the rear (default on) / front (default off) pair |
+| `debug.dxr.leia.scam_pair_tol_ms=<ms>` | pairing tolerance between the two lenses' image stamps (default 8; always capped at 0.3 frame period) |
+| `debug.dxr.leia.scam_still_quality=<50..100>` | v8: JPEG quality of the still (default 95) |
+| `debug.dxr.leia.scam_hal_af=1` | v8: use the HAL's AF (continuous, tap-to-focus) instead of AF off + one distance |
+| `debug.dxr.leia.scam_default_focus_d=<D>` | v8: the fixed focus distance with no focus control set (default 0.5 D) |
+| `debug.dxr.leia.scam_front_controls=1` | v8: metering point + exposure compensation on the front (tracking) pair |
